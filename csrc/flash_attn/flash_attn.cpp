@@ -105,8 +105,12 @@ void set_params_fprop(FMHA_fprop_params &params,
                       float softmax_scale,
                       bool is_causal,
                       bool is_bf16,
-                      int num_splits) {
-
+                      int num_splits,
+                      void *attn_mask = nullptr,
+                      void *attn_bias = nullptr,
+                      int bias_mod_size = 0,
+                      int mask_head_mod_size = 0,
+                      int mask_seq_mod_size = 0) {
     Data_type data_type = is_bf16 ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
 
     // Reset the parameters
@@ -147,6 +151,13 @@ void set_params_fprop(FMHA_fprop_params &params,
     params.seqlen_q = seqlen_q;
     params.seqlen_k = seqlen_k;
     params.d = d;
+
+    // attn mask & bias
+    params.attn_mask_ptr = attn_mask;
+    params.attn_bias_ptr = attn_bias;
+    params.bias_mod_size = bias_mod_size;
+    params.mask_head_mod_size = mask_head_mod_size;
+    params.mask_seq_mod_size = mask_seq_mod_size;
 
     // Set the different scale values.
     // const float scale_bmm1 = 1.f / sqrtf(d);
@@ -350,12 +361,130 @@ bool flash_attn_fwd(
         launch_params.params.philox_args = PhiloxCudaState(seed, offset);
     }
 
-    run_fmha_fwd(launch_params);
+// For just fxxking alphafold2
+bool flash_attn_fwd_with_bias_and_mask(
+        const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+        const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        void *out,                  // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const void *cu_seqlens_q,   // int32, batch_size+1, starting offset of each sequence
+        const void *cu_seqlens_k,   // int32, batch_size+1, starting offset of each sequence
+        const int total_q,
+        const int total_k,
+        const int batch_size,
+        const int num_heads,
+        const int head_size,
+        const int max_seqlen_q_,
+        const int max_seqlen_k_,
+        const float p_dropout,
+        const float softmax_scale,
+        const bool zero_tensors,
+        const bool is_causal,
+        const bool is_bf16,
+        const int num_splits,        // SMs per attention matrix, can be 1
+        void *softmax_lse_ptr,       // softmax log_sum_exp
+        void *softmax_ptr,
+        void *workspace_ptr,
+        uint64_t *workspace_size,
+        cudaStream_t stream,
+        uint64_t seed,
+        uint64_t offset,
+        void *attn_mask = nullptr,
+        void *attn_bias = nullptr,
+        int64_t* mask_dims = nullptr,
+        int64_t* bias_dims = nullptr) {
+    // printf("forward seed %jd offset %jd\b", seed, offset);
+    FLASHATTNLIB_BEGIN_FUNC 
+
+    auto dprops = GetDeviceProperties(-1);
+    bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
+    bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
+    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+
+    ASSERT_CHECK(is_sm8x || is_sm75);
+    ASSERT_CHECK(batch_size > 0);
+    ASSERT_CHECK((head_size % 8 == 0) && (head_size <= 128));
+
+    int blocksize_c = head_size > 64 ? 128 : 256;
+    // Need to round max_seqlen_k to multiples of blocksize_c
+    int max_seqlen_k = ((max_seqlen_k_ + blocksize_c - 1) / blocksize_c) * blocksize_c;
+    if( max_seqlen_k_ <= 128 ) {
+        max_seqlen_k = 128;
+    } else if( max_seqlen_k_ <= 256 ) {
+        max_seqlen_k = 256;
+    }
+    int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
+    bool loop = max_seqlen_k > blocksize_c;
+
+    void* o_tmp_ptr = workspace_ptr;
+    // nullptr out to calculate workspace size
+    if (out == nullptr) {
+        if (loop) {
+            *workspace_size = uint64_t(total_q) * num_heads * head_size * sizeof(float);
+        } else {
+            *workspace_size = 0;
+        }
+        return true;
+    }
+
+    int bias_mod_size = attn_bias ? bias_dims[0] : 0;
+    if (attn_bias) {
+        static_assert(bias_dims[1] == num_heads, "please checkout bias dims in paddle flash_attn.");
+    }
+    int mask_head_mod_size = attn_mask ? mask_dims[1] : 0;
+    int mask_seq_mod_size  = attn_mask ? mask_dims[2] : 0;
+    if (attn_mask) {
+        static_assert(mask_dims[1] == 1 || mask_dims[1] == num_heads, 
+                      "please checkout mask dims in paddle flash_attn.")
+        static_assert(mask_dims[2] == 1 || mask_dims[2] == max_seqlen_q_,
+                      "please checkout mask dims in paddle flash_attn.")
+    }
+
+    const bool return_softmax = (softmax_ptr != nullptr);
+    bool is_dropout = p_dropout > 0.0;
+    Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
+
+    if (zero_tensors) {
+        SetZero(out,  2, {total_q, num_heads, head_size}, stream);
+        SetConstValue<float>(softmax_lse_ptr, -std::numeric_limits<float>::infinity(), uint64_t(batch_size) * num_heads * max_seqlen_q, stream);   
+        if (return_softmax) SetZero(softmax_ptr, 2, {batch_size, num_heads, max_seqlen_q, max_seqlen_k}, stream);  // float16
+    }
+
+    set_params_fprop(launch_params.params,
+                     batch_size,
+                     max_seqlen_q,
+                     max_seqlen_k,
+                     num_heads,
+                     head_size,
+                     const_cast<void*>(q),
+                     const_cast<void*>(k),
+                     const_cast<void*>(v),
+                     const_cast<void*>(out),
+                     const_cast<void*>(cu_seqlens_q),
+                     const_cast<void*>(cu_seqlens_k),
+                     loop ? o_tmp_ptr : nullptr,
+                     return_softmax ? softmax_ptr : nullptr,
+                     softmax_lse_ptr,
+                     p_dropout,
+                     softmax_scale,
+                     is_causal,
+                     is_bf16,
+                     num_splits,
+                     attn_mask,
+                     attn_bias,
+                     bias_mod_size,
+                     mask_head_mod_size,
+                     mask_seq_mod_size);
+    run_fmha_fwd_with_bias_mask(launch_params, /*configure=*/ true);
+    if( is_dropout ) {
+      launch_params.params.philox_args = PhiloxCudaState(seed, offset);
+    }
+    run_fmha_fwd_with_bias_mask(launch_params, /*configure=*/false);
 
     return true;
-
     FLASHATTNLIB_END_FUNC 
 }
+
 
 
 bool flash_attn_bwd(

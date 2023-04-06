@@ -38,3 +38,25 @@
             F();                             \
         }                                    \
     }
+
+#define BOOL_SWITCH_FUNC(COND, CONST_NAME, ...)  \
+    [&] {                                        \
+        if (COND) {                              \
+            constexpr bool CONST_NAME = true;    \
+            return __VA_ARGS__();                \
+        } else {                                 \
+            constexpr bool CONST_NAME = false;   \
+            return __VA_ARGS__();                \
+        }                                        \
+    }()
+
+#define FP16_SWITCH_FUNC(COND, ...)              \
+    [&] {                                        \
+        if (COND) {                              \
+            using elem_type = __nv_bfloat16;     \
+            return __VA_ARGS__();                \
+        } else {                                 \
+            using elem_type = __half;            \
+            return __VA_ARGS__();                \
+        }                                        \
+    }()

@@ -65,7 +65,7 @@ struct Gmem_tile_qkv {
     static constexpr int LDGS = DivUpConstexpr(ROWS, ROWS_PER_LDG);
 
     // Ctor.
-    template< typename BInfo >
+    template<typename BInfo>
     inline __device__ Gmem_tile_qkv(void *ptr_, const uint32_t row_stride_in_elts,
                                     const uint32_t head_stride_in_elts, const int headdim,
                                     const BInfo &binfo, const int tidx, bool use_seqlen_q)
@@ -88,6 +88,38 @@ struct Gmem_tile_qkv {
         // int64_t row_offset = (int64_t)row * params.qkv_stride_in_bytes;
         uint32_t row_offset = (uint32_t)(((use_seqlen_q ? binfo.sum_s_q : binfo.sum_s_k) + row) * row_stride_in_bytes);
         // Add the block index.
+        // row_offset += (int64_t)((binfo.sum_s * NUM_MATS + qkv_offset) * binfo.h + binfo.bidh) * BYTES_PER_ROW;
+        row_offset += (uint32_t)(binfo.bidh * head_stride_in_elts * BYTES_PER_ELEMENT);
+
+        // Assemble the final pointer.
+        ptr += row_offset + col * BYTES_PER_LDG;
+    }
+
+    // Ctor.
+    template<typename BInfo>
+    inline __device__ Gmem_tile_qkv(void *ptr_, const uint32_t row_stride_in_elts,
+                                    const uint32_t head_stride_in_elts, 
+                                    const BInfo &binfo, const int tidx, bool use_seqlen_q)
+        : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
+        , actual_seqlen(use_seqlen_q ? binfo.actual_seqlen_q : binfo.actual_seqlen_k)
+        , ptr(reinterpret_cast<char *>(ptr_))
+        , tidx_(tidx) {
+
+        col_predicate = true;
+        // Compute the position in the sequence (within the CTA for the moment).
+        int row = tidx / THREADS_PER_ROW;
+        // Compute the position of the thread in the row.
+        int col = tidx % THREADS_PER_ROW;
+
+        // Store the row as we need it to disable the loads.
+        // TD [2022-04-16]: To minimize registers, we'll recompute row_ instead of storing it
+        // row_ = row;
+
+        // The row offset in the batched GEMM. For each seq element, we store QKV in that order.
+        // int64_t row_offset = (int64_t)row * params.qkv_stride_in_bytes;
+        uint32_t row_offset = (uint32_t)(((use_seqlen_q ? binfo.sum_s_q : binfo.sum_s_k) + row) * row_stride_in_bytes);
+        // Add the block index.
+      
         // row_offset += (int64_t)((binfo.sum_s * NUM_MATS + qkv_offset) * binfo.h + binfo.bidh) * BYTES_PER_ROW;
         row_offset += (uint32_t)(binfo.bidh * head_stride_in_elts * BYTES_PER_ELEMENT);
 
@@ -206,6 +238,38 @@ struct Gmem_tile_o {
         , tidx_(tidx)
         , col_predicate((tidx % THREADS_PER_ROW) * (BYTES_PER_STG / BYTES_PER_ELEMENT) < headdim) {
 
+        // Compute the position in the sequence (within the CTA for the moment).
+        int row = tidx / THREADS_PER_ROW;
+        // Compute the position of the thread in the row.
+        int col = tidx % THREADS_PER_ROW;
+
+        // Store the row as we need it to disable loads.
+        // row_ = row;
+
+        // The row offset in the batched GEMM.
+        // int64_t row_offset = (int64_t)row * row_stride_in_bytes + binfo.bidx * BYTES_PER_ROW;
+        uint32_t row_offset = (uint32_t)((binfo.sum_s_q + row) * row_stride_in_bytes);
+        row_offset += (uint32_t)(binfo.bidh * head_stride_in_elts * BYTES_PER_ELEMENT);
+        // Assemble the final pointer.
+        ptr_ += row_offset + col * BYTES_PER_STG;
+
+        // Is that thread active on the last STG?
+        if( HAS_INCOMPLETE_STG ) {
+            is_active_for_last_stg_ = row + (STGS - 1) * ROWS_PER_STG < Cta_tile::M;
+        }
+    }
+
+    // Ctor.
+    template<typename BInfo>
+    // inline __device__ Gmem_tile_o(void *ptr, const size_t row_stride_in_elts, const BInfo &binfo, const int tidx)
+    inline __device__ Gmem_tile_o(void *ptr, const uint32_t row_stride_in_elts,
+                                  const uint32_t head_stride_in_elts, const BInfo &binfo, const int tidx)
+        : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
+        , actual_seqlen_q(binfo.actual_seqlen_q)
+        , ptr_(reinterpret_cast<char *>(ptr))
+        , tidx_(tidx) {
+
+        col_predicate = true;
         // Compute the position in the sequence (within the CTA for the moment).
         int row = tidx / THREADS_PER_ROW;
         // Compute the position of the thread in the row.
@@ -435,6 +499,526 @@ struct Gmem_tile_mma_s : public Base {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template< typename Cta_tile, int BYTES_PER_ELEMENT = 2>
+struct Gmem_tile_mma_mask {
+
+    using Mma_tile = fmha::Hmma_tile<Cta_tile>;
+    // The type of the vectors stored by each STG.
+    using StoreType = uint32_t;
+    
+    // static constexpr int LDG_ELEMENTS = 2
+    // using Type = typename fmha::Uint_from_size_in_bytes< LDG_ELEMENTS * BYTES_PER_ELEMENT >::Type;
+
+    // The number of MMAs in the M dimension.
+    static constexpr int M = Mma_tile::MMAS_M;
+    // The number of MMAs in the N dimension.
+    static constexpr int N = Mma_tile::MMAS_N;
+
+    // The number of "rows" stored per iteration of the loop. The output of 1 MMA.
+    static constexpr int ROWS = Cta_tile::M;
+    static constexpr int COLS = Cta_tile::N;
+
+    // The size of each LDG.
+    // load two elements of data
+    static constexpr int BYTES_PER_LDG = 2 * BYTES_PER_ELEMENT;
+    // The size of a row in bytes.
+    static constexpr int BYTES_PER_ROW = COLS * BYTES_PER_ELEMENT;
+
+    // The number of LDGS needed to store a chunk of the P matrix in total.
+    // Tell me if has more efficient way 
+    static constexpr int LDGS_PER_THREAD_PER_WARP = 4;
+    static constexpr int THREADS_PER_QUAD = 4;
+    static constexpr int COL_PER_MMA_PER_CTA = Cta_tile::THREADS_PER_WARP / THREADS_PER_QUAD;
+
+    // Ctor.
+    template< typename Params, typename Block_info >
+    inline __device__ Gmem_tile_mma_mask(const Params &params,
+        // const uint32_t row_stride_in_elts, const uint32_t head_stride_in_elts, 
+        const Block_info& binfo, const int tidx, const int loop_step_idx) 
+        : ptr_(static_cast<char *>(params.attn_mask_ptr))
+        // : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
+        , actual_seqlen_q(binfo.actual_seqlen_q)
+        , actual_seqlen_k(binfo.actual_seqlen_k)
+        , tidx_(tidx)
+        , loop_step_idx(loop_step_idx)
+        , mask_seq_mod_size(params.mask_seq_mod_size)
+    {
+        row_stride_in_bytes = binfo.actual_seqlen_k * BYTES_PER_ELEMENT;
+        
+        const int warp = tidx_ / Cta_tile::THREADS_PER_WARP;
+        const int lane = tidx_ % Cta_tile::THREADS_PER_WARP;
+        
+        // find the warp in the Cta tile
+        const int warp_n = (warp / Cta_tile::WARPS_M);
+        const int warp_m = (warp % Cta_tile::WARPS_M);
+
+        // decompose warp into 8x4 tile
+        const int quad = lane / 4;
+        const int tid = (lane % 4) * 2;
+        // this col is mean the 8x4 tile's cole
+
+        row = warp_m * Mma_tile::M_PER_MMA + quad;
+        static_assert(Mma_tile::M_PER_MMA == 16);
+
+        col = warp_n * Mma_tile::N_PER_MMA + tid;
+        static_assert(Mma_tile::N_PER_MMA == 16);
+
+        // The distance between two blocks (in bytes).
+        // TODO: mask is [bs * seq, head, seq_q, seq_k]
+        // The block index.
+        // uint32_t bidx = binfo.bidb * params.h + binfo.bidh;
+        uint32_t bidx = binfo.bidb * params.mask_head_mod_size + (binfo.bidh % params.mask_head_mod_size);
+
+        // the index of bs and head dim
+        // uint32_t row_offset = bidx * binfo.actual_seqlen_q * binfo.actual_seqlen_k * BYTES_PER_ELEMENT;
+        // row_offset += (uint32_t)(row * binfo.actual_seqlen_k * BYTES_PER_ELEMENT);
+
+        // to support the mask last two dimension 
+        uint32_t row_offset = bidx * params.mask_seq_mod_size * binfo.actual_seqlen_k * BYTES_PER_ELEMENT;
+        row_offset += (uint32_t)( (row % params.mask_seq_mod_size) * binfo.actual_seqlen_k * BYTES_PER_ELEMENT); 
+
+        ptr_ += row_offset;
+    }
+
+    // Load from global memory to Fragment.
+    template<typename Fragment, typename elem_type>
+    inline __device__ void load(Fragment (&frag)[M][N]) {
+        // using Fragment = typename fmha::Fragment<cutlass::half_t, 8>;
+
+        const void *ptrs[LDGS_PER_THREAD_PER_WARP];
+        uint32_t preds[LDGS_PER_THREAD_PER_WARP];
+
+        if (!(actual_seqlen_k & 1)) {
+            #pragma unroll
+            for( int mi = 0; mi < M; mi++ ) {
+                #pragma unroll
+                for( int ni = 0; ni < N; ni++ ) {
+                    #pragma unroll
+                    for ( int ii = 0; ii < 2; ++ii ) {
+                        #pragma unroll
+                        for (int jj = 0; jj < 2; ++jj ) {
+                            int offset = ii * 2 + jj;
+                            const int current_row = mi * ROWS + ii * 8;
+                            const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
+                            ptrs[offset] = ptr_ + (uint32_t)(current_row % mask_seq_mod_size) * row_stride_in_bytes +
+                                        (uint32_t)current_col * BYTES_PER_ELEMENT;
+                            preds[offset] = (current_row + (row % mask_seq_mod_size) < min(ROWS, actual_seqlen_q))
+                                            && ((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k);
+                        }
+                    }
+                    // load data
+                    Ldg_functor<StoreType, LDGS_PER_THREAD_PER_WARP> fct(frag[mi][ni].regs_, ptrs);
+                    #pragma unroll
+                    for(int kk = 0; kk < LDGS_PER_THREAD_PER_WARP; ++kk ) {
+                        fct.load(kk, preds[kk]);
+                    }
+                }
+            }
+        }else{
+            #pragma unroll
+            for( int mi = 0; mi < M; mi++ ) {
+                #pragma unroll
+                for( int ni = 0; ni < N; ni++ ) {
+                    #pragma unroll
+                    for ( int ii = 0; ii < 2; ++ii ) {
+                        #pragma unroll
+                        for (int jj = 0; jj < 2; ++jj ) {
+                            int offset = ii * 2 + jj;
+                            const int current_row = mi * ROWS + ii * 8;
+                            const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
+                            ptrs[offset] = ptr_ + (uint32_t)(current_row % mask_seq_mod_size) * row_stride_in_bytes +
+                                        (uint32_t)current_col * BYTES_PER_ELEMENT;
+                            preds[offset] = 0;
+                            if ((current_row + (row % mask_seq_mod_size) < min(ROWS, actual_seqlen_q))) {
+                                if(current_col <= actual_seqlen_k) {
+                                    if((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k){
+                                        preds[offset] = 1;
+                                    }else if((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT - 1) == actual_seqlen_k) {
+                                        preds[offset] = 2;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // load data
+                    #pragma unroll
+                    for(int kk = 0; kk < LDGS_PER_THREAD_PER_WARP; ++kk ) {
+                        if (preds[kk] == 1) {
+                            uint16_t dst_16_h = *reinterpret_cast<const uint16_t*>(ptrs[kk]);
+                            uint16_t dst_16_l = *(reinterpret_cast<const uint16_t*>(ptrs[kk]) + 1);
+                            frag[mi][ni].regs_[kk] = ((uint32_t)dst_16_l << 16) + dst_16_h;
+                        }
+                        if (preds[kk] == 2) {
+                            uint16_t dst_16 = *reinterpret_cast<const uint16_t*>(ptrs[kk]);
+                            frag[mi][ni].regs_[kk] = ((uint32_t)0 << 16) + dst_16;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    inline __device__ void move(const int steps = 1) {
+        // to support the mask last two dimension
+        ptr_ += (uint32_t)(ROWS % mask_seq_mod_size) * row_stride_in_bytes * steps;
+        this->actual_seqlen_q -= ROWS * steps;
+    }
+
+    int row;
+    int col;
+    const int loop_step_idx;
+    uint32_t row_stride_in_bytes;
+    // The pointer.
+    char *ptr_;
+    int actual_seqlen_q;
+    int actual_seqlen_k;
+    int mask_seq_mod_size;
+    const int tidx_;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+template< typename Cta_tile, int BYTES_PER_ELEMENT = 2>
+struct Gmem_tile_mma_bias {
+
+    using Mma_tile = fmha::Hmma_tile<Cta_tile>;
+    // The type of the vectors stored by each STG.
+    using StoreType = uint32_t;
+    
+    // static constexpr int LDG_ELEMENTS = 2
+    // using Type = typename fmha::Uint_from_size_in_bytes< LDG_ELEMENTS * BYTES_PER_ELEMENT >::Type;
+
+    // The number of MMAs in the M dimension.
+    static constexpr int M = Mma_tile::MMAS_M;
+    // The number of MMAs in the N dimension.
+    static constexpr int N = Mma_tile::MMAS_N;
+
+    // The number of "rows" stored per iteration of the loop. The output of 1 MMA.
+    static constexpr int ROWS = Cta_tile::M;
+    static constexpr int COLS = Cta_tile::N;
+
+    // The size of each LDG.
+    // load two elements of data
+    static constexpr int BYTES_PER_LDG = 2 * BYTES_PER_ELEMENT;
+    // The size of a row in bytes.
+    static constexpr int BYTES_PER_ROW = COLS * BYTES_PER_ELEMENT;
+
+    // The number of LDGS needed to store a chunk of the P matrix in total.
+    // Tell me if has more efficient way 
+    static constexpr int LDGS_PER_THREAD_PER_WARP = 4;
+    static constexpr int THREADS_PER_QUAD = 4;
+    static constexpr int COL_PER_MMA_PER_CTA = Cta_tile::THREADS_PER_WARP / THREADS_PER_QUAD;
+
+    // Ctor.
+    template< typename Params, typename Block_info >
+    inline __device__ Gmem_tile_mma_bias(const Params &params,
+        // const uint32_t row_stride_in_elts, const uint32_t head_stride_in_elts, 
+        const Block_info& binfo, const int tidx, const int loop_step_idx) 
+        : ptr_(static_cast<char *>(params.attn_bias_ptr))
+        // : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
+        , actual_seqlen_q(binfo.actual_seqlen_q)
+        , actual_seqlen_k(binfo.actual_seqlen_k)
+        , tidx_(tidx)
+        , loop_step_idx(loop_step_idx)
+    {
+        row_stride_in_bytes = binfo.actual_seqlen_k * BYTES_PER_ELEMENT;
+        
+        const int warp = tidx_ / Cta_tile::THREADS_PER_WARP;
+        const int lane = tidx_ % Cta_tile::THREADS_PER_WARP;
+        
+        // find the warp in the Cta tile
+        const int warp_n = (warp / Cta_tile::WARPS_M);
+        const int warp_m = (warp % Cta_tile::WARPS_M);
+
+        // decompose warp into 8x4 tile
+        const int quad = lane / 4;
+        const int tid = (lane % 4) * 2;
+        // this col is mean the 8x4 tile's cole
+
+        row = warp_m * Mma_tile::M_PER_MMA + quad;
+        static_assert(Mma_tile::M_PER_MMA == 16);
+
+        col = warp_n * Mma_tile::N_PER_MMA + tid;
+        static_assert(Mma_tile::N_PER_MMA == 16);
+
+        // The distance between two blocks (in bytes).
+        // TODO: mask is [bs, head, seq_q, seq_k]
+        // The block index.
+        //  uint32_t bidx = binfo.bidb * params.h + binfo.bidh;
+        uint32_t bidx = ( binfo.bidb % params.bias_mod_size ) * params.h + binfo.bidh;
+
+        // the index of bs and head dim
+        uint32_t row_offset = bidx * binfo.actual_seqlen_q * binfo.actual_seqlen_k * BYTES_PER_ELEMENT;
+        // row_offset = (uint32_t)(row * row_stride_in_bytes);
+        row_offset += (uint32_t)(row * binfo.actual_seqlen_k * BYTES_PER_ELEMENT);   
+
+        // do we need to move col first if seklen_k > cols
+        ptr_ += row_offset;
+    }
+
+    // Load from global memory to Fragment.
+    template<typename Fragment, typename elem_type>
+    inline __device__ void load(Fragment (&frag)[M][N]) {
+        const void *ptrs[LDGS_PER_THREAD_PER_WARP];
+        uint32_t preds[LDGS_PER_THREAD_PER_WARP];
+
+        if (!(actual_seqlen_k & 1)) {
+            #pragma unroll
+            for( int mi = 0; mi < M; mi++ ) {
+                #pragma unroll
+                for( int ni = 0; ni < N; ni++ ) {
+                    #pragma unroll
+                    for ( int ii = 0; ii < 2; ++ii ) {
+                        #pragma unroll
+                        for (int jj = 0; jj < 2; ++jj ) {
+                            int offset = ii * 2 + jj;
+                            const int current_row = mi * ROWS + ii * 8;
+                            const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
+                            ptrs[offset] = ptr_ + (uint32_t)current_row * row_stride_in_bytes +
+                                        (uint32_t)current_col * BYTES_PER_ELEMENT;
+
+                            preds[offset] = (current_row + row < min(ROWS, actual_seqlen_q))
+                                            && ((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k);
+                        }
+                    }
+
+                    Ldg_functor<StoreType, LDGS_PER_THREAD_PER_WARP> fct(frag[mi][ni].regs_, ptrs);
+                    #pragma unroll
+                    for(int kk = 0; kk < LDGS_PER_THREAD_PER_WARP; ++kk ) {
+                        fct.load(kk, preds[kk]);
+                    }
+                }
+            }
+        }else{
+            #pragma unroll
+            for( int mi = 0; mi < M; mi++ ) {
+                #pragma unroll
+                for( int ni = 0; ni < N; ni++ ) {
+                    #pragma unroll
+                    for ( int ii = 0; ii < 2; ++ii ) {
+                        #pragma unroll
+                        for (int jj = 0; jj < 2; ++jj ) {
+                            int offset = ii * 2 + jj;
+                            const int current_row = mi * ROWS + ii * 8;
+                            const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
+                            ptrs[offset] = ptr_ + (uint32_t)current_row * row_stride_in_bytes +
+                                        (uint32_t)current_col * BYTES_PER_ELEMENT;
+                            preds[offset] = 0;
+                            if ((current_row + row < min(ROWS, actual_seqlen_q))) {
+                                if(current_col <= actual_seqlen_k) {
+                                    if((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k){
+                                        preds[offset] = 1;
+                                    }else if((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT - 1) == actual_seqlen_k) {
+                                        preds[offset] = 2;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // load data
+                    #pragma unroll
+                    for(int kk = 0; kk < LDGS_PER_THREAD_PER_WARP; ++kk ) {
+                        if (preds[kk] == 1) {
+                            uint16_t dst_16_h = *reinterpret_cast<const uint16_t*>(ptrs[kk]);
+                            uint16_t dst_16_l = *(reinterpret_cast<const uint16_t*>(ptrs[kk]) + 1);
+                            frag[mi][ni].regs_[kk] = ((uint32_t)dst_16_l << 16) + dst_16_h;
+                        }
+                        if (preds[kk] == 2) {
+                            uint16_t dst_16 = *reinterpret_cast<const uint16_t*>(ptrs[kk]);
+                            frag[mi][ni].regs_[kk] = ((uint32_t)0 << 16) + dst_16;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    inline __device__ void move(const int steps = 1) {
+        ptr_ += (uint32_t)ROWS * row_stride_in_bytes * steps;
+        this->actual_seqlen_q -= ROWS * steps;
+    }
+
+    int row;
+    int col;
+    const int loop_step_idx;
+    uint32_t row_stride_in_bytes;
+    // The pointer.
+    char *ptr_;
+    int actual_seqlen_q;
+    int actual_seqlen_k;
+    const int tidx_;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+template< typename Cta_tile, int BYTES_PER_ELEMENT = 2>
+struct Gmem_tile_mma_ds {
+
+    using Mma_tile = fmha::Hmma_tile<Cta_tile>;
+    // The type of the vectors stored by each STG.
+    using StoreType = uint32_t;
+
+    // The number of MMAs in the M dimension.
+    static constexpr int M = Mma_tile::MMAS_M;
+    // The number of MMAs in the N dimension.
+    static constexpr int N = Mma_tile::MMAS_N;
+
+    // The number of "rows" stored per iteration of the loop. The output of 1 MMA.
+    static constexpr int ROWS = Cta_tile::M;
+    static constexpr int COLS = Cta_tile::N;
+
+    // The size of each LDG.
+    // load two elements of data
+    static constexpr int BYTES_PER_LDG = 2 * BYTES_PER_ELEMENT;
+    // The size of a row in bytes.
+    static constexpr int BYTES_PER_ROW = COLS * BYTES_PER_ELEMENT;
+
+    // The number of LDGS needed to store a chunk of the P matrix in total.
+    // Tell me if has more efficient way 
+    static constexpr int LDGS_PER_THREAD_PER_WARP = 4;
+    static constexpr int THREADS_PER_QUAD = 4;
+    static constexpr int COL_PER_MMA_PER_CTA = Cta_tile::THREADS_PER_WARP / THREADS_PER_QUAD;
+
+    // Ctor.
+    template< typename Params, typename Block_info >
+    inline __device__ Gmem_tile_mma_ds(const Params &params,
+        // const uint32_t row_stride_in_elts, const uint32_t head_stride_in_elts,
+        const Block_info& binfo, const int tidx, const int loop_step_idx)
+        : ptr_(static_cast<char *>(params.attn_ds_ptr))
+        // : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
+        , actual_seqlen_q(binfo.actual_seqlen_q)
+        , actual_seqlen_k(binfo.actual_seqlen_k)
+        , tidx_(tidx)
+        , loop_step_idx(loop_step_idx)
+    {
+        row_stride_in_bytes = binfo.actual_seqlen_k * BYTES_PER_ELEMENT;
+
+        const int warp = tidx_ / Cta_tile::THREADS_PER_WARP;
+        const int lane = tidx_ % Cta_tile::THREADS_PER_WARP;
+
+        // find the warp in the Cta tile
+        const int warp_n = (warp / Cta_tile::WARPS_M);
+        const int warp_m = (warp % Cta_tile::WARPS_M);
+
+        // decompose warp into 8x4 tile
+        const int quad = lane / 4;
+        const int tid = (lane % 4) * 2;
+        // this col is mean the 8x4 tile's cole
+
+        row = warp_m * Mma_tile::M_PER_MMA + quad;
+        static_assert(Mma_tile::M_PER_MMA == 16,
+                "only support sm80 m16n8k16 tensor core");
+
+        col = warp_n * Mma_tile::N_PER_MMA + tid;
+        static_assert(Mma_tile::N_PER_MMA == 16,
+                "only support sm80 m16n8k16 tensor core");
+
+        // The distance between two blocks (in bytes).
+        // TODO: mask is [bs, head, seq_q, seq_k]
+        // The block index.
+        uint32_t bidx = binfo.bidb * params.h + binfo.bidh;
+
+        // the index of bs and head dim
+        uint32_t row_offset = bidx * binfo.actual_seqlen_q * binfo.actual_seqlen_k * BYTES_PER_ELEMENT;
+        // row_offset = (uint32_t)(row * row_stride_in_bytes);
+
+        row_offset += (uint32_t)(row * binfo.actual_seqlen_k * BYTES_PER_ELEMENT);
+        // do we need to move col first if seklen_k > cols
+        ptr_ += row_offset;
+    }
+
+    // Store to global memory.
+    template<typename elem_type>
+    inline __device__ void store(const float (&softmax)[2 * M][4 * N], int l=0) {
+        uint32_t preds;
+        uint32_t dst;
+
+        if (!(actual_seqlen_k & 1)) {
+            #pragma unroll
+            for( int mi = 0; mi < M; mi++ ) {
+                #pragma unroll
+                for( int ni = 0; ni < N; ni++ ) {
+                    #pragma unroll
+                    for ( int ii = 0; ii < 2; ++ii ) {
+                        #pragma unroll
+                        for (int jj = 0; jj < 2; ++jj ) {
+                            float tmp00 = softmax[2 * mi + ii][4 * ni + jj * 2];
+                            float tmp01 = softmax[2 * mi + ii][4 * ni + jj * 2 + 1];
+                            dst = fmha::float2_pack<elem_type>(tmp00, tmp01);
+
+                            const int current_row = mi * ROWS + ii * 8;
+                            const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
+
+                            char *ptrs = ptr_ + (uint32_t)current_row * row_stride_in_bytes +
+                                            (uint32_t)current_col * BYTES_PER_ELEMENT;
+
+                            preds = (current_row + row < min(ROWS, actual_seqlen_q))
+                                            && ((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k);
+                            if (preds) {
+                                fmha::stg(ptrs, dst);
+                            }
+                        }
+                    }
+                }
+            }
+        }else{
+            #pragma unroll
+            for( int mi = 0; mi < M; mi++ ) {
+                #pragma unroll
+                for( int ni = 0; ni < N; ni++ ) {
+                    #pragma unroll
+                    for ( int ii = 0; ii < 2; ++ii ) {
+                        #pragma unroll
+                        for (int jj = 0; jj < 2; ++jj ) {
+                            float tmp00 = softmax[2 * mi + ii][4 * ni + jj * 2];
+                            float tmp01 = softmax[2 * mi + ii][4 * ni + jj * 2 + 1];
+                            uint16_t data1 = fmha::float_pack<elem_type>(tmp00);
+                            uint16_t data2 = fmha::float_pack<elem_type>(tmp01);
+
+                            const int current_row = mi * ROWS + ii * 8;
+                            const int current_col = loop_step_idx * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA + jj * 8 + col;
+
+                            char *ptrs = ptr_ + (uint32_t)current_row * row_stride_in_bytes +
+                                            (uint32_t)current_col * BYTES_PER_ELEMENT;
+                            preds = 0;
+                            if ((current_row + row < min(ROWS, actual_seqlen_q))) {
+                                if(current_col <= actual_seqlen_k) {
+                                    if((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT) <= actual_seqlen_k){
+                                        preds = 1;
+                                    }else if((current_col + BYTES_PER_LDG / BYTES_PER_ELEMENT - 1) == actual_seqlen_k) {
+                                        preds = 2;
+                                    }
+                                }
+                            }
+
+                            if (preds == 1) {
+                                fmha::stg(reinterpret_cast<uint16_t*>(ptrs), data1);
+                                fmha::stg(reinterpret_cast<uint16_t*>(ptrs) + 1, data2);
+                            }else if (preds == 2) {
+                                fmha::stg(reinterpret_cast<uint16_t*>(ptrs), data1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    inline __device__ void move(const int steps = 1) {
+        ptr_ += (uint32_t)ROWS * row_stride_in_bytes * steps;
+        this->actual_seqlen_q -= ROWS * steps;
+    }
+
+    int row;
+    int col;
+    const int loop_step_idx;
+    uint32_t row_stride_in_bytes;
+    // The pointer.
+    char *ptr_;
+    int actual_seqlen_q;
+    int actual_seqlen_k;
+    const int tidx_;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 template<
     // The dimensions of the tile computed by the CTA.
     typename Cta_tile

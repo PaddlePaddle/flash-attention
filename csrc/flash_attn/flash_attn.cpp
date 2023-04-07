@@ -360,6 +360,7 @@ bool flash_attn_fwd(
     if( is_dropout ) {
         launch_params.params.philox_args = PhiloxCudaState(seed, offset);
     }
+}
 
 // For just alphafold2
 bool flash_attn_fwd_with_bias_and_mask(

@@ -430,19 +430,17 @@ bool flash_attn_fwd_with_bias_and_mask(
 
     int bias_mod_size = attn_bias ? bias_dims[0] : 0;
     if (attn_bias) {
-        static_assert(bias_dims[1] == num_heads, "please checkout bias dims in paddle flash_attn.");
+        ASSERT_CHECK(bias_dims[1] == num_heads);
     }
     int mask_head_mod_size = attn_mask ? mask_dims[1] : 0;
     int mask_seq_mod_size  = attn_mask ? mask_dims[2] : 0;
     if (attn_mask) {
-        static_assert(mask_dims[1] == 1 || mask_dims[1] == num_heads, 
-                      "please checkout mask dims in paddle flash_attn.")
-        static_assert(mask_dims[2] == 1 || mask_dims[2] == max_seqlen_q_,
-                      "please checkout mask dims in paddle flash_attn.")
+        ASSERT_CHECK(mask_dims[1] == 1 || mask_dims[1] == num_heads);
+        ASSERT_CHECK(mask_dims[2] == 1 || mask_dims[2] == max_seqlen_q_);
     }
 
-    const bool return_softmax = (softmax_ptr != nullptr);
-    bool is_dropout = p_dropout > 0.0;
+    bool return_softmax = (softmax_ptr != nullptr);
+    bool is_dropout = p_dropout > 0.f;
     Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
 
     if (zero_tensors) {

@@ -165,6 +165,12 @@ struct Fragment_b : public Fragment<uint16_t, 8> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template< typename Layout, typename elem_type >
+struct Fragment_c : public Fragment<elem_type, 8> {
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 struct Fragment_accumulator : public Fragment<float, 8> {
 
     // The base class.
@@ -181,6 +187,15 @@ struct Fragment_accumulator : public Fragment<float, 8> {
     inline __device__ void mul_(const float other) {
         for( int ii = 0; ii < Base::NUM_ELTS; ++ii ) {
             this->elt(ii) *= other;
+        }
+    }
+
+    template< typename Other_fragment_ >
+    inline __device__ void addf(const Other_fragment_ &other) {
+        // elt or reg?
+        #pragma unroll
+        for( int ii = 0; ii < Base::NUM_ELTS; ++ii ) {
+            this->elt(ii) = this->elt(ii) +  toFloat(other.elt(ii));
         }
     }
 

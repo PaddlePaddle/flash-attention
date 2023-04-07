@@ -361,7 +361,7 @@ bool flash_attn_fwd(
         launch_params.params.philox_args = PhiloxCudaState(seed, offset);
     }
 
-// For just fxxking alphafold2
+// For just alphafold2
 bool flash_attn_fwd_with_bias_and_mask(
         const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
         const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -486,7 +486,6 @@ bool flash_attn_fwd_with_bias_and_mask(
 }
 
 
-
 bool flash_attn_bwd(
         const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
         const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -520,7 +519,6 @@ bool flash_attn_bwd(
         uint64_t offset
 ) {
     // printf("backward seed %jd offset %jd\b", seed, offset);
-
     FLASHATTNLIB_BEGIN_FUNC 
 
     auto dprops = GetDeviceProperties(-1);

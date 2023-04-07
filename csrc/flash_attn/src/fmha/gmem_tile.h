@@ -103,9 +103,9 @@ struct Gmem_tile_qkv {
         : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
         , actual_seqlen(use_seqlen_q ? binfo.actual_seqlen_q : binfo.actual_seqlen_k)
         , ptr(reinterpret_cast<char *>(ptr_))
-        , tidx_(tidx) {
+        , tidx_(tidx)
+        , col_predicate(true) {
 
-        col_predicate = true;
         // Compute the position in the sequence (within the CTA for the moment).
         int row = tidx / THREADS_PER_ROW;
         // Compute the position of the thread in the row.
@@ -267,9 +267,9 @@ struct Gmem_tile_o {
         : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
         , actual_seqlen_q(binfo.actual_seqlen_q)
         , ptr_(reinterpret_cast<char *>(ptr))
-        , tidx_(tidx) {
+        , tidx_(tidx)
+        , col_predicate(true) {
 
-        col_predicate = true;
         // Compute the position in the sequence (within the CTA for the moment).
         int row = tidx / THREADS_PER_ROW;
         // Compute the position of the thread in the row.

@@ -294,7 +294,8 @@ bool flash_attn_fwd(
         uint64_t *workspace_size,
         cudaStream_t stream,
         uint64_t seed,
-        uint64_t offset) {
+        uint64_t offset
+) {
     // printf("forward seed %jd offset %jd\b", seed, offset);
     FLASHATTNLIB_BEGIN_FUNC 
 
@@ -363,7 +364,10 @@ bool flash_attn_fwd(
     if( is_dropout ) {
         launch_params.params.philox_args = PhiloxCudaState(seed, offset);
     }
-    FLASHATTNLIB_END_FUNC
+
+    run_fmha_fwd(launch_params);
+    return true;
+    FLASHATTNLIB_END_FUNC 
 }
 
 // For just alphafold2
@@ -522,6 +526,7 @@ bool flash_attn_bwd(
         uint64_t offset
 ) {
     // printf("backward seed %jd offset %jd\b", seed, offset);
+
     FLASHATTNLIB_BEGIN_FUNC 
 
     auto dprops = GetDeviceProperties(-1);
@@ -606,7 +611,7 @@ bool flash_attn_bwd(
         }
     }
 
-    if(is_dropout) {
+    if( is_dropout ) {
         params.philox_args = PhiloxCudaState(seed, offset);
     }
 
@@ -620,6 +625,7 @@ bool flash_attn_bwd(
             Float2Half(dq_tmp_ptr, dq, uint64_t(total_q) * num_heads * head_size, stream);
         }
     }
+
     return true;
     FLASHATTNLIB_END_FUNC 
 }

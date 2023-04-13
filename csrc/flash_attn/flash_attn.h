@@ -97,10 +97,10 @@ bool flash_attn_fwd_with_bias_and_mask(
         cudaStream_t stream,
         uint64_t seed,
         uint64_t offset,
-        void *attn_mask,
-        void *attn_bias,
-        int64_t* mask_dims,
-        int64_t* bias_dims
+        const void *attn_mask,
+        const void *attn_bias,
+        const int64_t* mask_dims,
+        const int64_t* bias_dims
 );
 
 const char *flash_attn_error();

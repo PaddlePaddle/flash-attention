@@ -234,13 +234,12 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
     TORCH_CHECK(cu_seqlens_q.is_contiguous());
     TORCH_CHECK(cu_seqlens_k.is_contiguous());
 
-    const auto sizes = q.sizes();
-
-    const int batch_size = cu_seqlens_q.numel() - 1;
-    const int total_q = sizes[TOTAL_DIM];
-    const int num_heads = sizes[H_DIM];
-    const int head_size = sizes[D_DIM];
-    const int total_k = k.size(TOTAL_DIM);
+    const auto sizes = q.sizes(); // q :  torch.Size([32768, 8, 32])
+    const int batch_size = cu_seqlens_q.numel() - 1; // q_cu_seqlens :  torch.Size([129])
+    const int total_q = sizes[/*0*/TOTAL_DIM]; // 32768
+    const int num_heads = sizes[/*1*/H_DIM];   // 8
+    const int head_size = sizes[/*2*/D_DIM];   // 32
+    const int total_k = k.size(TOTAL_DIM);     // 32768
     TORCH_CHECK(batch_size > 0);
     TORCH_CHECK((head_size % 8 == 0) && (head_size <= 128));
 

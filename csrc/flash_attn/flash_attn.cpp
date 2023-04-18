@@ -413,10 +413,10 @@ bool flash_attn_fwd_with_bias_and_mask(
     printf("[%s, %d]: head_size    = %d\n", __func__, __LINE__, head_size, static_cast<int>(head_size));    
     printf("[%s, %d]: max_seqlen_q = %d\n", __func__, __LINE__, max_seqlen_q_, static_cast<int>(max_seqlen_q_));
     printf("[%s, %d]: max_seqlen_k = %d\n", __func__, __LINE__, max_seqlen_k_, static_cast<int>(max_seqlen_k_));
-    printf("[%s, %d]: p_dropout    = %d\n", __func__, __LINE__, p_dropout, static_cast<float>(p_dropout));
-    printf("[%s, %d]: softmax_scale= %d\n", __func__, __LINE__, softmax_scale, static_cast<float>(softmax_scale));
-    printf("[%s, %d]: zero_tensors = %d\n", __func__, __LINE__, zero_tensors, static_cast<float>(zero_tensors));
-    printf("[%s, %d]: is_causal    = %d\n", __func__, __LINE__, is_causal, static_cast<float>(is_causal));    
+    printf("[%s, %d]: p_dropout    = %f\n", __func__, __LINE__, p_dropout, static_cast<float>(p_dropout));
+    printf("[%s, %d]: softmax_scale= %f\n", __func__, __LINE__, softmax_scale, static_cast<float>(softmax_scale));
+    printf("[%s, %d]: zero_tensors = %d\n", __func__, __LINE__, zero_tensors, static_cast<int>(zero_tensors));
+    printf("[%s, %d]: is_causal    = %d\n", __func__, __LINE__, is_causal, static_cast<int>(is_causal));    
     printf("[%s, %d]: is_bf16      = %d\n", __func__, __LINE__, is_bf16, static_cast<int>(is_bf16));
     printf("[%s, %d]: num_splits   = %d\n", __func__, __LINE__, num_splits, static_cast<int>(num_splits));
     printf("[%s, %d]: seed         = %d\n", __func__, __LINE__, seed, static_cast<int>(seed));
@@ -494,8 +494,8 @@ bool flash_attn_fwd_with_bias_and_mask(
                      is_causal,
                      is_bf16,
                      num_splits,
-                     attn_mask,
-                     attn_bias,
+                     const_cast<void*>(attn_mask),
+                     const_cast<void*>(attn_bias),
                      bias_mod_size,
                      mask_head_mod_size,
                      mask_seq_mod_size);

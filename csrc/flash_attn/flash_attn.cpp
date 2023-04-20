@@ -370,6 +370,14 @@ bool flash_attn_fwd(
     FLASHATTNLIB_END_FUNC 
 }
 
+#define DBGTEST printf("[%s, %d]: Run here!\n", __func__, __LINE__);
+
+#define FLASHATTNDBGPTR(ptr, prefix) do { \
+  printf("[%s, %d] ");      \
+  printf(prefix);           \
+  printf(" pointer is : "); \
+  printf(" pointer is %d\n", ptr);  \
+} while (0);
 
 // For just alphafold2
 bool flash_attn_fwd_with_bias_and_mask(
@@ -422,6 +430,20 @@ bool flash_attn_fwd_with_bias_and_mask(
     printf("[%s, %d]: seed         = %d\n", __func__, __LINE__, seed, static_cast<int>(seed));
     printf("[%s, %d]: offset       = %d\n", __func__, __LINE__, offset, static_cast<int>(offset));
 
+    FLASHATTNDBGPTR(q, "q");
+    FLASHATTNDBGPTR(k, "k");
+    FLASHATTNDBGPTR(v, "v");
+    FLASHATTNDBGPTR(out, "fmha_out");
+    FLASHATTNDBGPTR(cu_seqlens_q, "cu_seq_q");
+    FLASHATTNDBGPTR(cu_seqlens_k, "cu_seq_k");
+    FLASHATTNDBGPTR(softmax_lse_ptr, "softmax_lse");
+    FLASHATTNDBGPTR(softmax_ptr,   "softmax_out");
+    FLASHATTNDBGPTR(workspace_ptr, "workspace");
+    FLASHATTNDBGPTR(attn_mask, "attn_mask");
+    FLASHATTNDBGPTR(attn_bias, "attn_bias");
+    FLASHATTNDBGPTR(mask_dims, "temp_mask.dims");
+    FLASHATTNDBGPTR(bias_dims, "temp_bias.dims");
+
     auto dprops = GetDeviceProperties(-1);
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
@@ -452,7 +474,6 @@ bool flash_attn_fwd_with_bias_and_mask(
         }
         return true;
     }
-
     int bias_mod_size = attn_bias ? bias_dims[0] : 0;
     if (attn_bias) {
         ASSERT_CHECK(bias_dims[1] == num_heads);
@@ -500,11 +521,12 @@ bool flash_attn_fwd_with_bias_and_mask(
                      mask_head_mod_size,
                      mask_seq_mod_size);
     run_fwd_with_bias_mask(launch_params, /*configure=*/ true);
+
     if( is_dropout ) {
       launch_params.params.philox_args = PhiloxCudaState(seed, offset);
     }
     run_fwd_with_bias_mask(launch_params, /*configure=*/false);
-
+    DBGTEST;
     return true;
     FLASHATTNLIB_END_FUNC 
 }

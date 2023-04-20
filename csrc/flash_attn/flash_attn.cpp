@@ -372,12 +372,6 @@ bool flash_attn_fwd(
 
 #define DBGTEST printf("[%s, %d]: Run here!\n", __func__, __LINE__);
 
-#define FLASHATTNDBGPTR(ptr, prefix) do { \
-  printf("[%s, %d] ");      \
-  printf(prefix);           \
-  printf(" pointer is : "); \
-  printf(" pointer is %d\n", ptr);  \
-} while (0);
 
 // For just alphafold2
 bool flash_attn_fwd_with_bias_and_mask(
@@ -430,19 +424,19 @@ bool flash_attn_fwd_with_bias_and_mask(
     printf("[%s, %d]: seed         = %d\n", __func__, __LINE__, seed, static_cast<int>(seed));
     printf("[%s, %d]: offset       = %d\n", __func__, __LINE__, offset, static_cast<int>(offset));
 
-    FLASHATTNDBGPTR(q, "q");
-    FLASHATTNDBGPTR(k, "k");
-    FLASHATTNDBGPTR(v, "v");
-    FLASHATTNDBGPTR(out, "fmha_out");
-    FLASHATTNDBGPTR(cu_seqlens_q, "cu_seq_q");
-    FLASHATTNDBGPTR(cu_seqlens_k, "cu_seq_k");
-    FLASHATTNDBGPTR(softmax_lse_ptr, "softmax_lse");
-    FLASHATTNDBGPTR(softmax_ptr,   "softmax_out");
-    FLASHATTNDBGPTR(workspace_ptr, "workspace");
-    FLASHATTNDBGPTR(attn_mask, "attn_mask");
-    FLASHATTNDBGPTR(attn_bias, "attn_bias");
-    FLASHATTNDBGPTR(mask_dims, "temp_mask.dims");
-    FLASHATTNDBGPTR(bias_dims, "temp_bias.dims");
+    printf("[%s, %d] q = %d\n", __func__, __LINE__, q);
+    printf("[%s, %d] k = %d\n", __func__, __LINE__, k);
+    printf("[%s, %d] v = %d\n", __func__, __LINE__, v);
+    printf("[%s, %d] fmha_out = %d\n", __func__, __LINE__, out);
+    printf("[%s, %d] cu_seq_q = %d\n", __func__, __LINE__, cu_seqlens_q);
+    printf("[%s, %d] cu_seq_k = %d\n", __func__, __LINE__, cu_seqlens_k);
+    printf("[%s, %d] softmax_lse = %d\n", __func__, __LINE__, softmax_lse_ptr);
+    printf("[%s, %d] softmax_out = %d\n", __func__, __LINE__, softmax_ptr);
+    printf("[%s, %d] workspace = %d\n", __func__, __LINE__, workspace_ptr);
+    printf("[%s, %d] attn_mask = %d\n", __func__, __LINE__, attn_mask);
+    printf("[%s, %d] attn_bias = %d\n", __func__, __LINE__, attn_bias);
+    printf("[%s, %d] temp_mask.dims = %d\n", __func__, __LINE__, mask_dims);
+    printf("[%s, %d] temp_bias.dims = %d\n", __func__, __LINE__, bias_dims);
 
     auto dprops = GetDeviceProperties(-1);
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
@@ -669,157 +663,157 @@ bool flash_attn_bwd(
     FLASHATTNLIB_END_FUNC 
 }
 
-// bool flash_attn_bwd_with_mask_bias(
-//         const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
-//         const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-//         const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-//         void *dq,                   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
-//         void *dk,                   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-//         void *dv,                   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-//         const void *out,            // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-//         const void *dout,           // total_q x num_heads, x head_size
-//         const void *cu_seqlens_q,   // int32, batch_size+1
-//         const void *cu_seqlens_k,   // int32, batch_size+1
-//         const int total_q,
-//         const int total_k,
-//         const int batch_size,
-//         const int num_heads,
-//         const int head_size,
-//         const int max_seqlen_q_,
-//         const int max_seqlen_k_,
-//         const float p_dropout,
-//         const float softmax_scale,
-//         const bool zero_tensors,
-//         const bool is_causal,
-//         const bool is_bf16,
-//         const int num_splits,
-//         void *softmax_lse_ptr,
-//         void *dsoftmax_ptr,
-//         void *workspace_ptr,
-//         uint64_t *workspace_size,
-//         cudaStream_t stream,
-//         uint64_t seed,
-//         uint64_t offset,
-//         void* attn_bias = nullptr,
-//         void* attn_mask = nullptr,
-//         void* bias_dims = nullptr,
-//         void* mask_dims = nullptr) {
-//     // printf("backward seed %jd offset %jd\b", seed, offset);
-//     FLASHATTNLIB_BEGIN_FUNC
-//     auto dprops = GetDeviceProperties(-1);
-//     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
-//     bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
-//     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
-//     ASSERT_CHECK(is_sm8x || is_sm75);
+bool flash_attn_bwd_with_mask_bias(
+        const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+        const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        void *dq,                   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+        void *dk,                   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        void *dv,                   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const void *out,            // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const void *dout,           // total_q x num_heads, x head_size
+        const void *cu_seqlens_q,   // int32, batch_size+1
+        const void *cu_seqlens_k,   // int32, batch_size+1
+        const int total_q,
+        const int total_k,
+        const int batch_size,
+        const int num_heads,
+        const int head_size,
+        const int max_seqlen_q_,
+        const int max_seqlen_k_,
+        const float p_dropout,
+        const float softmax_scale,
+        const bool zero_tensors,
+        const bool is_causal,
+        const bool is_bf16,
+        const int num_splits,
+        void *softmax_lse_ptr,
+        void *dsoftmax_ptr,
+        void *workspace_ptr,
+        uint64_t *workspace_size,
+        cudaStream_t stream,
+        uint64_t seed,
+        uint64_t offset,
+        void* attn_bias = nullptr,
+        void* attn_mask = nullptr,
+        void* bias_dims = nullptr,
+        void* mask_dims = nullptr) {
+    // printf("backward seed %jd offset %jd\b", seed, offset);
+    FLASHATTNLIB_BEGIN_FUNC
+    auto dprops = GetDeviceProperties(-1);
+    bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
+    bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
+    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    ASSERT_CHECK(is_sm8x || is_sm75);
 
-//     auto launch = &run_fmha_bwd;
-//     bool is_dropout = p_dropout > 0.0;
+    auto launch = &run_fmha_bwd;
+    bool is_dropout = p_dropout > 0.0;
 
-//     ASSERT_CHECK(batch_size > 0);
-//     ASSERT_CHECK((head_size % 8 == 0) && (head_size <= 128));
-//     if (head_size > 64) {  // TODO: eventually we should support SM86 and SM70 with d=128 as well
-//         ASSERT_CHECK(is_sm80);
-//     }
+    ASSERT_CHECK(batch_size > 0);
+    ASSERT_CHECK((head_size % 8 == 0) && (head_size <= 128));
+    if (head_size > 64) {  // TODO: eventually we should support SM86 and SM70 with d=128 as well
+        ASSERT_CHECK(is_sm80);
+    }
 
-//     int blocksize_c = (head_size > 64 || (is_sm75 && head_size > 32)) ? 128 : 256;
-//     int max_seqlen_k = ((max_seqlen_k_ + blocksize_c - 1) / blocksize_c) * blocksize_c;
-//     if( max_seqlen_k_ <= 128 ) {
-//         max_seqlen_k = 128;
-//     } else if( max_seqlen_k_ <= 256 ) {
-//         max_seqlen_k = 256;
-//     }
-//     int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
-//     bool loop = max_seqlen_k > blocksize_c;
+    int blocksize_c = (head_size > 64 || (is_sm75 && head_size > 32)) ? 128 : 256;
+    int max_seqlen_k = ((max_seqlen_k_ + blocksize_c - 1) / blocksize_c) * blocksize_c;
+    if( max_seqlen_k_ <= 128 ) {
+        max_seqlen_k = 128;
+    } else if( max_seqlen_k_ <= 256 ) {
+        max_seqlen_k = 256;
+    }
+    int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
+    bool loop = max_seqlen_k > blocksize_c;
 
-//     void *dq_tmp_ptr = workspace_ptr;
-//     // nullptr out to calculate workspace size
-//     if (out == nullptr) {
-//         // There are two cases no need to allocate workspace:
-//         // 1) num_splits == 1
-//         // 2) num_splits == 0 for auto calculation, result to num_splits == 1
-//         // we do allocation for case 2 for simplicity
-//         if (num_splits == 1) {
-//             *workspace_size = 0;
-//         } else {
-//             *workspace_size = uint64_t(total_q) * num_heads * head_size * sizeof(float);
-//         }
-//         return true;
-//     }
+    void *dq_tmp_ptr = workspace_ptr;
+    // nullptr out to calculate workspace size
+    if (out == nullptr) {
+        // There are two cases no need to allocate workspace:
+        // 1) num_splits == 1
+        // 2) num_splits == 0 for auto calculation, result to num_splits == 1
+        // we do allocation for case 2 for simplicity
+        if (num_splits == 1) {
+            *workspace_size = 0;
+        } else {
+            *workspace_size = uint64_t(total_q) * num_heads * head_size * sizeof(float);
+        }
+        return true;
+    }
 
-//     int bias_mod_size = 0;
-//     if (attn_bias) {
-//         // check attn_bias shape
-//         bias_mod_size = bias_dims[0];
-//         ASSERT_CHECK(bias_sizes[1] == num_heads);
-//     }
+    int bias_mod_size = 0;
+    if (attn_bias) {
+        // check attn_bias shape
+        bias_mod_size = bias_dims[0];
+        ASSERT_CHECK(bias_sizes[1] == num_heads);
+    }
 
-//     int mask_head_mod_size = 0;
-//     int mask_seq_mod_size = 0;
-//     if (attn_mask) {
-//         // last two dimension
-//         mask_head_mod_size = mask_dims[1];
-//         mask_seq_mod_size = mask_dims[2];
-//         ASSERT_CHECK(mask_sizes[1] == 1 || mask_sizes[1] == num_heads);
-//         ASSERT_CHECK(mask_sizes[2] == 1 || mask_sizes[2] == max_seqlen_q_);
-//     }
+    int mask_head_mod_size = 0;
+    int mask_seq_mod_size = 0;
+    if (attn_mask) {
+        // last two dimension
+        mask_head_mod_size = mask_dims[1];
+        mask_seq_mod_size = mask_dims[2];
+        ASSERT_CHECK(mask_sizes[1] == 1 || mask_sizes[1] == num_heads);
+        ASSERT_CHECK(mask_sizes[2] == 1 || mask_sizes[2] == max_seqlen_q_);
+    }
     
-//     if(zero_tensors) {
-//         SetZero(dq, 2, {total_q, num_heads, head_size}, stream);
-//         SetZero(dk, 2, {total_q, num_heads, head_size}, stream);
-//         SetZero(dv, 2, {total_q, num_heads, head_size}, stream);
-//         SetZero(dsoftmax_ptr, 4, {batch_size, num_heads, max_seqlen_q}, stream);  
-//     }
+    if(zero_tensors) {
+        SetZero(dq, 2, {total_q, num_heads, head_size}, stream);
+        SetZero(dk, 2, {total_q, num_heads, head_size}, stream);
+        SetZero(dv, 2, {total_q, num_heads, head_size}, stream);
+        SetZero(dsoftmax_ptr, 4, {batch_size, num_heads, max_seqlen_q}, stream);  
+    }
 
-//     FMHA_dgrad_params params;
+    FMHA_dgrad_params params;
 
-//     set_params_dgrad(params,
-//                      batch_size,
-//                      max_seqlen_q,
-//                      max_seqlen_k,
-//                      num_heads,
-//                      head_size,
-//                      const_cast<void*>(q),
-//                      const_cast<void*>(k),
-//                      const_cast<void*>(v),
-//                      const_cast<void*>(out),
-//                      dq, dk, dv,
-//                      const_cast<void*>(cu_seqlens_q),
-//                      const_cast<void*>(cu_seqlens_k),
-//                      loop ? dq_tmp_ptr : nullptr,
-//                      const_cast<void*>(dout),
-//                      softmax_lse_ptr,
-//                      dsoftmax_ptr,
-//                      p_dropout,
-//                      softmax_scale,
-//                      is_causal,
-//                      is_bf16,
-//                      num_splits);
-//     // calculate and set params.num_splits if num_splits == 0
-//     launch(params, stream, /*configure=*/true);
+    set_params_dgrad(params,
+                     batch_size,
+                     max_seqlen_q,
+                     max_seqlen_k,
+                     num_heads,
+                     head_size,
+                     const_cast<void*>(q),
+                     const_cast<void*>(k),
+                     const_cast<void*>(v),
+                     const_cast<void*>(out),
+                     dq, dk, dv,
+                     const_cast<void*>(cu_seqlens_q),
+                     const_cast<void*>(cu_seqlens_k),
+                     loop ? dq_tmp_ptr : nullptr,
+                     const_cast<void*>(dout),
+                     softmax_lse_ptr,
+                     dsoftmax_ptr,
+                     p_dropout,
+                     softmax_scale,
+                     is_causal,
+                     is_bf16,
+                     num_splits);
+    // calculate and set params.num_splits if num_splits == 0
+    launch(params, stream, /*configure=*/true);
 
-//     if (params.num_splits > 1) {
-//         SetZero(dq_tmp_ptr, 4, {total_q, num_heads, head_size}, stream);
-//         if (!loop) {
-//             params.o_tmp_ptr = dq_tmp_ptr; // o_tmp stores dq_tmp in the backward pass
-//         }
-//     }
-//     if( is_dropout ) {
-//         params.philox_args = PhiloxCudaState(seed, offset);
-//     }
+    if (params.num_splits > 1) {
+        SetZero(dq_tmp_ptr, 4, {total_q, num_heads, head_size}, stream);
+        if (!loop) {
+            params.o_tmp_ptr = dq_tmp_ptr; // o_tmp stores dq_tmp in the backward pass
+        }
+    }
+    if( is_dropout ) {
+        params.philox_args = PhiloxCudaState(seed, offset);
+    }
 
-//     launch(params, stream, /*configure=*/false);
+    launch(params, stream, /*configure=*/false);
 
-//     if (params.num_splits > 1) {
-//         //dq.copy_(dq_tmp);
-//         if (is_bf16) {
-//             Float2BF16(dq_tmp_ptr, dq, uint64_t(total_q) * num_heads * head_size, stream);
-//         } else {
-//             Float2Half(dq_tmp_ptr, dq, uint64_t(total_q) * num_heads * head_size, stream);
-//         }
-//     }
-//     return true;
-//     FLASHATTNLIB_END_FUNC 
-// }
+    if (params.num_splits > 1) {
+        //dq.copy_(dq_tmp);
+        if (is_bf16) {
+            Float2BF16(dq_tmp_ptr, dq, uint64_t(total_q) * num_heads * head_size, stream);
+        } else {
+            Float2Half(dq_tmp_ptr, dq, uint64_t(total_q) * num_heads * head_size, stream);
+        }
+    }
+    return true;
+    FLASHATTNLIB_END_FUNC 
+}
 
 #ifdef __cplusplus
 }

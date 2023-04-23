@@ -284,8 +284,8 @@ void run_fwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params,
 }
 
 void run_bwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params,
-                            const bool configure) {
-    run_fmha_bwd_with_bias_mask(launch_params, configure);
+                            cudaStream_t stream) {
+    run_fmha_bwd_with_bias_mask(launch_params, stream);
 }
 
 
@@ -688,7 +688,7 @@ bool flash_attn_bwd(
     FLASHATTNLIB_END_FUNC 
 }
 
-bool flash_attn_fwd_with_bias_and_mask(
+bool flash_attn_bwd_with_bias_and_mask(
         const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
         const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -697,8 +697,8 @@ bool flash_attn_fwd_with_bias_and_mask(
         void *dv,                   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *out,            // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *dout,           // total_q x num_heads, x head_size
-        const void *cu_seqlens_q,   // int32, batch_size+1
-        const void *cu_seqlens_k,   // int32, batch_size+1
+        void *cu_seqlens_q,   // int32, batch_size+1
+        void *cu_seqlens_k,   // int32, batch_size+1
         const int total_q,
         const int total_k,
         const int batch_size,
@@ -720,10 +720,10 @@ bool flash_attn_fwd_with_bias_and_mask(
         cudaStream_t stream,
         uint64_t seed,
         uint64_t offset,
-        const void* attn_bias = nullptr,
-        const void* attn_mask = nullptr,
-        const void* bias_dims = nullptr,
-        const void* mask_dims = nullptr) {
+        void* attn_mask = nullptr,
+        void* attn_bias = nullptr,
+        const int64_t* mask_dims = nullptr,
+        const int64_t* bias_dims = nullptr) {
     // printf("backward seed %jd offset %jd\b", seed, offset);
     FLASHATTNLIB_BEGIN_FUNC
     auto dprops = GetDeviceProperties(-1);
@@ -770,7 +770,8 @@ bool flash_attn_fwd_with_bias_and_mask(
     if (attn_bias) {
         // check attn_bias shape
         bias_mod_size = bias_dims[0];
-        ASSERT_CHECK(bias_sizes[1] == num_heads);
+        SetZero(dbaias_ptr, 2, {batch_size, num_heads, max_seqlen_q_, max_seqlen_k_}, stream);
+        ASSERT_CHECK(bias_dims[1] == num_heads);
     }
 
     int mask_head_mod_size = 0;
@@ -779,8 +780,8 @@ bool flash_attn_fwd_with_bias_and_mask(
         // last two dimension
         mask_head_mod_size = mask_dims[1];
         mask_seq_mod_size = mask_dims[2];
-        ASSERT_CHECK(mask_sizes[1] == 1 || mask_sizes[1] == num_heads);
-        ASSERT_CHECK(mask_sizes[2] == 1 || mask_sizes[2] == max_seqlen_q_);
+        ASSERT_CHECK(mask_dims[1] == 1 || mask_dims[1] == num_heads);
+        ASSERT_CHECK(mask_dims[2] == 1 || mask_dims[2] == max_seqlen_q_);
     }
     
     if(zero_tensors) {
@@ -822,7 +823,7 @@ bool flash_attn_fwd_with_bias_and_mask(
     if(is_dropout) {
         params.philox_args = PhiloxCudaState(seed, offset);
     }
-    launch(params, stream, /*configure=*/false);
+    launch(params, stream);
     return true;
     FLASHATTNLIB_END_FUNC 
 }

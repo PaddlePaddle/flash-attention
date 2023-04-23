@@ -4,11 +4,6 @@
 #include "fmha.h"
 #include "fmha_block_dgrad_kernel_1xN_loop.h"
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, int loop_steps=-1>
-__global__ void fmha_block_dgrad_fp16_sm80_dq_dk_dv_loop_kernel(FMHA_dgrad_params params) {
-    fmha::compute_block_dq_dk_dv_1xN<Kernel_traits, Is_dropout, Is_causal, loop_steps>(params);
-}
-
 template<typename Kernel_traits>
 void run_fmha_block_dgrad_fp16_sm80_loop_(const FMHA_dgrad_params &params, cudaStream_t stream) {
     constexpr int smem_size_softmax = Kernel_traits::Cta_tile_p::M * Kernel_traits::Cta_tile_p::WARPS_N * sizeof(float);
@@ -61,4 +56,10 @@ void run_fmha_block_dgrad_fp16_sm80(const FMHA_dgrad_params &params, cudaStream_
         using Kernel_traits = FMHA_kernel_traits<256, 64, 16, 1, 8, 0x100u>;
         run_fmha_block_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream);
     }
+}
+
+
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Need_attn_mask, bool Need_attn_bias, int loop_steps=-1>
+__global__ void fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel(FMHA_dgrad_params params) {
+    fmha::compute_dq_dk_dv_1xN<Kernel_traits, Is_dropout, Is_causal, Need_attn_mask, Need_attn_bias, loop_steps>(params);
 }

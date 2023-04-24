@@ -18,7 +18,6 @@ void run_fmha_fwd_hdim32(Launch_params<FMHA_fprop_params> &launch_params) {
 
 void run_fmha_fwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params,
                         const bool configure) {
-    printf("[%s, %d] Run here!\n", __func__, __LINE__);
     FP16_SWITCH_FUNC(launch_params.params.is_bf16, [&] {
         auto dprops = GetDeviceProperties(-1);
         if (launch_params.params.d == 16) {

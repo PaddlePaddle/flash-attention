@@ -182,14 +182,12 @@ void set_params_fprop(FMHA_fprop_params &params,
 }
 
 void set_params_dgrad(FMHA_dgrad_params &params,
-                      // sizes
-                      const size_t b,
+                      const size_t b, // sizes
                       const size_t seqlen_q,
                       const size_t seqlen_k,
                       const size_t h,
                       const size_t d,
-                      // device pointers
-                      void *q,
+                      void *q, // device pointers
                       void *k,
                       void *v,
                       void *out,
@@ -207,13 +205,12 @@ void set_params_dgrad(FMHA_dgrad_params &params,
                       bool is_causal,
                       bool is_bf16,
                       int num_splits,
-                      void *attn_mask,
-                      void *attn_bias,
-                      void *attn_ds,
-                      int bias_mod_size,
-                      int mask_head_mod_size,
-                      int mask_seq_mod_size) {
-
+                      void *attn_mask = nullptr,
+                      void *attn_bias = nullptr,
+                      void *attn_ds = nullptr,
+                      int bias_mod_size = 0,
+                      int mask_head_mod_size = 0,
+                      int mask_seq_mod_size = 0) {
     set_params_fprop(params,
                      b, 
                      seqlen_q,
@@ -236,7 +233,6 @@ void set_params_dgrad(FMHA_dgrad_params &params,
                      num_splits,
                      attn_mask,
                      attn_bias,
-                     attn_ds,
                      bias_mod_size,
                      mask_head_mod_size,
                      mask_seq_mod_size);
@@ -283,7 +279,7 @@ void run_fwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params,
     run_fmha_fwd_with_bias_mask(launch_params, configure);
 }
 
-void run_bwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params,
+void run_bwd_with_bias_mask(FMHA_dgrad_params &launch_params,
                             cudaStream_t stream) {
     run_fmha_bwd_with_bias_mask(launch_params, stream);
 }
@@ -646,7 +642,9 @@ bool flash_attn_bwd(
                      const_cast<void*>(k),
                      const_cast<void*>(v),
                      const_cast<void*>(out),
-                     dq, dk, dv,
+                     dq,
+                     dk,
+                     dv,
                      const_cast<void*>(cu_seqlens_q),
                      const_cast<void*>(cu_seqlens_k),
                      loop ? dq_tmp_ptr : nullptr,
@@ -802,7 +800,9 @@ bool flash_attn_bwd_with_bias_and_mask(
                      const_cast<void*>(k),
                      const_cast<void*>(v),
                      const_cast<void*>(out),
-                     dq, dk, dv,
+                     dq,
+                     dk,
+                     dv,
                      const_cast<void*>(cu_seqlens_q),
                      const_cast<void*>(cu_seqlens_k),
                      loop ? dq_tmp_ptr : nullptr,
@@ -814,12 +814,13 @@ bool flash_attn_bwd_with_bias_and_mask(
                      is_causal,
                      is_bf16,
                      num_splits,
-                     attn_mask ? attn_mask->data_ptr() : nullptr,
-                     attn_bias ? attn_bias->data_ptr() : nullptr,
+                     attn_mask ? attn_mask : nullptr,
+                     attn_bias ? attn_bias : nullptr,
                      attn_bias ? dbaias_ptr : nullptr,
                      bias_mod_size,
                      mask_head_mod_size,
                      mask_seq_mod_size);
+
     if(is_dropout) {
         params.philox_args = PhiloxCudaState(seed, offset);
     }

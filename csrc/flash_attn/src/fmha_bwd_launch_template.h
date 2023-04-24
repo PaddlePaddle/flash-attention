@@ -46,7 +46,7 @@ __global__ void fmha_bwd_q_dk_dv_loop_seqparallel_kernel(FMHA_dgrad_params param
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, int loop_steps=-1>
 __global__ void fmha_block_dgrad_fp16_sm80_dq_dk_dv_loop_kernel(FMHA_dgrad_params params) {
-    fmha::compute_dq_dk_dv_1xN_with_bias_mask<Kernel_traits, Is_dropout, Is_causal, loop_steps>(params);
+    fmha::compute_dq_dk_dv_1xN<Kernel_traits, Is_dropout, Is_causal, loop_steps>(params);
 }
 
 template<typename Kernel_traits>
@@ -119,6 +119,11 @@ void run_fmha_bwd_loop(FMHA_dgrad_params &params, cudaStream_t stream, const boo
     }));
 }
 
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Need_attn_mask, bool Need_attn_bias, int loop_steps=-1>
+__global__ void fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel(FMHA_dgrad_params params) {
+    fmha::compute_dq_dk_dv_1xN_with_bias_mask<Kernel_traits, Is_dropout, Is_causal, Need_attn_mask, Need_attn_bias, loop_steps>(params);
+}
+
 template<typename Kernel_traits>
 void run_fmha_dgrad_fp16_sm80_loop_(const FMHA_dgrad_params &params, cudaStream_t stream) {
     constexpr int smem_size_softmax = Kernel_traits::Cta_tile_p::M * Kernel_traits::Cta_tile_p::WARPS_N * sizeof(float);
@@ -142,7 +147,7 @@ void run_fmha_dgrad_fp16_sm80_loop_(const FMHA_dgrad_params &params, cudaStream_
 
     if (has_attn_mask) {
         if (has_attn_bias) {
-            BOOL_SWITCH(is_dropout, IsDropoutConst, [&] {
+            BOOL_SWITCH_FUNC(is_dropout, IsDropoutConst, [&] {
                 auto kernel = params.is_causal
                     ? &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, true, true, true>
                     : &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, false, true, true>;
@@ -164,7 +169,7 @@ void run_fmha_dgrad_fp16_sm80_loop_(const FMHA_dgrad_params &params, cudaStream_
                 FMHA_CHECK_CUDA(cudaPeekAtLastError());
             });
         }else{
-            BOOL_SWITCH(is_dropout, IsDropoutConst, [&] {
+            BOOL_SWITCH_FUNC(is_dropout, IsDropoutConst, [&] {
                 auto kernel = params.is_causal
                     ? &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, true, true, false>
                     : &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, false, true, false>;
@@ -188,7 +193,7 @@ void run_fmha_dgrad_fp16_sm80_loop_(const FMHA_dgrad_params &params, cudaStream_
         }
     }else{
         if (has_attn_bias) {
-            BOOL_SWITCH(is_dropout, IsDropoutConst, [&] {
+            BOOL_SWITCH_FUNC(is_dropout, IsDropoutConst, [&] {
                 auto kernel = params.is_causal
                     ? &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, true, false, true>
                     : &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, false, false, true>;
@@ -210,7 +215,7 @@ void run_fmha_dgrad_fp16_sm80_loop_(const FMHA_dgrad_params &params, cudaStream_
                 FMHA_CHECK_CUDA(cudaPeekAtLastError());
             });
         }else{
-            BOOL_SWITCH(is_dropout, IsDropoutConst, [&] {
+            BOOL_SWITCH_FUNC(is_dropout, IsDropoutConst, [&] {
                 auto kernel = params.is_causal
                     ? &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, true, false, false>
                     : &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, false, false, false>;
@@ -234,4 +239,3 @@ void run_fmha_dgrad_fp16_sm80_loop_(const FMHA_dgrad_params &params, cudaStream_
         }
     }
 }
-

@@ -1532,7 +1532,7 @@ inline __device__ void compute_dq_dk_dv_1xN_with_bias_mask(const Params &params)
     const int tidx = threadIdx.x;
 
     const int tidx_global = (bidb * params.h + bidh) * blockDim.x + tidx;
-    auto seeds = at::cuda::philox::unpack(params.philox_args);
+    auto seeds = philox::unpack(params.philox_args);
     Philox ph(std::get<0>(seeds), tidx_global, std::get<1>(seeds));
 
     if (loop_steps == 1) {

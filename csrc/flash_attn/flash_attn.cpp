@@ -429,35 +429,35 @@ bool flash_attn_fwd_with_bias_and_mask(
     // printf("forward seed %jd offset %jd\b", seed, offset);
     FLASHATTNLIB_BEGIN_FUNC 
 
-    printf("[%s, %d]: total_q      = %d\n", __func__, __LINE__, total_q, static_cast<int>(total_q));
-    printf("[%s, %d]: total_k      = %d\n", __func__, __LINE__, total_k, static_cast<int>(total_k));
-    printf("[%s, %d]: batch_size   = %d\n", __func__, __LINE__, batch_size, static_cast<int>(batch_size));
-    printf("[%s, %d]: num_heads    = %d\n", __func__, __LINE__, num_heads, static_cast<int>(num_heads));
-    printf("[%s, %d]: head_size    = %d\n", __func__, __LINE__, head_size, static_cast<int>(head_size));    
-    printf("[%s, %d]: max_seqlen_q = %d\n", __func__, __LINE__, max_seqlen_q_, static_cast<int>(max_seqlen_q_));
-    printf("[%s, %d]: max_seqlen_k = %d\n", __func__, __LINE__, max_seqlen_k_, static_cast<int>(max_seqlen_k_));
-    printf("[%s, %d]: p_dropout    = %f\n", __func__, __LINE__, p_dropout, static_cast<float>(p_dropout));
-    printf("[%s, %d]: softmax_scale= %f\n", __func__, __LINE__, softmax_scale, static_cast<float>(softmax_scale));
-    printf("[%s, %d]: zero_tensors = %d\n", __func__, __LINE__, zero_tensors, static_cast<int>(zero_tensors));
-    printf("[%s, %d]: is_causal    = %d\n", __func__, __LINE__, is_causal, static_cast<int>(is_causal));    
-    printf("[%s, %d]: is_bf16      = %d\n", __func__, __LINE__, is_bf16, static_cast<int>(is_bf16));
-    printf("[%s, %d]: num_splits   = %d\n", __func__, __LINE__, num_splits, static_cast<int>(num_splits));
-    printf("[%s, %d]: seed         = %d\n", __func__, __LINE__, seed, static_cast<int>(seed));
-    printf("[%s, %d]: offset       = %d\n", __func__, __LINE__, offset, static_cast<int>(offset));
+    // printf("[%s, %d]: total_q      = %d\n", __func__, __LINE__, total_q, static_cast<int>(total_q));
+    // printf("[%s, %d]: total_k      = %d\n", __func__, __LINE__, total_k, static_cast<int>(total_k));
+    // printf("[%s, %d]: batch_size   = %d\n", __func__, __LINE__, batch_size, static_cast<int>(batch_size));
+    // printf("[%s, %d]: num_heads    = %d\n", __func__, __LINE__, num_heads, static_cast<int>(num_heads));
+    // printf("[%s, %d]: head_size    = %d\n", __func__, __LINE__, head_size, static_cast<int>(head_size));    
+    // printf("[%s, %d]: max_seqlen_q = %d\n", __func__, __LINE__, max_seqlen_q_, static_cast<int>(max_seqlen_q_));
+    // printf("[%s, %d]: max_seqlen_k = %d\n", __func__, __LINE__, max_seqlen_k_, static_cast<int>(max_seqlen_k_));
+    // printf("[%s, %d]: p_dropout    = %f\n", __func__, __LINE__, p_dropout, static_cast<float>(p_dropout));
+    // printf("[%s, %d]: softmax_scale= %f\n", __func__, __LINE__, softmax_scale, static_cast<float>(softmax_scale));
+    // printf("[%s, %d]: zero_tensors = %d\n", __func__, __LINE__, zero_tensors, static_cast<int>(zero_tensors));
+    // printf("[%s, %d]: is_causal    = %d\n", __func__, __LINE__, is_causal, static_cast<int>(is_causal));    
+    // printf("[%s, %d]: is_bf16      = %d\n", __func__, __LINE__, is_bf16, static_cast<int>(is_bf16));
+    // printf("[%s, %d]: num_splits   = %d\n", __func__, __LINE__, num_splits, static_cast<int>(num_splits));
+    // printf("[%s, %d]: seed         = %d\n", __func__, __LINE__, seed, static_cast<int>(seed));
+    // printf("[%s, %d]: offset       = %d\n", __func__, __LINE__, offset, static_cast<int>(offset));
 
-    printf("[%s, %d] q = %d\n", __func__, __LINE__, q);
-    printf("[%s, %d] k = %d\n", __func__, __LINE__, k);
-    printf("[%s, %d] v = %d\n", __func__, __LINE__, v);
-    printf("[%s, %d] fmha_out = %d\n", __func__, __LINE__, out);
-    printf("[%s, %d] cu_seq_q = %d\n", __func__, __LINE__, cu_seqlens_q);
-    printf("[%s, %d] cu_seq_k = %d\n", __func__, __LINE__, cu_seqlens_k);
-    printf("[%s, %d] softmax_lse = %d\n", __func__, __LINE__, softmax_lse_ptr);
-    printf("[%s, %d] softmax_out = %d\n", __func__, __LINE__, softmax_ptr);
-    printf("[%s, %d] workspace = %d\n", __func__, __LINE__, workspace_ptr);
-    printf("[%s, %d] attn_mask = %d\n", __func__, __LINE__, attn_mask);
-    printf("[%s, %d] attn_bias = %d\n", __func__, __LINE__, attn_bias);
-    printf("[%s, %d] temp_mask.dims = %d\n", __func__, __LINE__, mask_dims);
-    printf("[%s, %d] temp_bias.dims = %d\n", __func__, __LINE__, bias_dims);
+    // printf("[%s, %d] q = %d\n", __func__, __LINE__, q);
+    // printf("[%s, %d] k = %d\n", __func__, __LINE__, k);
+    // printf("[%s, %d] v = %d\n", __func__, __LINE__, v);
+    // printf("[%s, %d] fmha_out = %d\n", __func__, __LINE__, out);
+    // printf("[%s, %d] cu_seq_q = %d\n", __func__, __LINE__, cu_seqlens_q);
+    // printf("[%s, %d] cu_seq_k = %d\n", __func__, __LINE__, cu_seqlens_k);
+    // printf("[%s, %d] softmax_lse = %d\n", __func__, __LINE__, softmax_lse_ptr);
+    // printf("[%s, %d] softmax_out = %d\n", __func__, __LINE__, softmax_ptr);
+    // printf("[%s, %d] workspace = %d\n", __func__, __LINE__, workspace_ptr);
+    // printf("[%s, %d] attn_mask = %d\n", __func__, __LINE__, attn_mask);
+    // printf("[%s, %d] attn_bias = %d\n", __func__, __LINE__, attn_bias);
+    // printf("[%s, %d] temp_mask.dims = %d\n", __func__, __LINE__, mask_dims);
+    // printf("[%s, %d] temp_bias.dims = %d\n", __func__, __LINE__, bias_dims);
 
     auto dprops = GetDeviceProperties(-1);
     bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
@@ -730,7 +730,6 @@ bool flash_attn_bwd_with_bias_and_mask(
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     ASSERT_CHECK(is_sm8x || is_sm75);
 
-    auto launch = &run_bwd_with_bias_mask;
     bool is_dropout = p_dropout > 0.0;
 
     ASSERT_CHECK(batch_size > 0);
@@ -824,7 +823,7 @@ bool flash_attn_bwd_with_bias_and_mask(
     if(is_dropout) {
         params.philox_args = PhiloxCudaState(seed, offset);
     }
-    launch(params, stream);
+    run_bwd_with_bias_mask(params, stream);
     return true;
     FLASHATTNLIB_END_FUNC 
 }

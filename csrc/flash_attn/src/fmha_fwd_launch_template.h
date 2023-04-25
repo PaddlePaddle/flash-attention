@@ -113,19 +113,19 @@ void run_fmha_fp16_sm80_loop_(Launch_params<FMHA_fprop_params> &launch_params,
         launch_params.elts_per_thread = elts_per_head;
         return;
     }
-    printf("[%s, %d] Run here!\n", __func__, __LINE__);
-    printf("[%s, %d] attn_mask_ptr = %p\n", __func__, __LINE__, launch_params.params.attn_mask_ptr);
-    printf("[%s, %d] attn_bias_ptr = %p\n", __func__, __LINE__, launch_params.params.attn_bias_ptr);
-    printf("[%s, %d] o_ptr = %p\n", __func__, __LINE__, launch_params.params.o_ptr);
-    printf("[%s, %d] o_tmp_ptr = %p\n", __func__, __LINE__, launch_params.params.o_tmp_ptr);
-    printf("[%s, %d] s_ptr = %p\n", __func__, __LINE__, launch_params.params.s_ptr);
-    printf("[%s, %d] q_ptr = %p\n", __func__, __LINE__, launch_params.params.q_ptr);
-    printf("[%s, %d] k_ptr = %p\n", __func__, __LINE__, launch_params.params.k_ptr);
-    printf("[%s, %d] v_ptr = %p\n", __func__, __LINE__, launch_params.params.v_ptr);
-    printf("[%s, %d] cu_seqlens_q = %p\n", __func__, __LINE__, launch_params.params.cu_seqlens_q);
-    printf("[%s, %d] cu_seqlens_k = %p\n", __func__, __LINE__, launch_params.params.cu_seqlens_k);
-    printf("[%s, %d] softmax_lse_ptr = %p\n", __func__, __LINE__, launch_params.params.softmax_lse_ptr);
-    printf("[%s, %d] blockmask = %p\n", __func__, __LINE__, launch_params.params.blockmask);
+    // printf("[%s, %d] Run here!\n", __func__, __LINE__);
+    // printf("[%s, %d] attn_mask_ptr = %p\n", __func__, __LINE__, launch_params.params.attn_mask_ptr);
+    // printf("[%s, %d] attn_bias_ptr = %p\n", __func__, __LINE__, launch_params.params.attn_bias_ptr);
+    // printf("[%s, %d] o_ptr = %p\n", __func__, __LINE__, launch_params.params.o_ptr);
+    // printf("[%s, %d] o_tmp_ptr = %p\n", __func__, __LINE__, launch_params.params.o_tmp_ptr);
+    // printf("[%s, %d] s_ptr = %p\n", __func__, __LINE__, launch_params.params.s_ptr);
+    // printf("[%s, %d] q_ptr = %p\n", __func__, __LINE__, launch_params.params.q_ptr);
+    // printf("[%s, %d] k_ptr = %p\n", __func__, __LINE__, launch_params.params.k_ptr);
+    // printf("[%s, %d] v_ptr = %p\n", __func__, __LINE__, launch_params.params.v_ptr);
+    // printf("[%s, %d] cu_seqlens_q = %p\n", __func__, __LINE__, launch_params.params.cu_seqlens_q);
+    // printf("[%s, %d] cu_seqlens_k = %p\n", __func__, __LINE__, launch_params.params.cu_seqlens_k);
+    // printf("[%s, %d] softmax_lse_ptr = %p\n", __func__, __LINE__, launch_params.params.softmax_lse_ptr);
+    // printf("[%s, %d] blockmask = %p\n", __func__, __LINE__, launch_params.params.blockmask);
 
     constexpr int smem_size_softmax_lse = Kernel_traits::Smem_dp_sum::BYTES_PER_TILE;
     // Don't need smem_size_softmax_lse if we're not looping

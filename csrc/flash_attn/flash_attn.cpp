@@ -767,7 +767,7 @@ bool flash_attn_bwd_with_bias_and_mask(
     if (attn_bias) {
         // check attn_bias shape
         bias_mod_size = bias_dims[0];
-        SetZero(dbaias_ptr, 2, {batch_size, num_heads, max_seqlen_q_, max_seqlen_k_}, stream);
+        SetZero(dbias_ptr, 2, {batch_size, num_heads, max_seqlen_q_, max_seqlen_k_}, stream);
         ASSERT_CHECK(bias_dims[1] == num_heads);
     }
 
@@ -815,7 +815,7 @@ bool flash_attn_bwd_with_bias_and_mask(
                      num_splits,
                      attn_mask ? attn_mask : nullptr,
                      attn_bias ? attn_bias : nullptr,
-                     attn_bias ? dbaias_ptr : nullptr,
+                     attn_bias ? dbias_ptr : nullptr,
                      bias_mod_size,
                      mask_head_mod_size,
                      mask_seq_mod_size);

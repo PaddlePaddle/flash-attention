@@ -102,7 +102,6 @@ bool flash_attn_fwd_with_bias_and_mask(
         const int64_t* mask_dims,
         const int64_t* bias_dims
 );
-,
 
 bool flash_attn_bwd_with_bias_and_mask(
         const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i

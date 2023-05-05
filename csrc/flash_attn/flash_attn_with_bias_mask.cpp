@@ -254,16 +254,40 @@ void set_params_dgrad_with_bias_mask(FMHA_dgrad_params &params,
     params.attn_ds_ptr = attn_ds;
 }
 
-void run_fwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params,
-                            const bool configure) {
-    run_fmha_fwd_with_bias_mask(launch_params, configure);
+// void run_fwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params,
+//                             const bool configure) {
+//     run_fmha_fwd_with_bias_mask(launch_params, configure);
+// }
+
+// void run_bwd_with_bias_mask(FMHA_dgrad_params &launch_params,
+//                             cudaStream_t stream) {
+//     run_fmha_bwd_with_bias_mask(launch_params, stream);
+// }
+
+void run_fwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params) {
+    if (launch_params.params.d == 16) {
+        run_fmha_fwd_with_mask_bias_hdim16(launch_params);
+    } else if (launch_params.params.d == 32) {
+        run_fmha_fwd_with_mask_bias_hdim32(launch_params);
+    } else if (launch_params.params.d == 64) {
+        run_fmha_fwd_with_mask_bias_hdim64(launch_params);
+    } else if (launch_params.params.d == 128) {
+        run_fmha_fwd_with_mask_bias_hdim128(launch_params);
+    }
 }
 
-void run_bwd_with_bias_mask(FMHA_dgrad_params &launch_params,
+void run_bwd_with_bias_mask(FMHA_dgrad_params &params,
                             cudaStream_t stream) {
-    run_fmha_bwd_with_bias_mask(launch_params, stream);
+  if (params.d == 16) {
+      run_fmha_bwd_with_mask_bias_hdim16(params, stream, configure);
+  } else if (params.d == 32) {
+      run_fmha_bwd_with_mask_bias_hdim32(params, stream, configure);
+  } else if (params.d == 64) {
+      run_fmha_bwd_with_mask_bias_hdim64(params, stream, configure);
+  } else if (params.d == 128) {
+      run_fmha_bwd_with_mask_bias_hdim128(params, stream, configure);
+  }
 }
-
 
 #ifdef __cplusplus
 extern "C" {

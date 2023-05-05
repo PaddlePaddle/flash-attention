@@ -254,16 +254,6 @@ void set_params_dgrad_with_bias_mask(FMHA_dgrad_params &params,
     params.attn_ds_ptr = attn_ds;
 }
 
-// void run_fwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params,
-//                             const bool configure) {
-//     run_fmha_fwd_with_bias_mask(launch_params, configure);
-// }
-
-// void run_bwd_with_bias_mask(FMHA_dgrad_params &launch_params,
-//                             cudaStream_t stream) {
-//     run_fmha_bwd_with_bias_mask(launch_params, stream);
-// }
-
 void run_fwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params) {
     if (launch_params.params.d == 16) {
         run_fmha_fwd_with_mask_bias_hdim16(launch_params);

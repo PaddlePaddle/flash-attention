@@ -2,7 +2,7 @@
 
 // Splitting the different head dimensions to different files to speed up compilation.
 
-#include "fmha_fwd_launch_template.h"
+#include "fmha_bwd_launch_template.h"
 
 void run_fmha_bwd_with_mask_bias_hdim32(Launch_params<FMHA_fprop_params> &launch_params) {
     FP16_SWITCH(launch_params.params.is_bf16, ([&] {

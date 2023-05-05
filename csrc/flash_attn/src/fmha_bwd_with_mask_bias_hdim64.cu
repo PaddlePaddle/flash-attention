@@ -2,7 +2,7 @@
 
 // Splitting the different head dimensions to different files to speed up compilation.
 
-#include "fmha_fwd_launch_template.h"
+#include "fmha_bwd_launch_template.h"
 
 void run_fmha_bwd_with_mask_bias_hdim64(Launch_params<FMHA_fprop_params> &launch_params) {
     auto dprops = GetDeviceProperties(-1);

@@ -387,7 +387,6 @@ bool flash_attn_fwd_with_bias_and_mask(
       launch_params.params.philox_args = PhiloxCudaState(seed, offset);
     }
     run_fwd_with_bias_mask(launch_params, /*configure=*/false);
-    DBGTEST;
     return true;
     FLASHATTNLIB_END_FUNC 
 }

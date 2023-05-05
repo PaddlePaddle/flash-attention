@@ -4,10 +4,10 @@
 
 #include "fmha_bwd_launch_template.h"
 
-void run_fmha_bwd_with_mask_bias_hdim64(const FMHA_dgrad_params &launch_params, 
+void run_fmha_bwd_with_mask_bias_hdim64(const FMHA_dgrad_params &params, 
                                         cudaStream_t stream) {
     auto dprops = GetDeviceProperties(-1);
-    FP16_SWITCH(launch_params.params.is_bf16, ([&] {
+    FP16_SWITCH(params.is_bf16, ([&] {
         if( params.seqlen_k == 128 ) {
             using Kernel_traits = FMHA_kernel_traits<128, 64, 16, 1, 8, 0x08u, elem_type>;
             run_fmha_dgrad_fp16_sm80_loop_<Kernel_traits>(params, stream);

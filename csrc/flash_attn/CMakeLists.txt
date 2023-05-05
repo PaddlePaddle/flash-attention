@@ -22,6 +22,7 @@ add_library(flashattn SHARED
     ${SOURCES_CU}
     ${SOURCES_CPP}
     flash_attn.cpp
+    flash_attn_with_bias_mask.cpp
   )
 
 target_compile_options(flashattn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:

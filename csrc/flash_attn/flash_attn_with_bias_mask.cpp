@@ -26,6 +26,7 @@
  *
  ******************************************************************************/
 
+#include "flash_attn.h"
 #include "fmha.h"
 #include "utils.h"
 #include "cuda_utils.h"
@@ -60,29 +61,12 @@
 extern "C" {
 #endif
 
-static thread_local std::unique_ptr<char[]> flash_attn_err_msg_;
-
-static void flash_attn_set_error_(const char *msg) {
-  if (msg == nullptr || *msg == '\0') {
-    msg = "unknown error";
-  }
-
-  auto n = strlen(msg);
-  std::unique_ptr<char[]> new_err_msg(new char[n+1]);
-  std::strcpy(new_err_msg.get(), msg);
-  flash_attn_err_msg_ = std::move(new_err_msg);
-}
-
-const char *flash_attn_error() {
-  return flash_attn_err_msg_.get();
-}
-
 #ifdef __cplusplus
 }
 #endif
 
 #define FLASHATTNLIB_BEGIN_FUNC try {
-#define FLASHATTNLIB_END_FUNC } catch (::std::exception &__e) { flash_attn_set_error_(__e.what()); return false; } catch (...) { flash_attn_set_error_(nullptr); return false; }
+#define FLASHATTNLIB_END_FUNC } catch (::std::exception &__e) { flash_attn_set_error(__e.what()); return false; } catch (...) { flash_attn_set_error(nullptr); return false; }
 
 void set_params_fprop_with_bias_mask(FMHA_fprop_params &params,
                       // sizes
@@ -96,8 +80,8 @@ void set_params_fprop_with_bias_mask(FMHA_fprop_params &params,
                       void *k,
                       void *v,
                       void *out,
-                      void *cu_seqlens_q_d,
-                      void *cu_seqlens_k_d,
+                      int32_t *cu_seqlens_q_d,
+                      int32_t *cu_seqlens_k_d,
                       void *o_tmp_d,
                       void *s_d,
                       void *softmax_lse_d,
@@ -135,8 +119,8 @@ void set_params_fprop_with_bias_mask(FMHA_fprop_params &params,
     params.o_tmp_row_stride_in_elts = h * d;
     params.o_tmp_head_stride_in_elts = d;
 
-    params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
-    params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
+    params.cu_seqlens_q = cu_seqlens_q_d;
+    params.cu_seqlens_k = cu_seqlens_k_d;
 
     // S = softmax(P)
     params.s_ptr = s_d;
@@ -194,8 +178,8 @@ void set_params_dgrad_with_bias_mask(FMHA_dgrad_params &params,
                       void *dq,
                       void *dk,
                       void *dv,
-                      void *cu_seqlens_q_d,
-                      void *cu_seqlens_k_d,
+                      int32_t *cu_seqlens_q_d,
+                      int32_t *cu_seqlens_k_d,
                       void *dq_tmp_d,
                       void *do_packed_d,
                       void *softmax_lse_d,
@@ -291,8 +275,8 @@ bool flash_attn_fwd_with_bias_and_mask(
         const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         void *out,                  // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-        const void *cu_seqlens_q,   // int32, batch_size+1, starting offset of each sequence
-        const void *cu_seqlens_k,   // int32, batch_size+1, starting offset of each sequence
+        const int32_t *cu_seqlens_q,   // int32, batch_size+1, starting offset of each sequence
+        const int32_t *cu_seqlens_k,   // int32, batch_size+1, starting offset of each sequence
         const int total_q,
         const int total_k,
         const int batch_size,
@@ -381,8 +365,8 @@ bool flash_attn_fwd_with_bias_and_mask(
                      const_cast<void*>(k),
                      const_cast<void*>(v),
                      const_cast<void*>(out),
-                     const_cast<void*>(cu_seqlens_q),
-                     const_cast<void*>(cu_seqlens_k),
+                     const_cast<int32_t*>(cu_seqlens_q),
+                     const_cast<int32_t*>(cu_seqlens_k),
                      loop ? o_tmp_ptr : nullptr,
                      return_softmax ? softmax_ptr : nullptr,
                      softmax_lse_ptr,
@@ -416,8 +400,8 @@ bool flash_attn_bwd_with_bias_and_mask(
         void *dv,                   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *out,            // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *dout,           // total_q x num_heads, x head_size
-        void *cu_seqlens_q,   // int32, batch_size+1
-        void *cu_seqlens_k,   // int32, batch_size+1
+        const int32_t *cu_seqlens_q,   // int32, batch_size+1
+        const int32_t *cu_seqlens_k,   // int32, batch_size+1
         const int total_q,
         const int total_k,
         const int batch_size,
@@ -431,7 +415,7 @@ bool flash_attn_bwd_with_bias_and_mask(
         const bool is_causal,
         const bool is_bf16,
         const int num_splits,
-        void *softmax_lse_ptr,
+        const void *softmax_lse_ptr,
         void *dsoftmax_ptr,
         void *dbias_ptr,
         void *workspace_ptr,
@@ -439,8 +423,8 @@ bool flash_attn_bwd_with_bias_and_mask(
         cudaStream_t stream,
         uint64_t seed,
         uint64_t offset,
-        void* attn_mask = nullptr,
-        void* attn_bias = nullptr,
+        const void* attn_mask = nullptr,
+        const void* attn_bias = nullptr,
         const int64_t* mask_dims = nullptr,
         const int64_t* bias_dims = nullptr) {
     // printf("backward seed %jd offset %jd\b", seed, offset);
@@ -523,19 +507,19 @@ bool flash_attn_bwd_with_bias_and_mask(
                      dq,
                      dk,
                      dv,
-                     const_cast<void*>(cu_seqlens_q),
-                     const_cast<void*>(cu_seqlens_k),
+                     const_cast<int32_t*>(cu_seqlens_q),
+                     const_cast<int32_t*>(cu_seqlens_k),
                      loop ? dq_tmp_ptr : nullptr,
                      const_cast<void*>(dout),
-                     softmax_lse_ptr,
+                     const_cast<void*>(softmax_lse_ptr),
                      dsoftmax_ptr,
                      p_dropout,
                      softmax_scale,
                      is_causal,
                      is_bf16,
                      num_splits,
-                     attn_mask ? attn_mask : nullptr,
-                     attn_bias ? attn_bias : nullptr,
+                     attn_mask ? const_cast<void*>(attn_mask) : nullptr,
+                     attn_bias ? const_cast<void*>(attn_bias) : nullptr,
                      attn_bias ? dbias_ptr : nullptr,
                      bias_mod_size,
                      mask_head_mod_size,

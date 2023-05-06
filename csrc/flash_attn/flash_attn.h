@@ -75,8 +75,8 @@ bool flash_attn_fwd_with_bias_and_mask(
         const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         void *out,                  // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-        const void *cu_seqlens_q,   // int32, batch_size+1, starting offset of each sequence
-        const void *cu_seqlens_k,   // int32, batch_size+1, starting offset of each sequence
+        const int32_t *cu_seqlens_q,   // int32, batch_size+1, starting offset of each sequence
+        const int32_t *cu_seqlens_k,   // int32, batch_size+1, starting offset of each sequence
         const int total_q,
         const int total_k,
         const int batch_size,
@@ -112,8 +112,8 @@ bool flash_attn_bwd_with_bias_and_mask(
         void *dv,                   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *out,            // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *dout,           // total_q x num_heads, x head_size
-        int32_t *cu_seqlens_q,   // int32, batch_size+1
-        int32_t *cu_seqlens_k,   // int32, batch_size+1
+        const int32_t *cu_seqlens_q,   // int32, batch_size+1
+        const int32_t *cu_seqlens_k,   // int32, batch_size+1
         const int total_q,
         const int total_k,
         const int batch_size,
@@ -135,11 +135,13 @@ bool flash_attn_bwd_with_bias_and_mask(
         cudaStream_t stream,
         uint64_t seed,
         uint64_t offset,
-        void* attn_mask,
-        void* attn_bias,
+        const void* attn_mask,
+        const void* attn_bias,
         const int64_t* mask_dims,
         const int64_t* bias_dims
 );
+
+void flash_attn_set_error(const char *msg);
 
 const char *flash_attn_error();
 

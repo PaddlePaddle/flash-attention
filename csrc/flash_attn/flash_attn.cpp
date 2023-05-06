@@ -26,6 +26,7 @@
  *
  ******************************************************************************/
 
+#include "flash_attn.h"
 #include "fmha.h"
 #include "utils.h"
 #include "cuda_utils.h"
@@ -62,7 +63,7 @@ extern "C" {
 
 static thread_local std::unique_ptr<char[]> flash_attn_err_msg;
 
-static void flash_attn_set_error(const char *msg) {
+void flash_attn_set_error(const char *msg) {
   if (msg == nullptr || *msg == '\0') {
     msg = "unknown error";
   }

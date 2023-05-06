@@ -4,8 +4,8 @@
 
 #include "fmha_fwd_launch_template.h"
 
-void run_fmha_fwd_with_mask_bias_hdim32(Launch_params<FMHA_fprop_params> &launch_params,
-                                        const bool configure) {
+void run_fmha_fwd_with_mask_bias_hdim128(Launch_params<FMHA_fprop_params> &launch_params,
+                                         const bool configure) {
     auto dprops = GetDeviceProperties(-1);
     FP16_SWITCH(launch_params.params.is_bf16, ([&] {
         if( launch_params.params.seqlen_k == 128 ) {

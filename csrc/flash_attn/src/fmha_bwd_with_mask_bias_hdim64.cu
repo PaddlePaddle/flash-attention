@@ -4,8 +4,7 @@
 
 #include "fmha_bwd_launch_template.h"
 
-void run_fmha_bwd_with_mask_bias_hdim64(const FMHA_dgrad_params &params, 
-                                        cudaStream_t stream) {
+void run_fmha_bwd_with_mask_bias_hdim64(FMHA_dgrad_params &params, cudaStream_t stream) {
     auto dprops = GetDeviceProperties(-1);
     FP16_SWITCH(params.is_bf16, ([&] {
         if( params.seqlen_k == 128 ) {

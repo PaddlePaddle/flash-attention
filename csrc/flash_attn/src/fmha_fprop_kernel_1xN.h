@@ -658,8 +658,17 @@ inline __device__ void device_1xN_(const Params &params, const int bidb, const i
     }  // Outer loop over the sequence length.
 }
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Return_softmax, bool has_attn_mask, bool has_attn_bias, bool Is_first, bool Is_last, typename Params, typename Prng>
-inline __device__ void device_1xN_with_mask_bias(const Params &params, const int bidb, const int bidh, int begin, int steps, Prng &ph0, Prng &ph1, const int loop_step_idx) {
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Return_softmax, bool Is_first, bool Is_last, typename Params, typename Prng>
+inline __device__ void device_1xN_with_mask_bias(const Params &params,
+                                                 const int bidb,
+                                                 const int bidh,
+                                                 int begin,
+                                                 int steps,
+                                                 Prng &ph0,
+                                                 Prng &ph1,
+                                                 const int loop_step_idx,
+                                                 const bool has_attn_mask,
+                                                 const bool has_attn_bias) {
 
 #if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
     using elem_type = typename Kernel_traits::elem_type;
@@ -750,11 +759,11 @@ inline __device__ void device_1xN_with_mask_bias(const Params &params, const int
     if (Return_softmax) { gmem_s.move(begin); }
     gmem_softmax_lse.move(begin);
     
-    if constexpr (has_attn_mask) {
+    if (has_attn_mask) {
         gmem_mask.move(begin);
     }
 
-    if constexpr (has_attn_bias) {
+    if (has_attn_bias) {
         gmem_bias.move(begin);
     }
     
@@ -868,7 +877,7 @@ inline __device__ void device_1xN_with_mask_bias(const Params &params, const int
         // Convert from the accumulator type to FP32 for Softmax.
         softmax.unpack_noscale(acc_p);
 
-        if constexpr (has_attn_mask) {
+        if (has_attn_mask) {
             using Frag_mask = fmha::Fragment_c<fmha::Row, elem_type>;
             Frag_mask frag_mask[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];
             fmha::clear(frag_mask);
@@ -879,7 +888,7 @@ inline __device__ void device_1xN_with_mask_bias(const Params &params, const int
             softmax.apply_attn_mask(frag_mask, mask);
         }
 
-        if constexpr (has_attn_bias) {
+        if (has_attn_bias) {
             using Frag_Bias = fmha::Fragment_c<fmha::Row, elem_type>;
             Frag_Bias frag_bias[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];
             fmha::clear(frag_bias);
@@ -1130,8 +1139,10 @@ inline __device__ void device_1xN_loop(const Params &params) {
 }
 
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Return_softmax, bool Need_attn_mask, bool Need_attn_bias, typename Params>
-inline __device__ void device_1xN_loop_with_mask_bias(const Params &params) {
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Return_softmax, typename Params>
+inline __device__ void device_1xN_loop_with_mask_bias(const Params &params,
+                                                      const bool need_attn_mask,
+                                                      const bool need_attn_bias) {
 
     // The block index for the batch.
     const int bidb = blockIdx.x;
@@ -1152,15 +1163,19 @@ inline __device__ void device_1xN_loop_with_mask_bias(const Params &params) {
     constexpr int blocksize_c = Kernel_traits::Cta_tile_p::N;
     
     if (params.seqlen_k == blocksize_c) {
-        fmha::device_1xN_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, Return_softmax, Need_attn_mask, Need_attn_bias, true, true>(params, bidb, bidh, 0, STEPS, ph0, ph1, 0);
+        fmha::device_1xN_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, true>(
+            params, bidb, bidh, 0, STEPS, ph0, ph1, 0, need_attn_mask, need_attn_bias);
     } else {
         const int max_loop_steps = (params.seqlen_k + blocksize_c - 1) / blocksize_c;
         // iterative with k
-        fmha::device_1xN_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, Return_softmax, Need_attn_mask, Need_attn_bias, true, false>(params, bidb, bidh, 0, STEPS, ph0, ph1, 0);
+        fmha::device_1xN_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, false>(
+            params, bidb, bidh, 0, STEPS, ph0, ph1, 0, need_attn_mask, need_attn_bias);
         for (int loop_step_idx = 1; loop_step_idx < max_loop_steps - 1; loop_step_idx++) {
-            fmha::device_1xN_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, Return_softmax, Need_attn_mask, Need_attn_bias, false, false>(params, bidb, bidh, 0, STEPS, ph0, ph1, loop_step_idx);
+            fmha::device_1xN_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, Return_softmax, false, false>(
+                params, bidb, bidh, 0, STEPS, ph0, ph1, loop_step_idx, need_attn_mask, need_attn_bias);
         }
-        fmha::device_1xN_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, Return_softmax, Need_attn_mask, Need_attn_bias, false, true>(params, bidb, bidh, 0, STEPS, ph0, ph1, max_loop_steps - 1);
+        fmha::device_1xN_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, Return_softmax, false, true>(
+            params, bidb, bidh, 0, STEPS, ph0, ph1, max_loop_steps - 1, need_attn_mask, need_attn_bias);
     }
 }
 

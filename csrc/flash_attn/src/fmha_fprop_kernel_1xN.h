@@ -852,11 +852,6 @@ inline __device__ void device_1xN_with_mask_bias(const Params &params, const int
         // Do this part of P = Q * K^T.
         gemm_q_k(acc_p);
 
-        // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
-        //     printf("acc_p=%.6f, %.6f\n", acc_p[0][0].elt(0), acc_p[0][0].elt(1));
-        // }
-
-
         uint4 out[Gmem_tile_o::STGS_PER_LOOP];
         if (!Is_first) { gmem_o_tmp.load(out, 0); }
 
@@ -903,11 +898,6 @@ inline __device__ void device_1xN_with_mask_bias(const Params &params, const int
             // if we share K and V, it could be that V was not fully read yet but we write into smem for reduction
             __syncthreads();
         }
-        // if (!Is_first) {
-        //     if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
-        //         printf("p_prev_lse=%.6f, %.6f\n", p_prev_lse[0], p_prev_lse[1]);
-        //     }
-        // }
         // Compute the max.
         float p_max[Mma_tile_p::MMAS_M * 2];
         if (!Is_first) {
@@ -927,36 +917,13 @@ inline __device__ void device_1xN_with_mask_bias(const Params &params, const int
 
         softmax.template reduce_max</*zero_init=*/Is_first>(p_max);
 
-        // if ((threadIdx.x == 0) && (l == 38)) {
-        //     printf("loop_step_idx %d, p_max = %.6f, %.6f., p_prev_lse = %.6f, %.6f\n", loop_step_idx, p_max[0], p_max[1], Is_first ? -10000.f : p_prev_lse[0], Is_first ? -10000.f : p_prev_lse[1]);
-        // }
-
-        // if (!Is_first) {
-        //     if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
-        //         printf("after reduce_max=%.6f, %.6f\n", softmax.elt_[0][0], softmax.elt_[0][1]);
-        //     }
-        // }
-
         // Compute the exponential value.
         // softmax.apply_exp(p_max);
         softmax.scale_apply_exp(p_max, params.scale_bmm1f);
 
-        // if (!Is_first) {
-        //     if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
-        //         printf("after apply_exp=%.6f, %.6f\n", softmax.elt_[0][0], softmax.elt_[0][1]);
-        //     }
-        // }
-
         // Compute the sum.
         float p_sum[Mma_tile_p::MMAS_M * 2];
-        // if (!Is_first) {
-        //     int warp = tidx / Cta_tile_p::THREADS_PER_WARP;
-        //     int lane = tidx % Cta_tile_p::THREADS_PER_WARP;
-        //     for (int mi = 0; mi < Mma_tile_p::MMAS_M * 2; mi++) {
-        //         p_sum[mi] = ((warp == 0) && (lane % 4 == 0)) ? expf(p_prev_lse[mi] - p_max[mi]) : 0;
-        //     }
-        // }
-        // softmax.reduce_sum(p_sum);
+
         softmax.reduce_sum_before_sync_(p_sum);
         // softmax.template reduce_sum_before_sync_</*zero_init=*/Is_first>(p_sum);
 
@@ -1017,16 +984,7 @@ inline __device__ void device_1xN_with_mask_bias(const Params &params, const int
         #pragma unroll
         for( int ki = 0; ki < Mma_tile_o::MMAS_K; ++ki ) {
             fmha::gemm_cl<elem_type>(acc_o, frag_p[ki], frag_v[ki]);
-            // if ((threadIdx.x == 4) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
-            //     float2 tmp_p = __half22float2(reinterpret_cast<__half2 &>(frag_p[ki]));
-            //     float2 tmp_v = __half22float2(reinterpret_cast<__half2 &>(frag_v[ki]));
-            //     printf("Per warp, threadIdx.x = %d, frag_p = %.6f, %.6f, frag_v = %.6f, %.6f, acc_o=%.6f\n", threadIdx.x, tmp_p.x, tmp_p.y, tmp_v.x, tmp_v.y, acc_o[0][0].elt(0));
-            // }
         }
-
-        // if ((threadIdx.x % 32 == 16) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
-        //     printf("Per warp, threadIdx.x = %d, acc_o=%.6f\n", threadIdx.x, acc_o[0][2].elt(0));
-        // }
 
         // The mapping from tidx to rows changes between the softmax and the
         // O-reduction. So we recalculate the max.
@@ -1051,11 +1009,6 @@ inline __device__ void device_1xN_with_mask_bias(const Params &params, const int
         if ((!Is_first) && o_rows_are_valid) {
             smem_softmax_lse.load(p_prev_scale_o, rows, l % 2);
         }
-        // if (!Is_first) {
-        //     if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
-        //         printf("p_prev_scale_o=%.6f\n", p_prev_scale_o[0]);
-        //     }
-        // }
 
         static_assert(Gmem_tile_o::LOOPS == 1);
 
@@ -1082,14 +1035,6 @@ inline __device__ void device_1xN_with_mask_bias(const Params &params, const int
         for (int jj = 0; jj < Gmem_tile_o::STGS_PER_LOOP; jj++) {
             float sum = p_sum_o[jj][0];
             p_sum_log[jj][0] = (sum == 0.f || sum != sum) ? -INFINITY : p_max_o[jj][0] + __logf(sum);
-            // if (sum == 0.f || sum != sum) {
-            //     printf("loop_step_idx = %d, l = %d, tidx = %d, sum = %.6f, p_max_o = %.6f\n", loop_step_idx, l, tidx, sum, p_max_o[jj][0]);
-            // }
-            // if (Is_first) {
-            //     if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0) && (l == 0))  {
-            //         printf("p_sum_log=%.6f\n", p_sum_log[jj][0]);
-            //     }
-            // }
             if ((tidx % Gmem_tile_o::THREADS_PER_ROW == 0) && o_rows_are_valid) {
                 gmem_softmax_lse.store_row(
                     reinterpret_cast<uint32_t(&)[Mma_tile_p::MMAS_M]>(p_sum_log[jj]), rows[jj]);

@@ -240,26 +240,22 @@ void set_params_dgrad_with_bias_mask(FMHA_dgrad_params &params,
 
 void run_fwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params,
                             const bool configure) {
-    if (launch_params.params.d == 16) {
-        run_fmha_fwd_with_mask_bias_hdim16(launch_params, configure);
-    } else if (launch_params.params.d == 32) {
+    if (launch_params.params.d <= 32) {
         run_fmha_fwd_with_mask_bias_hdim32(launch_params, configure);
-    } else if (launch_params.params.d == 64) {
+    } else if (launch_params.params.d <= 64) {
         run_fmha_fwd_with_mask_bias_hdim64(launch_params, configure);
-    } else if (launch_params.params.d == 128) {
+    } else if (launch_params.params.d <= 128) {
         run_fmha_fwd_with_mask_bias_hdim128(launch_params, configure);
     }
 }
 
 void run_bwd_with_bias_mask(FMHA_dgrad_params &params,
                             cudaStream_t stream) {
-  if (params.d == 16) {
-      run_fmha_bwd_with_mask_bias_hdim16(params, stream);
-  } else if (params.d == 32) {
+  if (params.d <= 32) {
       run_fmha_bwd_with_mask_bias_hdim32(params, stream);
-  } else if (params.d == 64) {
+  } else if (params.d <= 64) {
       run_fmha_bwd_with_mask_bias_hdim64(params, stream);
-  } else if (params.d == 128) {
+  } else if (params.d <= 128) {
       run_fmha_bwd_with_mask_bias_hdim128(params, stream);
   }
 }

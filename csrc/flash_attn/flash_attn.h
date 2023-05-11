@@ -8,7 +8,9 @@
 extern "C" {
 #endif
 
-bool flash_attn_fwd(
+#define FA_SYMBOL_EXPORT __attribute__((visibility("default")))
+
+FA_SYMBOL_EXPORT bool flash_attn_fwd(
         const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
         const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -37,7 +39,7 @@ bool flash_attn_fwd(
         uint64_t offset
 );
 
-bool flash_attn_bwd(
+FA_SYMBOL_EXPORT bool flash_attn_bwd(
         const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
         const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -70,7 +72,7 @@ bool flash_attn_bwd(
         uint64_t offset
 );
 
-bool flash_attn_fwd_with_bias_and_mask(
+FA_SYMBOL_EXPORT bool flash_attn_fwd_with_bias_and_mask(
         const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
         const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -103,7 +105,7 @@ bool flash_attn_fwd_with_bias_and_mask(
         const int64_t* bias_dims
 );
 
-bool flash_attn_bwd_with_bias_and_mask(
+FA_SYMBOL_EXPORT bool flash_attn_bwd_with_bias_and_mask(
         const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
         const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -143,7 +145,7 @@ bool flash_attn_bwd_with_bias_and_mask(
 
 void flash_attn_set_error(const char *msg);
 
-const char *flash_attn_error();
+FA_SYMBOL_EXPORT const char *flash_attn_error();
 
 #ifdef __cplusplus
 }

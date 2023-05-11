@@ -45,56 +45,52 @@
 #include <exception>
 #include <string>
 
-#define FLASH_ATTN_ASSERT_CHECK(__cond)                  \
-      do {                                               \
-        const bool __cond_var = (__cond);                \
-        if (!__cond_var) {                               \
-          ::std::string __err_msg = ::std::string("`") + \
-                #__cond + "` check failed at " +         \
-		__FILE__ + ":" +                         \
-		::std::to_string(__LINE__);              \
-          throw std::runtime_error(__err_msg);           \
-        }                                                \
+#define FLASH_ATTN_ASSERT_CHECK(__cond)                                         \
+    do {                                                                        \
+        const bool __cond_var = (__cond);                                       \
+        if (!__cond_var) {                                                      \
+            ::std::string __err_msg = ::std::string("`") + #__cond +            \
+            "` check failed at " + __FILE__ + ":" + ::std::to_string(__LINE__); \
+          throw std::runtime_error(__err_msg);                                  \
+        }                                                                       \
       } while (0)
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-#ifdef __cplusplus
-}
-#endif
-
 #define FLASHATTNLIB_BEGIN_FUNC try {
-#define FLASHATTNLIB_END_FUNC } catch (::std::exception &__e) { flash_attn_set_error(__e.what()); return false; } catch (...) { flash_attn_set_error(nullptr); return false; }
+#define FLASHATTNLIB_END_FUNC } catch (::std::exception &__e) { \
+        flash_attn_set_error(__e.what());                       \
+        return false;                                           \
+    } catch (...) {                                             \
+        flash_attn_set_error(nullptr);                          \
+        return false;                                           \
+    }
 
 void set_params_fprop_with_bias_mask(FMHA_fprop_params &params,
-                      // sizes
-                      const size_t b,
-                      const size_t seqlen_q,
-                      const size_t seqlen_k,
-                      const size_t h,
-                      const size_t d,
-                      // device pointers
-                      void *q,
-                      void *k,
-                      void *v,
-                      void *out,
-                      int32_t *cu_seqlens_q_d,
-                      int32_t *cu_seqlens_k_d,
-                      void *o_tmp_d,
-                      void *s_d,
-                      void *softmax_lse_d,
-                      float p_dropout,
-                      float softmax_scale,
-                      bool is_causal,
-                      bool is_bf16,
-                      int num_splits,
-                      void *attn_mask = nullptr,
-                      void *attn_bias = nullptr,
-                      int bias_mod_size = 0,
-                      int mask_head_mod_size = 0,
-                      int mask_seq_mod_size = 0) {
+                                     // sizes
+                                     const size_t b,
+                                     const size_t seqlen_q,
+                                     const size_t seqlen_k,
+                                     const size_t h,
+                                     const size_t d,
+                                     // device pointers
+                                     void *q,
+                                     void *k,
+                                     void *v,
+                                     void *out,
+                                     int32_t *cu_seqlens_q_d,
+                                     int32_t *cu_seqlens_k_d,
+                                     void *o_tmp_d,
+                                     void *s_d,
+                                     void *softmax_lse_d,
+                                     float p_dropout,
+                                     float softmax_scale,
+                                     bool is_causal,
+                                     bool is_bf16,
+                                     int num_splits,
+                                     void *attn_mask = nullptr,
+                                     void *attn_bias = nullptr,
+                                     int bias_mod_size = 0,
+                                     int mask_head_mod_size = 0,
+                                     int mask_seq_mod_size = 0) {
     Data_type data_type = is_bf16 ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
 
     // Reset the parameters
@@ -166,60 +162,60 @@ void set_params_fprop_with_bias_mask(FMHA_fprop_params &params,
 }
 
 void set_params_dgrad_with_bias_mask(FMHA_dgrad_params &params,
-                      const size_t b, // sizes
-                      const size_t seqlen_q,
-                      const size_t seqlen_k,
-                      const size_t h,
-                      const size_t d,
-                      void *q, // device pointers
-                      void *k,
-                      void *v,
-                      void *out,
-                      void *dq,
-                      void *dk,
-                      void *dv,
-                      int32_t *cu_seqlens_q_d,
-                      int32_t *cu_seqlens_k_d,
-                      void *dq_tmp_d,
-                      void *do_packed_d,
-                      void *softmax_lse_d,
-                      void *dsoftmax_sum_d,
-                      float p_dropout,
-                      float softmax_scale,
-                      bool is_causal,
-                      bool is_bf16,
-                      int num_splits,
-                      void *attn_mask = nullptr,
-                      void *attn_bias = nullptr,
-                      void *attn_ds = nullptr,
-                      int bias_mod_size = 0,
-                      int mask_head_mod_size = 0,
-                      int mask_seq_mod_size = 0) {
+                                     const size_t b, // sizes
+                                     const size_t seqlen_q,
+                                     const size_t seqlen_k,
+                                     const size_t h,
+                                     const size_t d,
+                                     void *q, // device pointers
+                                     void *k,
+                                     void *v,
+                                     void *out,
+                                     void *dq,
+                                     void *dk,
+                                     void *dv,
+                                     int32_t *cu_seqlens_q_d,
+                                     int32_t *cu_seqlens_k_d,
+                                     void *dq_tmp_d,
+                                     void *do_packed_d,
+                                     void *softmax_lse_d,
+                                     void *dsoftmax_sum_d,
+                                     float p_dropout,
+                                     float softmax_scale,
+                                     bool is_causal,
+                                     bool is_bf16,
+                                     int num_splits,
+                                     void *attn_mask = nullptr,
+                                     void *attn_bias = nullptr,
+                                     void *attn_ds = nullptr,
+                                     int bias_mod_size = 0,
+                                     int mask_head_mod_size = 0,
+                                     int mask_seq_mod_size = 0) {
     set_params_fprop_with_bias_mask(params,
-                     b, 
-                     seqlen_q,
-                     seqlen_k,
-                     h,
-                     d,
-                     q,
-                     k,
-                     v,
-                     out,
-                     cu_seqlens_q_d,
-                     cu_seqlens_k_d,
-                     dq_tmp_d,  // Reusing the o_tmp_ptr variable to store dq_tmp
-                     nullptr,
-                     softmax_lse_d,
-                     p_dropout,
-                     softmax_scale,
-                     is_causal,
-                     is_bf16,
-                     num_splits,
-                     attn_mask,
-                     attn_bias,
-                     bias_mod_size,
-                     mask_head_mod_size,
-                     mask_seq_mod_size);
+                                    b, 
+                                    seqlen_q,
+                                    seqlen_k,
+                                    h,
+                                    d,
+                                    q,
+                                    k,
+                                    v,
+                                    out,
+                                    cu_seqlens_q_d,
+                                    cu_seqlens_k_d,
+                                    dq_tmp_d,  // Reusing the o_tmp_ptr variable to store dq_tmp
+                                    nullptr,
+                                    softmax_lse_d,
+                                    p_dropout,
+                                    softmax_scale,
+                                    is_causal,
+                                    is_bf16,
+                                    num_splits,
+                                    attn_mask,
+                                    attn_bias,
+                                    bias_mod_size,
+                                    mask_head_mod_size,
+                                    mask_seq_mod_size);
 
     // Set the pointers and strides.
     params.dq_ptr = dq;
@@ -240,22 +236,22 @@ void set_params_dgrad_with_bias_mask(FMHA_dgrad_params &params,
 
 void run_fwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params,
                             const bool configure) {
-    if (launch_params.params.d <= 32) {
+    if (launch_params.params.d == 32) {
         run_fmha_fwd_with_mask_bias_hdim32(launch_params, configure);
-    } else if (launch_params.params.d <= 64) {
+    } else if (launch_params.params.d == 64) {
         run_fmha_fwd_with_mask_bias_hdim64(launch_params, configure);
-    } else if (launch_params.params.d <= 128) {
+    } else if (launch_params.params.d == 128) {
         run_fmha_fwd_with_mask_bias_hdim128(launch_params, configure);
     }
 }
 
 void run_bwd_with_bias_mask(FMHA_dgrad_params &params,
                             cudaStream_t stream) {
-  if (params.d <= 32) {
+  if (params.d == 32) {
       run_fmha_bwd_with_mask_bias_hdim32(params, stream);
-  } else if (params.d <= 64) {
+  } else if (params.d == 64) {
       run_fmha_bwd_with_mask_bias_hdim64(params, stream);
-  } else if (params.d <= 128) {
+  } else if (params.d == 128) {
       run_fmha_bwd_with_mask_bias_hdim128(params, stream);
   }
 }
@@ -352,30 +348,30 @@ bool flash_attn_fwd_with_bias_and_mask(
     }
 
     set_params_fprop_with_bias_mask(launch_params.params,
-                     batch_size,
-                     max_seqlen_q,
-                     max_seqlen_k,
-                     num_heads,
-                     head_size,
-                     const_cast<void*>(q),
-                     const_cast<void*>(k),
-                     const_cast<void*>(v),
-                     const_cast<void*>(out),
-                     const_cast<int32_t*>(cu_seqlens_q),
-                     const_cast<int32_t*>(cu_seqlens_k),
-                     loop ? o_tmp_ptr : nullptr,
-                     return_softmax ? softmax_ptr : nullptr,
-                     softmax_lse_ptr,
-                     p_dropout,
-                     softmax_scale,
-                     is_causal,
-                     is_bf16,
-                     num_splits,
-                     const_cast<void*>(attn_mask),
-                     const_cast<void*>(attn_bias),
-                     bias_mod_size,
-                     mask_head_mod_size,
-                     mask_seq_mod_size);
+                                    batch_size,
+                                    max_seqlen_q,
+                                    max_seqlen_k,
+                                    num_heads,
+                                    head_size,
+                                    const_cast<void*>(q),
+                                    const_cast<void*>(k),
+                                    const_cast<void*>(v),
+                                    const_cast<void*>(out),
+                                    const_cast<int32_t*>(cu_seqlens_q),
+                                    const_cast<int32_t*>(cu_seqlens_k),
+                                    loop ? o_tmp_ptr : nullptr,
+                                    return_softmax ? softmax_ptr : nullptr,
+                                    softmax_lse_ptr,
+                                    p_dropout,
+                                    softmax_scale,
+                                    is_causal,
+                                    is_bf16,
+                                    num_splits,
+                                    const_cast<void*>(attn_mask),
+                                    const_cast<void*>(attn_bias),
+                                    bias_mod_size,
+                                    mask_head_mod_size,
+                                    mask_seq_mod_size);
     run_fwd_with_bias_mask(launch_params, /*configure=*/ true);
 
     if( is_dropout ) {
@@ -491,35 +487,35 @@ bool flash_attn_bwd_with_bias_and_mask(
 
     FMHA_dgrad_params params;
     set_params_dgrad_with_bias_mask(params,
-                     batch_size,
-                     max_seqlen_q,
-                     max_seqlen_k,
-                     num_heads,
-                     head_size,
-                     const_cast<void*>(q),
-                     const_cast<void*>(k),
-                     const_cast<void*>(v),
-                     const_cast<void*>(out),
-                     dq,
-                     dk,
-                     dv,
-                     const_cast<int32_t*>(cu_seqlens_q),
-                     const_cast<int32_t*>(cu_seqlens_k),
-                     loop ? dq_tmp_ptr : nullptr,
-                     const_cast<void*>(dout),
-                     const_cast<void*>(softmax_lse_ptr),
-                     dsoftmax_ptr,
-                     p_dropout,
-                     softmax_scale,
-                     is_causal,
-                     is_bf16,
-                     num_splits,
-                     attn_mask ? const_cast<void*>(attn_mask) : nullptr,
-                     attn_bias ? const_cast<void*>(attn_bias) : nullptr,
-                     attn_bias ? dbias_ptr : nullptr,
-                     bias_mod_size,
-                     mask_head_mod_size,
-                     mask_seq_mod_size);
+                                    batch_size,
+                                    max_seqlen_q,
+                                    max_seqlen_k,
+                                    num_heads,
+                                    head_size,
+                                    const_cast<void*>(q),
+                                    const_cast<void*>(k),
+                                    const_cast<void*>(v),
+                                    const_cast<void*>(out),
+                                    dq,
+                                    dk,
+                                    dv,
+                                    const_cast<int32_t*>(cu_seqlens_q),
+                                    const_cast<int32_t*>(cu_seqlens_k),
+                                    loop ? dq_tmp_ptr : nullptr,
+                                    const_cast<void*>(dout),
+                                    const_cast<void*>(softmax_lse_ptr),
+                                    dsoftmax_ptr,
+                                    p_dropout,
+                                    softmax_scale,
+                                    is_causal,
+                                    is_bf16,
+                                    num_splits,
+                                    attn_mask ? const_cast<void*>(attn_mask) : nullptr,
+                                    attn_bias ? const_cast<void*>(attn_bias) : nullptr,
+                                    attn_bias ? dbias_ptr : nullptr,
+                                    bias_mod_size,
+                                    mask_head_mod_size,
+                                    mask_seq_mod_size);
 
     if(is_dropout) {
         params.philox_args = PhiloxCudaState(seed, offset);

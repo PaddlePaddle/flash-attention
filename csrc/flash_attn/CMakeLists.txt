@@ -13,8 +13,23 @@ include_directories(
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
     )
 
-file(GLOB SOURCES_CU "src/*.cu")
-file(GLOB SOURCES_CPP "src/*.cpp")
+#file(GLOB SOURCES_CU "src/*.cu")
+#file(GLOB SOURCES_CPP "src/*.cpp")
+set(SOURCES_CU
+    src/fmha_fwd_hdim32.cu
+    src/fmha_fwd_hdim64.cu
+    src/fmha_fwd_hdim128.cu
+    src/fmha_bwd_hdim32.cu
+    src/fmha_bwd_hdim64.cu
+    src/fmha_bwd_hdim128.cu
+    src/fmha_fwd_with_mask_bias_hdim32.cu
+    src/fmha_fwd_with_mask_bias_hdim64.cu
+    src/fmha_fwd_with_mask_bias_hdim128.cu
+    src/fmha_bwd_with_mask_bias_hdim32.cu
+    src/fmha_bwd_with_mask_bias_hdim64.cu
+    src/fmha_bwd_with_mask_bias_hdim128.cu
+    src/utils.cu)
+set(SOURCES_CPP src/cuda_utils.cpp)
 
 #add_library(flashattn OBJECT
 add_library(flashattn SHARED

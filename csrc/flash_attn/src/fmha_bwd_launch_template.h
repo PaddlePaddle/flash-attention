@@ -119,16 +119,21 @@ void run_fmha_bwd_loop(FMHA_dgrad_params &params, cudaStream_t stream, const boo
     }));
 }
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, int loop_steps=-1>
+template<typename Kernel_traits, bool Is_dropout, int loop_steps=-1>
 __global__ void fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel(FMHA_dgrad_params params,
                                                           const bool need_attn_mask,
                                                           const bool need_attn_bias) {
-    fmha::compute_dq_dk_dv_1xN_with_bias_mask<Kernel_traits, Is_dropout, Is_causal, loop_steps>(
+    fmha::compute_dq_dk_dv_1xN_with_bias_mask<Kernel_traits, Is_dropout, false, loop_steps>(
         params, need_attn_mask, need_attn_bias);
 }
 
 template<typename Kernel_traits>
-void run_fmha_dgrad_fp16_sm80_loop_(const FMHA_dgrad_params &params, cudaStream_t stream) {
+bool run_fmha_dgrad_fp16_sm80_loop_(const FMHA_dgrad_params &params, cudaStream_t stream) {
+    if (params.is_causal) {
+        // Only support the implementation for is_causal = false.
+        return false;
+    }
+
     constexpr int smem_size_softmax = Kernel_traits::Cta_tile_p::M * Kernel_traits::Cta_tile_p::WARPS_N * sizeof(float);
     constexpr int smem_size_q = Kernel_traits::Smem_tile_q::BYTES_PER_TILE;
     constexpr int smem_size_v = Kernel_traits::Smem_tile_v::BYTES_PER_TILE;
@@ -149,17 +154,11 @@ void run_fmha_dgrad_fp16_sm80_loop_(const FMHA_dgrad_params &params, cudaStream_
     bool has_attn_bias = !(params.attn_bias_ptr == nullptr);
 
     BOOL_SWITCH_FUNC(is_dropout, IsDropoutConst, [&] {
-        auto kernel = params.is_causal
-            ? &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, true>
-            : &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, false>;
+        auto kernel = &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst>;
         if (params.seqlen_k == blocksize_c) {
-            kernel = params.is_causal
-                ? &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, true, /*loop_steps=*/1>
-                : &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, false, /*loop_steps=*/1>;
+            kernel = &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, /*loop_steps=*/1>;
         } else if (params.seqlen_k == blocksize_c * 2) {
-            kernel = params.is_causal
-                ? &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, true, /*loop_steps=*/2>
-                : &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, false, /*loop_steps=*/2>;
+            kernel = &fmha_dgrad_fp16_sm80_dq_dk_dv_loop_kernel<Kernel_traits, IsDropoutConst, /*loop_steps=*/2>;
         }
         if( smem_size_dq_dk_dv >= 48 * 1024 ) {
             FMHA_CHECK_CUDA(cudaFuncSetAttribute(
@@ -169,4 +168,6 @@ void run_fmha_dgrad_fp16_sm80_loop_(const FMHA_dgrad_params &params, cudaStream_
         kernel<<<grid, Kernel_traits::THREADS, smem_size_dq_dk_dv, stream>>>(params, has_attn_mask, has_attn_bias);
         FMHA_CHECK_CUDA(cudaPeekAtLastError());
     });
+
+    return true;
 }

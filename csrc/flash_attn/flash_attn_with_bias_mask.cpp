@@ -234,26 +234,30 @@ void set_params_dgrad_with_bias_mask(FMHA_dgrad_params &params,
     params.attn_ds_ptr = attn_ds;
 }
 
-void run_fwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params,
+bool run_fwd_with_bias_mask(Launch_params<FMHA_fprop_params> &launch_params,
                             const bool configure) {
+    bool status = true;
     if (launch_params.params.d == 32) {
-        run_fmha_fwd_with_mask_bias_hdim32(launch_params, configure);
+        status = run_fmha_fwd_with_mask_bias_hdim32(launch_params, configure);
     } else if (launch_params.params.d == 64) {
-        run_fmha_fwd_with_mask_bias_hdim64(launch_params, configure);
+        status = run_fmha_fwd_with_mask_bias_hdim64(launch_params, configure);
     } else if (launch_params.params.d == 128) {
-        run_fmha_fwd_with_mask_bias_hdim128(launch_params, configure);
+        status = run_fmha_fwd_with_mask_bias_hdim128(launch_params, configure);
     }
+    return status;
 }
 
-void run_bwd_with_bias_mask(FMHA_dgrad_params &params,
+bool run_bwd_with_bias_mask(FMHA_dgrad_params &params,
                             cudaStream_t stream) {
-  if (params.d == 32) {
-      run_fmha_bwd_with_mask_bias_hdim32(params, stream);
-  } else if (params.d == 64) {
-      run_fmha_bwd_with_mask_bias_hdim64(params, stream);
-  } else if (params.d == 128) {
-      run_fmha_bwd_with_mask_bias_hdim128(params, stream);
-  }
+    bool status = true;
+    if (params.d == 32) {
+        status = run_fmha_bwd_with_mask_bias_hdim32(params, stream);
+    } else if (params.d == 64) {
+        status = run_fmha_bwd_with_mask_bias_hdim64(params, stream);
+    } else if (params.d == 128) {
+        status = run_fmha_bwd_with_mask_bias_hdim128(params, stream);
+    }
+    return status;
 }
 
 #ifdef __cplusplus
@@ -279,7 +283,6 @@ bool flash_attn_fwd_with_bias_and_mask(
         const float p_dropout,
         const float softmax_scale,
         const bool zero_tensors,
-        const bool is_causal,
         const bool is_bf16,
         const int  num_splits,        // SMs per attention matrix, can be 1
         void *softmax_lse_ptr,       // softmax log_sum_exp
@@ -362,7 +365,7 @@ bool flash_attn_fwd_with_bias_and_mask(
                                     softmax_lse_ptr,
                                     p_dropout,
                                     softmax_scale,
-                                    is_causal,
+                                    false, // is_causal
                                     is_bf16,
                                     num_splits,
                                     const_cast<void*>(attn_mask),
@@ -372,11 +375,11 @@ bool flash_attn_fwd_with_bias_and_mask(
                                     mask_seq_mod_size);
     run_fwd_with_bias_mask(launch_params, /*configure=*/ true);
 
-    if( is_dropout ) {
-      launch_params.params.philox_args = PhiloxCudaState(seed, offset);
+    if (is_dropout) {
+        launch_params.params.philox_args = PhiloxCudaState(seed, offset);
     }
-    run_fwd_with_bias_mask(launch_params, /*configure=*/false);
-    return true;
+    bool status = run_fwd_with_bias_mask(launch_params, /*configure=*/false);
+    return status;
     FLASHATTNLIB_END_FUNC 
 }
 
@@ -402,7 +405,6 @@ bool flash_attn_bwd_with_bias_and_mask(
         const float p_dropout,
         const float softmax_scale,
         const bool zero_tensors,
-        const bool is_causal,
         const bool is_bf16,
         const int num_splits,
         const void *softmax_lse_ptr,
@@ -505,7 +507,7 @@ bool flash_attn_bwd_with_bias_and_mask(
                                     dsoftmax_ptr,
                                     p_dropout,
                                     softmax_scale,
-                                    is_causal,
+                                    false, // is_causal
                                     is_bf16,
                                     num_splits,
                                     attn_mask ? const_cast<void*>(attn_mask) : nullptr,
@@ -518,8 +520,8 @@ bool flash_attn_bwd_with_bias_and_mask(
     if(is_dropout) {
         params.philox_args = PhiloxCudaState(seed, offset);
     }
-    run_bwd_with_bias_mask(params, stream);
-    return true;
+    bool status = run_bwd_with_bias_mask(params, stream);
+    return status;
     FLASHATTNLIB_END_FUNC 
 }
 

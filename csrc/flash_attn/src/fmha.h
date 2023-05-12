@@ -167,16 +167,16 @@ struct FMHA_dgrad_params : public FMHA_fprop_params {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_params>
-struct Launch_params{
+struct Launch_params {
     Launch_params(cudaDeviceProp * props_,
                   cudaStream_t stream_,
                   bool is_dropout_,
                   bool return_softmax_)
-        : elts_per_thread(0)
-        , props(props_)
-        , stream(stream_)
-        , is_dropout(is_dropout_)
-        , return_softmax(return_softmax_) {
+        : elts_per_thread(0),
+          props(props_),
+          stream(stream_),
+          is_dropout(is_dropout_),
+          return_softmax(return_softmax_) {
     }
 
     size_t elts_per_thread;
@@ -206,13 +206,13 @@ void run_fmha_bwd_hdim32(FMHA_dgrad_params &params, cudaStream_t stream, const b
 void run_fmha_bwd_hdim64(FMHA_dgrad_params &params, cudaStream_t stream, const bool configure);
 void run_fmha_bwd_hdim128(FMHA_dgrad_params &params, cudaStream_t stream, const bool configure);
 
-void run_fmha_fwd_with_mask_bias_hdim32(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
-void run_fmha_fwd_with_mask_bias_hdim64(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
-void run_fmha_fwd_with_mask_bias_hdim128(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
+bool run_fmha_fwd_with_mask_bias_hdim32(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
+bool run_fmha_fwd_with_mask_bias_hdim64(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
+bool run_fmha_fwd_with_mask_bias_hdim128(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
 
-void run_fmha_bwd_with_mask_bias_hdim32(FMHA_dgrad_params &params, cudaStream_t stream);
-void run_fmha_bwd_with_mask_bias_hdim64(FMHA_dgrad_params &params, cudaStream_t stream);
-void run_fmha_bwd_with_mask_bias_hdim128(FMHA_dgrad_params &params, cudaStream_t stream);
+bool run_fmha_bwd_with_mask_bias_hdim32(FMHA_dgrad_params &params, cudaStream_t stream);
+bool run_fmha_bwd_with_mask_bias_hdim64(FMHA_dgrad_params &params, cudaStream_t stream);
+bool run_fmha_bwd_with_mask_bias_hdim128(FMHA_dgrad_params &params, cudaStream_t stream);
 
 void run_fmha_block_fp16_sm80(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
 

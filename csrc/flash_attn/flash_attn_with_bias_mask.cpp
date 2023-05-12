@@ -283,7 +283,6 @@ bool flash_attn_fwd_with_bias_and_mask(
         const bool is_bf16,
         const int  num_splits,        // SMs per attention matrix, can be 1
         void *softmax_lse_ptr,       // softmax log_sum_exp
-        void *softmax_ptr,
         void *workspace_ptr,
         uint64_t *workspace_size,
         cudaStream_t stream,
@@ -337,14 +336,13 @@ bool flash_attn_fwd_with_bias_and_mask(
         FLASH_ATTN_ASSERT_CHECK(mask_dims[2] == 1 || mask_dims[2] == max_seqlen_q_);
     }
 
-    bool return_softmax = (softmax_ptr != nullptr);
+    bool return_softmax = false;
     bool is_dropout = p_dropout > 0.f;
     Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
 
     if (zero_tensors) {
         SetZero(out,  2, {total_q, num_heads, head_size}, stream);
         SetConstValue<float>(softmax_lse_ptr, -std::numeric_limits<float>::infinity(), uint64_t(batch_size) * num_heads * max_seqlen_q, stream);   
-        if (return_softmax) SetZero(softmax_ptr, 2, {batch_size, num_heads, max_seqlen_q, max_seqlen_k}, stream);  // float16
     }
 
     set_params_fprop_with_bias_mask(launch_params.params,
@@ -360,7 +358,7 @@ bool flash_attn_fwd_with_bias_and_mask(
                                     const_cast<int32_t*>(cu_seqlens_q),
                                     const_cast<int32_t*>(cu_seqlens_k),
                                     loop ? o_tmp_ptr : nullptr,
-                                    return_softmax ? softmax_ptr : nullptr,
+                                    nullptr,
                                     softmax_lse_ptr,
                                     p_dropout,
                                     softmax_scale,

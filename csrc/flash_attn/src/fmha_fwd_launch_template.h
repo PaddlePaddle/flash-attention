@@ -92,11 +92,11 @@ void run_fmha_fwd_loop(Launch_params<FMHA_fprop_params> &launch_params) {
 }
 
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Return_softmax>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 __global__ void fmha_fprop_fp16_sm80_loop_kernel(FMHA_fprop_params params,
                                                  const bool need_attn_mask,
                                                  const bool need_attn_bias) {
-    fmha::device_1xN_loop_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, Return_softmax>(
+    fmha::device_1xN_loop_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, false>(
         params, need_attn_mask, need_attn_bias);
 }
 
@@ -129,12 +129,8 @@ void run_fmha_fp16_sm80_loop_(Launch_params<FMHA_fprop_params> &launch_params,
     // https://github.com/HazyResearch/flash-attention/issues/21
     BOOL_SWITCH_FUNC(launch_params.is_dropout, IsDropoutConst, [&] {
         auto kernel = launch_params.params.is_causal
-            ? (launch_params.return_softmax
-            ? &fmha_fprop_fp16_sm80_loop_kernel<Kernel_traits, IsDropoutConst, true, true>
-            : &fmha_fprop_fp16_sm80_loop_kernel<Kernel_traits, IsDropoutConst, true, false>)
-            : (launch_params.return_softmax
-            ? &fmha_fprop_fp16_sm80_loop_kernel<Kernel_traits, IsDropoutConst, false, true>
-            : &fmha_fprop_fp16_sm80_loop_kernel<Kernel_traits, IsDropoutConst, false, false>);
+            ? &fmha_fprop_fp16_sm80_loop_kernel<Kernel_traits, IsDropoutConst, true>
+            : &fmha_fprop_fp16_sm80_loop_kernel<Kernel_traits, IsDropoutConst, false>;
         if( smem_size >= 48 * 1024 ) {
             FMHA_CHECK_CUDA(cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));

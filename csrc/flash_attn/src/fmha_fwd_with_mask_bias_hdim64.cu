@@ -1,8 +1,6 @@
 // Copyright (c) 2022, Tri Dao.
 
-// Splitting the different head dimensions to different files to speed up compilation.
-
-#include "fmha_fwd_launch_template.h"
+#include "fmha_fwd_with_mask_bias_launch_template.h"
 
 bool run_fmha_fwd_with_mask_bias_hdim64(Launch_params<FMHA_fprop_params> &launch_params,
                                         const bool configure) {

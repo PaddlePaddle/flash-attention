@@ -1,8 +1,6 @@
 // Copyright (c) 2022, Tri Dao.
 
-// Splitting the different head dimensions to different files to speed up compilation.
-
-#include "fmha_bwd_launch_template.h"
+#include "fmha_bwd_with_mask_bias_launch_template.h"
 
 bool run_fmha_bwd_with_mask_bias_hdim128(FMHA_dgrad_params &params, cudaStream_t stream) {
     bool status = true;

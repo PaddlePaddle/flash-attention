@@ -14,10 +14,10 @@
 
 template<typename Kernel_traits, bool Is_dropout>
 __global__ void fmha_fprop_fp16_sm80_loop_kernel(FMHA_fprop_params params,
-                                                 const bool need_attn_mask,
-                                                 const bool need_attn_bias) {
+                                                 const bool has_attn_mask,
+                                                 const bool has_attn_bias) {
     fmha::device_1xN_loop_with_mask_bias<Kernel_traits, Is_dropout, false, false>(
-        params, need_attn_mask, need_attn_bias);
+        params, has_attn_mask, has_attn_bias);
 }
 
 template<typename Kernel_traits>
@@ -46,8 +46,8 @@ bool run_fmha_fp16_sm80_loop_(Launch_params<FMHA_fprop_params> &launch_params,
     const int smem_size = fmha::get_dynamic_smem_size<Kernel_traits>()
         + (loop_steps > 1 ? smem_size_softmax_lse : 0);
 
-    bool has_attn_mask = !(launch_params.params.attn_mask_ptr == nullptr);
-    bool has_attn_bias = !(launch_params.params.attn_bias_ptr == nullptr);
+    bool has_attn_mask = launch_params.params.attn_mask_ptr != nullptr;
+    bool has_attn_bias = launch_params.params.attn_bias_ptr != nullptr;
 
     // Work-around for gcc 7. It doesn't like nested BOOL_SWITCH_FUNC.
     // https://github.com/kokkos/kokkos-kernels/issues/349

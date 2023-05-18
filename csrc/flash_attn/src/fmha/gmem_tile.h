@@ -741,7 +741,7 @@ struct Gmem_tile_mma_bias {
         static_assert(Mma_tile::N_PER_MMA == 16);
 
         // The distance between two blocks (in bytes).
-        // TODO: mask is [bs, head, seq_q, seq_k]
+        // TODO: bias is [bs, head, seq_q, seq_k]
         // The block index.
         //  uint32_t bidx = binfo.bidb * params.h + binfo.bidh;
         uint32_t bidx = ( binfo.bidb % params.bias_mod_size ) * params.h + binfo.bidh;

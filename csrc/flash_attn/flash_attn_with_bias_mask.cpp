@@ -78,8 +78,8 @@ void set_params_fprop_with_bias_mask(FMHA_fprop_params &params,
                                      void *out,
                                      int32_t *cu_seqlens_q_d,
                                      int32_t *cu_seqlens_k_d,
-                                     void *o_tmp_d,
-                                     void *s_d,
+                                     void *o_tmp_d, // temprary output
+                                     void *s_d,     // softmax output
                                      void *softmax_lse_d,
                                      float p_dropout,
                                      float softmax_scale,

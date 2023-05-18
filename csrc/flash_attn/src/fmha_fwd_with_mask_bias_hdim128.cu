@@ -7,7 +7,7 @@ bool run_fmha_fwd_with_mask_bias_hdim128(Launch_params<FMHA_fprop_params> &launc
     bool status = true;
     auto dprops = GetDeviceProperties(-1);
     FP16_SWITCH(launch_params.params.is_bf16, ([&] {
-        if( launch_params.params.seqlen_k == 128 ) {
+        if (launch_params.params.seqlen_k == 128) {
             using Kernel_traits = FMHA_kernel_traits<128, 128, 16, 1, 4, 0x08u, elem_type>;
             status = run_fmha_fp16_sm80_loop_<Kernel_traits>(launch_params, configure);
         } else {

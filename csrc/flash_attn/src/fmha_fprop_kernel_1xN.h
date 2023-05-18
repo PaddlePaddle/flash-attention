@@ -895,7 +895,7 @@ inline __device__ void device_1xN_with_mask_bias(const Params &params,
             gmem_bias.template load<Frag_Bias, elem_type>(frag_bias);
             gmem_bias.move();
 
-            // Apply the attn mask.
+            // Apply the attn bias.
             softmax.apply_attn_bias(frag_bias, mask);
         }
 
@@ -1141,8 +1141,8 @@ inline __device__ void device_1xN_loop(const Params &params) {
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Return_softmax, typename Params>
 inline __device__ void device_1xN_loop_with_mask_bias(const Params &params,
-                                                      const bool need_attn_mask,
-                                                      const bool need_attn_bias) {
+                                                      const bool has_attn_mask,
+                                                      const bool has_attn_bias) {
 
     // The block index for the batch.
     const int bidb = blockIdx.x;
@@ -1164,18 +1164,18 @@ inline __device__ void device_1xN_loop_with_mask_bias(const Params &params,
     
     if (params.seqlen_k == blocksize_c) {
         fmha::device_1xN_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, true>(
-            params, bidb, bidh, 0, STEPS, ph0, ph1, 0, need_attn_mask, need_attn_bias);
+            params, bidb, bidh, 0, STEPS, ph0, ph1, 0, has_attn_mask, has_attn_bias);
     } else {
         const int max_loop_steps = (params.seqlen_k + blocksize_c - 1) / blocksize_c;
         // iterative with k
         fmha::device_1xN_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, Return_softmax, true, false>(
-            params, bidb, bidh, 0, STEPS, ph0, ph1, 0, need_attn_mask, need_attn_bias);
+            params, bidb, bidh, 0, STEPS, ph0, ph1, 0, has_attn_mask, has_attn_bias);
         for (int loop_step_idx = 1; loop_step_idx < max_loop_steps - 1; loop_step_idx++) {
             fmha::device_1xN_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, Return_softmax, false, false>(
-                params, bidb, bidh, 0, STEPS, ph0, ph1, loop_step_idx, need_attn_mask, need_attn_bias);
+                params, bidb, bidh, 0, STEPS, ph0, ph1, loop_step_idx, has_attn_mask, has_attn_bias);
         }
         fmha::device_1xN_with_mask_bias<Kernel_traits, Is_dropout, Is_causal, Return_softmax, false, true>(
-            params, bidb, bidh, 0, STEPS, ph0, ph1, max_loop_steps - 1, need_attn_mask, need_attn_bias);
+            params, bidb, bidh, 0, STEPS, ph0, ph1, max_loop_steps - 1, has_attn_mask, has_attn_bias);
     }
 }
 

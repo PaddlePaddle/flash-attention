@@ -328,15 +328,22 @@ bool flash_attn_fwd_with_bias_and_mask(
         }
         return true;
     }
+
     int bias_mod_size = attn_bias ? bias_dims[0] : 0;
     if (attn_bias) {
         FLASH_ATTN_ASSERT_CHECK(bias_dims[1] == num_heads);
     }
+
     int mask_head_mod_size = attn_mask ? mask_dims[1] : 0;
     int mask_seq_mod_size  = attn_mask ? mask_dims[2] : 0;
     if (attn_mask) {
         FLASH_ATTN_ASSERT_CHECK(mask_dims[1] == 1 || mask_dims[1] == num_heads);
         FLASH_ATTN_ASSERT_CHECK(mask_dims[2] == 1 || mask_dims[2] == max_seqlen_q_);
+    }
+
+    if (attn_bias || attn_mask) {
+        // When attn_bias or attn_mask is not nullptr, softmax_scale must be 1.
+        FLASH_ATTN_ASSERT_CHECK(softmax_scale == 1.0f);
     }
 
     bool return_softmax = false;
@@ -476,6 +483,11 @@ bool flash_attn_bwd_with_bias_and_mask(
         mask_seq_mod_size = mask_dims[2];
         FLASH_ATTN_ASSERT_CHECK(mask_dims[1] == 1 || mask_dims[1] == num_heads);
         FLASH_ATTN_ASSERT_CHECK(mask_dims[2] == 1 || mask_dims[2] == max_seqlen_q_);
+    }
+
+    if (attn_bias || attn_mask) {
+        // When attn_bias or attn_mask is not nullptr, softmax_scale must be 1.
+        FLASH_ATTN_ASSERT_CHECK(softmax_scale == 1.0f);
     }
     
     if(zero_tensors) {

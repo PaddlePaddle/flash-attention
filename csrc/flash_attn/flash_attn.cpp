@@ -497,6 +497,214 @@ bool flash_attn_bwd(
     FLASHATTNLIB_END_FUNC 
 }
 
+bool flash_attn_fwd_block(
+        const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+        const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        void *out,                  // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const void *cu_seqlens_q,   // int32, batch_size+1, starting offset of each sequence
+        const void *cu_seqlens_k,   // int32, batch_size+1, starting offset of each sequence
+        const void *blockmask,      // int32, (seqlen_k / 256, seqlen_q / 16)
+        const int total_q,
+        const int total_k,
+        const int batch_size,
+        const int num_heads,
+        const int head_size,
+        const int max_seqlen_q_,
+        const int max_seqlen_k_,
+        const float p_dropout,
+        const float softmax_scale,
+        const bool is_causal,
+        const bool is_bf16,
+        void *softmax_lse_ptr,       // softmax log_sum_exp
+        void *softmax_ptr,
+        void *workspace_ptr,
+        uint64_t *workspace_size,
+        cudaStream_t stream,
+        uint64_t seed,
+        uint64_t offset
+) {
+    // printf("forward seed %jd offset %jd\b", seed, offset);
+    FLASHATTNLIB_BEGIN_FUNC 
+
+    auto dprops = GetDeviceProperties(-1);
+    ASSERT_CHECK(dprops->major == 8 && dprops->minor >= 0);
+    bool is_dropout = p_dropout > 0.0;
+
+    const bool return_softmax = (softmax_ptr != nullptr);
+    Launch_params<FMHA_fprop_params> launch_params(dprops, stream, is_dropout, return_softmax);
+
+    ASSERT_CHECK(batch_size > 0);
+    ASSERT_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
+
+    int max_seqlen_k = ((max_seqlen_k_ + 256 - 1) / 256) * 256;
+    if( max_seqlen_k <= 256 ) {
+        max_seqlen_k = 256;
+    }
+    int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
+    bool loop = max_seqlen_k > 256;
+
+    void* o_tmp_ptr = workspace_ptr;
+    // nullptr out to calculate workspace size
+    if (out == nullptr) {
+        if (loop) {
+            *workspace_size = uint64_t(total_q) * num_heads * head_size * sizeof(float);
+        } else {
+            *workspace_size = 0;
+        }
+        return true;
+    }
+
+    if (return_softmax) {
+        SetZero(softmax_ptr, 2, {batch_size, num_heads, max_seqlen_q, max_seqlen_k}, stream);  // float16
+    }
+
+    set_params_fprop(launch_params.params,
+                     batch_size,
+                     max_seqlen_q,
+                     max_seqlen_k,
+                     num_heads,
+                     head_size,
+                     const_cast<void*>(q),
+                     const_cast<void*>(k),
+                     const_cast<void*>(v),
+                     const_cast<void*>(out),
+                     const_cast<void*>(cu_seqlens_q),
+                     const_cast<void*>(cu_seqlens_k),
+                     loop ? o_tmp_ptr : nullptr,
+                     return_softmax ? softmax_ptr : nullptr,
+                     softmax_lse_ptr,
+                     p_dropout,
+                     softmax_scale,
+                     is_causal,
+                     is_bf16,
+                     /*num_splits=*/1);
+    launch_params.params.blockmask = static_cast<int*>(const_cast<void*>(blockmask));
+
+    run_fmha_block_sm80(launch_params, /*configure=*/ true);
+    // number of times random will be generated per thread, to offset philox counter in thc random
+    // state
+    int64_t counter_offset = launch_params.elts_per_thread + offset;
+
+    if( is_dropout ) {
+        launch_params.params.philox_args = PhiloxCudaState(seed, counter_offset);
+    }
+
+    run_fmha_block_sm80(launch_params, /*configure=*/false);
+
+    return true;
+
+    FLASHATTNLIB_END_FUNC 
+}
+
+bool flash_attn_bwd_block(
+        const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+        const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        void *dq,                   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+        void *dk,                   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        void *dv,                   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const void *out,            // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+        const void *dout,           // total_q x num_heads, x head_size
+        const void *cu_seqlens_q,   // int32, batch_size+1
+        const void *cu_seqlens_k,   // int32, batch_size+1
+        const void *blockmask,      // int32, (seqlen_k / 256, seqlen_q / 16)
+        const int total_q,
+        const int total_k,
+        const int batch_size,
+        const int num_heads,
+        const int head_size,
+        const int max_seqlen_q_,
+        const int max_seqlen_k_,
+        const float p_dropout,
+        const float softmax_scale,
+        const bool is_causal,
+        const bool is_bf16,
+        void *softmax_lse_ptr,
+        void *dsoftmax_ptr,
+        void *workspace_ptr,
+        uint64_t *workspace_size,
+        cudaStream_t stream,
+        uint64_t seed,
+        uint64_t offset
+) {
+    // printf("backward seed %jd offset %jd\b", seed, offset);
+
+    FLASHATTNLIB_BEGIN_FUNC 
+
+    auto dprops = GetDeviceProperties(-1);
+    bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
+    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    ASSERT_CHECK(dprops->major == 8 && dprops->minor >= 0);
+    auto launch = &run_fmha_block_dgrad_sm80;
+
+    bool is_dropout = p_dropout > 0.0;
+
+    ASSERT_CHECK(batch_size > 0);
+    ASSERT_CHECK(head_size == 16 || head_size == 32 || head_size == 64 || head_size == 128);
+    if (head_size == 128) {  // TODO: eventually we should support SM86 and SM70 with d=128 as well
+        ASSERT_CHECK(is_sm80);
+    }
+
+    int max_seqlen_k = ((max_seqlen_k_ + 256 - 1) / 256) * 256;
+    if( max_seqlen_k <= 256 ) {
+        max_seqlen_k = 256;
+    }
+    int max_seqlen_q = ((max_seqlen_q_ + 16 - 1) / 16) * 16;
+    bool loop = max_seqlen_k > 256;
+
+    void *dq_tmp_ptr = workspace_ptr;
+    // nullptr out to calculate workspace size
+    if (out == nullptr) {
+        if (loop) {
+            *workspace_size = uint64_t(total_q) * num_heads * head_size * sizeof(float);
+        } else {
+            *workspace_size = 0;
+        }
+        return true;
+    }
+
+    FMHA_dgrad_params params;
+
+    set_params_dgrad(params,
+                     batch_size,
+                     max_seqlen_q,
+                     max_seqlen_k,
+                     num_heads,
+                     head_size,
+                     const_cast<void*>(q),
+                     const_cast<void*>(k),
+                     const_cast<void*>(v),
+                     const_cast<void*>(out),
+                     dq, dk, dv,
+                     const_cast<void*>(cu_seqlens_q),
+                     const_cast<void*>(cu_seqlens_k),
+                     loop ? dq_tmp_ptr : nullptr,
+                     const_cast<void*>(dout),
+                     softmax_lse_ptr,
+                     dsoftmax_ptr,
+                     p_dropout,
+                     softmax_scale,
+                     is_causal,
+                     is_bf16,
+                     /*num_splits=*/1);
+    params.blockmask = static_cast<int*>(const_cast<void*>(blockmask));
+
+    // We're gonna reset the rng state in Python after this kernel, so the counter offset
+    // here doesn't matter at all. We just choose an arbitrary number;
+    int64_t counter_offset = 4 + offset;
+
+    if( is_dropout ) {
+        params.philox_args = PhiloxCudaState(seed, counter_offset);
+    }
+
+    launch(params, stream);
+
+    return true;
+
+    FLASHATTNLIB_END_FUNC 
+}
+
 #ifdef __cplusplus
 }
 #endif

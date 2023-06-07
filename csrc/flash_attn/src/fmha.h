@@ -216,4 +216,4 @@ bool run_fmha_bwd_with_mask_bias_hdim128(FMHA_dgrad_params &params, cudaStream_t
 
 void run_fmha_block_sm80(Launch_params<FMHA_fprop_params> &launch_params, const bool configure);
 
-void run_fmha_block_dgrad_sm80(const FMHA_dgrad_params &params, cudaStream_t stream);
+void run_fmha_block_dgrad_sm80(FMHA_dgrad_params &params, cudaStream_t stream);

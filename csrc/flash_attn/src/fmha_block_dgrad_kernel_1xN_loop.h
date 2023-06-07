@@ -26,7 +26,105 @@ inline __device__ void dot_do_o(float (&sum)[M], const uint4 (&do_)[M], const ui
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_first, bool Is_last, typename Params, typename Prng>
+template <int ROWS, int THREADS_PER_ROW, typename elem_type=__half, int M, typename Gmem_softmax_sum>
+inline __device__ void dot_do_o(const uint4 (&do_)[M], const uint4 (&o)[M], const float scale,
+                                Gmem_softmax_sum gmem_softmax_d, int tidx) {
+    float sum[M];
+    fmha::SumOp<float> sum_op;
+    #pragma unroll
+    for (int mi = 0; mi < M; ++mi) {
+        sum[mi] = fmha::Allreduce<THREADS_PER_ROW>::run(
+            fmha::hmulsum8<elem_type>(do_[mi], o[mi]), sum_op
+        ) * scale;
+    }
+    const int dp_sum_row = tidx / THREADS_PER_ROW;
+    if ((dp_sum_row < ROWS) && (tidx % THREADS_PER_ROW == 0)) {
+        gmem_softmax_d.store_row(reinterpret_cast<const uint32_t (&)[M]>(sum), dp_sum_row);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Just compute dot(do, o) and write the result (softmax_d) to global memory as a separate kernel.
+// This is used in the case where we want to parallelize the backward across seqlen_k.
+template<typename Kernel_traits, typename Params>
+inline __device__ void compute_dot_do_o(const Params &params) {
+
+#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
+    using elem_type = typename Kernel_traits::elem_type;
+#else
+    constexpr bool is_fp16_type = std::is_same<typename Kernel_traits::elem_type, __half>::value;
+    assert(is_fp16_type);
+    using elem_type = __half;
+#endif
+
+    // The description of the CTA tile for the 1st batched GEMM.
+    using Cta_tile_p = typename Kernel_traits::Cta_tile_p;
+    // The description of the CTA tile for the 3rd batched GEMM.
+    using Cta_tile_dkv =
+        fmha::Cta_tile_extd<Cta_tile_p::N, Cta_tile_p::K, Cta_tile_p::M, Cta_tile_p::WARPS_N, 1, Cta_tile_p::WARPS_M>;
+
+    static_assert(Cta_tile_dkv::N == 16 || Cta_tile_dkv::N == 32 || Cta_tile_dkv::N == 64 || Cta_tile_dkv::N == 128);
+    static_assert(Cta_tile_dkv::K == 16);
+
+    // The global memory tile to load dO.
+    using Gmem_tile_do = typename Kernel_traits::Gmem_tile_do;
+
+    // The global memory tile to load O.Loading O here is similar to loading dO.
+    using Gmem_tile_o = Gmem_tile_do;
+
+    using Gmem_softmax_sum = typename Kernel_traits::Gmem_softmax_sum;
+
+    // The block index for the batch.
+    const int bidb = blockIdx.x;
+    // The block index for the head.
+    const int bidh = blockIdx.y;
+    // The thread index.
+    const int tidx = threadIdx.x;
+
+    // How many steps to jump per iteration.
+    const int step_stride = gridDim.z;
+
+    const BlockInfoPadded<Kernel_traits::THREADS> binfo(params, bidb, bidh, tidx);
+    if( binfo.stop_early() ) return;
+
+    // Allocate the global memory tile loader for dO.
+    Gmem_tile_do gmem_do(params.do_ptr, params.o_row_stride_in_elts, params.o_head_stride_in_elts,
+                         params.d, binfo, tidx, true);
+
+    // Allocate the global memory tile loader for O.
+    Gmem_tile_o gmem_o(params.o_ptr, params.o_row_stride_in_elts, params.o_head_stride_in_elts,
+                       params.d, binfo, tidx, true);
+
+    Gmem_softmax_sum gmem_softmax_d(params.dsoftmax_sum, params, tidx);
+
+    static_assert(Cta_tile_p::N % Cta_tile_p::M == 0);
+    const int steps = (params.seqlen_q + Cta_tile_p::M - 1) / Cta_tile_p::M;
+    // Wind gmem tiles to the correct position.
+    gmem_do.move(blockIdx.z);
+    gmem_o.move(blockIdx.z);
+    gmem_softmax_d.move(blockIdx.z);
+
+    // Load over the entire sequence length.
+    for (int l = blockIdx.z; l < steps; l += step_stride) {
+        if (l * Cta_tile_p::M  >= binfo.actual_seqlen_q)
+            break;
+
+        gmem_do.load();
+        gmem_do.move(step_stride);
+        gmem_o.load();
+        gmem_o.move(step_stride);
+
+        dot_do_o<Gmem_tile_do::ROWS, Gmem_tile_do::THREADS_PER_ROW, elem_type>(
+            gmem_do.fetch_, gmem_o.fetch_, params.p_dropout, gmem_softmax_d, tidx
+        );
+        gmem_softmax_d.move(step_stride);
+    }  // Outer loop over the sequence length.
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params, typename Prng>
 inline __device__ void compute_block_dq_dk_dv_1xN_one_iter(const Params &params, Prng &ph,
                                                      const int loop_step_idx) {
 
@@ -207,7 +305,10 @@ inline __device__ void compute_block_dq_dk_dv_1xN_one_iter(const Params &params,
     gmem_q.move(block_row_idx_to_move);
     gmem_do.move(block_row_idx_to_move);
     gmem_o.move(block_row_idx_to_move);
-    gmem_dq.move(block_row_idx_to_move);
+    //gmem_dq.move(block_row_idx_to_move);
+    if (!Seq_parallel) { 
+        gmem_dq.move(block_row_idx_to_move);
+    }  // If Seq_parallel, we're not using gmem_dq at all
     gmem_dq_tmp.move(block_row_idx_to_move);
     // TODO: need to move gmem_s if we want the intermediate result for debugging
     gmem_softmax_lse.move(block_row_idx_to_move);
@@ -613,7 +714,7 @@ inline __device__ void compute_block_dq_dk_dv_1xN_one_iter(const Params &params,
 
         uint4 dq_out[Gmem_tile_dq::STGS_PER_LOOP];
         // if (!Is_first) { gmem_dq_tmp.load(dq_out, 0); }
-        if (!is_first_read) { gmem_dq_tmp.load(dq_out, 0); }
+        if (!is_first_read && !Seq_parallel) { gmem_dq_tmp.load(dq_out, 0); }
 
         // __syncthreads();
         // Commit the values for Q and dO into shared memory.
@@ -667,25 +768,33 @@ inline __device__ void compute_block_dq_dk_dv_1xN_one_iter(const Params &params,
         __syncthreads();
 
         // Load from shared memory.
-        is_first_read ? smem_dq.template load</*zero_init=*/true>(dq_out) : smem_dq.template load</*zero_init=*/false>(dq_out);
+        (is_first_read || Seq_parallel) ? smem_dq.template load</*zero_init=*/true>(dq_out) : smem_dq.template load</*zero_init=*/false>(dq_out);
 
-        const bool is_final_write =
-            Is_last
-            || ((loop_step_idx + 1) * Cta_tile_p::N >= binfo.actual_seqlen_k)
-            || ((mask_val & 0x2) != 0)
-            || ((Is_causal) && (block_row_idx * Cta_tile_p::M < (loop_step_idx + 1) * Cta_tile_p::N));
-        if (is_final_write) {
-            // if (Is_dropout) {
-            //     dq_out[0] = fmha::fmul4(dq_out[0], params.rp_dropout);
-            // }
-            for (int jj = 0; jj < Gmem_tile_dq::STGS_PER_LOOP; ++jj) {	    
-              dq_out[jj] = fmha::fmul4(dq_out[jj], params.scale_bmm1f);
-	    }
-            // Output the values.
-            gmem_dq.template store<elem_type>(dq_out, 0);
-        } else  {
-            // Output the values.
-            gmem_dq_tmp.store(dq_out, 0);
+        if(!Seq_parallel){
+            const bool is_final_write =
+                Is_last
+                || ((loop_step_idx + 1) * Cta_tile_p::N >= binfo.actual_seqlen_k)
+                || ((mask_val & 0x2) != 0)
+                || ((Is_causal) && (block_row_idx * Cta_tile_p::M < (loop_step_idx + 1) * Cta_tile_p::N));
+            if (is_final_write) {
+                // if (Is_dropout) {
+                //     dq_out[0] = fmha::fmul4(dq_out[0], params.rp_dropout);
+                // }
+                for (int jj = 0; jj < Gmem_tile_dq::STGS_PER_LOOP; ++jj) {	    
+                    dq_out[jj] = fmha::fmul4(dq_out[jj], params.scale_bmm1f);
+                }
+                // Output the values.
+                gmem_dq.template store<elem_type>(dq_out, 0);
+            } else  {
+                // Output the values.
+                gmem_dq_tmp.store(dq_out, 0);
+            }
+        }else{
+            for (int jj = 0; jj < Gmem_tile_dq::STGS_PER_LOOP; ++jj) {
+                // dq_out[jj] = fmha::fmul4(dq_out[jj], params.scale_bmm1f);
+                dq_out[jj] = fmha::fmul4(dq_out[jj], params.scale_bmm1_rp_dropout);
+            }
+            gmem_dq_tmp.atomic_add(dq_out, 0);
         }
 
         // Move to the next part of the output.
@@ -804,6 +913,22 @@ inline __device__ void compute_block_dq_dk_dv_1xN(const Params &params) {
     }
 }
 
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, int loop_steps=-1, typename Params>
+inline __device__ void compute_block_dq_dk_dv_1xN_seqparallel(const Params &params) {
+    // The block index for the batch.
+    const int bidb = blockIdx.x;
+    // The block index for the head.
+    const int bidh = blockIdx.y;
+    // The thread index.
+    const int tidx = threadIdx.x;
+
+    const int tidx_global = (bidb * params.h + bidh) * blockDim.x + tidx;
+    auto seeds = philox::unpack(params.philox_args);
+    Philox ph(std::get<0>(seeds), tidx_global, std::get<1>(seeds));
+
+    int loop_step_idx = blockIdx.z;
+    compute_block_dq_dk_dv_1xN_one_iter<Kernel_traits, Is_dropout, Is_causal, false, false, true>(params, ph, loop_step_idx);
+}
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace fmha

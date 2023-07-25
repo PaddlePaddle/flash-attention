@@ -2,14 +2,16 @@
  * Copyright (c) 2023, Tri Dao.
  ******************************************************************************/
 
-#include "flash.h"
-#include "static_switch.h"
+#include "src/flash.h"
+#include "src/static_switch.h"
 #include "cuda.h"
 #include "cuda_runtime.h"
 #include "dlfcn.h"
 #include "math.h"
-#include "utils.h"
-#include "cuda_utils.h"
+//#include "src/utils.h"
+#include "src/cuda_utils.h"
+#include "cutlass/bfloat16.h"
+#include "cutlass/half.h"
 
 #include <cmath>
 #include <limits>
@@ -74,20 +76,20 @@ void set_params_fprop(Flash_fwd_params &params,
                       const size_t d,
                       const size_t d_rounded,
                       // device pointers
-                      const void *q,
-                      const void *k,
-                      const void *v,
-                      void *out,
-                      void *cu_seqlens_q_d,
-                      void *cu_seqlens_k_d,
-                      void *p_d,
-                      void *softmax_lse_d,
+                      void * const q,
+                      void * const k,
+                      void * const v,
+                      void * const out,
+                      void * const cu_seqlens_q_d,
+                      void * const cu_seqlens_k_d,
+                      void * const p_d,
+                      void * const softmax_lse_d,
                       float p_dropout,
                       float softmax_scale,
-                      bool is_causal) {
+                      bool is_causal,
+		      bool is_bf16) {
     // TODO: assert dq.shape == do.shape, dk.shape == dv.shape
     // TODO: should we use d_rounded and seqlen_rounded?
-    Data_type data_type = is_bf16 ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
 
     // Reset the parameters
     memset(&params, 0, sizeof(params));
@@ -151,7 +153,7 @@ void set_params_fprop(Flash_fwd_params &params,
     params.p_dropout_in_uint8_t = uint8_t(std::floor(params.p_dropout * 255.0));
     params.rp_dropout = 1.f / params.p_dropout;
     params.scale_softmax_rp_dropout = params.rp_dropout * params.scale_softmax;
-    TORCH_CHECK(p_dropout < 1.f);
+    ASSERT_CHECK(p_dropout < 1.f);
 
     params.is_causal = is_causal;
 }
@@ -168,24 +170,25 @@ void set_params_dgrad(Flash_bwd_params &params,
                       const size_t d,
                       const size_t d_rounded,
                       // device pointers
-                      const void *q,
-                      const void *k,
-                      const void *v,
-                      const void *out,
-                      const void *dout,
-                      void *dq,
-                      void *dk,
-                      void *dv,
-                      void *cu_seqlens_q_d,
-                      void *cu_seqlens_k_d,
-                      void *dq_accum_d,
-                      void *dk_accum_d,
-                      void *dv_accum_d,
-                      void *softmax_lse_d,
-                      void *dsoftmax_sum_d,
+                      void * const q,
+                      void * const k,
+                      void * const v,
+                      void * const out,
+                      void * const dout,
+                      void * const dq,
+                      void * const dk,
+                      void * const dv,
+                      void * const cu_seqlens_q_d,
+                      void * const cu_seqlens_k_d,
+                      void * const dq_accum_d,
+                      void * const dk_accum_d,
+                      void * const dv_accum_d,
+                      void * const softmax_lse_d,
+                      void * const dsoftmax_sum_d,
                       float p_dropout,
                       float softmax_scale,
-                      bool is_causal) {
+                      bool is_causal,
+		      bool is_bf16) {
     // TODO: assert dq.shape == do.shape, dk.shape == dv.shape
     // TODO: should we use d_rounded and seqlen_rounded?
 
@@ -198,7 +201,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                      softmax_lse_d,
                      p_dropout,
                      softmax_scale,
-                     is_causal);
+                     is_causal, is_bf16);
 
     // Set the pointers and strides.
     params.do_ptr = dout;
@@ -242,23 +245,26 @@ extern "C" {
 #endif
 
 bool flash_attn_fwd(
-        const void *q,
-	const void *k,
-	const void *v,
-	void *out,
+        void * const q,
+	void * const k,
+	void * const v,
+	void * const out,
 	const int batch_size,
 	const int seqlen_q,
 	const int seqlen_k,
+	const int seqlen_q_rounded,
+	const int seqlen_k_rounded,
 	const int num_heads,
 	const int num_heads_k,
 	const int head_size,
+	const int head_size_rounded,
 	const float p_dropout,
 	const float softmax_scale,
 	const bool is_causal,
 	const bool return_softmax,
 	const bool is_bf16,
-	void *softmax_ptr,
-	void *softmax_lse_ptr,
+	void * const softmax_ptr,
+	void * const softmax_lse_ptr,
 	cudaStream_t stream,
 	uint64_t seed,
 	uint64_t offset) {
@@ -303,14 +309,15 @@ bool flash_attn_fwd(
 		     seqlen_q_rounded, seqlen_k_rounded,
 		     num_heads, num_heads_k,
 		     head_size, head_size_rounded,
-		     q_padded, k_padded, v_padded, out,
+		     q, k, v, out,
 		     /*cu_seqlens_q_d=*/nullptr,
 		     /*cu_seqlens_k_d=*/nullptr,
 		     return_softmax ? softmax_ptr : nullptr,
-		     softmax_lse_tr,
+		     softmax_lse_ptr,
 		     p_dropout,
 		     softmax_scale,
-		     is_causal);
+		     is_causal,
+		     is_bf16);
 
     if (p_dropout > 0.0) {
         // number of times random will be generated per thread, to offset philox counter in thc random

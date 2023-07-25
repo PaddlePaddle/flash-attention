@@ -4,16 +4,17 @@
 
 #pragma once
 
-#include <cuda.h>
+#include "cuda_runtime.h"
 #include <vector>
+#include "random_utils.h"
 
 #ifdef OLD_GENERATOR_PATH
-#include <ATen/CUDAGeneratorImpl.h>
+//#include <ATen/CUDAGeneratorImpl.h>
 #else
-#include <ATen/cuda/CUDAGeneratorImpl.h>
+//#include <ATen/cuda/CUDAGeneratorImpl.h>
 #endif
 
-#include <ATen/cuda/CUDAGraphsUtils.cuh>
+//#include <ATen/cuda/CUDAGraphsUtils.cuh>
 
 
 constexpr int TOTAL_DIM = 0;
@@ -89,7 +90,7 @@ struct Flash_fwd_params : public Qkv_params {
     float scale_softmax_rp_dropout;
 
     // Random state.
-    at::PhiloxCudaState philox_args;
+    PhiloxCudaState philox_args;
 
     bool is_bf16;
     bool is_causal;

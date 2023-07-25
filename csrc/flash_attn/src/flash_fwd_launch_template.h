@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <ATen/cuda/CUDAContext.h>
+//#include <ATen/cuda/CUDAContext.h>
 
 #include "static_switch.h"
 #include "flash.h"
@@ -87,7 +87,7 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T>
 void run_mha_fwd_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr int Headdim = 96;
-    auto dprops = at::cuda::getCurrentDeviceProperties();
+    auto dprops = GetCurrentDeviceProperties(-1);
     bool is_sm8x = dprops->major == 8 && dprops->minor > 0;
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -113,7 +113,7 @@ void run_mha_fwd_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T>
 void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr int Headdim = 128;
-    auto dprops = at::cuda::getCurrentDeviceProperties();
+    auto dprops = GetCurrentDeviceProperties(-1);
     bool is_sm8x = dprops->major == 8 && dprops->minor > 0;
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -150,7 +150,7 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T>
 void run_mha_fwd_hdim160(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr int Headdim = 160;
-    auto dprops = at::cuda::getCurrentDeviceProperties();
+    auto dprops = GetCurrentDeviceProperties(-1);
     bool is_sm8x = dprops->major == 8 && dprops->minor > 0;
     BOOL_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         BOOL_SWITCH(params.is_causal, Is_causal, [&] {

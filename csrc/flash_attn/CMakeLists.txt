@@ -25,7 +25,7 @@ include_directories(${CUTLASS_DIR}/include)
 #add_library(flashattn OBJECT
 set(SOURCES_CU
      flash_attn.cu
-#     src/cuda_utils.cu
+     src/cuda_utils.cu
      src/flash_fwd_hdim32_fp16_sm80.cu)
 #     src/flash_fwd_hdim32_bf16_sm80.cu
 #     src/flash_fwd_hdim64_fp16_sm80.cu

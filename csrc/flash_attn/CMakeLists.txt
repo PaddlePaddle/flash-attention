@@ -26,7 +26,7 @@ include_directories(${CUTLASS_DIR}/include)
 set(SOURCES_CU
      flash_attn.cu
      src/cuda_utils.cu
-     src/flash_fwd_hdim32_fp16_sm80.cu)
+     src/flash_fwd_hdim32_fp16_sm80.cu
 #     src/flash_fwd_hdim32_bf16_sm80.cu
 #     src/flash_fwd_hdim64_fp16_sm80.cu
 #     src/flash_fwd_hdim64_bf16_sm80.cu
@@ -41,8 +41,8 @@ set(SOURCES_CU
 #     src/flash_fwd_hdim224_fp16_sm80.cu
 #     src/flash_fwd_hdim224_bf16_sm80.cu
 #     src/flash_fwd_hdim256_fp16_sm80.cu
-#     src/flash_fwd_hdim256_bf16_sm80.cu)
-#     src/flash_bwd_hdim32_fp16_sm80.cu
+#     src/flash_fwd_hdim256_bf16_sm80.cu
+     src/flash_bwd_hdim32_fp16_sm80.cu)
 #     src/flash_bwd_hdim32_bf16_sm80.cu
 #     src/flash_bwd_hdim64_fp16_sm80.cu
 #     src/flash_bwd_hdim64_bf16_sm80.cu

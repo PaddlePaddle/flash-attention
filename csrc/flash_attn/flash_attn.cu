@@ -367,6 +367,7 @@ bool flash_attn_varlen_fwd(
 	cudaStream_t stream,
 	uint64_t seed,
 	uint64_t offset) {
+    printf("\nwe are here varlen\n");
     FLASHATTNLIB_BEGIN_FUNC
     auto dprops = GetDeviceProperties(-1);
 
@@ -413,39 +414,114 @@ bool flash_attn_varlen_fwd(
     FLASHATTNLIB_END_FUNC
 }
 
+// What's configure?
+void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream, const bool configure) {
+    FP16_SWITCH(!params.is_bf16, [&] {
+        if (params.d <= 32) {
+            run_mha_bwd_<elem_type, 32>(params, stream, configure);
+        } else if (params.d <= 64) {
+            run_mha_bwd_<elem_type, 64>(params, stream, configure);
+        } else if (params.d <= 96) {
+            run_mha_bwd_<elem_type, 96>(params, stream, configure);
+        } else if (params.d <= 128) {
+            run_mha_bwd_<elem_type, 128>(params, stream, configure);
+        } else if (params.d <= 160) {
+            run_mha_bwd_<elem_type, 160>(params, stream, configure);
+        } else if (params.d <= 192) {
+            run_mha_bwd_<elem_type, 192>(params, stream, configure);
+        } else if (params.d <= 224) {
+          run_mha_bwd_<elem_type, 224>(params, stream, configure);
+        } else if (params.d <= 256) {
+          run_mha_bwd_<elem_type, 256>(params, stream, configure);
+        }
+    });
+}
+
 bool flash_attn_bwd(
-        const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
-        const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-        const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-        void *dq,                   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
-        void *dk,                   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-        void *dv,                   // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-        const void *out,            // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-        const void *dout,           // total_q x num_heads, x head_size
-        const void *cu_seqlens_q,   // int32, batch_size+1
-        const void *cu_seqlens_k,   // int32, batch_size+1
-        const int total_q,
-        const int total_k,
-        const int batch_size,
-        const int num_heads,
-        const int head_size,
-        const int max_seqlen_q_,
-        const int max_seqlen_k_,
-        const float p_dropout,
-        const float softmax_scale,
-        const bool zero_tensors,
-        const bool is_causal,
-        const bool is_bf16,
-        const int num_splits,
-        void *softmax_lse_ptr,
-        void *dsoftmax_ptr,
-        void *workspace_ptr,
-        uint64_t *workspace_size,
-        cudaStream_t stream,
-        uint64_t seed,
-        uint64_t offset
-) {
-  return true;
+        void * const dout,
+	void * const q,
+	void * const k,
+	void * const v,
+	void * const out,
+	void * const softmax_lse,
+	void * const softmax_d,
+	void * const dq,
+	void * const dk,
+	void * const dv,
+	void * const dq_accum,
+	const int batch_size,
+	const int seqlen_q,
+	const int num_heads,
+	const int head_size_og,
+	const int head_size,
+	const int seqlen_k,
+	const int num_heads_k,
+	const int head_size_rounded,
+	const int seqlen_q_rounded,
+	const int seqlen_k_rounded,
+	const float p_dropout,
+	const float softmax_scale,
+	const bool is_causal,
+	const bool is_bf16,
+	cudaStream_t stream,
+	uint64_t seed,
+	uint64_t offset) {
+    printf("\nwe are here bwd\n");
+    FLASHATTNLIB_BEGIN_FUNC
+    auto dprops = GetDeviceProperties(-1);
+
+    const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    const bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
+    const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+
+    ASSERT_CHECK(is_sm8x || is_sm90);
+    ASSERT_CHECK(batch_size > 0);
+    if (head_size > 192) {
+        // FlashAttention backward for head dim > 192 requires A100/A800 or H100/H800
+        ASSERT_CHECK(is_sm80 || is_sm90);
+    }
+    const bool is_dropout = p_dropout > 0.0;
+    // bool loop = seqlen_k > blocksize_c;
+    // TODO: change later, for now set to true for simplicity
+    const bool loop = true;
+
+    // we do shape check in paddle
+    // actually we do not check at all.
+
+    Flash_bwd_params params;
+
+    set_params_dgrad(params,
+                     batch_size,
+                     seqlen_q, seqlen_k,
+                     seqlen_q_rounded, seqlen_k_rounded,
+                     num_heads, num_heads_k,
+                     head_size, head_size_rounded,
+                     q, k, v, out,
+		     // we do not support MQA / GQA, so just dk and dv will be OK.
+                     dout, dq, dk, dv,
+                     nullptr,
+                     nullptr,
+                     loop ? dq_accum : nullptr,
+                     // loop ? dk_accum.data_ptr() : nullptr,
+                     // loop ? dv_accum.data_ptr() : nullptr,
+                     nullptr,
+                     nullptr,
+                     softmax_lse,
+                     softmax_d,
+                     p_dropout,
+                     softmax_scale,
+                     is_causal,
+		     is_bf16);
+
+    auto launch = &run_mha_bwd;
+
+    launch(params, stream, /*configure=*/false);
+    
+    // TODO(umiswing): support MQA/GQA
+
+    return true;
+    
+    FLASHATTNLIB_END_FUNC
 }
 
 bool flash_attn_fwd_with_bias_and_mask(

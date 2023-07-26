@@ -268,14 +268,16 @@ bool flash_attn_fwd(
 	cudaStream_t stream,
 	uint64_t seed,
 	uint64_t offset) {
+    printf("\nwe are here\n");
 
     FLASHATTNLIB_BEGIN_FUNC
 
     auto dprops = GetDeviceProperties(-1);
 
-    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
     
-    ASSERT_CHECK(is_sm8x);
+    ASSERT_CHECK(is_sm8x || is_sm90);
     ASSERT_CHECK(batch_size > 0);
     // We should use pad to remove this assert
     // But maybe we don't have to pad this shit.
@@ -335,6 +337,79 @@ bool flash_attn_fwd(
     
     return true;
 
+    FLASHATTNLIB_END_FUNC
+}
+
+bool flash_attn_varlen_fwd(
+        void * const q,
+	void * const k,
+	void * const v,
+	void * const out,
+	void * const cu_seqlens_q,
+	void * const cu_seqlens_k,
+	const int batch_size,
+	const int max_seqlen_q,
+	const int max_seqlen_k,
+	const int seqlen_q_rounded,
+	const int seqlen_k_rounded,
+	const int num_heads,
+	const int num_heads_k,
+	const int head_size,
+	const int head_size_rounded,
+	const float p_dropout,
+	const float softmax_scale,
+	const bool zero_tensors,
+	const bool is_causal,
+	const bool return_softmax,
+	const bool is_bf16,
+	void * const softmax_ptr,
+        void * const softmax_lse_ptr,
+	cudaStream_t stream,
+	uint64_t seed,
+	uint64_t offset) {
+    FLASHATTNLIB_BEGIN_FUNC
+    auto dprops = GetDeviceProperties(-1);
+
+    const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+
+    ASSERT_CHECK(is_sm8x || is_sm90);
+    ASSERT_CHECK(batch_size > 0);
+    
+    // Add checking shit in paddle
+    
+    // This shit seems to be so easy...
+    
+    Flash_fwd_params params;
+    set_params_fprop(params,
+                     batch_size,
+		     max_seqlen_q, max_seqlen_k,
+		     seqlen_q_rounded, seqlen_k_rounded,
+		     num_heads, num_heads_k,
+		     head_size, head_size_rounded,
+		     q, k, v, out,
+		     cu_seqlens_q,
+		     cu_seqlens_k,
+		     return_softmax ? softmax_ptr : nullptr,
+		     softmax_lse_ptr,
+		     p_dropout,
+		     softmax_scale,
+		     is_causal,
+		     is_bf16);
+    
+    if (p_dropout > 0.0) {
+        params.philox_args = PhiloxCudaState(seed, offset);
+    }
+
+    run_mha_fwd(params, stream);
+
+    // we don't pad this shit yet.
+    // TODO
+    // if (head_size_og % 8 != 0)
+    // ...
+    
+    return true;
+    
     FLASHATTNLIB_END_FUNC
 }
 

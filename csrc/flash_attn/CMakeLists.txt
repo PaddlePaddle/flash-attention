@@ -27,13 +27,13 @@ set(SOURCES_CU
      flash_attn.cu
      src/cuda_utils.cu
      src/flash_fwd_hdim32_fp16_sm80.cu
-#     src/flash_fwd_hdim32_bf16_sm80.cu
+     src/flash_fwd_hdim32_bf16_sm80.cu
 #     src/flash_fwd_hdim64_fp16_sm80.cu
 #     src/flash_fwd_hdim64_bf16_sm80.cu
 #     src/flash_fwd_hdim96_fp16_sm80.cu
 #     src/flash_fwd_hdim96_bf16_sm80.cu
-#     src/flash_fwd_hdim128_fp16_sm80.cu
-#     src/flash_fwd_hdim128_bf16_sm80.cu
+     src/flash_fwd_hdim128_fp16_sm80.cu
+     src/flash_fwd_hdim128_bf16_sm80.cu
 #     src/flash_fwd_hdim160_fp16_sm80.cu
 #     src/flash_fwd_hdim160_bf16_sm80.cu
 #     src/flash_fwd_hdim192_fp16_sm80.cu
@@ -42,14 +42,14 @@ set(SOURCES_CU
 #     src/flash_fwd_hdim224_bf16_sm80.cu
 #     src/flash_fwd_hdim256_fp16_sm80.cu
 #     src/flash_fwd_hdim256_bf16_sm80.cu
-     src/flash_bwd_hdim32_fp16_sm80.cu)
-#     src/flash_bwd_hdim32_bf16_sm80.cu
+     src/flash_bwd_hdim32_fp16_sm80.cu
+     src/flash_bwd_hdim32_bf16_sm80.cu
 #     src/flash_bwd_hdim64_fp16_sm80.cu
 #     src/flash_bwd_hdim64_bf16_sm80.cu
 #     src/flash_bwd_hdim96_fp16_sm80.cu
 #     src/flash_bwd_hdim96_bf16_sm80.cu
-#     src/flash_bwd_hdim128_fp16_sm80.cu
-#     src/flash_bwd_hdim128_bf16_sm80.cu
+     src/flash_bwd_hdim128_fp16_sm80.cu
+     src/flash_bwd_hdim128_bf16_sm80.cu
 #     src/flash_bwd_hdim160_fp16_sm80.cu
 #     src/flash_bwd_hdim160_bf16_sm80.cu
 #     src/flash_bwd_hdim192_fp16_sm80.cu
@@ -57,7 +57,8 @@ set(SOURCES_CU
 #     src/flash_bwd_hdim224_fp16_sm80.cu
 #     src/flash_bwd_hdim224_bf16_sm80.cu
 #     src/flash_bwd_hdim256_fp16_sm80.cu
-#     src/flash_bwd_hdim256_bf16_sm80.cu)
+#     src/flash_bwd_hdim256_bf16_sm80.cu
+  )
 #set(SOURCES_CPP src/cuda_utils.cpp)
 add_library(flashattn SHARED
     ${SOURCES_CU}

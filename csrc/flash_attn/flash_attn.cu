@@ -276,6 +276,7 @@ bool flash_attn_fwd(
 
     const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    bool is_dropout = p_dropout > 0.0;
     
     ASSERT_CHECK(is_sm8x || is_sm90);
     ASSERT_CHECK(batch_size > 0);
@@ -321,7 +322,7 @@ bool flash_attn_fwd(
 		     is_causal,
 		     is_bf16);
 
-    if (p_dropout > 0.0) {
+    if (is_dropout) {
         // number of times random will be generated per thread, to offset philox counter in thc random
         // state
         // We use a custom RNG that increases the offset by batch_size * nheads * 32.
@@ -373,6 +374,7 @@ bool flash_attn_varlen_fwd(
 
     const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    const bool is_dropout = p_dropout > 0.0;
 
     ASSERT_CHECK(is_sm8x || is_sm90);
     ASSERT_CHECK(batch_size > 0);
@@ -398,7 +400,7 @@ bool flash_attn_varlen_fwd(
 		     is_causal,
 		     is_bf16);
     
-    if (p_dropout > 0.0) {
+    if (is_dropout) {
         params.philox_args = PhiloxCudaState(seed, offset);
     }
 
@@ -473,6 +475,7 @@ bool flash_attn_bwd(
     const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     const bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
     const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    const bool is_dropout = p_dropout > 0.0;
 
     ASSERT_CHECK(is_sm8x || is_sm90);
     ASSERT_CHECK(batch_size > 0);
@@ -480,7 +483,6 @@ bool flash_attn_bwd(
         // FlashAttention backward for head dim > 192 requires A100/A800 or H100/H800
         ASSERT_CHECK(is_sm80 || is_sm90);
     }
-    const bool is_dropout = p_dropout > 0.0;
     // bool loop = seqlen_k > blocksize_c;
     // TODO: change later, for now set to true for simplicity
     const bool loop = true;
@@ -514,6 +516,10 @@ bool flash_attn_bwd(
 		     is_bf16);
 
     auto launch = &run_mha_bwd;
+    
+    if (is_dropout) {
+	params.philox_args = PhiloxCudaState(seed, offset);
+    }
 
     launch(params, stream, /*configure=*/false);
     
@@ -522,6 +528,100 @@ bool flash_attn_bwd(
     return true;
     
     FLASHATTNLIB_END_FUNC
+
+}
+
+bool flash_attn_varlen_bwd(
+        void * const dout,
+	void * const q,
+	void * const k,
+	void * const v,
+	void * const out,
+	void * const softmax_lse,
+	void * const softmax_d,
+	void * const dq,
+	void * const dk,
+	void * const dv,
+	void * const dq_accum,
+	int32_t * const cu_seqlens_q,
+	int32_t * const cu_seqlens_k,
+	const int max_seqlen_q,
+	const int max_seqlen_k,
+	const int batch_size,
+	const int num_heads,
+	const int head_size_og,
+	const int head_size,
+	const int num_heads_k,
+	const int head_size_rounded,
+	const int seqlen_q_rounded,
+	const int seqlen_k_rounded,
+	const float p_dropout,
+	const float softmax_scale,
+	const bool is_causal,
+	const bool is_bf16,
+	cudaStream_t stream,
+	uint64_t seed,
+	uint64_t offset) {
+    printf("\nwe are here varlen bwd\n");
+    FLASHATTNLIB_BEGIN_FUNC
+    auto dprops = GetDeviceProperties(-1);
+
+    const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    const bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
+    const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    const bool is_dropout = p_dropout > 0.0;
+    const bool loop = true;
+
+    ASSERT_CHECK(is_sm8x || is_sm90);
+    ASSERT_CHECK(batch_size > 0);
+    ASSERT_CHECK(head_size <= 256);
+    if (head_size > 192) {
+        // FlashAttention backward for head dim > 192 requires A100/A800 or H100/H800
+        ASSERT_CHECK(is_sm80 || is_sm90);
+    }
+    // bool loop = seqlen_k > blocksize_c;
+    // TODO: change later, for now set to true for simplicity
+
+    // we do shape check in paddle
+    // actually we do not check at all.
+
+    Flash_bwd_params params;
+
+    set_params_dgrad(params,
+                     batch_size,
+                     max_seqlen_q, max_seqlen_k,
+                     seqlen_q_rounded, seqlen_k_rounded,
+                     num_heads, num_heads_k,
+                     head_size, head_size_rounded,
+                     q, k, v, out,
+		     // we do not support MQA / GQA, so just dk and dv will be OK.
+                     dout, dq, dk, dv,
+                     cu_seqlens_q,
+                     cu_seqlens_k,
+                     loop ? dq_accum : nullptr,
+                     nullptr,
+                     nullptr,
+                     softmax_lse,
+                     softmax_d,
+                     p_dropout,
+                     softmax_scale,
+                     is_causal,
+		     is_bf16);
+
+    auto launch = &run_mha_bwd;
+
+    if (is_dropout) {
+	params.philox_args = PhiloxCudaState(seed, offset);
+    }
+
+    launch(params, stream, /*configure=*/false);
+    
+    // TODO(umiswing): support MQA/GQA
+
+    return true;
+    
+    FLASHATTNLIB_END_FUNC
+
 }
 
 bool flash_attn_fwd_with_bias_and_mask(

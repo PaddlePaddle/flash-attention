@@ -91,6 +91,38 @@ bool flash_attn_bwd(
 	uint64_t seed,
 	uint64_t offset);
 
+bool flash_attn_varlen_bwd(
+        void * const dout,
+	void * const q,
+	void * const k,
+	void * const v,
+	void * const out,
+	void * const softmax_lse,
+	void * const softmax_d,
+	void * const dq,
+	void * const dk,
+	void * const dv,
+	void * const dq_accum,
+	int32_t * const cu_seqlens_q,
+	int32_t * const cu_seqlens_k,
+	const int max_seqlen_q,
+	const int max_seqlen_k,
+	const int batch_size,
+	const int num_heads,
+	const int head_size_og,
+	const int head_size,
+	const int num_heads_k,
+	const int head_size_rounded,
+	const int seqlen_q_rounded,
+	const int seqlen_k_rounded,
+	const float p_dropout,
+	const float softmax_scale,
+	const bool is_causal,
+	const bool is_bf16,
+	cudaStream_t stream,
+	uint64_t seed,
+	uint64_t offset);
+
 bool flash_attn_fwd_with_bias_and_mask(
         const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
         const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i

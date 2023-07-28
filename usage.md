@@ -27,13 +27,15 @@ PR or email us. We'd very much like to hear from you!
   
 - EleutherAI's [GPT-NeoX](https://github.com/EleutherAI/gpt-neox/pull/725). This is a research library for training large language transformer models at scale based on NVIDIA's Megatron-LM and Microsoft's DeepSpeed.
 
+- PaddlePaddle: integrated into the framework with [API](https://github.com/PaddlePaddle/Paddle/blob/develop/python/paddle/nn/functional/flash_attention.py) `paddle.nn.functional.flash_attention`.
+
 ## MLPerf benchmarks
 
 [MLPerf](https://mlcommons.org/en/) is a competitive machine learning performance benchmark. FlashAttention
 yields the fastest BERT training on cloud instances in MLPerf training 2.0 (June
 2022) and MLPerf training 2.1 (November 2022).
 
-- MLPerf 2.0: IEEE Spectrum [article](https://spectrum.ieee.org/mlperf-rankings-2022) about our submission to the MLPerf 2.0 benchmark using FlashAttention.
+- MLPerf 2.0: [IEEE Spectrum](https://spectrum.ieee.org/mlperf-rankings-2022) and [Forbes](ttps://www.forbes.com/sites/moorinsights/2022/07/12/google-dethrones-nvidia-in-latest-artificial-intelligence-benchmarking-tests/) articles about our submission to the MLPerf 2.0 benchmark using FlashAttention.
 
 - MLPerf 2.1 -
   collaboration
@@ -121,3 +123,5 @@ yields the fastest BERT training on cloud instances in MLPerf training 2.0 (June
 
 - [Jax](https://github.com/google/jax): an [implementation](https://github.com/lucidrains/flash-attention-jax)
   in Jax by [lucidrains](https://github.com/lucidrains/).
+
+- [Metal](https://developer.apple.com/metal): an [implementation](https://github.com/philipturner/metal-flash-attention) in Metal by Philip Turner. This ports FlashAttention to mobile GPU architectures such as Apple silicon.

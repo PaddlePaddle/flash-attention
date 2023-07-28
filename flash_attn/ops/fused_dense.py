@@ -15,14 +15,9 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 # import fused_dense_cuda  # from apex
 import fused_dense_lib as fused_dense_cuda
 
-from flash_attn.ops.gelu_activation import gelu_bwd
+from flash_attn.ops.activations import gelu_bwd, relu_bwd, sqrelu_fwd, sqrelu_bwd
 from flash_attn.utils.distributed import all_gather_raw, reduce_scatter_raw, all_reduce_raw
 from flash_attn.utils.distributed import reduce_scatter, all_reduce
-
-
-@torch.jit.script
-def relu_bwd(g, x):
-    return torch.where(x >= 0, g, 0.0).to(dtype=x.dtype)
 
 
 class FusedDenseFunc(torch.autograd.Function):
@@ -209,7 +204,9 @@ class FusedMLPFunc(torch.autograd.Function):
         2: recompute pre_act and gelu_out / relu_out in the bwd
         """
         assert -1 <= heuristic <= 4
-        assert activation in ['gelu_approx', 'relu']
+        assert activation in ['gelu_approx', 'relu', 'sqrelu']
+        if activation == 'sqrelu':
+            assert heuristic == -1
         if not save_pre_act:
             checkpoint_lvl = 2
         assert checkpoint_lvl in [0, 1, 2]
@@ -248,8 +245,9 @@ class FusedMLPFunc(torch.autograd.Function):
         if heuristic == -1:
             pre_act = F.linear(total_x, weight1, bias1)
             activation_fn = (partial(F.gelu, approximate='tanh') if activation == 'gelu_approx'
-                             else F.relu)
-            output1 = activation_fn(pre_act)
+                             else (sqrelu_fwd if activation == 'sqrelu' else F.relu))
+            with torch.jit.fuser('fuser2'):
+                output1 = activation_fn(pre_act)
             # This is before adding bias1
             # pre_act = F.linear(total_x.reshape(batch_dim, n), weight1)
             # with torch.jit.fuser('fuser2'):
@@ -279,7 +277,7 @@ class FusedMLPFunc(torch.autograd.Function):
         checkpoint_lvl = ctx.checkpoint_lvl
         activation = ctx.activation
         activation_fn = (partial(F.gelu, approximate='tanh') if activation == 'gelu_approx'
-                            else F.relu)
+                         else (sqrelu_fwd if activation == 'sqrelu' else F.relu))
         if ctx.return_residual:
             grad_input, = args
             grad_input = grad_input.contiguous()
@@ -297,14 +295,16 @@ class FusedMLPFunc(torch.autograd.Function):
                 pre_act, output1 = rest
             elif checkpoint_lvl == 1:
                 pre_act, = rest
-                output1 = activation_fn(pre_act)
+                with torch.jit.fuser('fuser2'):
+                    output1 = activation_fn(pre_act)
         elif checkpoint_lvl == 2:
             bias1, = rest
             if process_group is not None and sequence_parallel:
                 total_x, _ = all_gather_raw(x, process_group)
             if ctx.heuristic == -1:
                 pre_act = F.linear(total_x, weight1, bias1)
-                output1 = activation_fn(pre_act)
+                with torch.jit.fuser('fuser2'):
+                    output1 = activation_fn(pre_act)
             else:
                 output1, pre_act = fused_dense_cuda.linear_act_forward(
                     total_x.reshape(batch_dim, total_x.shape[-1]), weight1, bias1,
@@ -324,8 +324,9 @@ class FusedMLPFunc(torch.autograd.Function):
         if ctx.heuristic == -1:
             # grad_pre_act = matmul_dgelu(grad_output, weight2, pre_act)
             grad_output1 = F.linear(grad_output, weight2.t())
+            activation_grad_fn = (gelu_bwd if activation == 'gelu_approx'
+                                  else (sqrelu_bwd if activation == 'sqrelu' else relu_bwd))
             with torch.jit.fuser('fuser2'):
-                activation_grad_fn = gelu_bwd if activation == 'gelu_approx' else relu_bwd
                 grad_pre_act = activation_grad_fn(grad_output1, pre_act)
         else:
             # The cublasLt epilogue has to compute both gelu/relu grad and bias grad, we can't
@@ -380,7 +381,7 @@ def fused_mlp_func(
     process_group: Optional[ProcessGroup] = None,
     sequence_parallel: bool = True
 ):
-    assert activation in ['gelu_approx', 'relu']
+    assert activation in ['gelu_approx', 'relu', 'sqrelu']
     dtype_eligible = (x.dtype in [torch.float16, torch.bfloat16]
                       or (x.dtype == torch.float32 and torch.is_autocast_enabled()))
     # If we save pre-activation, dimension must be divisible by 128 (relu) or 8 (gelu)
@@ -403,7 +404,7 @@ def fused_mlp_func(
 
 class FusedMLP(nn.Module):
 
-    def __init__(self, in_features, hidden_features, out_features=None, bias1=True,
+    def __init__(self, in_features, hidden_features=None, out_features=None, bias1=True,
                  bias2=True, activation='gelu_approx', return_residual=False,
                  checkpoint_lvl=0, heuristic='auto', device=None, dtype=None):
         """
@@ -421,20 +422,22 @@ class FusedMLP(nn.Module):
             'auto': heuristic will be picked automatically:
                 For CUDA >= 11.8, we set heuristic=0 for both fp16 and bf16 for best perf.
                 For CUDA <= 11.7, we set heuristic=1 for fp16 and heuristic=-1 for bf16.
+                For H100, we set heuristic=-1 for both fp16 and bf16 as the fused cuBlasLt implementation
+                is slower than the unfused version.
         return_residual: whether to return the input x along with the output. This is for
             performance reason: for post-norm architecture, returning the input allows us
             to fuse the backward of nn.Linear with the residual connection.
         """
         assert checkpoint_lvl in [0, 1, 2]
-        assert activation in ['gelu_approx', 'relu']
+        assert activation in ['gelu_approx', 'relu', 'sqrelu']
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
-        if out_features is None:
-            out_features = in_features
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features * 4
         self.activation = activation
         self.return_residual = return_residual
         self.checkpoint_lvl = checkpoint_lvl
-        self.heuristic = heuristic
+        self.heuristic = heuristic if activation != 'sqrelu' else -1
         self.fc1 = nn.Linear(in_features, hidden_features, bias=bias1, **factory_kwargs)
         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias2, **factory_kwargs)
 
@@ -442,8 +445,11 @@ class FusedMLP(nn.Module):
         dtype = x.dtype if not torch.is_autocast_enabled() else torch.get_autocast_gpu_dtype()
         if self.heuristic == 'auto':
             if self.activation == 'gelu_approx':
-                cuda_ver = tuple(map(int, torch.version.cuda.split('.')))
-                heuristic = 0 if cuda_ver >= (11, 8) else (1 if dtype == torch.float16 else -1)
+                if torch.cuda.get_device_capability('cuda') == (9, 0):
+                    heuristic = -1
+                else:
+                    cuda_ver = tuple(map(int, torch.version.cuda.split('.')))
+                    heuristic = 0 if cuda_ver >= (11, 8) else (1 if dtype == torch.float16 else -1)
             else:
                 heuristic = 0
         else:
@@ -463,9 +469,9 @@ class FusedMLP(nn.Module):
 
 class ParallelFusedMLP(nn.Module):
 
-    def __init__(self, in_features, hidden_features, out_features=None, activation='gelu_approx',
-                 process_group: ProcessGroup = None, bias1=True, bias2=True,
-                 sequence_parallel=True, checkpoint_lvl=0, heuristic='auto',
+    def __init__(self, in_features, hidden_features=None, out_features=None,
+                 activation='gelu_approx', process_group: ProcessGroup = None,
+                 bias1=True, bias2=True, sequence_parallel=True, checkpoint_lvl=0, heuristic='auto',
                  device=None, dtype=None):
         """
         process_group is required. We're doing Tensor Parallel with sequence parallelism:
@@ -484,17 +490,17 @@ class ParallelFusedMLP(nn.Module):
                 For CUDA <= 11.7, we set heuristic=1 for fp16 and heuristic=-1 for bf16.
         """
         assert checkpoint_lvl in [0, 1, 2]
-        assert activation in ['gelu_approx', 'relu']
+        assert activation in ['gelu_approx', 'relu', 'sqrelu']
         assert process_group is not None
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
-        if out_features is None:
-            out_features = in_features
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features * 4
         self.activation = activation
         self.process_group = process_group
         self.sequence_parallel = sequence_parallel
         self.checkpoint_lvl = checkpoint_lvl
-        self.heuristic = heuristic
+        self.heuristic = heuristic if activation != 'sqrelu' else -1
         self.fc1 = ColumnParallelLinear(in_features, hidden_features, process_group,
                                         bias=bias1, **factory_kwargs)
         self.fc2 = RowParallelLinear(hidden_features, out_features, process_group,

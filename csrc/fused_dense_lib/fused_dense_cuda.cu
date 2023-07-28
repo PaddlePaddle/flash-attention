@@ -110,7 +110,9 @@ int gemm_bias_act_lt(
     int64_t ldc,
     void* pre_act,
     bool is_gelu,
-    int heuristic
+    int heuristic,
+    void *lt_workspace,
+    size_t workspaceSize
     ) {
   static_assert(std::is_same<Dtype, at::Half>::value || std::is_same<Dtype, at::BFloat16>::value,
                 "gemm_bias_act_lt only supports fp16 and bf16");
@@ -120,12 +122,6 @@ int gemm_bias_act_lt(
 
   cublasLtHandle_t ltHandle =
     reinterpret_cast<cublasLtHandle_t>(at::cuda::getCurrentCUDABlasHandle());
-  // See https://github.com/pytorch/pytorch/issues/73328 for reasoning behind
-  // setting this to 1M.
-  size_t workspaceSize = 1024 * 1024;
-  void* workspace = at::empty(
-    {static_cast<int64_t>(workspaceSize)},
-    at::device({at::kCUDA, at::cuda::current_device()}).dtype(at::kByte)).data_ptr();
 
   cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 
@@ -226,7 +222,7 @@ int gemm_bias_act_lt(
                           // TD [2022-04-29] Somehow algo 0 and 2 are a lot slower than other algos
                           &heuristicResult[heuristic].algo,
                           // NULL,
-                          workspace,
+                          lt_workspace,
                           workspaceSize,
                           at::cuda::getCurrentCUDAStream());
 
@@ -252,7 +248,9 @@ template int gemm_bias_act_lt(
     int64_t ldc,
     void* pre_act,
     bool is_gelu,
-    int heuristic);
+    int heuristic,
+    void *lt_workspace,
+    size_t workspaceSize);
 
 template int gemm_bias_act_lt(
     cublasOperation_t transa,
@@ -270,7 +268,9 @@ template int gemm_bias_act_lt(
     int64_t ldc,
     void* pre_act,
     bool is_gelu,
-    int heuristic);
+    int heuristic,
+    void *lt_workspace,
+    size_t workspaceSize);
 
 template <typename Dtype>
 int gemm_bgradb_lt(
@@ -286,7 +286,9 @@ int gemm_bgradb_lt(
     int64_t ldb,
     Dtype* C,
     int64_t ldc,
-    Dtype* bgrad) {
+    Dtype* bgrad,
+    void *lt_workspace,
+    size_t workspaceSize) {
   static_assert(std::is_same<Dtype, at::Half>::value || std::is_same<Dtype, at::BFloat16>::value,
                 "gemm_bgradb_lt only supports fp16 and bf16");
   float beta = 0.0;
@@ -294,12 +296,6 @@ int gemm_bgradb_lt(
 
   cublasLtHandle_t ltHandle =
     reinterpret_cast<cublasLtHandle_t>(at::cuda::getCurrentCUDABlasHandle());
-  // See https://github.com/pytorch/pytorch/issues/73328 for reasoning behind
-  // setting this to 1M.
-  size_t workspaceSize = 1024 * 1024;
-  void* workspace = at::empty(
-    {static_cast<int64_t>(workspaceSize)},
-    at::device({at::kCUDA, at::cuda::current_device()}).dtype(at::kByte)).data_ptr();
 
   cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 
@@ -381,7 +377,7 @@ int gemm_bgradb_lt(
                           &Cdesc,
                           //&heuristicResult.algo,
                           NULL,
-                          workspace,
+                          lt_workspace,
                           workspaceSize,
                           at::cuda::getCurrentCUDAStream());
 
@@ -405,7 +401,9 @@ template int gemm_bgradb_lt(
     int64_t ldb,
     at::Half* C,
     int64_t ldc,
-    at::Half* bgrad);
+    at::Half* bgrad,
+    void *lt_workspace,
+    size_t workspaceSize);
 
 template int gemm_bgradb_lt(
     cublasOperation_t transa,
@@ -420,7 +418,9 @@ template int gemm_bgradb_lt(
     int64_t ldb,
     at::BFloat16* C,
     int64_t ldc,
-    at::BFloat16* bgrad);
+    at::BFloat16* bgrad,
+    void *lt_workspace,
+    size_t workspaceSize);
 
 template <typename Dtype>
 int gemm_dact_bgradb_lt(
@@ -439,7 +439,9 @@ int gemm_dact_bgradb_lt(
     int64_t ldc,
     Dtype* bgrad,
     bool is_gelu,
-    int heuristic) {
+    int heuristic,
+    void *lt_workspace,
+    size_t workspaceSize) {
   static_assert(std::is_same<Dtype, at::Half>::value || std::is_same<Dtype, at::BFloat16>::value,
                 "gemm_dact_bgradb_lt only supports fp16 and bf16");
   float beta = 0.0;
@@ -447,12 +449,6 @@ int gemm_dact_bgradb_lt(
 
   cublasLtHandle_t ltHandle =
     reinterpret_cast<cublasLtHandle_t>(at::cuda::getCurrentCUDABlasHandle());
-  // See https://github.com/pytorch/pytorch/issues/73328 for reasoning behind
-  // setting this to 1M.
-  size_t workspaceSize = 1024 * 1024;
-  void* workspace = at::empty(
-    {static_cast<int64_t>(workspaceSize)},
-    at::device({at::kCUDA, at::cuda::current_device()}).dtype(at::kByte)).data_ptr();
 
   cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 
@@ -538,7 +534,7 @@ int gemm_dact_bgradb_lt(
                           //&heuristicResult.algo,
                           &heuristicResult[heuristic].algo,
                           // NULL,
-                          workspace,
+                          lt_workspace,
                           workspaceSize,
                           at::cuda::getCurrentCUDAStream());
 
@@ -564,7 +560,9 @@ template int gemm_dact_bgradb_lt(
     int64_t ldc,
     at::Half* bgrad,
     bool is_gelu,
-    int heuristic);
+    int heuristic,
+    void *lt_workspace,
+    size_t workspaceSize);
 
 template int gemm_dact_bgradb_lt(
     cublasOperation_t transa,
@@ -582,12 +580,14 @@ template int gemm_dact_bgradb_lt(
     int64_t ldc,
     at::BFloat16* bgrad,
     bool is_gelu,
-    int heuristic);
+    int heuristic,
+    void *lt_workspace,
+    size_t workspaceSize);
 
 #endif
 
 template <typename T>
-int linear_bias_wgrad_cuda(const T *input, const T *d_output, int64_t in_features, int64_t batch_size, int64_t out_features, T *d_weight, T *d_bias) {
+int linear_bias_wgrad_cuda(const T *input, const T *d_output, int64_t in_features, int64_t batch_size, int64_t out_features, T *d_weight, T *d_bias, void *lt_workspace, size_t workspaceSize) {
     const float alpha          = 1.0;
     const float beta_zero      = 0.0;
     int status = 1;
@@ -606,7 +606,9 @@ int linear_bias_wgrad_cuda(const T *input, const T *d_output, int64_t in_feature
     out_features,
     d_weight,
     in_features,
-    d_bias);
+    d_bias,
+    lt_workspace,
+    workspaceSize);
 #endif
 
     if (status != 0){
@@ -648,7 +650,7 @@ int linear_bias_wgrad_cuda(const T *input, const T *d_output, int64_t in_feature
 }
 
 template <typename T>
-int linear_act_forward_cuda(const T *input, const T *weight, const T *bias, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, T *output, void *pre_act) {
+int linear_act_forward_cuda(const T *input, const T *weight, const T *bias, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, T *output, void *pre_act, void *lt_workspace, size_t workspaceSize) {
     int status = 1;
 #if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 11600
     status = gemm_bias_act_lt(
@@ -667,7 +669,9 @@ int linear_act_forward_cuda(const T *input, const T *weight, const T *bias, int6
     out_features,
     pre_act,
     is_gelu,
-    heuristic);
+    heuristic,
+    lt_workspace,
+    workspaceSize);
     return status;
 #else
     return 1;
@@ -675,7 +679,7 @@ int linear_act_forward_cuda(const T *input, const T *weight, const T *bias, int6
 }
 
 template <typename T>
-int bias_act_linear_dgrad_bgrad_cuda(const T *weight, const T *d_output, const void *pre_act, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, T *d_input, T *d_bias) {
+int bias_act_linear_dgrad_bgrad_cuda(const T *weight, const T *d_output, const void *pre_act, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, T *d_input, T *d_bias, void *lt_workspace, size_t workspaceSize) {
     const float alpha          = 1.0;
     int status = 1;
 #if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 11600
@@ -695,17 +699,19 @@ int bias_act_linear_dgrad_bgrad_cuda(const T *weight, const T *d_output, const v
     in_features,
     d_bias,
     is_gelu,
-    heuristic);
+    heuristic,
+    lt_workspace,
+    workspaceSize);
 #endif
     return status;
 
 }
 
-template int linear_bias_wgrad_cuda<at::Half>(const at::Half *input, const at::Half *d_output, int64_t in_features, int64_t batch_size, int64_t out_features, at::Half *d_weight, at::Half *d_bias);
-template int linear_bias_wgrad_cuda<at::BFloat16>(const at::BFloat16 *input, const at::BFloat16 *d_output, int64_t in_features, int64_t batch_size, int64_t out_features, at::BFloat16 *d_weight, at::BFloat16 *d_bias);
+template int linear_bias_wgrad_cuda<at::Half>(const at::Half *input, const at::Half *d_output, int64_t in_features, int64_t batch_size, int64_t out_features, at::Half *d_weight, at::Half *d_bias, void *lt_workspace, size_t workspaceSize);
+template int linear_bias_wgrad_cuda<at::BFloat16>(const at::BFloat16 *input, const at::BFloat16 *d_output, int64_t in_features, int64_t batch_size, int64_t out_features, at::BFloat16 *d_weight, at::BFloat16 *d_bias, void *lt_workspace, size_t workspaceSize);
 
-template int linear_act_forward_cuda<at::Half>(const at::Half *input, const at::Half *weight, const at::Half *bias, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, at::Half *output, void *pre_act);
-template int linear_act_forward_cuda<at::BFloat16>(const at::BFloat16 *input, const at::BFloat16 *weight, const at::BFloat16 *bias, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, at::BFloat16 *output, void *pre_act);
+template int linear_act_forward_cuda<at::Half>(const at::Half *input, const at::Half *weight, const at::Half *bias, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, at::Half *output, void *pre_act, void *lt_workspace, size_t workspaceSize);
+template int linear_act_forward_cuda<at::BFloat16>(const at::BFloat16 *input, const at::BFloat16 *weight, const at::BFloat16 *bias, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, at::BFloat16 *output, void *pre_act, void *lt_workspace, size_t workspaceSize);
 
-template int bias_act_linear_dgrad_bgrad_cuda<at::Half>(const at::Half *weight, const at::Half *d_output, const void *pre_act, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, at::Half *d_input, at::Half *d_bias);
-template int bias_act_linear_dgrad_bgrad_cuda<at::BFloat16>(const at::BFloat16 *weight, const at::BFloat16 *d_output, const void *pre_act, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, at::BFloat16 *d_input, at::BFloat16 *d_bias);
+template int bias_act_linear_dgrad_bgrad_cuda<at::Half>(const at::Half *weight, const at::Half *d_output, const void *pre_act, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, at::Half *d_input, at::Half *d_bias, void *lt_workspace, size_t workspaceSize);
+template int bias_act_linear_dgrad_bgrad_cuda<at::BFloat16>(const at::BFloat16 *weight, const at::BFloat16 *d_output, const void *pre_act, int64_t in_features, int64_t batch_size, int64_t out_features, bool is_gelu, int heuristic, at::BFloat16 *d_input, at::BFloat16 *d_bias, void *lt_workspace, size_t workspaceSize);

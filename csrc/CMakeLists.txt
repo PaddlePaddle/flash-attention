@@ -1,3 +1,4 @@
+cmake_minimum_required(VERSION 3.9 FATAL_ERROR)
 project(flash-attention LANGUAGES CXX CUDA)
 
 find_package(Git QUIET REQUIRED)

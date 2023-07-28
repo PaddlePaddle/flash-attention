@@ -44,7 +44,4 @@ add_library(flashattn SHARED
     ${SOURCES_CU}
   )
 
-INSTALL(TARGETS flashattn
-        LIBRARY DESTINATION "lib")
-
-INSTALL(FILES flash_attn.h DESTINATION "include")
+target_link_libraries(flashattn flashattn_with_bias_mask)

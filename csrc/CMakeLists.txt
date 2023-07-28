@@ -10,3 +10,4 @@ execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
 set(CUTLASS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cutlass)
 
 add_subdirectory(flash_attn)
+add_subdirectory(flash_attn_with_bias_and_mask)

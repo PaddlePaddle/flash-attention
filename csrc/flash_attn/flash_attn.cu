@@ -269,13 +269,13 @@ bool flash_attn_fwd(
 
     const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
-    bool is_dropout = p_dropout > 0.0;
+    const bool is_dropout = p_dropout > 0.0;
     
     ASSERT_CHECK(is_sm8x || is_sm90);
     ASSERT_CHECK(batch_size > 0);
     ASSERT_CHECK(head_size % 8 == 0) ;
     ASSERT_CHECK(head_size <= 256);
-    ASSERT_CHECK(num_heads % num_heads_k == 0);
+    ASSERT_CHECK(num_heads == num_heads_k);
 
     Flash_fwd_params params;
     set_params_fprop(params,
@@ -343,6 +343,9 @@ bool flash_attn_varlen_fwd(
 
     ASSERT_CHECK(is_sm8x || is_sm90);
     ASSERT_CHECK(batch_size > 0);
+    ASSERT_CHECK(head_size <= 256);
+    ASSERT_CHECK(num_heads == num_heads_k);
+    ASSERT_CHECK(head_size % 8 == 0);
     
     Flash_fwd_params params;
     set_params_fprop(params,
@@ -436,6 +439,10 @@ bool flash_attn_bwd(
         // FlashAttention backward for head dim > 192 requires A100/A800 or H100/H800
         ASSERT_CHECK(is_sm80 || is_sm90);
     }
+    ASSERT_CHECK(num_heads == num_heads_k);
+    ASSERT_CHECK(head_size % 8 == 0);
+    ASSERT_CHECK(head_size <= 256);
+
     // bool loop = seqlen_k > blocksize_c;
     // TODO: change later, for now set to true for simplicity
     const bool loop = true;
@@ -522,6 +529,8 @@ bool flash_attn_varlen_bwd(
         // FlashAttention backward for head dim > 192 requires A100/A800 or H100/H800
         ASSERT_CHECK(is_sm80 || is_sm90);
     }
+    ASSERT_CHECK(num_heads == num_heads_k);
+    ASSERT_CHECK(head_size % 8 == 0);
 
     Flash_bwd_params params;
 

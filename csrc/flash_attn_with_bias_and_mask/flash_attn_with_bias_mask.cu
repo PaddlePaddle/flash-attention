@@ -26,7 +26,7 @@
  *
  ******************************************************************************/
 
-#include "flash_attn.h"
+#include "flash_attn_with_bias_mask.h"
 #include "fmha.h"
 #include "utils.h"
 #include "cuda_utils.h"
@@ -266,7 +266,7 @@ extern "C" {
 
 
 // For just alphafold2
-bool flash_attn_fwd_with_bias_and_mask(
+bool flash_attn_fwd_with_bias_and_mask_(
         const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
         const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -391,7 +391,7 @@ bool flash_attn_fwd_with_bias_and_mask(
 }
 
 
-bool flash_attn_bwd_with_bias_and_mask(
+bool flash_attn_bwd_with_bias_and_mask_(
         const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
         const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
         const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i

@@ -111,3 +111,8 @@ target_compile_options(flashattn_with_bias_mask PRIVATE $<$<COMPILE_LANGUAGE:CUD
   -lineinfo
   "SHELL:-gencode arch=compute_80,code=sm_80"
   >)
+
+INSTALL(TARGETS flashattn
+        LIBRARY DESTINATION "lib")
+
+INSTALL(FILES flash_attn/flash_attn.h DESTINATION "include")

@@ -24,3 +24,6 @@ add_library(flashattn_with_bias_mask SHARED
     ${SOURCES_CPP}
     flash_attn_with_bias_mask.cpp
   )
+
+INSTALL(TARGETS flashattn_with_bias_mask
+        LIBRARY DESTINATION "lib")

@@ -81,6 +81,7 @@ add_dependencies(flashattn flashattn_with_bias_mask)
 
 
 target_compile_options(flashattn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+  -w
   -Xcompiler="-fPIC"
   -Xcompiler="-O3"
   -std=c++17
@@ -95,6 +96,7 @@ target_compile_options(flashattn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
   >)
 
 target_compile_options(flashattn_with_bias_mask PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+  -w
   -Xcompiler="-fPIC"
   -Xcompiler="-O3"
   -std=c++17

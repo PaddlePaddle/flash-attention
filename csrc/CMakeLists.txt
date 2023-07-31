@@ -91,8 +91,6 @@ target_compile_options(flashattn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
   --expt-relaxed-constexpr
   --expt-extended-lambda
   --use_fast_math
-  --ptxas-options=-v
-  -lineinfo
   "SHELL:-gencode arch=compute_80,code=sm_80"
   >)
 
@@ -107,8 +105,6 @@ target_compile_options(flashattn_with_bias_mask PRIVATE $<$<COMPILE_LANGUAGE:CUD
   --expt-relaxed-constexpr
   --expt-extended-lambda
   --use_fast_math
-  --ptxas-options=-v
-  -lineinfo
   "SHELL:-gencode arch=compute_80,code=sm_80"
   >)
 

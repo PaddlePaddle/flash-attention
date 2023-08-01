@@ -9,9 +9,9 @@ extern "C" {
 #endif
 
 bool flash_attn_fwd(
-        void * const q,
-	void * const k,
-	void * const v,
+        const void * const q,
+	const void * const k,
+	const void * const v,
 	void * const out,
 	void * const softmax_ptr,
 	void * const softmax_lse_ptr,
@@ -34,12 +34,12 @@ bool flash_attn_fwd(
 	uint64_t offset);
 
 bool flash_attn_varlen_fwd(
-        void * const q,
-	void * const k,
-	void * const v,
+        const void * const q,
+	const void * const k,
+	const void * const v,
 	void * const out,
-	void * const cu_seqlens_q,
-	void * const cu_seqlens_k,
+	const int32_t * const cu_seqlens_q,
+	const int32_t * const cu_seqlens_k,
 	void * const softmax_ptr,
         void * const softmax_lse_ptr,
 	const int batch_size,
@@ -61,13 +61,13 @@ bool flash_attn_varlen_fwd(
 	uint64_t offset);
 
 bool flash_attn_bwd(
-        void * const dout,
-	void * const q,
-	void * const k,
-	void * const v,
-	void * const out,
-	void * const softmax_d,
-	void * const softmax_lse,
+        const void * const dout,
+	const void * const q,
+	const void * const k,
+	const void * const v,
+	const void * const out,
+	const void * const softmax_d,
+	const void * const softmax_lse,
 	void * const dq,
 	void * const dk,
 	void * const dv,
@@ -90,19 +90,19 @@ bool flash_attn_bwd(
 	uint64_t offset);
 
 bool flash_attn_varlen_bwd(
-        void * const dout,
-	void * const q,
-	void * const k,
-	void * const v,
-	void * const out,
-	void * const softmax_d,
-	void * const softmax_lse,
+        const void * const dout,
+	const void * const q,
+	const void * const k,
+	const void * const v,
+	const void * const out,
+	const void * const softmax_d,
+	const void * const softmax_lse,
 	void * const dq,
 	void * const dk,
 	void * const dv,
 	void * const dq_accum,
-	int32_t * const cu_seqlens_q,
-	int32_t * const cu_seqlens_k,
+	const int32_t * const cu_seqlens_q,
+	const int32_t * const cu_seqlens_k,
 	const int batch_size,
 	const int max_seqlen_q,
 	const int max_seqlen_k,

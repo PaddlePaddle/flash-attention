@@ -8,15 +8,6 @@
 #include <vector>
 #include "random_utils.h"
 
-#ifdef OLD_GENERATOR_PATH
-//#include <ATen/CUDAGeneratorImpl.h>
-#else
-//#include <ATen/cuda/CUDAGeneratorImpl.h>
-#endif
-
-//#include <ATen/cuda/CUDAGraphsUtils.cuh>
-
-
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;
 constexpr int D_DIM = 2;

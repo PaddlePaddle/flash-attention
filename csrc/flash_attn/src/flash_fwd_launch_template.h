@@ -37,16 +37,15 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenNConst, IsEvenKConst, ReturnSoftmaxConst && Is_dropout>;
                 // auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenNConst, true, ReturnSoftmaxConst && Is_dropout>;
                 if (smem_size >= 48 * 1024) {
-                    // TODO(umiswing): add custom check here
-                    cudaFuncSetAttribute(
-                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+		    FMHA_CHECK_CUDA(cudaFuncSetAttribute(
+                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                 }
                 int ctas_per_sm;
                 cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
                 // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
                 kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
-                // TODO(umiswing): add custom check.
+		FMHA_CUDA_KERNEL_LAUNCH_CHECK();
             });
         });
     });

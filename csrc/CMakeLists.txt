@@ -49,7 +49,8 @@ set(FA2_SOURCES_CU
 add_library(flashattn SHARED
     ${FA2_SOURCES_CU}
   )
-target_include_directories(flashattn PRIVATE ${CUTLASS_3_DIR}/include)  
+target_include_directories(flashattn PRIVATE
+    ${CUTLASS_3_DIR}/include)
 
 set(FA1_SOURCES_CU
     flash_attn_with_bias_and_mask/flash_attn_with_bias_mask.cu

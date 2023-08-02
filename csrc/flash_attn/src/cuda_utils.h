@@ -18,6 +18,8 @@
         }                                                                                          \
     } while( 0 )
 
+#define FMHA_CUDA_KERNEL_LAUNCH_CHECK() FMHA_CHECK_CUDA(cudaGetLastError())
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static int GetCurrentDeviceId();

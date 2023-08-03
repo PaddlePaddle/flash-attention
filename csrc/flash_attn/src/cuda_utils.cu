@@ -14,13 +14,13 @@ static std::vector<cudaDeviceProp> g_device_props;
 
 static int GetCurrentDeviceId() {
   int device_id;
-  C10_CHECK_CUDA(cudaGetDevice(&device_id));
+  C10_CUDA_CHECK(cudaGetDevice(&device_id));
   return device_id;
 }
 
 static int GetCudaDeviceCount() {
   int count;
-  C10_CHECK_CUDA(cudaGetDeviceCount(&count));
+  C10_CUDA_CHECK(cudaGetDeviceCount(&count));
   return count;
 }
 
@@ -40,7 +40,7 @@ cudaDeviceProp* getCurrentDeviceProperties(int id) {
   }
 
   std::call_once(*(g_device_props_init_flags[id]), [&] {
-        C10_CHECK_CUDA(cudaGetDeviceProperties(&g_device_props[id], id));
+        C10_CUDA_CHECK(cudaGetDeviceProperties(&g_device_props[id], id));
   });
 
   return &g_device_props[id];

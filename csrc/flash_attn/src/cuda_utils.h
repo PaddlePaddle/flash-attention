@@ -5,7 +5,7 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#define C10_CHECK_CUDA( call )                                                                    \
+#define C10_CUDA_CHECK( call )                                                                    \
     do {                                                                                           \
         cudaError_t status_ = call;                                                                \
         if( status_ != cudaSuccess ) {                                                             \
@@ -18,7 +18,7 @@
         }                                                                                          \
     } while( 0 )
 
-#define C10_CUDA_KERNEL_LAUNCH_CHECK() C10_CHECK_CUDA(cudaGetLastError())
+#define C10_CUDA_KERNEL_LAUNCH_CHECK() C10_CUDA_CHECK(cudaGetLastError())
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

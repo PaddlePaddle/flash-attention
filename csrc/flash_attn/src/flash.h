@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include "cuda_runtime.h"
+#include <cuda.h>
 #include <vector>
 
 #if FLASH_ATTN_WITH_TORCH

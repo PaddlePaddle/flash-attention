@@ -12,7 +12,6 @@ add_definitions("-DFLASH_ATTN_WITH_TORCH=0")
 set(CUTLASS_3_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cutlass)
 
 set(FA2_SOURCES_CU
-     flash_attn/flash_attn.cu
      flash_attn/src/cuda_utils.cu
      flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu
      flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu
@@ -49,9 +48,11 @@ set(FA2_SOURCES_CU
   )
 
 add_library(flashattn SHARED
+    capi/flash_attn.cu
     ${FA2_SOURCES_CU}
   )
 target_include_directories(flashattn PRIVATE
+    flash_attn
     ${CUTLASS_3_DIR}/include)
 
 set(FA1_SOURCES_CU
@@ -116,4 +117,4 @@ target_compile_options(flashattn_with_bias_mask PRIVATE $<$<COMPILE_LANGUAGE:CUD
 INSTALL(TARGETS flashattn
         LIBRARY DESTINATION "lib")
 
-INSTALL(FILES flash_attn/flash_attn.h DESTINATION "include")
+INSTALL(FILES capi/flash_attn.h DESTINATION "include")

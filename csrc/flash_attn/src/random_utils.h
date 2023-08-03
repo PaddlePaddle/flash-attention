@@ -54,6 +54,7 @@ struct PhiloxCudaState {
 #define DEVICE
 #endif
 
+#if !FLASH_ATTN_WITH_TORCH
 namespace at {
 namespace cuda {
 namespace philox {
@@ -73,4 +74,4 @@ unpack(PhiloxCudaState arg) {
 } // namespace philox
 } // namespace cuda
 } // namespace at
-
+#endif

@@ -4,6 +4,10 @@
 
 #pragma once
 
+#if FLASH_ATTN_WITH_TORCH
+#include <ATen/cuda/CUDAContext.h>
+#endif
+
 #include "static_switch.h"
 #include "flash.h"
 #include "flash_fwd_kernel.h"

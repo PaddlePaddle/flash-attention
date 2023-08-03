@@ -6,6 +6,7 @@
 #include <memory>
 #include <algorithm>
 
+#if !FLASH_ATTN_WITH_TORCH
 namespace at {
 namespace cuda {
 static std::once_flag g_device_props_size_init_flag;
@@ -47,3 +48,4 @@ cudaDeviceProp* getCurrentDeviceProperties(int id) {
 }
 } // namespace cuda
 } // namespace at
+#endif

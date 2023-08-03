@@ -3,6 +3,7 @@
 #include "cuda.h"
 #include "cuda_runtime.h"
 
+#if !FLASH_ATTN_WITH_TORCH
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #define C10_CUDA_CHECK( call )                                                                    \
@@ -31,3 +32,4 @@ static int GetCudaDeviceCount();
 cudaDeviceProp* getCurrentDeviceProperties(int id = -1);
 } // namespace cuda
 } // namespace at
+#endif

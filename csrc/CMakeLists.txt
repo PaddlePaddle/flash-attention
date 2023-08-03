@@ -7,6 +7,8 @@ execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
                 RESULT_VARIABLE GIT_SUBMOD_RESULT)
 
+add_definitions("-DFLASH_ATTN_WITH_TORCH=0")
+
 set(CUTLASS_3_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cutlass)
 
 set(FA2_SOURCES_CU

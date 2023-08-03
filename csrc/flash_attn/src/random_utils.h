@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <tuple>
 
+#if !FLASH_ATTN_WITH_TORCH
 namespace at {
 struct PhiloxCudaState {
   PhiloxCudaState() = default;
@@ -41,6 +42,7 @@ struct PhiloxCudaState {
   bool captured_ = false;
 };
 } // namespace at
+#endif
 
 
 // In-kernel call to retrieve philox seed and offset from a PhiloxCudaState instance whether

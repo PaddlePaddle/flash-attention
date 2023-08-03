@@ -50,7 +50,7 @@ inline __device__ uint4 philox(unsigned long long seed,
 
 } // namespace flash
 
-namespace {
+namespace at{
 
 class Philox {
 public:
@@ -162,4 +162,4 @@ private:
   // static const unsigned long kPhiloxSB = 0xCD9E8D57;
 };
 
-} // namespace
+} // namespace at

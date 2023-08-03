@@ -265,8 +265,7 @@ bool flash_attn_fwd(
 	uint64_t seed,
 	uint64_t offset) {
     FLASHATTNLIB_BEGIN_FUNC
-
-    auto dprops = GetDeviceProperties(-1);
+    auto dprops = at::cuda::getCurrentDeviceProperties();
 
     const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
@@ -302,7 +301,7 @@ bool flash_attn_fwd(
         // number of times random will be generated per thread, to offset philox counter in thc random
         // state
         // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-	params.philox_args = PhiloxCudaState(seed, offset);
+        params.philox_args = at::PhiloxCudaState(seed, offset);
     }
 	
     run_mha_fwd(params, stream);
@@ -339,7 +338,7 @@ bool flash_attn_varlen_fwd(
 	uint64_t seed,
 	uint64_t offset) {
     FLASHATTNLIB_BEGIN_FUNC
-    auto dprops = GetDeviceProperties(-1);
+    auto dprops = at::cuda::getCurrentDeviceProperties();
 
     const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
@@ -372,7 +371,7 @@ bool flash_attn_varlen_fwd(
 		     is_bf16);
     
     if (is_dropout) {
-        params.philox_args = PhiloxCudaState(seed, offset);
+        params.philox_args = at::PhiloxCudaState(seed, offset);
     }
 
     run_mha_fwd(params, stream);
@@ -433,7 +432,7 @@ bool flash_attn_bwd(
 	uint64_t seed,
 	uint64_t offset) {
     FLASHATTNLIB_BEGIN_FUNC
-    auto dprops = GetDeviceProperties(-1);
+    auto dprops = at::cuda::getCurrentDeviceProperties();
 
     const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     const bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
@@ -483,7 +482,7 @@ bool flash_attn_bwd(
     auto launch = &run_mha_bwd;
     
     if (is_dropout) {
-	params.philox_args = PhiloxCudaState(seed, offset);
+        params.philox_args = at::PhiloxCudaState(seed, offset);
     }
 
     launch(params, stream, /*configure=*/false);
@@ -525,7 +524,7 @@ bool flash_attn_varlen_bwd(
 	uint64_t seed,
 	uint64_t offset) {
     FLASHATTNLIB_BEGIN_FUNC
-    auto dprops = GetDeviceProperties(-1);
+    auto dprops = at::cuda::getCurrentDeviceProperties();
 
     const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     const bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
@@ -572,7 +571,7 @@ bool flash_attn_varlen_bwd(
     auto launch = &run_mha_bwd;
 
     if (is_dropout) {
-	params.philox_args = PhiloxCudaState(seed, offset);
+        params.philox_args = at::PhiloxCudaState(seed, offset);
     }
 
     launch(params, stream, /*configure=*/false);

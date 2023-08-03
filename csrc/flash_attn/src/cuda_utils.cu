@@ -6,23 +6,25 @@
 #include <memory>
 #include <algorithm>
 
+namespace at {
+namespace cuda {
 static std::once_flag g_device_props_size_init_flag;
 static std::vector<std::unique_ptr<std::once_flag>> g_device_props_init_flags;
 static std::vector<cudaDeviceProp> g_device_props;
 
 static int GetCurrentDeviceId() {
   int device_id;
-  FMHA_CHECK_CUDA(cudaGetDevice(&device_id));
+  C10_CHECK_CUDA(cudaGetDevice(&device_id));
   return device_id;
 }
 
 static int GetCudaDeviceCount() {
   int count;
-  FMHA_CHECK_CUDA(cudaGetDeviceCount(&count));
+  C10_CHECK_CUDA(cudaGetDeviceCount(&count));
   return count;
 }
 
-cudaDeviceProp* GetDeviceProperties(int id) {
+cudaDeviceProp* getCurrentDeviceProperties(int id) {
   std::call_once(g_device_props_size_init_flag, [&] {
     int gpu_num = 0;
     gpu_num = GetCudaDeviceCount();
@@ -38,9 +40,10 @@ cudaDeviceProp* GetDeviceProperties(int id) {
   }
 
   std::call_once(*(g_device_props_init_flags[id]), [&] {
-        FMHA_CHECK_CUDA(cudaGetDeviceProperties(&g_device_props[id], id));
+        C10_CHECK_CUDA(cudaGetDeviceProperties(&g_device_props[id], id));
   });
 
   return &g_device_props[id];
 }
-
+} // namespace cuda
+} // namespace at

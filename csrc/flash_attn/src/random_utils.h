@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <tuple>
 
+namespace at {
 struct PhiloxCudaState {
   PhiloxCudaState() = default;
   // Called if graph capture is not underway
@@ -39,6 +40,7 @@ struct PhiloxCudaState {
   uint32_t offset_intragraph_ = 0;
   bool captured_ = false;
 };
+} // namespace at
 
 
 // In-kernel call to retrieve philox seed and offset from a PhiloxCudaState instance whether
@@ -52,6 +54,8 @@ struct PhiloxCudaState {
 #define DEVICE
 #endif
 
+namespace at {
+namespace cuda {
 namespace philox {
 
 inline DEVICE std::tuple<uint64_t, uint64_t>
@@ -67,4 +71,6 @@ unpack(PhiloxCudaState arg) {
 }
 
 } // namespace philox
+} // namespace cuda
+} // namespace at
 

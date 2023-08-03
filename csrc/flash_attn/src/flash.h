@@ -81,7 +81,7 @@ struct Flash_fwd_params : public Qkv_params {
     float scale_softmax_rp_dropout;
 
     // Random state.
-    PhiloxCudaState philox_args;
+    at::PhiloxCudaState philox_args;
 
     bool is_bf16;
     bool is_causal;

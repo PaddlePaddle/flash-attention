@@ -242,6 +242,7 @@ extern "C" {
 bool flash_attn_fwd(const void * const q,
                     const void * const k,
                     const void * const v,
+                    const void * const rng_state,
                     void * const out,
                     void * const softmax_ptr,
                     void * const softmax_lse_ptr,
@@ -295,6 +296,8 @@ bool flash_attn_fwd(const void * const q,
 		     is_causal,
 		     is_bf16);
 
+    params.rng_state = const_cast<uint64_t*>(static_cast<const uint64_t*>(rng_state));
+
     if (is_dropout) {
         // number of times random will be generated per thread, to offset philox counter in thc random
         // state
@@ -312,9 +315,10 @@ bool flash_attn_fwd(const void * const q,
 bool flash_attn_varlen_fwd(const void * const q,
                            const void * const k,
                            const void * const v,
-                           void * const out,
                            const int32_t * const cu_seqlens_q,
                            const int32_t * const cu_seqlens_k,
+                           const void * const rng_state,
+                           void * const out,
                            void * const softmax_ptr,
                            void * const softmax_lse_ptr,
                            const int batch_size,
@@ -367,6 +371,8 @@ bool flash_attn_varlen_fwd(const void * const q,
 		     is_causal,
 		     is_bf16);
     
+    params.rng_state = const_cast<uint64_t*>(static_cast<const uint64_t*>(rng_state));
+
     if (is_dropout) {
         params.philox_args = at::PhiloxCudaState(seed, offset);
     }
@@ -407,6 +413,7 @@ bool flash_attn_bwd(const void * const dout,
                     const void * const out,
                     const void * const softmax_d,
                     const void * const softmax_lse,
+                    const void * const rng_state,
                     void * const dq,
                     void * const dk,
                     void * const dv,
@@ -479,6 +486,10 @@ bool flash_attn_bwd(const void * const dout,
     
     if (is_dropout) {
         params.philox_args = at::PhiloxCudaState(seed, offset);
+        // seems a wild pointer at fa2: https://github.com/PaddlePaddle/flash-attention/blob/main/csrc/flash_attn/flash_api.cpp#L690-L691
+        params.rng_state = const_cast<uint64_t*>(static_cast<const uint64_t*>(rng_state));
+        uint64_t rng_state_data[2] = {seed, offset};
+        cudaMemcpyAsync(params.rng_state, rng_state_data, 2*sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
     }
 
     launch(params, stream, /*configure=*/false);
@@ -496,12 +507,13 @@ bool flash_attn_varlen_bwd(const void * const dout,
                            const void * const out,
                            const void * const softmax_d,
                            const void * const softmax_lse,
+                           const int32_t * const cu_seqlens_q,
+                           const int32_t * const cu_seqlens_k,
+                           const void * const rng_state,
                            void * const dq,
                            void * const dk,
                            void * const dv,
                            void * const dq_accum,
-                           const int32_t * const cu_seqlens_q,
-                           const int32_t * const cu_seqlens_k,
                            const int batch_size,
                            const int max_seqlen_q,
                            const int max_seqlen_k,
@@ -567,6 +579,10 @@ bool flash_attn_varlen_bwd(const void * const dout,
 
     if (is_dropout) {
         params.philox_args = at::PhiloxCudaState(seed, offset);
+        // seems a wild pointer at fa2: https://github.com/PaddlePaddle/flash-attention/blob/main/csrc/flash_attn/flash_api.cpp#L908-L909
+        params.rng_state = const_cast<uint64_t*>(static_cast<const uint64_t*>(rng_state));
+        uint64_t rng_state_data[2] = {seed, offset};
+        cudaMemcpyAsync(params.rng_state, rng_state_data, 2*sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
     }
 
     launch(params, stream, /*configure=*/false);

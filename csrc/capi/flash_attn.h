@@ -11,7 +11,7 @@ extern "C" {
 bool flash_attn_fwd(const void * const q,         // batch_size x seqlen_q x num_heads x head_size
                     const void * const k,         // batch_size x seqlen_k x num_heads_k x head_size
                     const void * const v,         // batch_size x seqlen_k x num_heads_k x head_size
-                    const void * const rng_state,
+                    void * const rng_state,
                     void * const out,
                     void * const softmax_ptr,
                     void * const softmax_lse_ptr,
@@ -38,7 +38,7 @@ bool flash_attn_varlen_fwd(const void * const q,  // total_q x num_heads x head_
                            const void * const v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                            const int32_t * const cu_seqlens_q,  // b+1
                            const int32_t * const cu_seqlens_k,  // b+1
-                           const void * const rng_state,
+                           void * const rng_state,
                            void * const out, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
                            void * const softmax_ptr,
                            void * const softmax_lse_ptr,
@@ -67,7 +67,7 @@ bool flash_attn_bwd(const void * const dout,  // batch_size x seqlen_q x num_hea
                     const void * const out,   // batch_size x seqlen_q x num_heads x head_size
                     const void * const softmax_d,
                     const void * const softmax_lse,     // b x h x seqlen_q
-                    const void * const rng_state,
+                    void * const rng_state,
                     void * const dq,   // batch_size x seqlen_q x num_heads x head_size
                     void * const dk,   // batch_size x seqlen_k x num_heads_k x head_size
                     void * const dv,   // batch_size x seqlen_k x num_heads_k x head_size
@@ -98,7 +98,7 @@ bool flash_attn_varlen_bwd(const void * const dout,  // total_q x num_heads, x h
                            const void * const softmax_lse,     // b x h x s   softmax logsumexp
                            const int32_t * const cu_seqlens_q,  // b+1
                            const int32_t * const cu_seqlens_k,  // b+1
-                           const void * const rng_state,
+                           void * const rng_state,
                            void * const dq,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                            void * const dk,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                            void * const dv,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i

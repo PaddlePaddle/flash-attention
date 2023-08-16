@@ -85,6 +85,7 @@ bool flash_attn_bwd(const void * const dout,  // batch_size x seqlen_q x num_hea
                     const float softmax_scale,
                     const bool is_causal,
                     const bool is_bf16,
+                    const int num_splits,
                     cudaStream_t stream,
                     uint64_t seed,
                     uint64_t offset);
@@ -116,6 +117,7 @@ bool flash_attn_varlen_bwd(const void * const dout,  // total_q x num_heads, x h
                            const float softmax_scale,
                            const bool is_causal,
                            const bool is_bf16,
+                           const int num_splits,
                            cudaStream_t stream,
                            uint64_t seed,
                            uint64_t offset);

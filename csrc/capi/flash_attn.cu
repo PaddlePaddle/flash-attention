@@ -30,8 +30,8 @@
         if (!__cond_var) {                               \
           ::std::string __err_msg = ::std::string("`") + \
                 #__cond + "` check failed at " +         \
-                __FILE__ + ":" +                         \
-                ::std::to_string(__LINE__);              \
+		__FILE__ + ":" +                         \
+		::std::to_string(__LINE__);              \
           throw std::runtime_error(__err_msg);           \
         }                                                \
       } while (0)
@@ -64,30 +64,6 @@ const char *flash_attn_error() {
 #define FLASHATTNLIB_BEGIN_FUNC try {
 #define FLASHATTNLIB_END_FUNC } catch (::std::exception &__e) { flash_attn_set_error(__e.what()); return false; } catch (...) { flash_attn_set_error(nullptr); return false; }
 
-#define CHECK_FWD_EXECTUABLE(__seqlen_q, __seqlen_k)                     \
-      auto dprops = at::cuda::getCurrentDeviceProperties();              \
-      const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;     \
-      const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;     \
-      ASSERT_CHECK(is_sm8x || is_sm90);                                  \
-      ASSERT_CHECK(batch_size > 0);                                      \
-      ASSERT_CHECK(head_size % 8 == 0);                                  \
-      ASSERT_CHECK(head_size <= 256);                                    \
-      ASSERT_CHECK(num_heads == num_heads_k);                            \
-      if (attn_mask) {                                                   \
-          ASSERT_CHECK(mask_dims[0] == batch_size);                      \
-          ASSERT_CHECK(mask_dims[1] == 1 || mask_dims[1] == num_heads);  \
-          ASSERT_CHECK(mask_dims[2] == 1 || mask_dims[2] == __seqlen_q); \
-          ASSERT_CHECK(mask_dims[3] == __seqlen_k);                      \
-      }
-
-#define CHECK_BWD_EXECTUABLE(__seqlen_q, __seqlen_k)                                       \
-      CHECK_FWD_EXECTUABLE(__seqlen_q, __seqlen_k)                                         \
-      const bool is_sm80 = dprops->major == 8 && dprops->minor == 0;                       \
-      if (head_size > 192) {                                                               \
-          /* FlashAttention backward for head dim > 192 requires A100/A800 or H100/H800 */ \
-          ASSERT_CHECK(is_sm80 || is_sm90);                                                \
-      }
-
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
                       const size_t b,
@@ -110,12 +86,8 @@ void set_params_fprop(Flash_fwd_params &params,
                       void * const softmax_lse_d,
                       float p_dropout,
                       float softmax_scale,
-                      float softmax_unscale,
                       bool is_causal,
-                      bool is_bf16,
-                      void * attn_mask = nullptr,
-                      int mask_head_mod_size = 0,
-                      int mask_seq_q_mod_size = 0) {
+                      bool is_bf16) {
     // Reset the parameters
     memset(&params, 0, sizeof(params));
 
@@ -164,15 +136,9 @@ void set_params_fprop(Flash_fwd_params &params,
     params.d = d;
     params.d_rounded = d_rounded;
 
-    // attn mask
-    params.attn_mask_ptr = attn_mask;
-    params.mask_head_mod_size = mask_head_mod_size;
-    params.mask_seq_q_mod_size = mask_seq_q_mod_size;
-
     // Set the different scale values.
     params.scale_softmax = softmax_scale;
     params.scale_softmax_log2 = softmax_scale * M_LOG2E;
-    params.unscale_softmax = softmax_unscale;
 
     // Set this to probability of keeping an element to simplify things.
     params.p_dropout = 1.f - p_dropout;
@@ -217,13 +183,9 @@ void set_params_dgrad(Flash_bwd_params &params,
                       void * const dsoftmax_sum_d,
                       float p_dropout,
                       float softmax_scale,
-                      float softmax_unscale,
                       bool is_causal,
                       bool is_bf16,
-                      const int num_splits = 0,
-                      void * attn_mask = nullptr,
-                      int mask_head_mod_size = 0,
-                      int mask_seq_q_mod_size = 0) {
+                      const int num_splits=0) {
 
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -234,12 +196,8 @@ void set_params_dgrad(Flash_bwd_params &params,
                      softmax_lse_d,
                      p_dropout,
                      softmax_scale,
-                     softmax_unscale,
                      is_causal,
-                     is_bf16,
-                     attn_mask,
-                     mask_head_mod_size,
-                     mask_seq_q_mod_size);
+                     is_bf16);
 
     // Set the pointers and strides.
     params.do_ptr = dout;
@@ -301,45 +259,44 @@ bool flash_attn_fwd(const void * const q,
                     const int head_size_rounded,
                     const float p_dropout,
                     const float softmax_scale,
-                    const float softmax_unscale,
                     const bool is_causal,
                     const bool return_softmax,
                     const bool is_bf16,
                     cudaStream_t stream,
                     uint64_t seed,
-                    uint64_t offset,
-                    const void * const attn_mask,
-                    const int64_t * const mask_dims) {
+                    uint64_t offset) {
     FLASHATTNLIB_BEGIN_FUNC
-    const bool is_dropout = p_dropout > 0.0;
-    const int mask_head_mod_size = attn_mask ? mask_dims[1] : 0;
-    const int mask_seq_q_mod_size = attn_mask ? mask_dims[2] : 0;
+    auto dprops = at::cuda::getCurrentDeviceProperties();
 
-    CHECK_FWD_EXECTUABLE(seqlen_q, seqlen_k)
+    const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    const bool is_dropout = p_dropout > 0.0;
+    
+    ASSERT_CHECK(is_sm8x || is_sm90);
+    ASSERT_CHECK(batch_size > 0);
+    ASSERT_CHECK(head_size % 8 == 0) ;
+    ASSERT_CHECK(head_size <= 256);
+    ASSERT_CHECK(num_heads == num_heads_k);
 
     Flash_fwd_params params;
     set_params_fprop(params,
                      batch_size,
-                     seqlen_q, seqlen_k,
-                     seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
-                     head_size, head_size_rounded,
-                     const_cast<void *>(q),
-                     const_cast<void *>(k),
-                     const_cast<void *>(v),
-                     out,
-                     /*cu_seqlens_q_d=*/nullptr,
-                     /*cu_seqlens_k_d=*/nullptr,
-                     return_softmax ? softmax_ptr : nullptr,
-                     softmax_lse_ptr,
-                     p_dropout,
-                     softmax_scale,
-                     softmax_unscale,
-                     is_causal,
-                     is_bf16,
-                     const_cast<void *>(attn_mask),
-                     mask_head_mod_size,
-                     mask_seq_q_mod_size);
+		     seqlen_q, seqlen_k,
+		     seqlen_q_rounded, seqlen_k_rounded,
+		     num_heads, num_heads_k,
+		     head_size, head_size_rounded,
+		     const_cast<void *>(q),
+		     const_cast<void *>(k),
+		     const_cast<void *>(v),
+		     out,
+		     /*cu_seqlens_q_d=*/nullptr,
+		     /*cu_seqlens_k_d=*/nullptr,
+		     return_softmax ? softmax_ptr : nullptr,
+		     softmax_lse_ptr,
+		     p_dropout,
+		     softmax_scale,
+		     is_causal,
+		     is_bf16);
 
     params.rng_state = static_cast<uint64_t*>(rng_state);
 
@@ -349,7 +306,7 @@ bool flash_attn_fwd(const void * const q,
         // We use a custom RNG that increases the offset by batch_size * nheads * 32.
         params.philox_args = at::PhiloxCudaState(seed, offset);
     }
-
+	
     run_mha_fwd(params, stream);
     
     return true;
@@ -377,45 +334,44 @@ bool flash_attn_varlen_fwd(const void * const q,
                            const int head_size_rounded,
                            const float p_dropout,
                            const float softmax_scale,
-                           const float softmax_unscale,
                            const bool is_causal,
                            const bool return_softmax,
                            const bool is_bf16,
                            cudaStream_t stream,
                            uint64_t seed,
-                           uint64_t offset,
-                           const void * const attn_mask,
-                           const int64_t * const mask_dims) {
+                           uint64_t offset) {
     FLASHATTNLIB_BEGIN_FUNC
-    const bool is_dropout = p_dropout > 0.0;
-    const int mask_head_mod_size = attn_mask ? mask_dims[1] : 0;
-    const int mask_seq_q_mod_size = attn_mask ? mask_dims[2] : 0;
+    auto dprops = at::cuda::getCurrentDeviceProperties();
 
-    CHECK_FWD_EXECTUABLE(max_seqlen_q, max_seqlen_k)
+    const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    const bool is_dropout = p_dropout > 0.0;
+
+    ASSERT_CHECK(is_sm8x || is_sm90);
+    ASSERT_CHECK(batch_size > 0);
+    ASSERT_CHECK(head_size <= 256);
+    ASSERT_CHECK(num_heads == num_heads_k);
+    ASSERT_CHECK(head_size % 8 == 0);
     
     Flash_fwd_params params;
     set_params_fprop(params,
                      batch_size,
-                     max_seqlen_q, max_seqlen_k,
-                     seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
-                     head_size, head_size_rounded,
-                     const_cast<void *>(q),
-                     const_cast<void *>(k),
-                     const_cast<void *>(v),
-                     out,
-                     const_cast<int32_t *>(cu_seqlens_q),
-                     const_cast<int32_t *>(cu_seqlens_k),
-                     return_softmax ? softmax_ptr : nullptr,
-                     softmax_lse_ptr,
-                     p_dropout,
-                     softmax_scale,
-                     softmax_unscale,
-                     is_causal,
-                     is_bf16,
-                     const_cast<void *>(attn_mask),
-                     mask_head_mod_size,
-                     mask_seq_q_mod_size);
+		     max_seqlen_q, max_seqlen_k,
+		     seqlen_q_rounded, seqlen_k_rounded,
+		     num_heads, num_heads_k,
+		     head_size, head_size_rounded,
+		     const_cast<void *>(q),
+		     const_cast<void *>(k),
+		     const_cast<void *>(v),
+		     out,
+		     const_cast<int32_t *>(cu_seqlens_q),
+		     const_cast<int32_t *>(cu_seqlens_k),
+		     return_softmax ? softmax_ptr : nullptr,
+		     softmax_lse_ptr,
+		     p_dropout,
+		     softmax_scale,
+		     is_causal,
+		     is_bf16);
     
     params.rng_state = static_cast<uint64_t*>(rng_state);
 
@@ -475,21 +431,29 @@ bool flash_attn_bwd(const void * const dout,
                     const int head_size_rounded,
                     const float p_dropout,
                     const float softmax_scale,
-                    const float softmax_unscale,
                     const bool is_causal,
                     const bool is_bf16,
                     const int num_splits,
                     cudaStream_t stream,
                     uint64_t seed,
-                    uint64_t offset,
-                    const void * const attn_mask,
-                    const int64_t * const mask_dims) {
+                    uint64_t offset) {
     FLASHATTNLIB_BEGIN_FUNC
-    const bool is_dropout = p_dropout > 0.0;
-    const int mask_head_mod_size = attn_mask ? mask_dims[1] : 0;
-    const int mask_seq_q_mod_size = attn_mask ? mask_dims[2] : 0;
+    auto dprops = at::cuda::getCurrentDeviceProperties();
 
-    CHECK_BWD_EXECTUABLE(seqlen_q, seqlen_k)
+    const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    const bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
+    const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    const bool is_dropout = p_dropout > 0.0;
+
+    ASSERT_CHECK(is_sm8x || is_sm90);
+    ASSERT_CHECK(batch_size > 0);
+    if (head_size > 192) {
+        // FlashAttention backward for head dim > 192 requires A100/A800 or H100/H800
+        ASSERT_CHECK(is_sm80 || is_sm90);
+    }
+    ASSERT_CHECK(num_heads == num_heads_k);
+    ASSERT_CHECK(head_size % 8 == 0);
+    ASSERT_CHECK(head_size <= 256);
 
     // bool loop = seqlen_k > blocksize_c;
     // TODO: change later, for now set to true for simplicity
@@ -520,13 +484,9 @@ bool flash_attn_bwd(const void * const dout,
                      const_cast<void *>(softmax_d),
                      p_dropout,
                      softmax_scale,
-                     softmax_unscale,
                      is_causal,
                      is_bf16,
-                     num_splits,
-                     const_cast<void *>(attn_mask),
-                     mask_head_mod_size,
-                     mask_seq_q_mod_size);
+                     num_splits);
 
     auto launch = &run_mha_bwd;
     
@@ -571,23 +531,30 @@ bool flash_attn_varlen_bwd(const void * const dout,
                            const int head_size_rounded,
                            const float p_dropout,
                            const float softmax_scale,
-                           const float softmax_unscale,
                            const bool is_causal,
                            const bool is_bf16,
                            const int num_splits,
                            cudaStream_t stream,
                            uint64_t seed,
-                           uint64_t offset,
-                           const void * const attn_mask,
-                           const int64_t * const mask_dims) {
+                           uint64_t offset) {
     FLASHATTNLIB_BEGIN_FUNC
-    const bool is_dropout = p_dropout > 0.0;
-    const int mask_head_mod_size = attn_mask ? mask_dims[1] : 0;
-    const int mask_seq_q_mod_size = attn_mask ? mask_dims[2] : 0;
+    auto dprops = at::cuda::getCurrentDeviceProperties();
 
+    const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    const bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
+    const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
+    const bool is_dropout = p_dropout > 0.0;
     const bool loop = true;
 
-    CHECK_BWD_EXECTUABLE(max_seqlen_q, max_seqlen_k)
+    ASSERT_CHECK(is_sm8x || is_sm90);
+    ASSERT_CHECK(batch_size > 0);
+    ASSERT_CHECK(head_size <= 256);
+    if (head_size > 192) {
+        // FlashAttention backward for head dim > 192 requires A100/A800 or H100/H800
+        ASSERT_CHECK(is_sm80 || is_sm90);
+    }
+    ASSERT_CHECK(num_heads == num_heads_k);
+    ASSERT_CHECK(head_size % 8 == 0);
 
     Flash_bwd_params params;
 
@@ -598,9 +565,9 @@ bool flash_attn_varlen_bwd(const void * const dout,
                      num_heads, num_heads_k,
                      head_size, head_size_rounded,
                      const_cast<void*>(q),
-                     const_cast<void*>(k),
-                     const_cast<void*>(v),
-                     const_cast<void*>(out),
+		     const_cast<void*>(k),
+		     const_cast<void*>(v),
+		     const_cast<void*>(out),
                      const_cast<void*>(dout),
                      dq,
                      dk,
@@ -614,13 +581,9 @@ bool flash_attn_varlen_bwd(const void * const dout,
                      const_cast<void*>(softmax_d),
                      p_dropout,
                      softmax_scale,
-                     softmax_unscale,
                      is_causal,
                      is_bf16,
-                     num_splits,
-                     const_cast<void *>(attn_mask),
-                     mask_head_mod_size,
-                     mask_seq_q_mod_size);
+                     num_splits);
 
     auto launch = &run_mha_bwd;
 

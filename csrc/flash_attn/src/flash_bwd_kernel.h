@@ -424,7 +424,7 @@ inline __device__ void convert_dKV(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Is_attn_mask, bool Seq_parallel=false, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -448,13 +448,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (n_block * kBlockN >= binfo.actual_seqlen_k || binfo.actual_seqlen_q == 0) return;
 
-    // umiswing: residue is for predication of additional mask gmem access.
-    // Additional mask for varlen qkv is supported, but a varlen mask is not supported.
-    const int m_residue = params.seqlen_q % kBlockM ? params.seqlen_q % kBlockM : kBlockM;
-    const int n_residue = params.seqlen_k % kBlockN ? params.seqlen_k % kBlockN : kBlockN;
-
-    const int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
-    const int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
+    int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
 
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
@@ -474,11 +468,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         + (m_block_max - 1) * kBlockM;
     const index_t row_offset_dpsum = (bidb * params.h + bidh) * params.seqlen_q_rounded
         + (m_block_max - 1) * kBlockM;
-
-    const index_t row_offset_mask = ((bidb * params.mask_head_mod_size
-        + (bidh % params.mask_head_mod_size)) * params.mask_seq_q_mod_size
-        + ((m_block_max - 1) * kBlockM % params.mask_seq_q_mod_size)) * params.seqlen_k
-        + n_block * kBlockN;
 
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -505,9 +494,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                               Shape<Int<kBlockM>>{}, Stride<_1>{});
     Tensor gdPsum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dsoftmax_sum) + row_offset_dpsum),
                                 Shape<Int<kBlockM>>{}, Stride<_1>{});
-    Tensor gMask = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_mask_ptr) + row_offset_mask),
-                               Shape<Int<kBlockM>, Int<kBlockN>>{},
-                               make_stride(params.seqlen_k, _1{}));
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQdO{});
@@ -572,11 +558,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     // }
 
     typename Kernel_traits::TiledMmaSdP tiled_mma_sdp;
-    auto gmem_thr_copy_P = make_tiled_copy_C_warpcontiguousN<MMA_N_SdP>(typename Kernel_traits::SmemCopyAtomPdS{}, tiled_mma_sdp).get_thread_slice(tidx);
-    Tensor tPgMask = gmem_thr_copy_P.partition_D(gMask);
-    Tensor cMask = make_identity_tensor(shape(gMask));
-    Tensor tPcMask = gmem_thr_copy_P.partition_D(cMask);
-
     auto thr_mma_sdp = tiled_mma_sdp.get_thread_slice(tidx);
     Tensor tSrQ = thr_mma_sdp.partition_fragment_A(sQ);         // (MMA,MMA_N,MMA_K)
     Tensor tSrK = thr_mma_sdp.partition_fragment_B(sK);         // (MMA,MMA_N,MMA_K)
@@ -832,13 +813,6 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // However, it's possible that the values in acc_s are so large that they overflow
         // when we multiply with dP and convert to fp16, resulting in Inf in dS and NaNs in dQ.
         // So we need to mask out the elements beyond actual_seqlen_k.
-        if (Is_attn_mask) {
-            flash::apply_attn_mask<Kernel_traits::TiledMmaSdP>(scores, tPgMask, tPcMask,
-                                                               m_block == m_block_max - 1 ? m_residue : params.seqlen_q,
-                                                               n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
-                                                               params.unscale_softmax);
-            tPgMask.data() = tPgMask.data() + (-kBlockM * params.seqlen_k);
-        }
         if (!Is_causal) {
             if (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k) {
                 flash::apply_mask(scores, binfo.actual_seqlen_k,
@@ -1576,7 +1550,7 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Is_attn_mask, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     const int n_block = blockIdx.x;
@@ -1588,11 +1562,11 @@ inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
     if (params.num_splits == 1) {  // means grid.x = 1, blockIdx.x = 0;
         int loop_step_x = 0;
         for(int i = 0; i < params.seqlen_k; i+= kBlockN) {
-           compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, false, false, Is_attn_mask, /*Seq_parallel=*/true>(params, bidb, bidh, loop_step_x);
+           compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, loop_step_x);
            loop_step_x += 1;
         }
     } else {
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, false, false, Is_attn_mask, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
     }
 }
 

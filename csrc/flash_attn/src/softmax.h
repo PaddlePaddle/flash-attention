@@ -177,39 +177,6 @@ inline __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor, const u
     }
 }
 
-// TODO(umiswing): support cu_attn_mask
-// This kernel should work after dealing with input cu_seq indicating mask position.
-template <typename Engine, typename Layout, typename T>
-inline __device__ void apply_cu_attn_mask(Tensor<Engine, Layout> &tensor, const T* const mask, const float unscale_softmax, const uint32_t col_idx_offset_,
-                                         const uint32_t max_seqlen_q, const uint32_t max_seqlen_k, const uint32_t row_idx_offset_,
-                                         const uint32_t warp_row_stride) {
-    // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
-    static_assert(Layout::rank == 2, "Only support 2D Tensor");
-    const uint32_t lane_id = threadIdx.x % 32;
-    // const uint32_t row_idx_offset = row_idx_offset_ + lane_id / 4;
-    const uint32_t row_idx_offset = row_idx_offset_;
-    const uint32_t col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
-    #pragma unroll
-    for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
-        const uint32_t row_idx_base = row_idx_offset + mi * warp_row_stride;
-        #pragma unroll
-        for (int i = 0; i < size<0, 0>(tensor); ++i) {
-            const uint32_t row_idx = row_idx_base + i * 8;
-            #pragma unroll
-            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-                const uint32_t col_idx_base = col_idx_offset + nj * 8;
-                #pragma unroll
-                for (int j = 0; j < size<1, 0>(tensor); ++j) {
-                    const uint32_t col_idx = col_idx_base + j;
-                    if (row_idx < max_seqlen_q && col_idx < max_seqlen_k) {
-                      tensor(make_coord(i, mi), make_coord(j, nj)) += mask[row_idx*max_seqlen_q+col_idx] * unscale_softmax;
-                    }
-                }
-            }
-        }
-    }
-}
-
 template <typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 inline __device__ void apply_mask_causal_w_idx(
     Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> const &idx_rowcol,
@@ -234,25 +201,6 @@ inline __device__ void apply_mask_causal_w_idx(
         //     print(tensor(_, make_coord(j, ni)));
         //     // print(tensor(_, j + ni * size<1, 0>(tensor)));
         // }
-    }
-}
-
-template<typename TiledMma, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename  Engine2, typename Layout2>
-inline __device__ void apply_attn_mask(
-    Tensor<Engine0, Layout0> &scores, Tensor<Engine1, Layout1> const &tPgMask, Tensor<Engine2, Layout2> const &tPcMask, const int seqlen_q, const int seqlen_k, const float unscale_softmax) {
-    // Reshape scores from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
-    // if using m16n8k16 or ((2, 2, 1), MMA_M, MMA_N) if using m16n8k8.
-    Tensor tOrScores = make_tensor(scores.data(), flash::convert_layout_rowcol_Aregs<TiledMma>(scores.layout()));
-
-    // Reshape tOrScores from (8, MMA_M, MMA_N) to (8, MMA_M * MMA_N)
-    Layout l = tOrScores.layout();
-    Tensor tPrScores = make_tensor(tOrScores.data(), make_layout(get<0>(l), make_layout(get<1>(l), get<2>(l))));
-
-    #pragma unroll
-    for (int i = 0; i < size(tPrScores); ++i) {
-        if (elem_less(tPcMask(i), make_coord(seqlen_q, seqlen_k))) {
-            tPrScores(i) = tPrScores(i) + tPgMask(i) * unscale_softmax;
-        }
     }
 }
 

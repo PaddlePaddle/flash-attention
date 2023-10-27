@@ -153,7 +153,6 @@ struct Flash_fwd_kernel_traits : public Base {
     using GmemLayoutAtomP = Layout<Shape <Int<kNThreads / kGmemThreadsPerRowP>, Int<kGmemThreadsPerRowP>>,
                                    Stride<Int<kGmemThreadsPerRowP>, _1>>;
 
-    using GmemCopyAtomMask = Copy_Atom<DefaultCopy, elem_type>;
     using GmemTiledCopyP = decltype(
         make_tiled_copy(Copy_Atom<DefaultCopy, elem_type>{},
                         GmemLayoutAtomP{},
@@ -373,6 +372,7 @@ struct Flash_bwd_kernel_traits : public Base {
                         Layout<Shape <_8, _32>,  // Thread layout, 8 threads per row
                                Stride<_32, _1>>{},
                         Layout<Shape < _1, _1>>{}));  // Val layout, 1 val per store
+
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

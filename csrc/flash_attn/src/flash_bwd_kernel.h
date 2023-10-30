@@ -1592,7 +1592,7 @@ inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
            loop_step_x += 1;
         }
     } else {
-      compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, false, false, Is_attn_mask, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, false, false, Is_attn_mask, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
     }
 }
 

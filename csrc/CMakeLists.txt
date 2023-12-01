@@ -84,6 +84,17 @@ target_link_libraries(flashattn flashattn_with_bias_mask)
 add_dependencies(flashattn flashattn_with_bias_mask)
 
 
+if (NOT DEFINED NVCC_ARCH_BIN)
+  message(FATAL_ERROR " NVCC_ARCH_BIN is not defined. ")
+endif()
+
+set(FA_GENCODE_OPTION "SHELL:")
+foreach(arch ${NVCC_ARCH_BIN})
+   if(${arch} GREATER_EQUAL 80)
+     set(FA_GENCODE_OPTION "${FA_GENCODE_OPTION} -gencode arch=compute_${arch},code=sm_${arch}")
+   endif()
+endforeach()
+
 target_compile_options(flashattn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
   -w
   -Xcompiler="-fPIC"
@@ -96,7 +107,7 @@ target_compile_options(flashattn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
   --expt-relaxed-constexpr
   --expt-extended-lambda
   --use_fast_math
-  "SHELL:-gencode arch=compute_80,code=sm_80"
+  "${FA_GENCODE_OPTION}"
   >)
 
 target_compile_options(flashattn_with_bias_mask PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
@@ -111,7 +122,7 @@ target_compile_options(flashattn_with_bias_mask PRIVATE $<$<COMPILE_LANGUAGE:CUD
   --expt-relaxed-constexpr
   --expt-extended-lambda
   --use_fast_math
-  "SHELL:-gencode arch=compute_80,code=sm_80"
+  "${FA_GENCODE_OPTION}"
   >)
 
 INSTALL(TARGETS flashattn

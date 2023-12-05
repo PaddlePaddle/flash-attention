@@ -85,11 +85,17 @@ add_dependencies(flashattn flashattn_with_bias_mask)
 
 
 if (NOT DEFINED NVCC_ARCH_BIN)
-  message(FATAL_ERROR " NVCC_ARCH_BIN is not defined. ")
+  message(FATAL_ERROR "NVCC_ARCH_BIN is not defined.")
 endif()
 
+if (NVCC_ARCH_BIN STREQUAL "")
+  message(FATAL_ERROR "NVCC_ARCH_BIN is not set.")
+endif()
+
+STRING(REPLACE "-" ";" FA_NVCC_ARCH_BIN ${NVCC_ARCH_BIN})
+
 set(FA_GENCODE_OPTION "SHELL:")
-foreach(arch ${NVCC_ARCH_BIN})
+foreach(arch ${FA_NVCC_ARCH_BIN})
    if(${arch} GREATER_EQUAL 80)
      set(FA_GENCODE_OPTION "${FA_GENCODE_OPTION} -gencode arch=compute_${arch},code=sm_${arch}")
    endif()

@@ -142,14 +142,14 @@ INSTALL(TARGETS flashattn
 
 INSTALL(FILES capi/flash_attn.h DESTINATION "include")
 
-add_custom_target(run_my_executable
+add_custom_target(build_whl
     COMMAND ${CMAKE_COMMAND} -E env python ${CMAKE_SOURCE_DIR}/setup.py bdist_wheel
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     DEPENDS flashattn
     COMMENT "Running my_executable"
 )
 
-add_custom_target(default_target DEPENDS run_my_executable)
+add_custom_target(default_target DEPENDS build_whl)
 
 # set 'default_target'
 set_property(DIRECTORY PROPERTY DEFAULT_TARGET default_target)

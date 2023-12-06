@@ -194,11 +194,12 @@ class CachedWheelsCommand(_bdist_wheel):
         impl_tag, abi_tag, plat_tag = self.get_tag()
         original_wheel_name = f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
 
-        new_wheel_name ='asdfsdf.whl' # wheel_filename
-        #shutil.move(
-        #    f"{self.dist_dir}/{original_wheel_name}.whl",
-        #    f"{self.dist_dir}/{new_wheel_name}"
-        #) 
+        #new_wheel_name = wheel_filename
+        new_wheel_name = f"{self.wheel_dist_name}-{python_version}-{abi_tag}-{plat_tag}"
+        shutil.move(
+            f"{self.dist_dir}/{original_wheel_name}.whl",
+            f"{self.dist_dir}/{new_wheel_name}.whl"
+        ) 
 
 
 setup(

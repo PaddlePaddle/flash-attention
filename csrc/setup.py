@@ -57,7 +57,7 @@ paddle_version = paddle.version.full_version
 cuda_version= paddle.version.cuda_version
 
 
-with open("../README.md", "r", encoding="utf-8") as fh:
+with open("../../README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 

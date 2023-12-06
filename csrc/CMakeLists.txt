@@ -18,38 +18,38 @@ set(CUTLASS_3_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cutlass)
 
 set(FA2_SOURCES_CU
      flash_attn/src/cuda_utils.cu
-     flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim96_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim160_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim160_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim192_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim192_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim224_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim224_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim256_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim256_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim32_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim32_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim64_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim64_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim96_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim96_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim128_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim128_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim160_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim160_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim192_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim192_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim224_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim224_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim256_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu
   )
 
 add_library(flashattn SHARED
@@ -62,13 +62,13 @@ target_include_directories(flashattn PRIVATE
 
 set(FA1_SOURCES_CU
     flash_attn_with_bias_and_mask/flash_attn_with_bias_mask.cu
-    flash_attn_with_bias_and_mask/src/cuda_utils.cu
-    flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim32.cu
-    flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim64.cu
-    flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim128.cu
-    flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim32.cu
-    flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim64.cu
-    flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim128.cu
+    #flash_attn_with_bias_and_mask/src/cuda_utils.cu
+    #flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim32.cu
+    #flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim64.cu
+    #flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim128.cu
+    #flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim32.cu
+    #flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim64.cu
+    #flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim128.cu
     flash_attn_with_bias_and_mask/src/utils.cu)
 
 add_library(flashattn_with_bias_mask STATIC
@@ -100,6 +100,7 @@ endif()
 STRING(REPLACE "-" ";" FA_NVCC_ARCH_BIN ${NVCC_ARCH_BIN})
 
 set(FA_GENCODE_OPTION "SHELL:")
+
 foreach(arch ${FA_NVCC_ARCH_BIN})
    if(${arch} GREATER_EQUAL 80)
      set(FA_GENCODE_OPTION "${FA_GENCODE_OPTION} -gencode arch=compute_${arch},code=sm_${arch}")

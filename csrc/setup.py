@@ -18,6 +18,7 @@ from setuptools import setup, find_packages
 import urllib.request
 import urllib.error
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+from setuptools.command.install import install
 
 import paddle
 from paddle.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension
@@ -159,14 +160,11 @@ def get_data_files():
     # Assuming 'libflashattn.so' is located in the same directory as setup.py
     source_lib_path = 'libflashattn.so'
 
-    # Specify the destination directory within the package
-    destination_lib_path = os.path.join(PACKAGE_NAME, 'build/libflashattn.so')
-
-    data_files.append((paddle_lib_path, [source_lib_path]))
+    data_files.append((".", [source_lib_path]))
     return data_files
 
 
-class CachedWheelsCommand(_bdist_wheel):
+class CustomWheelsCommand(_bdist_wheel):
     """
     The CachedWheelsCommand plugs into the default bdist wheel, which is ran by pip when it cannot
     find an existing wheel (which is currently the case for all flash attention installs). We use
@@ -174,9 +172,6 @@ class CachedWheelsCommand(_bdist_wheel):
     wheel available and short-circuits the standard full build pipeline.
     """
     def run(self):
-        print("88888888888888888888888888888")
-       # if FORCE_BUILD:
-       #     return super().run()
         self.run_command('build_ext')
         super().run()
         # Determine the version numbers that will be used to determine the correct wheel
@@ -202,6 +197,21 @@ class CachedWheelsCommand(_bdist_wheel):
         ) 
 
 
+class CustomInstallCommand(install):
+    def run(self):
+        install.run(self)
+        install_path = self.install_lib
+        # src
+        source_lib_path = os.path.abspath('libflashattn.so')
+
+        # 目标链接路径
+        destination_lib_path = os.path.join(paddle_lib_path, 'libflashattn.so')
+
+        # 创建软链接
+        shutil.move(f"{source_lib_path}", f"{destination_lib_path}")
+        #os.symlink(source_lib_path, destination_lib_path)
+
+
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),
@@ -219,7 +229,8 @@ setup(
         "Operating System :: Unix",
     ],
     cmdclass={
-    "bdist_wheel": CachedWheelsCommand,},
+    'bdist_wheel': CustomWheelsCommand,
+     'install': CustomInstallCommand},
     python_requires=">=3.7",
     install_requires=[
         "paddle",

@@ -1,3 +1,0 @@
-include build/libflashattn.so
-include src/libflashattn.so
-include ./libflashattn.so

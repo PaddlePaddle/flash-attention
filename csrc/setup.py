@@ -1,29 +1,36 @@
+# Copyright (c) 2023 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Adapted from https://github.com/NVIDIA/apex/blob/master/setup.py
+import ast
+import logging
+import os
+import platform
+import re
+import shutil
+import subprocess
 import sys
 import warnings
-import os
-import re
-import ast
 from pathlib import Path
-from packaging.version import parse, Version
-import platform
-import shutil
-from setuptools import Command, Extension, setup
-from setuptools.command.develop import develop as DevelopCommandBase
-from setuptools.command.egg_info import egg_info
-from setuptools.command.install import install as InstallCommandBase
-from setuptools.command.install_lib import install_lib
-from setuptools.dist import Distribution
-from setuptools import setup, find_packages
-import urllib.request
-import urllib.error
+
+from packaging.version import parse
+from setuptools import find_packages, setup
+from setuptools.command.install import install as _install
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
-from setuptools.command.install import install
 
 import paddle
-from paddle.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension
 from paddle.utils.cpp_extension.extension_utils import find_cuda_home
-import subprocess
 
 version_detail = sys.version_info
 python_version = platform.python_version()
@@ -55,7 +62,7 @@ print("Paddle Lib Path:", paddle_lib_path)
 
 # preparing parameters for setup()
 paddle_version = paddle.version.full_version
-cuda_version= paddle.version.cuda_version
+cuda_version = paddle.version.cuda_version
 
 
 with open("../../README.md", "r", encoding="utf-8") as fh:
@@ -66,6 +73,7 @@ with open("../../README.md", "r", encoding="utf-8") as fh:
 this_dir = os.path.dirname(os.path.abspath(__file__))
 CUDA_HOME = find_cuda_home()
 PACKAGE_NAME = "paddle_flash_attn"
+
 
 def get_platform():
     """
@@ -79,11 +87,13 @@ def get_platform():
     elif sys.platform == 'win32':
         return 'win_amd64'
     else:
-        raise ValueError('Unsupported platform: {}'.format(sys.platform))
+        raise ValueError(f'Unsupported platform: {sys.platform}')
 
 
 def get_cuda_bare_metal_version(cuda_dir):
-    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
+    raw_output = subprocess.check_output(
+        [cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True
+    )
     output = raw_output.split()
     release_idx = output.index("release") + 1
     bare_metal_version = parse(output[release_idx].split(",")[0])
@@ -105,18 +115,24 @@ def _is_cuda_available():
             f"\n Original Error is {e}"
         )
         return False
+
+
 check = _is_cuda_available()
 cmdclass = {}
 
+
 def get_package_version():
     with open(Path(this_dir) / "../flash_attn" / "__init__.py", "r") as f:
-        version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
+        version_match = re.search(
+            r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE
+        )
     public_version = ast.literal_eval(version_match.group(1))
     local_version = os.environ.get("FLASH_ATTN_LOCAL_VERSION")
     if local_version:
         return f"{public_version}+{local_version}"
     else:
         return str(public_version)
+
 
 def get_data_files():
     data_files = []
@@ -132,35 +148,40 @@ class CustomWheelsCommand(_bdist_wheel):
     the environment parameters to detect whether there is already a pre-built version of a compatible
     wheel available and short-circuits the standard full build pipeline.
     """
+
     def run(self):
         self.run_command('build_ext')
         super().run()
         # Determine the version numbers that will be used to determine the correct wheel
         # We're using the CUDA version used to build paddle, not the one currently installed
         # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
-        paddle_cuda_version = "234" #parse(paddle.version.cuda)
+        paddle_cuda_version = "234"  # parse(paddle.version.cuda)
         paddle_version_raw = parse(paddle.__version__)
         python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
         platform_name = get_platform()
         flash_version = get_package_version()
-        cxx11_abi ="" # str(paddle._C.-D_GLIBCXX_USE_CXX11_ABI).upper()
+        cxx11_abi = ""  # str(paddle._C.-D_GLIBCXX_USE_CXX11_ABI).upper()
 
         # Determine wheel URL based on CUDA version, paddle version, python version and OS
         wheel_filename = f'{PACKAGE_NAME}-{flash_version}-cu{cuda_version}-paddle{paddle_version}-{python_version}-{python_version}-{platform_name}.whl'
         impl_tag, abi_tag, plat_tag = self.get_tag()
-        original_wheel_name = f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
+        original_wheel_name = (
+            f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
+        )
 
-        #new_wheel_name = wheel_filename
-        new_wheel_name = f"{self.wheel_dist_name}-{python_version}-{abi_tag}-{plat_tag}"
+        # new_wheel_name = wheel_filename
+        new_wheel_name = (
+            f"{self.wheel_dist_name}-{python_version}-{abi_tag}-{plat_tag}"
+        )
         shutil.move(
             f"{self.dist_dir}/{original_wheel_name}.whl",
-            f"{self.dist_dir}/{new_wheel_name}.whl"
-        ) 
+            f"{self.dist_dir}/{new_wheel_name}.whl",
+        )
 
 
-class CustomInstallCommand(install):
+class CustomInstallCommand(_install):
     def run(self):
-        install.run(self)
+        super().run(self)
         install_path = self.install_lib
         # src
         source_lib_path = os.path.abspath('libflashattn.so')
@@ -170,7 +191,7 @@ class CustomInstallCommand(install):
 
         # 创建软链接
         shutil.move(f"{source_lib_path}", f"{destination_lib_path}")
-        #os.symlink(source_lib_path, destination_lib_path)
+        # os.symlink(source_lib_path, destination_lib_path)
 
 
 setup(
@@ -190,8 +211,9 @@ setup(
         "Operating System :: Unix",
     ],
     cmdclass={
-    'bdist_wheel': CustomWheelsCommand,
-     'install': CustomInstallCommand},
+        'bdist_wheel': CustomWheelsCommand,
+        'install': CustomInstallCommand,
+    },
     python_requires=">=3.7",
     install_requires=[
         "paddle",

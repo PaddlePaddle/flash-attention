@@ -181,7 +181,7 @@ class CustomWheelsCommand(_bdist_wheel):
 
 class CustomInstallCommand(_install):
     def run(self):
-        super().run(self)
+        _install.run(self)
         install_path = self.install_lib
         # src
         source_lib_path = os.path.abspath('libflashattn.so')

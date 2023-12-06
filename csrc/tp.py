@@ -2,7 +2,9 @@ import paddle
 from setuptools import setup, find_packages
 import sys
 import os
-
+import paddle
+paddle_path = paddle.sysconfig.get_lib
+print(paddle_path)
 python_version = sys.version
 print("Installing your_package...")
 
@@ -31,7 +33,7 @@ setup(
     data_files=get_data_files(),
     description='Flash attention in paddlepaddle',
     packages=find_packages(),
-    package_data={package_name: ['src/libflashattn.so']},
+    package_data={package_name: ['build/libflashattn.so']},
 )
 #
 #import paddle

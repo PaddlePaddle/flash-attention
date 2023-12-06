@@ -67,15 +67,6 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 CUDA_HOME = find_cuda_home()
 PACKAGE_NAME = "paddle_flash_attn"
 
-BASE_WHEEL_URL = "https://github.com/PaddlePaddle/flash-attention/releases/download/{tag_name}/{wheel_name}"
-
-FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
-# For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
-FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
-# For CI, we want the option to not add "--threads 4" to nvcc, since the runner can OOM
-FORCE_SINGLE_THREAD = os.getenv("FLASH_ATTENTION_FORCE_SINGLE_THREAD", "FALSE") == "TRUE"
-
-
 def get_platform():
     """
     Returns the platform name as used in wheel filenames.
@@ -100,33 +91,6 @@ def get_cuda_bare_metal_version(cuda_dir):
     return raw_output, bare_metal_version
 
 
-def check_cuda_paddle_binary_vs_bare_metal(cuda_dir):
-    raw_output, bare_metal_version = get_cuda_bare_metal_version(cuda_dir)
-    paddle_binary_version = parse(paddle.version.cuda())
-
-    print("\nCompiling cuda extensions with")
-    print(raw_output + "from " + cuda_dir + "/bin\n")
-
-    if (bare_metal_version != paddle_binary_version):
-        raise RuntimeError(
-            "Cuda extensions are being compiled with a version of Cuda that does "
-            "not match the version used to compile Pypaddle binaries.  "
-            "Pypaddle binaries were compiled with Cuda {}.\n".format(paddle.version.cuda)
-            + "In some cases, a minor-version mismatch will not cause later errors:  "
-            "https://github.com/NVIDIA/apex/pull/323#discussion_r287021798.  "
-            "You can try commenting out this check (at your own risk)."
-        )
-
-
-def raise_if_cuda_home_none(global_option: str) -> None:
-    if CUDA_HOME is not None:
-        return
-    raise RuntimeError(
-        f"{global_option} was requested, but nvcc was not found.  Are you sure your environment has nvcc available?  "
-        "If you're installing within a container from https://hub.docker.com/r/pypaddle/pypaddle, "
-        "only images whose names contain 'devel' will provide nvcc."
-    )
-
 def _is_cuda_available():
     """
     Check whether CUDA is available.
@@ -141,7 +105,7 @@ def _is_cuda_available():
             f"\n Original Error is {e}"
         )
         return False
-
+check = _is_cuda_available()
 cmdclass = {}
 
 def get_package_version():
@@ -156,10 +120,7 @@ def get_package_version():
 
 def get_data_files():
     data_files = []
-    
-    # Assuming 'libflashattn.so' is located in the same directory as setup.py
     source_lib_path = 'libflashattn.so'
-
     data_files.append((".", [source_lib_path]))
     return data_files
 

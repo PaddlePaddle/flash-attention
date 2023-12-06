@@ -6,10 +6,12 @@ find_package(Git QUIET REQUIRED)
 execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
                 RESULT_VARIABLE GIT_SUBMOD_RESULT)
+
 #cmake -DWITH_ADVANCED
 if (WITH_ADVANCED)
   add_compile_definitions(PADDLE_WITH_ADVANCED)cu
 endif()
+
 add_definitions("-DFLASH_ATTN_WITH_TORCH=0")
 
 set(CUTLASS_3_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cutlass)

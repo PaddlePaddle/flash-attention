@@ -186,11 +186,9 @@ class CustomInstallCommand(_install):
         # src
         source_lib_path = os.path.abspath('libflashattn.so')
 
-        # 目标链接路径
         destination_lib_path = os.path.join(paddle_lib_path, 'libflashattn.so')
 
-        # 创建软链接
-        shutil.move(f"{source_lib_path}", f"{destination_lib_path}")
+        # shutil.move(f"{source_lib_path}", f"{destination_lib_path}")
         # os.symlink(source_lib_path, destination_lib_path)
 
 

@@ -7,7 +7,7 @@ import ast
 from pathlib import Path
 from packaging.version import parse, Version
 import platform
-
+import shutil
 from setuptools import Command, Extension, setup
 from setuptools.command.develop import develop as DevelopCommandBase
 from setuptools.command.egg_info import egg_info
@@ -15,9 +15,17 @@ from setuptools.command.install import install as InstallCommandBase
 from setuptools.command.install_lib import install_lib
 from setuptools.dist import Distribution
 from setuptools import setup, find_packages
+import urllib.request
+import urllib.error
+from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+
+import paddle
+from paddle.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension
+from paddle.utils.cpp_extension.extension_utils import find_cuda_home
 import subprocess
-python_version = platform.python_version()
+
 version_detail = sys.version_info
+python_version = platform.python_version()
 version = version_detail[0] + version_detail[1] / 10
 env_version = os.getenv("PY_VERSION")
 
@@ -38,113 +46,16 @@ elif env_version != version:
     )
     os.environ["PY_VERSION"] = python_version
 
+paddle_include_path = paddle.sysconfig.get_include()
+paddle_lib_path = paddle.sysconfig.get_lib()
 
-global env_dict  # noqa: F811
-env_dict={
-    'PADDLE_SOURCE_DIR':'@PADDLE_SOURCE_DIR@',
-    'PADDLE_VERSION':'@PADDLE_VERSION@',
-    'PADDLE_BINARY_DIR':'@PADDLE_BINARY_DIR@',
-    'TAG_VERSION_REGEX':'@TAG_VERSION_REGEX@',
-    'WITH_GPU':'@WITH_GPU@',
-    'CUDNN_MAJOR_VERSION':'@CUDNN_MAJOR_VERSION@',
-    'CUDNN_MINOR_VERSION':'@CUDNN_MINOR_VERSION@',
-    'CUDNN_PATCHLEVEL_VERSION':'@CUDNN_PATCHLEVEL_VERSION@',
-    'CUDA_VERSION':'@CUDA_VERSION@',
-    'WITH_PSLI':'@WITH_PSLI@',
-    'FLUID_CORE_NAME':'@FLUID_CORE_NAME@',
-    'PHI_LIB':'@PHI_LIB@',
-    'PHI_NAME':'@PHI_NAME@',
-    'WITH_SHARED_PHI':'@WITH_SHARED_PHI@',
-    'IR_LIB':'@IR_LIB@',
-    'IR_NAME':'@IR_NAME@',
-    'WITH_SHARED_IR':'@WITH_SHARED_IR@',
-    'COMMON_LIB':'@COMMON_LIB@',
-    'COMMON_NAME':'@COMMON_NAME@',
-    'WARPCTC_LIBRARIES':'@WARPCTC_LIBRARIES@',
-    'WARPRNNT_LIBRARIES':'@WARPRNNT_LIBRARIES@',
-    'FLASHATTN_LIBRARIES':'@FLASHATTN_LIBRARIES@',
-    'LAPACK_LIB':'@LAPACK_LIB@',
-    'GFORTRAN_LIB':'@GFORTRAN_LIB@',
-    'GNU_RT_LIB_1':'@GNU_RT_LIB_1@',
-    'WITH_CUDNN_DSO':'@WITH_CUDNN_DSO@',
-    'CUDNN_LIBRARY':'@CUDNN_LIBRARY@',
-    'GNU_RT_LIB_2':'@GNU_RT_LIB_2@',
-    'WITH_MKL':'@WITH_MKL@',
-    'MKLML_SHARED_LIB':'@MKLML_SHARED_LIB@',
-    'MKLML_SHARED_IOMP_LIB':'@MKLML_SHARED_IOMP_LIB@',
-    'OPENBLAS_SHARED_LIB':'@OPENBLAS_SHARED_LIB@',
-    'OPENBLAS_LIB':'@OPENBLAS_LIB@',
-    'BLAS_LIB':'@BLAS_LIB@',
-    'WITH_LITE':'@WITH_LITE@',
-    'LITE_SHARED_LIB':'@LITE_SHARED_LIB@',
-    'LITE_WITH_NNADAPTER':'@LITE_WITH_NNADAPTER@',
-    'LITE_NNADAPTER_LIB':'@LITE_NNADAPTER_LIB@',
-    'NNADAPTER_WITH_HUAWEI_ASCEND_NPU':'@NNADAPTER_WITH_HUAWEI_ASCEND_NPU@',
-    'LITE_NNADAPTER_NPU_LIB':'@LITE_NNADAPTER_NPU_LIB@',
-    'WITH_CINN':'@WITH_CINN@',
-    'CINN_LIB_LOCATION':'@CINN_LIB_LOCATION@',
-    'CINN_LIB_NAME':'@CINN_LIB_NAME@',
-    'CINN_INCLUDE_DIR':'@CINN_INCLUDE_DIR@',
-    'CMAKE_BUILD_TYPE':'@CMAKE_BUILD_TYPE@',
-    'PSLIB_LIB':'@PSLIB_LIB@',
-    'JVM_LIB':'@JVM_LIB@',
-    'PSLIB_VERSION_PY':'@PSLIB_VERSION_PY@',
-    'WITH_MKLDNN':'@WITH_MKLDNN@',
-    'MKLDNN_SHARED_LIB':'@MKLDNN_SHARED_LIB@',
-    'MKLDNN_INSTALL_DIR':'@MKLDNN_INSTALL_DIR@',
-    'WITH_ONNXRUNTIME':'@WITH_ONNXRUNTIME@',
-    'ONNXRUNTIME_SHARED_LIB':'@ONNXRUNTIME_SHARED_LIB@',
-    'PADDLE2ONNX_LIB':'@PADDLE2ONNX_LIB@',
-    'PADDLE2ONNX_LIB_NAME':'@PADDLE2ONNX_LIB_NAME@',
-    'ONNXRUNTIME_LIB_NAME':'@ONNXRUNTIME_LIB_NAME@',
-    'WITH_XPU':'@WITH_XPU@',
-    'XPU_API_LIB':'@XPU_API_LIB@',
-    'XPU_API_LIB_NAME':'@XPU_API_LIB_NAME@',
-    'XPU_RT_LIB':'@XPU_RT_LIB@',
-    'XPU_RT_LIB_NAME':'@XPU_RT_LIB_NAME@',
-    'WITH_XPU_BKCL':'@WITH_XPU_BKCL@',
-    'XPU_BKCL_LIB':'@XPU_BKCL_LIB@',
-    'XPU_BKCL_LIB_NAME':'@XPU_BKCL_LIB_NAME@',
-    'WITH_XPU_XFT':'@WITH_XPU_XFT@',
-    'XPU_XFT_LIB':'@XPU_XFT_LIB@',
-    'XPU_XFT_LIB_NAME':'@XPU_XFT_LIB_NAME@',
-    'THIRD_PARTY_PATH':'@THIRD_PARTY_PATH@',
-    'SETUP_LOG_FILE':'@SETUP_LOG_FILE@',
-    'WITH_STRIP':'@WITH_STRIP@',
-    'PACKAGE_NAME':'@PACKAGE_NAME@',
-    'PADDLE_VERSION':'@PADDLE_VERSION@',
-    'APPLE':'@APPLE@',
-    'externalError_INCLUDE_DIR':'@externalError_INCLUDE_DIR@',
-    'WITH_ROCM':'@WITH_ROCM@',
-    'ORIGIN':'@ORIGIN@',
-    'WIN32':'@WIN32@',
-    'JIT_RELEASE_WHL':'@JIT_RELEASE_WHL@',
-    'WITH_PSLIB':'@WITH_PSLIB@',
-    'PYBIND_INCLUDE_DIR':'@PYBIND_INCLUDE_DIR@',
-    'WITH_PYTHON':'@WITH_PYTHON@',
-    'WITH_CINN':'@WITH_CINN@',
-    'CINN_SOURCE_DIR':'@CINN_SOURCE_DIR@',
-    'WITH_CPP_DIST':'@WITH_CPP_DIST@',
-    'PADDLE_INSTALL_DIR':'@PADDLE_INSTALL_DIR@',
-    'PADDLE_LIB_TEST_DIR':'@PADDLE_LIB_TEST_DIR@'
-}
-
-global paddle_binary_dir, paddle_source_dir
-
-paddle_binary_dir = env_dict.get("PADDLE_BINARY_DIR")
-paddle_source_dir = env_dict.get("PADDLE_SOURCE_DIR")
+print("Paddle Include Path:", paddle_include_path)
+print("Paddle Lib Path:", paddle_lib_path)
 
 # preparing parameters for setup()
-paddle_version = env_dict.get("PADDLE_VERSION")
-package_name = env_dict.get("PACKAGE_NAME")
+paddle_version = paddle.version.full_version
+cuda_version= paddle.version.cuda_version
 
-import urllib.request
-import urllib.error
-from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
-
-import paddle
-from paddle.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension
-from paddle.utils.cpp_extension.extension_utils import find_cuda_home
 
 with open("../README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -153,14 +64,11 @@ with open("../README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 CUDA_HOME = find_cuda_home()
-PACKAGE_NAME = "flash_attn"
+PACKAGE_NAME = "paddle_flash_attn"
 
-BASE_WHEEL_URL = "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
+BASE_WHEEL_URL = "https://github.com/PaddlePaddle/flash-attention/releases/download/{tag_name}/{wheel_name}"
 
-# FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
-# SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
 FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
-SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 # For CI, we want the option to not add "--threads 4" to nvcc, since the runner can OOM
@@ -218,12 +126,6 @@ def raise_if_cuda_home_none(global_option: str) -> None:
         "only images whose names contain 'devel' will provide nvcc."
     )
 
-
-def append_nvcc_threads(nvcc_extra_args):
-    if not FORCE_SINGLE_THREAD:
-        return nvcc_extra_args + ["--threads", "4"]
-    return nvcc_extra_args
-
 def _is_cuda_available():
     """
     Check whether CUDA is available.
@@ -261,7 +163,6 @@ if paddle.is_compiled_with_cuda() and _is_cuda_available():
             os.environ["PADDLE_CUDA_ARCH_LIST"] = "8.0;8.6"
 
 cmdclass = {}
-ext_modules = []
 
 def get_package_version():
     with open(Path(this_dir) / "../flash_attn" / "__init__.py", "r") as f:
@@ -294,49 +195,32 @@ class CachedWheelsCommand(_bdist_wheel):
     wheel available and short-circuits the standard full build pipeline.
     """
     def run(self):
-        if FORCE_BUILD:
-            return super().run()
-
+        print("88888888888888888888888888888")
+       # if FORCE_BUILD:
+       #     return super().run()
+        self.run_command('build_ext')
+        super().run()
         # Determine the version numbers that will be used to determine the correct wheel
         # We're using the CUDA version used to build paddle, not the one currently installed
         # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
-        paddle_cuda_version = parse(paddle.version.cuda)
+        paddle_cuda_version = "234" #parse(paddle.version.cuda)
         paddle_version_raw = parse(paddle.__version__)
         python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
         platform_name = get_platform()
         flash_version = get_package_version()
-        # cuda_version = f"{cuda_version_raw.major}{cuda_version_raw.minor}"
-        cuda_version = f"{paddle_cuda_version.major}{paddle_cuda_version.minor}"
-        paddle_version = f"{paddle_version_raw.major}.{paddle_version_raw.minor}"
-        cxx11_abi = str(paddle._C._GLIBCXX_USE_CXX11_ABI).upper()
+        cxx11_abi ="" # str(paddle._C.-D_GLIBCXX_USE_CXX11_ABI).upper()
 
         # Determine wheel URL based on CUDA version, paddle version, python version and OS
-        wheel_filename = f'{PACKAGE_NAME}-{flash_version}+cu{cuda_version}paddle{paddle_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl'
-        wheel_url = BASE_WHEEL_URL.format(
-            tag_name=f"v{flash_version}",
-            wheel_name=wheel_filename
-        )
-        print("Guessing wheel URL: ", wheel_url)
+        wheel_filename = f'{PACKAGE_NAME}-{flash_version}-cu{cuda_version}-paddle{paddle_version}-{python_version}-{python_version}-{platform_name}.whl'
+        impl_tag, abi_tag, plat_tag = self.get_tag()
+        original_wheel_name = f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
 
-        try:
-            urllib.request.urlretrieve(wheel_url, wheel_filename)
-
-            # Make the archive
-            # Lifted from the root wheel processing command
-            # https://github.com/pypa/wheel/blob/cf71108ff9f6ffc36978069acb28824b44ae028e/src/wheel/bdist_wheel.py#LL381C9-L381C85
-            if not os.path.exists(self.dist_dir):
-                os.makedirs(self.dist_dir)
-
-            impl_tag, abi_tag, plat_tag = self.get_tag()
-            archive_basename = f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
-
-            wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
-            print("Raw wheel path", wheel_path)
-            os.rename(wheel_filename, wheel_path)
-        except urllib.error.HTTPError:
-            print("Precompiled wheel not found. Building from source...")
-            # If the wheel could not be downloaded, build from source
-            super().run()
+        new_wheel_name = wheel_filename
+        print("self.asdfasdfsdfasdfasdfasdf", self.get_tag()) 
+        shutil.move(
+            f"{self.dist_dir}/{original_wheel_name}.whl",
+            f"{self.dist_dir}/{new_wheel_name}"
+        ) 
 
 class InstallHeaders(Command):
     """Override how headers are copied."""
@@ -497,20 +381,8 @@ setup(
         "License :: OSI Approved :: BSD License",
         "Operating System :: Unix",
     ],
-    ext_modules=ext_modules,
     cmdclass={
-        'install_headers': InstallHeaders,
-        'install': InstallCommand,
-        'egg_info': EggInfo,
-        'install_lib': InstallLib,
-        'develop': DevelopCommand,
-    },
-    #cmdclass={
-    #    "bdist_wheel": CachedWheelsCommand,
-    #    "build_ext": BuildExtension
-    #} if ext_modules else {
-    #    "bdist_wheel": CachedWheelsCommand,
-    #},
+    "bdist_wheel": CachedWheelsCommand,},
     python_requires=">=3.7",
     install_requires=[
         "paddle",

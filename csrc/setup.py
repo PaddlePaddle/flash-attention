@@ -141,27 +141,6 @@ def _is_cuda_available():
         )
         return False
 
-if paddle.is_compiled_with_cuda() and _is_cuda_available():
-    # https://github.com/NVIDIA/apex/issues/486
-    # Extension builds after https://github.com/pypaddle/pypaddle/pull/23408 attempt to query paddle.cuda.get_device_capability(),
-    # which will fail if you are compiling in an environment without visible GPUs (e.g. during an nvidia-docker build command).
-    print(
-        "\nWarning: Torch did not find available GPUs on this system.\n",
-        "If your intention is to cross-compile, this is not an error.\n"
-        "By default, FlashAttention will cross-compile for Ampere (compute capability 8.0, 8.6, "
-        "8.9), and, if the CUDA version is >= 11.8, Hopper (compute capability 9.0).\n"
-        "If you wish to cross-compile for a single specific architecture,\n"
-        'export PADDLE_CUDA_ARCH_LIST="compute capability" before running setup.py.\n',
-    )
-    if os.environ.get("PADDLE_CUDA_ARCH_LIST", None) is None and CUDA_HOME is not None:
-        _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
-        if bare_metal_version >= Version("11.8"):
-            os.environ["PADDLE_CUDA_ARCH_LIST"] = "8.0;8.6;9.0"
-        elif bare_metal_version >= Version("11.4"):
-            os.environ["PADDLE_CUDA_ARCH_LIST"] = "8.0;8.6"
-        else:
-            os.environ["PADDLE_CUDA_ARCH_LIST"] = "8.0;8.6"
-
 cmdclass = {}
 
 def get_package_version():
@@ -183,7 +162,7 @@ def get_data_files():
     # Specify the destination directory within the package
     destination_lib_path = os.path.join(PACKAGE_NAME, 'build/libflashattn.so')
 
-    data_files.append((os.path.join(PACKAGE_NAME, 'libflashattn.so'), [source_lib_path]))
+    data_files.append((paddle_lib_path, [source_lib_path]))
     return data_files
 
 
@@ -215,160 +194,17 @@ class CachedWheelsCommand(_bdist_wheel):
         impl_tag, abi_tag, plat_tag = self.get_tag()
         original_wheel_name = f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
 
-        new_wheel_name = wheel_filename
-        print("self.asdfasdfsdfasdfasdfasdf", self.get_tag()) 
-        shutil.move(
-            f"{self.dist_dir}/{original_wheel_name}.whl",
-            f"{self.dist_dir}/{new_wheel_name}"
-        ) 
-
-class InstallHeaders(Command):
-    """Override how headers are copied."""
-
-    description = 'install C/C++ header files'
-
-    user_options = [
-        ('install-dir=', 'd', 'directory to install header files to'),
-        ('force', 'f', 'force installation (overwrite existing files)'),
-    ]
-
-    boolean_options = ['force']
-
-    def initialize_options(self):
-        self.install_dir = None
-        self.force = 0
-        self.outfiles = []
-
-    def finalize_options(self):
-        self.set_undefined_options(
-            'install', ('install_headers', 'install_dir'), ('force', 'force')
-        )
-
-    def run(self):
-        hdrs = self.distribution.headers
-        if not hdrs:
-            return
-        self.mkpath(self.install_dir)
-        for header in hdrs:
-            install_dir = get_header_install_dir(header)
-            install_dir = os.path.join(
-                self.install_dir, os.path.dirname(install_dir)
-            )
-            if not os.path.exists(install_dir):
-                self.mkpath(install_dir)
-            (out, _) = self.copy_file(header, install_dir)
-            self.outfiles.append(out)
-            # (out, _) = self.mkdir_and_copy_file(header)
-            # self.outfiles.append(out)
-
-    def get_inputs(self):
-        return self.distribution.headers or []
-
-    def get_outputs(self):
-        return self.outfiles
-
-
-class InstallCommand(InstallCommandBase):
-    def finalize_options(self):
-        ret = InstallCommandBase.finalize_options(self)
-        self.install_lib = self.install_platlib
-
-        self.install_headers = os.path.join(
-            self.install_platlib, 'paddle', 'include'
-        )
-        return ret
-
-
-class DevelopCommand(DevelopCommandBase):
-    def run(self):
-        # copy proto and .so to python_source_dir
-        fluid_proto_binary_path = (
-            paddle_binary_dir + '/python/paddle/base/proto/'
-        )
-        fluid_proto_source_path = (
-            paddle_source_dir + '/python/paddle/base/proto/'
-        )
-        distributed_proto_binary_path = (
-            paddle_binary_dir + '/python/paddle/distributed/fleet/proto/'
-        )
-        distributed_proto_source_path = (
-            paddle_source_dir + '/python/paddle/distributed/fleet/proto/'
-        )
-        os.system(f"rm -rf {fluid_proto_source_path}")
-        shutil.copytree(fluid_proto_binary_path, fluid_proto_source_path)
-        os.system(f"rm -rf {distributed_proto_source_path}")
-        shutil.copytree(
-            distributed_proto_binary_path, distributed_proto_source_path
-        )
-        shutil.copy(
-            paddle_binary_dir + '/python/paddle/base/libpaddle.so',
-            paddle_source_dir + '/python/paddle/base/',
-        )
-        dynamic_library_binary_path = paddle_binary_dir + '/python/paddle/libs/'
-        dynamic_library_source_path = paddle_source_dir + '/python/paddle/libs/'
-        for lib_so in os.listdir(dynamic_library_binary_path):
-            shutil.copy(
-                dynamic_library_binary_path + lib_so,
-                dynamic_library_source_path,
-            )
-        # write version.py and cuda_env_config_py to python_source_dir
-        write_version_py(
-            filename=f'{paddle_source_dir}/python/paddle/version/__init__.py'
-        )
-        write_cuda_env_config_py(
-            filename=f'{paddle_source_dir}/python/paddle/cuda_env.py'
-        )
-        write_parameter_server_version_py(
-            filename='{}/python/paddle/incubate/distributed/fleet/parameter_server/version.py'.format(
-                paddle_source_dir
-            )
-        )
-        DevelopCommandBase.run(self)
-
-
-class EggInfo(egg_info):
-    """Copy license file into `.dist-info` folder."""
-
-    def run(self):
-        # don't duplicate license into `.dist-info` when building a distribution
-        if not self.distribution.have_run.get('install', True):
-            self.mkpath(self.egg_info)
-            #self.copy_file(
-            #    env_dict.get("PADDLE_SOURCE_DIR") + "/LICENSE", self.egg_info
-            #)
-
-        egg_info.run(self)
-
-
-# class Installlib is rewritten to add header files to .egg/paddle
-class InstallLib(install_lib):
-    def run(self):
-        self.build()
-        outfiles = self.install()
-        hrds = self.distribution.headers
-        if not hrds:
-            return
-        for header in hrds:
-            install_dir = get_header_install_dir(header)
-            install_dir = os.path.join(
-                self.install_dir, 'paddle/include', os.path.dirname(install_dir)
-            )
-            if not os.path.exists(install_dir):
-                self.mkpath(install_dir)
-            self.copy_file(header, install_dir)
-        if outfiles is not None:
-            # always compile, in case we have any extension stubs to deal with
-            self.byte_compile(outfiles)
-
+        new_wheel_name ='asdfsdf.whl' # wheel_filename
+        #shutil.move(
+        #    f"{self.dist_dir}/{original_wheel_name}.whl",
+        #    f"{self.dist_dir}/{new_wheel_name}"
+        #) 
 
 
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),
-    packages=find_packages(
-        #exclude=("build")
-    #, "csrc", "include", "tests", "dist", "docs", "benchmarks", "flash_attn.egg-info",)
-    ),
+    packages=find_packages(),
     data_files=get_data_files(),
     package_data={PACKAGE_NAME: ['build/libflashattn.so']},
     author_email="Paddle-better@baidu.com",

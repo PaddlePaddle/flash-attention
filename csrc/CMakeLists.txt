@@ -146,7 +146,7 @@ add_custom_target(build_whl
     COMMAND ${CMAKE_COMMAND} -E env python ${CMAKE_SOURCE_DIR}/setup.py bdist_wheel
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     DEPENDS flashattn
-    COMMENT "Running my_executable"
+    COMMENT "Running build wheel"
 )
 
 add_custom_target(default_target DEPENDS build_whl)

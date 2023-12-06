@@ -9,7 +9,7 @@ execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
 
 #cmake -DWITH_ADVANCED
 if (WITH_ADVANCED)
-  add_compile_definitions(PADDLE_WITH_ADVANCED)cu
+  add_compile_definitions(PADDLE_WITH_ADVANCED)
 endif()
 
 add_definitions("-DFLASH_ATTN_WITH_TORCH=0")

@@ -134,7 +134,6 @@ target_compile_options(flashattn_with_bias_mask PRIVATE $<$<COMPILE_LANGUAGE:CUD
   "${FA_GENCODE_OPTION}"
   >)
 
-#
 INSTALL(TARGETS flashattn
         LIBRARY DESTINATION "lib")
 
@@ -147,9 +146,8 @@ add_custom_target(run_my_executable
     COMMENT "Running my_executable"
 )
 
-# 创建一个伪目标作为默认构建目标
 add_custom_target(default_target DEPENDS run_my_executable)
 
-# 设置 'default_target' 为默认构建目标
+# set 'default_target'
 set_property(DIRECTORY PROPERTY DEFAULT_TARGET default_target)
 

@@ -136,8 +136,9 @@ def get_package_version():
 
 def get_data_files():
     data_files = []
-    source_lib_path = 'libflashattn.so'
-    data_files.append((".", [source_lib_path]))
+    #source_lib_path = 'libflashattn.so'
+    #data_files.append((".", [source_lib_path]))
+    data_files.append((".", ['flashattn_advanced.so']))
     return data_files
 
 
@@ -155,8 +156,6 @@ class CustomWheelsCommand(_bdist_wheel):
         # Determine the version numbers that will be used to determine the correct wheel
         # We're using the CUDA version used to build paddle, not the one currently installed
         # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
-        paddle_cuda_version = "234"  # parse(paddle.version.cuda)
-        paddle_version_raw = parse(paddle.__version__)
         python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
         platform_name = get_platform()
         flash_version = get_package_version()

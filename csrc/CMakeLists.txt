@@ -7,7 +7,7 @@ execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
                 RESULT_VARIABLE GIT_SUBMOD_RESULT)
 
-#cmake -DWITH_ADVANCED
+#cmake -DWITH_ADVANCED=ON
 if (WITH_ADVANCED)
   add_compile_definitions(PADDLE_WITH_ADVANCED)
 endif()
@@ -18,38 +18,38 @@ set(CUTLASS_3_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cutlass)
 
 set(FA2_SOURCES_CU
      flash_attn/src/cuda_utils.cu
-     flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim96_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim160_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim160_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim192_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim192_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim224_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim224_bf16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim256_fp16_sm80.cu
+     #flash_attn/src/flash_fwd_hdim256_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim32_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim32_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim64_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim64_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim96_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim96_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim128_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim128_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim160_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim160_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim192_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim192_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim224_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim224_bf16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim256_fp16_sm80.cu
+     #flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu
   )
 
 add_library(flashattn SHARED
@@ -63,12 +63,12 @@ target_include_directories(flashattn PRIVATE
 set(FA1_SOURCES_CU
     flash_attn_with_bias_and_mask/flash_attn_with_bias_mask.cu
     flash_attn_with_bias_and_mask/src/cuda_utils.cu
-    flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim32.cu
-    flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim64.cu
-    flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim128.cu
-    flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim32.cu
-    flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim64.cu
-    flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim128.cu
+    #flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim32.cu
+    #flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim64.cu
+    #flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim128.cu
+    #flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim32.cu
+    #flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim64.cu
+    #flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim128.cu
     flash_attn_with_bias_and_mask/src/utils.cu)
 
 add_library(flashattn_with_bias_mask STATIC
@@ -142,15 +142,22 @@ INSTALL(TARGETS flashattn
 
 INSTALL(FILES capi/flash_attn.h DESTINATION "include")
 
-add_custom_target(build_whl
-    COMMAND ${CMAKE_COMMAND} -E env python ${CMAKE_SOURCE_DIR}/setup.py bdist_wheel
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    DEPENDS flashattn
-    COMMENT "Running build wheel"
-)
+if (WITH_ADVANCED)
+  set_target_properties(flashattn PROPERTIES
+      OUTPUT_NAME libflashattn_advanced
+      PREFIX ""
+  )
+endif()
 
-add_custom_target(default_target DEPENDS build_whl)
-
-# set 'default_target'
-set_property(DIRECTORY PROPERTY DEFAULT_TARGET default_target)
-
+if (WITH_ADVANCED)
+  add_custom_target(build_whl
+      COMMAND ${CMAKE_COMMAND} -E env python ${CMAKE_SOURCE_DIR}/setup.py bdist_wheel
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+      DEPENDS flashattn
+      COMMENT "Running build wheel"
+  )
+  
+  add_custom_target(default_target DEPENDS build_whl)
+  
+  set_property(DIRECTORY PROPERTY DEFAULT_TARGET default_target)
+endif()

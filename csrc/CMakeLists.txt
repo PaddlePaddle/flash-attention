@@ -137,6 +137,9 @@ target_compile_options(flashattn_with_bias_mask PRIVATE $<$<COMPILE_LANGUAGE:CUD
   "${FA_GENCODE_OPTION}"
   >)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 INSTALL(TARGETS flashattn
         LIBRARY DESTINATION "lib")
 

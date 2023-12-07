@@ -138,7 +138,7 @@ def get_data_files():
     data_files = []
     #source_lib_path = 'libflashattn.so'
     #data_files.append((".", [source_lib_path]))
-    data_files.append((".", ['flashattn_advanced.so']))
+    data_files.append((".", ['libflashattn_advanced.so']))
     return data_files
 
 
@@ -213,9 +213,13 @@ setup(
     },
     python_requires=">=3.7",
     install_requires=[
-        "paddle",
-        "einops",
-        "packaging",
-        "ninja",
-    ],
+    "common",
+    "dual",
+    "tight>=0.1.0",
+    "data",
+    "prox",
+    "ninja",  # Put ninja before paddle if paddle depends on it
+    "einops",
+    "packaging",
+],
 )

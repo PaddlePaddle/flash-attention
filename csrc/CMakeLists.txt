@@ -88,14 +88,9 @@ target_link_libraries(flashattn flashattn_with_bias_mask)
   
 add_dependencies(flashattn flashattn_with_bias_mask)
 
+option(NVCC_ARCH_BIN "Set default compute arch to 80" "80")
 
-if (NOT DEFINED NVCC_ARCH_BIN)
-  message(FATAL_ERROR "NVCC_ARCH_BIN is not defined.")
-endif()
-
-if (NVCC_ARCH_BIN STREQUAL "")
-  message(FATAL_ERROR "NVCC_ARCH_BIN is not set.")
-endif()
+message("NVCC_ARCH_BIN is set to: ${NVCC_ARCH_BIN}")
 
 STRING(REPLACE "-" ";" FA_NVCC_ARCH_BIN ${NVCC_ARCH_BIN})
 

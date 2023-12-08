@@ -1576,7 +1576,7 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Is_attn_mask, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Is_attn_mask, bool Is_deterministic, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     const int n_block = blockIdx.x;
@@ -1585,15 +1585,15 @@ inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
     // The block index for the head.
     const int bidh = blockIdx.z;
     constexpr int kBlockN = Kernel_traits::kBlockN;
-    //if (params.num_splits == 1) {  // means grid.x = 1, blockIdx.x = 0;
-    //    int loop_step_x = 0;
-    //    for(int i = 0; i < params.seqlen_k; i+= kBlockN) {
-    //       compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, false, false, Is_attn_mask, /*Seq_parallel=*/true>(params, bidb, bidh, loop_step_x);
-    //       loop_step_x += 1;
-    //    }
-    //} else {
-    compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, false, false, Is_attn_mask, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
-    //}
+    if (Is_deterministic) {  // params.num_splits == 1, means grid.x = 1, blockIdx.x = 0;
+        int loop_step_x = 0;
+        for(int i = 0; i < params.seqlen_k; i+= kBlockN) {
+           compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, false, false, Is_attn_mask, /*Seq_parallel=*/true>(params, bidb, bidh, loop_step_x);
+           loop_step_x += 1;
+        }
+    } else {
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_even_MN, Is_even_K, false, false, Is_attn_mask, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

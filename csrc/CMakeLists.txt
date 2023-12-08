@@ -88,7 +88,7 @@ target_link_libraries(flashattn flashattn_with_bias_mask)
   
 add_dependencies(flashattn flashattn_with_bias_mask)
 
-option(NVCC_ARCH_BIN "Set default compute arch to 80" "80")
+set(NVCC_ARCH_BIN 80 CACHE STRING "CUDA architectures")
 
 message("NVCC_ARCH_BIN is set to: ${NVCC_ARCH_BIN}")
 

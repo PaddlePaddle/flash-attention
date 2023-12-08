@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.9 FATAL_ERROR)
 project(flash-attention LANGUAGES CXX CUDA)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Git QUIET REQUIRED)
 
@@ -132,8 +134,6 @@ target_compile_options(flashattn_with_bias_mask PRIVATE $<$<COMPILE_LANGUAGE:CUD
   "${FA_GENCODE_OPTION}"
   >)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 INSTALL(TARGETS flashattn
         LIBRARY DESTINATION "lib")

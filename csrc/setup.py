@@ -182,13 +182,9 @@ class CustomInstallCommand(_install):
     def run(self):
         _install.run(self)
         install_path = self.install_lib
-        # src
-        source_lib_path = os.path.abspath('libflashattn.so')
-
-        destination_lib_path = os.path.join(paddle_lib_path, 'libflashattn.so')
-
-        # shutil.move(f"{source_lib_path}", f"{destination_lib_path}")
-        # os.symlink(source_lib_path, destination_lib_path)
+        source_lib_path = os.path.abspath('libflashattn_advanced.so')
+        destination_lib_path = os.path.join(paddle_lib_path, 'libflashattn_advanced.so')
+        shutil.copy(f"{source_lib_path}", f"{destination_lib_path}")
 
 
 setup(

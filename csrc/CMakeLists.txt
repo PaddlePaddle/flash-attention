@@ -145,9 +145,6 @@ if (WITH_ADVANCED)
       OUTPUT_NAME libflashattn_advanced
       PREFIX ""
   )
-endif()
-
-if (WITH_ADVANCED)
   add_custom_target(build_whl
       COMMAND ${CMAKE_COMMAND} -E env python ${CMAKE_SOURCE_DIR}/setup.py bdist_wheel
       WORKING_DIRECTORY ${CMAKE_BINARY_DIR}

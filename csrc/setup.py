@@ -1,6 +1,4 @@
-# Copyright (c) 2023 PaddlePaddle Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
+#licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
@@ -11,211 +9,99 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# Adapted from https://github.com/NVIDIA/apex/blob/master/setup.py
-import ast
-import logging
-import os
-import platform
-import re
-import shutil
-import subprocess
-import sys
-import warnings
+import multiprocessing
 from pathlib import Path
+import os
 
-from packaging.version import parse
-from setuptools import find_packages, setup
-from setuptools.command.install import install as _install
-from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+def get_gencode_flags():
+    import paddle
 
-import paddle
-from paddle.utils.cpp_extension.extension_utils import find_cuda_home
-
-version_detail = sys.version_info
-python_version = platform.python_version()
-version = version_detail[0] + version_detail[1] / 10
-env_version = os.getenv("PY_VERSION")
-
-if version < 3.7:
-    raise RuntimeError(
-        f"Paddle only supports Python version >= 3.7 now,"
-        f"you are using Python {python_version}"
-    )
-elif env_version is None:
-    print(f"export PY_VERSION = { python_version }")
-    os.environ["PY_VERSION"] = python_version
-
-elif env_version != version:
-    warnings.warn(
-        f"You set PY_VERSION={env_version}, but"
-        f"your current python environment is {version}"
-        f"we will use your current python version to execute"
-    )
-    os.environ["PY_VERSION"] = python_version
-
-paddle_include_path = paddle.sysconfig.get_include()
-paddle_lib_path = paddle.sysconfig.get_lib()
-
-print("Paddle Include Path:", paddle_include_path)
-print("Paddle Lib Path:", paddle_lib_path)
-
-# preparing parameters for setup()
-paddle_version = paddle.version.full_version
-cuda_version = paddle.version.cuda_version
+    prop = paddle.device.cuda.get_device_properties()
+    cc = prop.major * 10 + prop.minor
+    return ["-gencode", "arch=compute_{0},code=sm_{0}".format(cc)]
 
 
-with open("../../README.md", "r", encoding="utf-8") as fh:
-    long_description = fh.read()
+def run(func):
+    p = multiprocessing.Process(target=func)
+    p.start()
+    p.join()
 
 
-# ninja build does not work unless include_dirs are abs path
+def change_pwd():
+    path = os.path.dirname(__file__)
+    if path:
+        os.chdir(path)
+
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
-CUDA_HOME = find_cuda_home()
-PACKAGE_NAME = "paddle_flash_attn"
+def setup_fused_ln():
+    from paddle.utils.cpp_extension import CUDAExtension, setup
 
-
-def get_platform():
-    """
-    Returns the platform name as used in wheel filenames.
-    """
-    if sys.platform.startswith('linux'):
-        return 'linux_x86_64'
-    elif sys.platform == 'darwin':
-        mac_version = '.'.join(platform.mac_ver()[0].split('.')[:2])
-        return f'macosx_{mac_version}_x86_64'
-    elif sys.platform == 'win32':
-        return 'win_amd64'
-    else:
-        raise ValueError(f'Unsupported platform: {sys.platform}')
-
-
-def get_cuda_bare_metal_version(cuda_dir):
-    raw_output = subprocess.check_output(
-        [cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True
+    gencode_flags = get_gencode_flags()
+    change_pwd()
+    setup(
+        name="flash_attn",
+        ext_modules=CUDAExtension(
+            sources=[
+                "flash_attn.cu",
+     "flash_attn/src/cuda_utils.cu",
+     "flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim96_fp16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim160_fp16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim160_bf16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim192_fp16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim192_bf16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim224_fp16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim224_bf16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim256_fp16_sm80.cu",
+     "flash_attn/src/flash_fwd_hdim256_bf16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim32_fp16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim32_bf16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim64_fp16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim64_bf16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim96_fp16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim96_bf16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim128_fp16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim128_bf16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim160_fp16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim160_bf16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim192_fp16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim192_bf16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim224_fp16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim224_bf16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim256_fp16_sm80.cu",
+     "flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu",
+            ],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++17"] + gencode_flags,
+                "nvcc": [
+                        "-O3",
+                        "-std=c++17",
+                        "-U__CUDA_NO_HALF_OPERATORS__",
+                        "-U__CUDA_NO_HALF_CONVERSIONS__",
+                        "-U__CUDA_NO_HALF2_OPERATORS__",
+                        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                        "--expt-relaxed-constexpr",
+                        "--expt-extended-lambda",
+                        "--use_fast_math",
+                        "--ptxas-options=-v",
+                        # "--ptxas-options=-O2",
+                        "-lineinfo"
+                ]
+            },
+            include_dirs=[
+             "flash_attn",
+             "flash_attn/src",
+             "cutlass/include",
+            ],
+        ),
     )
-    output = raw_output.split()
-    release_idx = output.index("release") + 1
-    bare_metal_version = parse(output[release_idx].split(",")[0])
-
-    return raw_output, bare_metal_version
 
 
-def _is_cuda_available():
-    """
-    Check whether CUDA is available.
-    """
-    try:
-        assert len(paddle.static.cuda_places()) > 0
-        return True
-    except Exception as e:
-        logging.warning(
-            "You are using GPU version PaddlePaddle, but there is no GPU "
-            "detected on your machine. Maybe CUDA devices is not set properly."
-            f"\n Original Error is {e}"
-        )
-        return False
-
-
-check = _is_cuda_available()
-cmdclass = {}
-
-
-def get_package_version():
-    with open(Path(this_dir) / "../flash_attn" / "__init__.py", "r") as f:
-        version_match = re.search(
-            r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE
-        )
-    public_version = ast.literal_eval(version_match.group(1))
-    local_version = os.environ.get("FLASH_ATTN_LOCAL_VERSION")
-    if local_version:
-        return f"{public_version}+{local_version}"
-    else:
-        return str(public_version)
-
-
-def get_data_files():
-    data_files = []
-    #source_lib_path = 'libflashattn.so'
-    #data_files.append((".", [source_lib_path]))
-    data_files.append((".", ['libflashattn_advanced.so']))
-    return data_files
-
-
-class CustomWheelsCommand(_bdist_wheel):
-    """
-    The CachedWheelsCommand plugs into the default bdist wheel, which is ran by pip when it cannot
-    find an existing wheel (which is currently the case for all flash attention installs). We use
-    the environment parameters to detect whether there is already a pre-built version of a compatible
-    wheel available and short-circuits the standard full build pipeline.
-    """
-
-    def run(self):
-        self.run_command('build_ext')
-        super().run()
-        # Determine the version numbers that will be used to determine the correct wheel
-        # We're using the CUDA version used to build paddle, not the one currently installed
-        # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
-        python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
-        platform_name = get_platform()
-        flash_version = get_package_version()
-        cxx11_abi = ""  # str(paddle._C.-D_GLIBCXX_USE_CXX11_ABI).upper()
-
-        # Determine wheel URL based on CUDA version, paddle version, python version and OS
-        wheel_filename = f'{PACKAGE_NAME}-{flash_version}-cu{cuda_version}-paddle{paddle_version}-{python_version}-{python_version}-{platform_name}.whl'
-        impl_tag, abi_tag, plat_tag = self.get_tag()
-        original_wheel_name = (
-            f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
-        )
-
-        # new_wheel_name = wheel_filename
-        new_wheel_name = (
-            f"{self.wheel_dist_name}-{python_version}-{abi_tag}-{plat_tag}"
-        )
-        shutil.move(
-            f"{self.dist_dir}/{original_wheel_name}.whl",
-            f"{self.dist_dir}/{new_wheel_name}.whl",
-        )
-
-
-class CustomInstallCommand(_install):
-    def run(self):
-        _install.run(self)
-        install_path = self.install_lib
-        source_lib_path = os.path.abspath('libflashattn_advanced.so')
-        destination_lib_path = os.path.join(paddle_lib_path, 'libflashattn_advanced.so')
-        shutil.copy(f"{source_lib_path}", f"{destination_lib_path}")
-
-
-setup(
-    name=PACKAGE_NAME,
-    version=get_package_version(),
-    packages=find_packages(),
-    data_files=get_data_files(),
-    package_data={PACKAGE_NAME: ['build/libflashattn.so']},
-    author_email="Paddle-better@baidu.com",
-    description="Flash Attention: Fast and Memory-Efficient Exact Attention",
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    url="https://github.com/PaddlePaddle/flash-attention",
-    classifiers=[
-        "Programming Language :: Python :: 37",
-        "License :: OSI Approved :: BSD License",
-        "Operating System :: Unix",
-    ],
-    cmdclass={
-        'bdist_wheel': CustomWheelsCommand,
-        'install': CustomInstallCommand,
-    },
-    python_requires=">=3.7",
-    install_requires=[
-    "common",
-    "dual",
-    "tight>=0.1.0",
-    "data",
-    "prox",
-    "ninja",  # Put ninja before paddle if paddle depends on it
-    "einops",
-    "packaging",
-],
-)
+run(setup_fused_ln)

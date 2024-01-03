@@ -72,7 +72,7 @@ const char *flash_attn_error() {
       ASSERT_CHECK(batch_size > 0);                                      \
       ASSERT_CHECK(head_size % 8 == 0);                                  \
       ASSERT_CHECK(head_size <= 256);                                    \
-      ASSERT_CHECK(num_heads == num_heads_k);                            \
+      ASSERT_CHECK(num_heads % num_heads_k == 0);                        \
       if (attn_mask) {                                                   \
           ASSERT_CHECK(mask_dims[0] == batch_size);                      \
           ASSERT_CHECK(mask_dims[1] == 1 || mask_dims[1] == num_heads);  \
@@ -126,8 +126,8 @@ void set_params_fprop(Flash_fwd_params &params,
     params.v_ptr = v;
     // All stride are in elements, not bytes.
     params.q_row_stride = h * d;
-    params.k_row_stride = h * d;
-    params.v_row_stride = h * d;
+    params.k_row_stride = h_k * d;
+    params.v_row_stride = h_k * d;
     params.q_head_stride = d;
     params.k_head_stride = d;
     params.v_head_stride = d;
@@ -137,8 +137,8 @@ void set_params_fprop(Flash_fwd_params &params,
 
     if (cu_seqlens_q_d == nullptr) {
         params.q_batch_stride = seqlen_q * h * d;
-        params.k_batch_stride = seqlen_k * h * d;
-        params.v_batch_stride = seqlen_k * h * d;
+        params.k_batch_stride = seqlen_k * h_k * d;
+        params.v_batch_stride = seqlen_k * h_k * d;
         params.o_batch_stride = seqlen_q * h * d;
     }
 
@@ -258,8 +258,8 @@ void set_params_dgrad(Flash_bwd_params &params,
     if (cu_seqlens_q_d == nullptr) {
         params.do_batch_stride = seqlen_q * h * d;
         params.dq_batch_stride = seqlen_q * h * d;
-        params.dk_batch_stride = seqlen_k * h_k * d;
-        params.dv_batch_stride = seqlen_k * h_k * d;
+        params.dk_batch_stride = seqlen_k * h * d;
+        params.dv_batch_stride = seqlen_k * h * d;
     }
 
     params.dq_accum_ptr = dq_accum_d;

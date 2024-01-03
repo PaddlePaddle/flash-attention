@@ -1,11 +1,18 @@
 cmake_minimum_required(VERSION 3.9 FATAL_ERROR)
 project(flash-attention LANGUAGES CXX CUDA)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Git QUIET REQUIRED)
 
 execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
                 RESULT_VARIABLE GIT_SUBMOD_RESULT)
+
+#cmake -DWITH_ADVANCED=ON
+if (WITH_ADVANCED)
+  add_compile_definitions(PADDLE_WITH_ADVANCED)
+endif()
 
 add_definitions("-DFLASH_ATTN_WITH_TORCH=0")
 
@@ -55,6 +62,7 @@ target_include_directories(flashattn PRIVATE
     flash_attn
     ${CUTLASS_3_DIR}/include)
 
+if (WITH_ADVANCED)
 set(FA1_SOURCES_CU
     flash_attn_with_bias_and_mask/flash_attn_with_bias_mask.cu
     flash_attn_with_bias_and_mask/src/cuda_utils.cu
@@ -65,6 +73,12 @@ set(FA1_SOURCES_CU
     flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim64.cu
     flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim128.cu
     flash_attn_with_bias_and_mask/src/utils.cu)
+else()
+set(FA1_SOURCES_CU
+    flash_attn_with_bias_and_mask/flash_attn_with_bias_mask.cu
+    flash_attn_with_bias_and_mask/src/cuda_utils.cu
+    flash_attn_with_bias_and_mask/src/utils.cu)
+endif()
 
 add_library(flashattn_with_bias_mask STATIC
     flash_attn_with_bias_and_mask/
@@ -83,18 +97,14 @@ target_link_libraries(flashattn flashattn_with_bias_mask)
   
 add_dependencies(flashattn flashattn_with_bias_mask)
 
+set(NVCC_ARCH_BIN 80 CACHE STRING "CUDA architectures")
 
-if (NOT DEFINED NVCC_ARCH_BIN)
-  message(FATAL_ERROR "NVCC_ARCH_BIN is not defined.")
-endif()
-
-if (NVCC_ARCH_BIN STREQUAL "")
-  message(FATAL_ERROR "NVCC_ARCH_BIN is not set.")
-endif()
+message("NVCC_ARCH_BIN is set to: ${NVCC_ARCH_BIN}")
 
 STRING(REPLACE "-" ";" FA_NVCC_ARCH_BIN ${NVCC_ARCH_BIN})
 
 set(FA_GENCODE_OPTION "SHELL:")
+
 foreach(arch ${FA_NVCC_ARCH_BIN})
    if(${arch} GREATER_EQUAL 80)
      set(FA_GENCODE_OPTION "${FA_GENCODE_OPTION} -gencode arch=compute_${arch},code=sm_${arch}")
@@ -131,7 +141,25 @@ target_compile_options(flashattn_with_bias_mask PRIVATE $<$<COMPILE_LANGUAGE:CUD
   "${FA_GENCODE_OPTION}"
   >)
 
+
 INSTALL(TARGETS flashattn
         LIBRARY DESTINATION "lib")
 
 INSTALL(FILES capi/flash_attn.h DESTINATION "include")
+
+if (WITH_ADVANCED)
+  set_target_properties(flashattn PROPERTIES
+      OUTPUT_NAME libflashattn_advanced
+      PREFIX ""
+  )
+  add_custom_target(build_whl
+      COMMAND ${CMAKE_COMMAND} -E env python ${CMAKE_SOURCE_DIR}/setup.py bdist_wheel
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+      DEPENDS flashattn
+      COMMENT "Running build wheel"
+  )
+  
+  add_custom_target(default_target DEPENDS build_whl)
+  
+  set_property(DIRECTORY PROPERTY DEFAULT_TARGET default_target)
+endif()

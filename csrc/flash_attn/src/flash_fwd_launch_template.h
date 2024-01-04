@@ -36,6 +36,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     const bool return_softmax = params.p_ptr != nullptr;
     const bool is_attn_mask = params.attn_mask_ptr != nullptr;
     const bool is_equal_qk = (params.seqlen_q == params.seqlen_k) && (Is_causal) && (!is_attn_mask); 
+#ifdef PADDLE_WITH_ADVANCED
     BOOL_SWITCH(is_even_N, IsEvenNConst, [&] {
         BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
             BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
@@ -59,6 +60,29 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             });
         });
     });
+#else
+    BOOL_SWITCH(is_even_N, IsEvenNConst, [&] {
+        BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
+            BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
+                BOOL_SWITCH(is_equal_qk, Is_equal_seq_qk, [&] {
+                    // Will only return softmax if dropout, to reduce compilation time.
+                    auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenNConst, IsEvenKConst, ReturnSoftmaxConst && Is_dropout, false, Is_equal_seq_qk>;
+                    // auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenNConst, true, ReturnSoftmaxConst && Is_dropout>;
+                    if (smem_size >= 48 * 1024) {
+                        C10_CUDA_CHECK(cudaFuncSetAttribute(
+                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                    }
+                    int ctas_per_sm;
+                    cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                        &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
+                    // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
+                    kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                });
+            });
+        });
+    });
+#endif
 }
 
 template<typename T>

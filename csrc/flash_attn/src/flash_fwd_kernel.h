@@ -173,7 +173,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
         + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
 
-    const index_t row_offset_mask = ((bidb * params.mask_head_mod_size
+    const uint64_t row_offset_mask = (uint64_t)((bidb * params.mask_head_mod_size
         + (bidh % params.mask_head_mod_size)) * params.mask_seq_q_mod_size
         + (m_block * kBlockM % params.mask_seq_q_mod_size)) * params.seqlen_k
         + (n_block_max - 1) * kBlockN;

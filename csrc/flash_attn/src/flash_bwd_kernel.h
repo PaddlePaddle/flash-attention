@@ -477,7 +477,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     const index_t row_offset_dpsum = (bidb * params.h + bidh) * params.seqlen_q_rounded
         + (m_block_max - 1) * kBlockM;
 
-    const index_t row_offset_mask = ((bidb * params.mask_head_mod_size
+    const uint64_t row_offset_mask = (uint64_t)((bidb * params.mask_head_mod_size
         + (bidh % params.mask_head_mod_size)) * params.mask_seq_q_mod_size
         + ((m_block_max - 1) * kBlockM % params.mask_seq_q_mod_size)) * params.seqlen_k
         + n_block * kBlockN;

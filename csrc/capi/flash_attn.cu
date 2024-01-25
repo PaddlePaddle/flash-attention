@@ -114,6 +114,7 @@ void set_params_fprop(Flash_fwd_params &params,
                       bool is_causal,
                       bool is_bf16,
                       void * attn_mask = nullptr,
+                      void * attn_mask_start_row_indices = nullptr,
                       int mask_head_mod_size = 0,
                       int mask_seq_q_mod_size = 0) {
     // Reset the parameters
@@ -164,10 +165,15 @@ void set_params_fprop(Flash_fwd_params &params,
     params.d = d;
     params.d_rounded = d_rounded;
 
+
+
     // attn mask
     params.attn_mask_ptr = attn_mask;
     params.mask_head_mod_size = mask_head_mod_size;
     params.mask_seq_q_mod_size = mask_seq_q_mod_size;
+
+    // sparse mask row index
+    params.attn_mask_start_row_indices_ptr = attn_mask_start_row_indices;
 
     // Set the different scale values.
     params.scale_softmax = softmax_scale;
@@ -222,6 +228,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                       bool is_bf16,
                       const int num_splits = 0,
                       void * attn_mask = nullptr,
+                      void * attn_mask_start_row_indices = nullptr,
                       int mask_head_mod_size = 0,
                       int mask_seq_q_mod_size = 0) {
 
@@ -238,6 +245,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                      is_causal,
                      is_bf16,
                      attn_mask,
+                     attn_mask_start_row_indices,
                      mask_head_mod_size,
                      mask_seq_q_mod_size);
 
@@ -309,6 +317,7 @@ bool flash_attn_fwd(const void * const q,
                     uint64_t seed,
                     uint64_t offset,
                     const void * const attn_mask,
+                    const void * const attn_mask_start_row_indices,
                     const int64_t * const mask_dims) {
     FLASHATTNLIB_BEGIN_FUNC
     const bool is_dropout = p_dropout > 0.0;
@@ -316,6 +325,7 @@ bool flash_attn_fwd(const void * const q,
     const int mask_seq_q_mod_size = attn_mask ? mask_dims[2] : 0;
 
     CHECK_FWD_EXECTUABLE(seqlen_q, seqlen_k)
+
 
     Flash_fwd_params params;
     set_params_fprop(params,
@@ -338,6 +348,7 @@ bool flash_attn_fwd(const void * const q,
                      is_causal,
                      is_bf16,
                      const_cast<void *>(attn_mask),
+                     const_cast<void *>(attn_mask_start_row_indices),
                      mask_head_mod_size,
                      mask_seq_q_mod_size);
 
@@ -414,6 +425,7 @@ bool flash_attn_varlen_fwd(const void * const q,
                      is_causal,
                      is_bf16,
                      const_cast<void *>(attn_mask),
+                     nullptr,
                      mask_head_mod_size,
                      mask_seq_q_mod_size);
     
@@ -483,6 +495,7 @@ bool flash_attn_bwd(const void * const dout,
                     uint64_t seed,
                     uint64_t offset,
                     const void * const attn_mask,
+                    const void * const attn_mask_start_row_indices,
                     const int64_t * const mask_dims) {
     FLASHATTNLIB_BEGIN_FUNC
     const bool is_dropout = p_dropout > 0.0;
@@ -525,6 +538,7 @@ bool flash_attn_bwd(const void * const dout,
                      is_bf16,
                      num_splits,
                      const_cast<void *>(attn_mask),
+                     const_cast<void *>(attn_mask_start_row_indices),
                      mask_head_mod_size,
                      mask_seq_q_mod_size);
 
@@ -619,6 +633,7 @@ bool flash_attn_varlen_bwd(const void * const dout,
                      is_bf16,
                      num_splits,
                      const_cast<void *>(attn_mask),
+                     nullptr,
                      mask_head_mod_size,
                      mask_seq_q_mod_size);
 

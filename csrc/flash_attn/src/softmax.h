@@ -177,6 +177,41 @@ inline __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor, const u
     }
 }
 
+template <typename Engine, typename Layout, typename Engine1, typename Layout1>
+inline __device__ void apply_sparse_mask_causal(Tensor<Engine, Layout> &tensor, Tensor<Engine1, Layout1> &attn_mask_start_row_indices, const uint32_t col_idx_offset_,
+                                         const uint32_t max_seqlen_k, const uint32_t row_idx_offset_,
+                                         const uint32_t warp_row_stride, const uint32_t flag, const uint32_t m_block, const uint32_t n_block, const uint32_t bidb, const uint32_t bidh) {
+    // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
+    static_assert(Layout::rank == 2, "Only support 2D Tensor");
+    const uint32_t lane_id = threadIdx.x % 32;
+    // const uint32_t row_idx_offset = row_idx_offset_ + lane_id / 4;
+    const uint32_t row_idx_offset = row_idx_offset_;
+    const uint32_t col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+    #pragma unroll
+    for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+        const uint32_t row_idx_base = row_idx_offset + mi * warp_row_stride;
+        #pragma unroll
+        for (int i = 0; i < size<0, 0>(tensor); ++i) {
+            const uint32_t row_idx = row_idx_base + i * 8;
+            const uint32_t col_idx_limit = std::min(max_seqlen_k, row_idx + 1);
+            #pragma unroll
+            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+                const uint32_t col_idx_base = col_idx_offset + nj * 8;
+                #pragma unroll
+                for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                    const uint32_t col_idx = col_idx_base + j;
+                    if (col_idx >= col_idx_limit) {
+                        tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                    }
+                    else if (col_idx < col_idx_limit - 1 && row_idx >= attn_mask_start_row_indices(col_idx)) {
+                        tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // TODO(umiswing): support cu_attn_mask
 // This kernel should work after dealing with input cu_seq indicating mask position.
 template <typename Engine, typename Layout, typename T>

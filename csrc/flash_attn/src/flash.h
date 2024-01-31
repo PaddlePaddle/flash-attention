@@ -108,6 +108,7 @@ struct Flash_fwd_params : public Qkv_params {
     int mask_head_mod_size;
     int mask_seq_q_mod_size;
     void * __restrict__ attn_mask_start_row_indices_ptr;
+    int attn_mask_start_row;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

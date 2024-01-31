@@ -180,7 +180,7 @@ inline __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor, const u
 template <typename Engine, typename Layout, typename Engine1, typename Layout1>
 inline __device__ void apply_sparse_mask_causal(Tensor<Engine, Layout> &tensor, Tensor<Engine1, Layout1> &attn_mask_start_row_indices, const uint32_t col_idx_offset_,
                                          const uint32_t max_seqlen_k, const uint32_t row_idx_offset_,
-                                         const uint32_t warp_row_stride, const uint32_t flag, const uint32_t m_block, const uint32_t n_block, const uint32_t bidb, const uint32_t bidh) {
+                                         const uint32_t warp_row_stride, const uint32_t mask_col_idx_offset) {
     // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
     static_assert(Layout::rank == 2, "Only support 2D Tensor");
     const uint32_t lane_id = threadIdx.x % 32;
@@ -203,7 +203,7 @@ inline __device__ void apply_sparse_mask_causal(Tensor<Engine, Layout> &tensor, 
                     if (col_idx >= col_idx_limit) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
-                    else if (col_idx < col_idx_limit - 1 && row_idx >= attn_mask_start_row_indices(col_idx)) {
+                    else if (col_idx < col_idx_limit - 1 && row_idx >= attn_mask_start_row_indices(col_idx - mask_col_idx_offset)) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
                 }

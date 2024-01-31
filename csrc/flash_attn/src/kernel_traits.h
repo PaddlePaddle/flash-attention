@@ -119,7 +119,8 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kSmemKVCount = size(SmemLayoutKV{}) * 2;
     static constexpr int kSmemQSize = kSmemQCount * sizeof(Element);
     static constexpr int kSmemKVSize = kSmemKVCount * sizeof(Element);
-    static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
+    static constexpr int kSmemSparseMaskIndicesSize = kBlockN * sizeof(int32_t);
+    static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize + kSmemSparseMaskIndicesSize;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
@@ -312,15 +313,16 @@ struct Flash_bwd_kernel_traits : public Base {
     static constexpr int kSmemPSize = kSmemPCount * sizeof(Element);
     static constexpr int kSmemdQSize = kSmemdQCount * sizeof(Element);
     static constexpr int kSmemdPsumSize = kSmemdPsumCount * sizeof(ElementAccum);
+    static constexpr int kSmemSparseMaskIndicesSize = kBlockN * sizeof(int32_t);
     static constexpr int kSmemSize = kSmemQdOSize
         + (!Is_V_in_regs
            ? kSmemKVSize + kSmemdSSize + std::max(kSmemPSize, kSmemdQSize)
            : std::max(kSmemKVSize, kSmemKVSize / 2 + kSmemdSSize + std::max(kSmemPSize, kSmemdQSize)));
-    static constexpr int kSmemSize1colblock = kSmemQdOSize
+    static constexpr int kSmemSize1colblock = kSmemSparseMaskIndicesSize + kSmemQdOSize
         + (!Is_V_in_regs
            ? kSmemKVSize + kSmemdSSize + kSmemPSize
            : std::max(kSmemKVSize, kSmemKVSize / 2 + kSmemdSSize + kSmemPSize));
-    static constexpr int kSmemSize1rowblock = kSmemQdOSize / 3 * 2 + kSmemKVSize / 2 * 3
+    static constexpr int kSmemSize1rowblock = kSmemSparseMaskIndicesSize + kSmemQdOSize / 3 * 2 + kSmemKVSize / 2 * 3
         + kSmemdSSize + kSmemPSize;
 
 

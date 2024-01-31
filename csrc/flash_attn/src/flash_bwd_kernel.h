@@ -428,12 +428,14 @@ template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_M
 inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     const bool Is_sparse_attn_mask = params.attn_mask_start_row_indices_ptr != nullptr;
+    const int attn_mask_start_row = params.attn_mask_start_row;
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
 
     // Shared memory.
+    __shared__ int32_t sparse_mask_smem_[Kernel_traits::kBlockN];
     extern __shared__ char smem_[];
 
     // The thread index.
@@ -482,7 +484,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         + ((m_block_max - 1) * kBlockM % params.mask_seq_q_mod_size)) * params.seqlen_k
         + n_block * kBlockN;
 
-    const index_t row_offset_sparse_mask = (bidb * params.h + bidh) * params.seqlen_k;
+    const index_t row_offset_sparse_mask = (bidb * params.mask_head_mod_size + bidh % params.mask_head_mod_size) * params.seqlen_k + n_block * kBlockN;
 
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -512,7 +514,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor gMask = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_mask_ptr) + row_offset_mask),
                                Shape<Int<kBlockM>, Int<kBlockN>>{},
                                make_stride(params.seqlen_k, _1{}));
-    Tensor gSparseMask = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.attn_mask_start_row_indices_ptr) + row_offset_sparse_mask), params.seqlen_k);
+    Tensor gSparseMask = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.attn_mask_start_row_indices_ptr) + row_offset_sparse_mask),
+                               Shape<Int<kBlockN>>{});
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQdO{});
@@ -536,6 +539,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor sPtNoSwizzle = make_tensor(sP.data(), typename Kernel_traits::SmemLayoutPdStransposedNoSwizzle{});
     // sP and sdQ share the same memory so be careful
     Tensor sdQ = make_tensor(sP.data(), typename Kernel_traits::SmemLayoutdQ{});
+    Tensor sSparseMask = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_)), Shape<Int<kBlockN>>{});
     Tensor sdPsum = make_tensor(make_smem_ptr(reinterpret_cast<float2 *>((sP.data() + cute::max(size(sP), size(sdQ))).get())),
                                 Shape<Int<Kernel_traits::kSmemdPsumCount / 2>>{});
 
@@ -801,6 +805,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         cute::copy(smem_tiled_copy_KV, tdPsV, tdPrV_copy_view);
     }
 
+    if (Is_sparse_attn_mask) {
+	    if (tidx < kBlockN) {
+	    	sSparseMask(tidx) = gSparseMask(tidx);
+	    }
+	    __syncthreads();
+    }
+
     auto seed = params.rng_state[0];
     auto offset = params.rng_state[1] + (bidb * params.h + bidh) * 32 + tidx % 32;
 
@@ -855,10 +866,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             // (e.g., 256 and 2), the 2nd block of seqlen_q (from 128 to 255), we're not doing causal masking.
             // But we still want to mask out elements not beyond actual_seqlen_k.
 
-            if (Is_sparse_attn_mask) {
-                flash::apply_sparse_mask_causal(scores, gSparseMask, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16, binfo.actual_seqlen_k,
+            if (Is_sparse_attn_mask && m_block * kBlockM >= attn_mask_start_row) {
+                flash::apply_sparse_mask_causal(scores, sSparseMask, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16, binfo.actual_seqlen_k,
                                          m_block * kBlockM + get<0>(taccScS_row(0)),
-                                         AtomLayoutMS * 16, 1, m_block, n_block, bidb, bidh);
+                                         AtomLayoutMS * 16, n_block * kBlockN);
             } else if (m_block * kBlockM < (n_block + 1) * kBlockN
                 || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k)) {
                 flash::apply_mask_causal(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,

@@ -34,8 +34,10 @@ bool flash_attn_fwd(const void * const q,         // batch_size x seqlen_q x num
                     uint64_t seed,
                     uint64_t offset,
                     const void * const attn_mask,
+                    const int64_t * const mask_dims,
                     const void * const attn_mask_start_row_indices,
-                    const int64_t * const mask_dims);
+                    const int64_t * const attn_mask_start_row_indices_dims,
+                    const int attn_mask_start_row);
 
 bool flash_attn_varlen_fwd(const void * const q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                            const void * const k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
@@ -98,8 +100,10 @@ bool flash_attn_bwd(const void * const dout,  // batch_size x seqlen_q x num_hea
                     uint64_t seed,
                     uint64_t offset,
                     const void * const attn_mask,
+                    const int64_t * const mask_dims,
                     const void * const attn_mask_start_row_indices,
-                    const int64_t * const mask_dims);
+                    const int64_t * const attn_mask_start_row_indices_dims,
+                    const int attn_mask_start_row);
 
 bool flash_attn_varlen_bwd(const void * const dout,  // total_q x num_heads, x head_size
                            const void * const q,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i

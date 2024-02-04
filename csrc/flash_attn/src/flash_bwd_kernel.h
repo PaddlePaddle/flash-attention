@@ -806,9 +806,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     }
 
     if (Is_sparse_attn_mask) {
-	    if (tidx < kBlockN) {
-	    	sSparseMask(tidx) = gSparseMask(tidx);
-	    }
+        if (tidx < kBlockN) {
+	        sSparseMask(tidx) = gSparseMask(tidx);
+        }
 	    __syncthreads();
     }
 

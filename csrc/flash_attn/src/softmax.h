@@ -188,22 +188,23 @@ inline __device__ void apply_sparse_mask_causal(Tensor<Engine, Layout> &tensor, 
     const uint32_t row_idx_offset = row_idx_offset_;
     const uint32_t col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
     #pragma unroll
-    for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
-        const uint32_t row_idx_base = row_idx_offset + mi * warp_row_stride;
+    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+        const uint32_t col_idx_base = col_idx_offset + nj * 8;
         #pragma unroll
-        for (int i = 0; i < size<0, 0>(tensor); ++i) {
-            const uint32_t row_idx = row_idx_base + i * 8;
-            const uint32_t col_idx_limit = std::min(max_seqlen_k, row_idx + 1);
+        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+            const uint32_t col_idx = col_idx_base + j;
+            const uint32_t start_row = attn_mask_start_row_indices(col_idx - mask_col_idx_offset);
             #pragma unroll
-            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-                const uint32_t col_idx_base = col_idx_offset + nj * 8;
+            for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+                const uint32_t row_idx_base = row_idx_offset + mi * warp_row_stride;
                 #pragma unroll
-                for (int j = 0; j < size<1, 0>(tensor); ++j) {
-                    const uint32_t col_idx = col_idx_base + j;
+                for (int i = 0; i < size<0, 0>(tensor); ++i) {
+                    const uint32_t row_idx = row_idx_base + i * 8;
+                    const uint32_t col_idx_limit = std::min(max_seqlen_k, row_idx + 1);
                     if (col_idx >= col_idx_limit) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
-                    else if (col_idx < col_idx_limit - 1 && row_idx >= attn_mask_start_row_indices(col_idx - mask_col_idx_offset)) {
+                    else if (col_idx < col_idx_limit - 1 && row_idx >= start_row) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
                 }

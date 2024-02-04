@@ -180,7 +180,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         + (m_block * kBlockM % params.mask_seq_q_mod_size)) * params.seqlen_k
         + (n_block_max - 1) * kBlockN;
 
-    const index_t row_offset_sparse_mask = (bidb * params.h + bidh) * params.seqlen_k;
+    const index_t row_offset_sparse_mask = (bidb * params.mask_head_mod_size + bidh % params.mask_head_mod_size) * params.seqlen_k + (n_block_max - 1) * kBlockN;
 
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -417,12 +417,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             // if (cute::thread0()) { print(idx_row.layout()); print(stride<1>(idx_row)); printf("stride = %d \n", get<1>(stride<1>(idx_row))); }
             // I can't get the stride from idx_row
             if (Is_sparse_attn_mask && m_block * kBlockM >= attn_mask_start_row) {
-                // from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M_2), ncol=(2, MMA_N_8))
-                // ((_2,_2),(_2,_8)):((_2,_4),(_1,_8))
 	            if (tidx < kBlockN) {
-	            	sSparseMask(tidx) = gSparseMask(tidx);
-	            }
-	            __syncthreads();
+                    sSparseMask(tidx) = gSparseMask(tidx);
+                }
+                __syncthreads();
                 flash::apply_sparse_mask_causal(scores, sSparseMask, n_block * kBlockN, binfo.actual_seqlen_k,
                                          // m_block * kBlockM + get<0>(idx_row(0)),
                                          m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
@@ -527,11 +525,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             tPgMask.data() = tPgMask.data() + (-kBlockN);
         }
         if (Is_causal && Is_sparse_attn_mask && m_block * kBlockM >= params.attn_mask_start_row) {
-            // ((_2,_2),(_2,_8)):((_2,_4),(_1,_8)) 
 	        if (tidx < kBlockN) {
-	        	sSparseMask(tidx) = gSparseMask(tidx);
-	        }
-	        __syncthreads();
+                sSparseMask(tidx) = gSparseMask(tidx);
+            }
+            __syncthreads();
             flash::apply_sparse_mask_causal(scores, sSparseMask, n_block * kBlockN, binfo.actual_seqlen_k,
                                      // m_block * kBlockM + get<0>(idx_row(0)),
                                      m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,

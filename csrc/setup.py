@@ -24,12 +24,6 @@ from env_dict import env_dict
 from setuptools import setup
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
-python_version = sys.version_info
-if python_version < (3, 7):
-    raise RuntimeError(
-        f"Only supports Python version >= 3.7 now,"
-        f"you are using Python {python_version}"
-    )
 
 with open("../../README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -117,16 +111,13 @@ class CustomWheelsCommand(_bdist_wheel):
         wheel_name = 'paddle_flash_attn'
 
         # Determine wheel URL based on CUDA version, python version and OS
-        # wheel_filename = f'{wheel_name}-{flash_version}-cu{cuda_version}-{python_version}-{python_version}-{platform_name}'
-        # {distribution}-{version}(-{build tag})?-{python tag}-{abi tag}-{platform tag}.whl
-
         impl_tag, abi_tag, plat_tag = self.get_tag()
         archive_basename = (
             f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
         )
         wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
         print("Raw wheel path", wheel_path)
-        wheel_filename = f'{wheel_name}-{flash_version}+cu{cuda_version}-{python_version}-{abi_tag}-{platform_name}.whl'
+        wheel_filename = f'{wheel_name}-{flash_version}+cu{cuda_version}-{impl_tag}-{abi_tag}-{platform_name}.whl'
         os.rename(wheel_path, os.path.join(self.dist_dir, wheel_filename))
 
 

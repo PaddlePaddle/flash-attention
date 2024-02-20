@@ -3,6 +3,10 @@ project(flash-attention LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+
+set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CMAKE_COMMAND} -E time")
+set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "${CMAKE_COMMAND} -E time")
+
 find_package(Git QUIET REQUIRED)
 
 execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
@@ -149,13 +153,19 @@ INSTALL(TARGETS flashattn
 INSTALL(FILES capi/flash_attn.h DESTINATION "include")
 
 if (WITH_ADVANCED)
+  if(WIN32)
+    set(target_output_name "flashattn")
+  else()
+    set(target_output_name "libflashattn")
+  endif()
   set_target_properties(flashattn PROPERTIES
-      OUTPUT_NAME libflashattn_advanced
-      PREFIX ""
+    OUTPUT_NAME ${target_output_name}_advanced
+    PREFIX ""
   )
+
   configure_file(${CMAKE_SOURCE_DIR}/env_dict.py.in ${CMAKE_SOURCE_DIR}/env_dict.py @ONLY)
   set_target_properties(flashattn PROPERTIES
-      LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/paddle_flash_attn/lib
+      LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/paddle_flash_attn/
   )
   add_custom_target(build_whl
       COMMAND ${CMAKE_COMMAND} -E env python ${CMAKE_SOURCE_DIR}/setup.py bdist_wheel

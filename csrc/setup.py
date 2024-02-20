@@ -87,7 +87,7 @@ def get_package_data():
     binary_dir = env_dict.get("CMAKE_BINARY_DIR")
     lib = os.path.join(
         os.path.abspath(os.path.dirname(__file__)),
-        binary_dir + '/paddle_flash_attn/lib/libflashattn_advanced.so',
+        binary_dir + '/paddle_flash_attn/*',
     )
     package_data = {'paddle_flash_attn': [lib]}
     return package_data

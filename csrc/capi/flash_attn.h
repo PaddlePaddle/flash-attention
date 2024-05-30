@@ -214,6 +214,44 @@ bool flash_attn_varlen_bwd(const void * const dout,  // total_q x num_heads, x h
                            const int do_batch_stride,
                            const bool varlen_padded_input);
 
+bool reduce_attn_scores(
+                    const void * const q,
+                    const void * const k,
+                    const void * const softmax_lse,
+                    void * const reduced_scores,
+                    // umiswing: write attn scores to softmax_ptr, just for debugging.
+                    void * const softmax_ptr,
+                    const int batch_size,
+                    const int seqlen_q,
+                    const int seqlen_k,
+                    const int seqlen_q_rounded,
+                    const int seqlen_k_rounded,
+                    const int num_heads,
+                    const int num_heads_k,
+                    const int head_size,
+                    const int head_size_rounded,
+                    const float softmax_scale,
+                    const float softmax_unscale,
+                    const bool is_causal,
+                    const bool return_softmax,
+                    const bool is_bf16,
+                    const int num_splits,
+                    cudaStream_t stream,
+                    const void * const attn_mask,
+                    const int64_t * const mask_dims,
+                    const void * const attn_mask_start_row_indices,
+                    const int64_t * const attn_mask_start_row_indices_dims,
+                    const int attn_mask_start_row,
+                    const int q_row_stride,
+                    const int k_row_stride,
+                    const int q_head_stride,
+                    const int k_head_stride,
+                    const int o_row_stride,
+                    const int o_head_stride,
+                    const int q_batch_stride,
+                    const int k_batch_stride,
+                    const int o_batch_stride);
+
 bool flash_attn_fwd_with_bias_and_mask(const void *q,              // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                                        const void *k,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
                                        const void *v,              // total_k x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i

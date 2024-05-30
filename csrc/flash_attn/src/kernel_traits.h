@@ -378,3 +378,25 @@ struct Flash_bwd_kernel_traits : public Base {
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_,
+         int AtomLayoutMSdP_=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=2,
+         bool Is_V_in_regs_=false, bool No_double_buffer_=false, typename elem_type=cutlass::half_t,
+         typename Base=Flash_bwd_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_,
+                                               AtomLayoutMSdP_, AtomLayoutNdKV, AtomLayoutMdQ,
+                                               Is_V_in_regs_, No_double_buffer_, elem_type>>
+struct Reduce_kernel_traits : public Base {
+    static constexpr int kBlockN = kBlockN_;
+    static constexpr int kNThreads = kNWarps_ * 32;
+    static constexpr int kGmemElemsPerLoad = Base::kGmemElemsPerLoad;
+    static constexpr int kGmemThreadsPerRowP = kBlockN / kGmemElemsPerLoad;
+    static_assert(kNThreads % kGmemThreadsPerRowP == 0, "kNThreads must be a multiple of kGmemThreadsPerRowP");
+    using GmemLayoutAtomP = Layout<Shape <Int<kNThreads / kGmemThreadsPerRowP>, Int<kGmemThreadsPerRowP>>,
+                                   Stride<Int<kGmemThreadsPerRowP>, _1>>;
+    using GmemTiledCopyP = decltype(
+        make_tiled_copy(Copy_Atom<DefaultCopy, elem_type>{},
+                        GmemLayoutAtomP{},
+                        Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////

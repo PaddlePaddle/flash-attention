@@ -154,7 +154,13 @@ struct Flash_bwd_params : public Flash_fwd_params {
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+struct Reduce_attn_scores_params : public Flash_bwd_params {
+    void *__restrict__  reduced_scores;
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename T, int Headdim> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
 
 template<typename T, int Headdim> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream, const bool configure);
+
+template<typename T, int Headdim> void run_reduce_(Reduce_attn_scores_params &params, cudaStream_t stream, const bool configure);

@@ -17,7 +17,7 @@ namespace flash {
 
 using namespace cute;
 
-#define p(x) do {/* printf("\n%s\n",#x);print(x); */ } while(false)
+#define p(x) do {printf("\n%s\n",#x);print(x);} while(false)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -140,6 +140,9 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
 
     const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded)
         * params.seqlen_k_rounded;
+
+    // (b,n,1,s_k)
+    const index_t offset_reduced_scores = (bidb * params.h + bidh) * params.seqlen_k_rounded;
 
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -282,6 +285,14 @@ umiswing: comment out the fucking double buffer.
 	    __syncthreads();
     }
 
+    auto atomMNK = typename decltype(tiled_mma_sdp)::AtomShape_MNK{};
+    auto thrVMNK = typename decltype(tiled_mma_sdp)::ThrLayoutVMNK{};
+    auto shape_MN = Shape<Int<kBlockM>, Int<kBlockN>>{};
+
+    auto MMA_N = shape_div(size<1>(shape_MN), size<1>(atomMNK) * size<2>(thrVMNK));
+
+    Tensor local_reduced_scores = make_tensor<float>(Shape<Int<2>, Int<MMA_N>>{}); // (2, MMA_N)
+
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
         clear(acc_s);
@@ -290,17 +301,26 @@ umiswing: comment out the fucking double buffer.
 
         flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
                     smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
-
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
         // umiswing: I think it should be Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (row=(2, MMA_M), col=(2, MMA_N))? Just check gemm() in utils.h
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         // Compute the exponential value.
         flash::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);
+
+        // umiswing: add a fucking assert.
+        for(int n=0; n < size<1>(scores); ++n) {
+          for(int m=0;m<size<0>(scores);++m) {
+            local_reduced_scores(n) += scores(m,n);
+          }
+        }
+
 if(cute::thread0()) {
   p(kBlockM);
   p(kBlockN);
+  p(MMA_N);
   p(acc_s);
   p(scores);
+  p(local_reduced_scores);
   p(tiled_mma_sdp);
 }
 
@@ -383,6 +403,11 @@ umiswing: still, I don't think we need this shits.
 #endif
 
     }
+
+    write_reduced_scores(local_reduced_scores,
+                         reinterpret_cast<float *>(params.reduced_scores) + offset_reduced_scores,
+                         n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                         binfo.actual_seqlen_k);
 
     // Epilogue
 

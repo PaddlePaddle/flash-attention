@@ -394,5 +394,30 @@ inline __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename Engine, typename Layout, typename T>
+inline __device__ void write_reduced_scores(Tensor<Engine, Layout> &rScores,
+                                            T * const gScores_ptr,
+                                            const uint32_t col_idx_offset_,
+                                            const uint32_t max_seqlen_k) {
+    // rScores has shape (2, MMA_M) umiswing: or just 2*MMA_M?
+    static_assert(Layout::rank == 2, "Only support 2D Tensor");
+    const uint32_t lane_id = threadIdx.x % 32;
+    const uint32_t col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+
+    const uint32_t col_idx_limit = max_seqlen_k;
+    #pragma unroll
+    for (int nj = 0; nj < size<1>(rScores); ++nj) {
+        const uint32_t col_idx_base = col_idx_offset + nj * 8;
+        #pragma unroll
+        for (int j = 0; j < size<0>(rScores); ++j) {
+            const uint32_t col_idx = col_idx_base + j;
+            if (col_idx < col_idx_limit) {
+                atomicAdd(gScores_ptr+col_idx, rScores(j,nj));
+                // *(gScores_ptr+col_idx) = col_idx;
+            }
+        }
+    }
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace flash

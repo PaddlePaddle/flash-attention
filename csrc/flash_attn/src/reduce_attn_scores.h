@@ -17,6 +17,8 @@ namespace flash {
 
 using namespace cute;
 
+#define p(x) do {/* printf("\n%s\n",#x);print(x); */ } while(false)
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int MMA_N,
@@ -280,10 +282,6 @@ umiswing: comment out the fucking double buffer.
 	    __syncthreads();
     }
 
-    auto seed = params.rng_state[0];
-    auto offset = params.rng_state[1] + (bidb * params.h + bidh) * 32 + tidx % 32;
-
-
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
         clear(acc_s);
@@ -294,54 +292,17 @@ umiswing: comment out the fucking double buffer.
                     smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
 
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
+        // umiswing: I think it should be Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (row=(2, MMA_M), col=(2, MMA_N))? Just check gemm() in utils.h
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
-#if 0
-umiswing: comment out the annoying mask branch to make kernel code a little bit cleaner, just for debug.
-        // if (cute::thread(32, 0)) { print(scores); }
-        // TD [2023-07-29]: I was thinking that we don't need to mask out the elements beyond
-        // actual_seqlen_k, because acc_s would be some finite value for those indices.
-        // In the end when we multiply with K to get dQ, the corresponding values of K would be 0,
-        // so the result would still be correct.
-        // However, it's possible that the values in acc_s are so large that they overflow
-        // when we multiply with dP and convert to fp16, resulting in Inf in dS and NaNs in dQ.
-        // So we need to mask out the elements beyond actual_seqlen_k.
-        if (Is_attn_mask) {
-            flash::apply_attn_mask<Kernel_traits::TiledMmaSdP>(scores, tPgMask, tPcMask,
-                                                               m_block == m_block_max - 1 ? m_residue : params.seqlen_q,
-                                                               n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
-                                                               params.unscale_softmax);
-            tPgMask.data() = tPgMask.data() + (-kBlockM * params.seqlen_k);
-        }
-        if (!Is_causal) {
-            if (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k) {
-                flash::apply_mask(scores, binfo.actual_seqlen_k,
-                                  n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16);
-            }
-        } else {
-            // Putting this causal masking right after acc_s is *much* slower for some reason.
-            // TD [2023-08-16]: We need the 2nd condition because if seqlen_q is long and seqlen_k is short
-            // (e.g., 256 and 2), the 2nd block of seqlen_q (from 128 to 255), we're not doing causal masking.
-            // But we still want to mask out elements not beyond actual_seqlen_k.
-
-            if (Is_sparse_attn_mask && m_block * kBlockM >= attn_mask_start_row) {
-                flash::apply_sparse_mask_causal(scores, sSparseMask, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16, binfo.actual_seqlen_k,
-                                         m_block * kBlockM + get<0>(taccScS_row(0)),
-                                         AtomLayoutMS * 16, n_block * kBlockN);
-            } else if (m_block * kBlockM < (n_block + 1) * kBlockN
-                || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k)) {
-                flash::apply_mask_causal(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                                         binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
-                                         // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
-                                         AtomLayoutMS * 16);
-            }
-        }
-#endif
-        // if (cute::thread(32, 0)) { print(scores); }
         // Compute the exponential value.
-#if 0
-umiswing: comment out softmax for debug
         flash::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);
-#endif
+if(cute::thread0()) {
+  p(kBlockM);
+  p(kBlockN);
+  p(acc_s);
+  p(scores);
+  p(tiled_mma_sdp);
+}
 
 // umiswing: write attn scores out for debug
 if (/*Return_softmax=*/true) {
@@ -359,6 +320,15 @@ umiswing: I guess we don't need this.
         // if (cute::thread0()) { print(tPaP); }
         // __syncthreads();
         // if (cute::thread0()) { print(sP); }
+
+        if (Double_buffer && m_block > m_block_min) {  // Double buffer for sQ
+// umiswing: this is a stupid fake double buffer, just for debugging...
+            __syncthreads();
+            // Advance gQ
+            tQgQ.data() = tQgQ.data() + (-int(kBlockM * params.q_row_stride));
+            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ);
+            flash::cp_async_fence();
+        }
 
 #if 0
 umiswing: we only have one gemm now, should we keep double buffer?
@@ -394,14 +364,8 @@ umiswing: do we need to keep double buffer?
         if (Double_buffer) {  // Double buffer for sQ
         }
 #endif
-        if (Double_buffer) {  // Double buffer for sQ
-// umiswing: this is a stupid fake double buffer, just for debugging...
-            __syncthreads();
-            // Advance gQ
-            tQgQ.data() = tQgQ.data() + (-int(kBlockM * params.q_row_stride));
-            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ);
-            flash::cp_async_fence();
-        }
+#if 0
+// umiswing: actually we don't need this branch right now.
         if (!Double_buffer && m_block > m_block_min) {
             __syncthreads();
             // Advance gQ
@@ -409,6 +373,7 @@ umiswing: do we need to keep double buffer?
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ);
             flash::cp_async_fence();
         }
+#endif
 
 #if 0
 umiswing: still, I don't think we need this shits.

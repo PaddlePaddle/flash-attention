@@ -17,7 +17,24 @@ namespace flash {
 
 using namespace cute;
 
-#define p(x) do {printf("\n%s\n",#x);print(x);} while(false)
+#define p(x,sync) \
+do { \
+  if(sync) \
+    __syncthreads(); \
+  printf("\n%s\n",#x); \
+  if(sync) \
+    __syncthreads(); \
+  print(x); \
+  if(sync) \
+    __syncthreads(); \
+} while(false)
+
+#define p0(x) \
+do { \
+  if(cute::thread0()) { \
+    p(x,false); \
+  } \
+} while(false)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -48,58 +65,84 @@ make_tiled_copy_B_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int MMA_N,
-          class... Args,
-          class TiledMMA>
-CUTE_HOST_DEVICE
-auto
-make_tiled_copy_C_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
-                                  TiledMMA           const& tiled_mma) {
-    using TileShape_MNK = typename TiledMMA::TiledShape_MNK;
-    using AtomShape_MNK = typename TiledMMA::AtomShape_MNK;
-    constexpr int AtomShape_N = decltype(size<1>(AtomShape_MNK{}))::value;
-    // Divide by 2 because right now we always use 2 for the ValLayout
-    constexpr int kNWarpsN = decltype(size<1>(TileShape_MNK{}))::value / AtomShape_N / 2;
-    constexpr int MMAStride_N = MMA_N * AtomShape_N * 2;
-    auto t = make_tile(make_layout(size<0>(TileShape_MNK{})),
-                       Layout<Shape<Int<AtomShape_N>, Int<kNWarpsN>, _2>,   // (8, 2, 2) or (8, 4, 2)
-                              Stride<_1, Int<MMAStride_N>, _8> >{});       // (1, 64, 8) or (1, 32, 8)
-    // if (cute::thread0()) {printf("make_tiled_copy_C_warpcontiguousN "); print(t); printf("\n");  }
-    return make_tiled_copy_impl(copy_atom, tiled_mma.get_layoutC_TV(), t);
+template <typename Engine, typename Layout, typename T>
+inline __device__ void write_attn_scores(Tensor<Engine, Layout> &tensor, T * const gScores_ptr, const uint32_t col_idx_offset_,
+                                         const uint32_t max_seqlen_k, const uint32_t row_idx_offset_,
+                                         const uint32_t warp_row_stride) {
+    // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
+    static_assert(Layout::rank == 2, "Only support 2D Tensor");
+    const uint32_t lane_id = threadIdx.x % 32;
+    // const uint32_t row_idx_offset = row_idx_offset_ + lane_id / 4;
+    const uint32_t row_idx_offset = row_idx_offset_;
+    const uint32_t col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+    #pragma unroll
+    for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+        const uint32_t row_idx_base = row_idx_offset + mi * warp_row_stride;
+        #pragma unroll
+        for (int i = 0; i < size<0, 0>(tensor); ++i) {
+            const uint32_t row_idx = row_idx_base + i * 8;
+            // const uint32_t col_idx_limit = std::min(max_seqlen_k, row_idx + 1);
+            const uint32_t col_idx_limit = max_seqlen_k;
+            #pragma unroll
+            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+                const uint32_t col_idx_base = col_idx_offset + nj * 8;
+                #pragma unroll
+                for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                    const uint32_t col_idx = col_idx_base + j;
+                    if (col_idx < col_idx_limit) {
+                        // *(gScores_ptr + col_idx + row_idx*max_seqlen_k) = row_idx+col_idx;
+                        *(gScores_ptr + col_idx + row_idx*max_seqlen_k) = tensor(make_coord(i, mi), make_coord(j, nj));
+                        // *(gScores_ptr + col_idx) = col_idx;
+                    }
+                    if (col_idx >= col_idx_limit) {
+                        // tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                    }
+                }
+            }
+            // if (cute::thread0()) {
+            //     printf("mi = %d, i = %d, row_idx = %d, max_seqlen_k = %d\n", mi, i, row_idx, max_seqlen_k);
+            //     print(tensor(make_coord(i, mi), _));
+            //     // print(tensor(_, j + nj * size<1, 0>(tensor)));
+            // }
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+template <typename Engine, typename Layout, typename T>
+inline __device__ void write_reduced_scores(Tensor<Engine, Layout> &rScores,
+                                            T * const gScores_ptr,
+                                            const uint32_t col_idx_offset_,
+                                            const uint32_t max_seqlen_k) {
+    // rScores has shape (2, MMA_M) umiswing: or just 2*MMA_M?
+    static_assert(Layout::rank == 2, "Only support 2D Tensor");
+    const uint32_t lane_id = threadIdx.x % 32;
+    const uint32_t col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
 
-template<typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename TiledCopy>
-inline __device__ void write_softmax_to_gmem(
-    Tensor<Engine0, Layout0> const &tPrP, Tensor<Engine1, Layout1> &tPgP, TiledCopy gmem_tiled_copy_P
-) {
-#if 0
-    // Reshape tOrP from (8, MMA_M, MMA_N) to (8, MMA_M * MMA_N)
-    Layout l = tOrP.layout();
-    Tensor tPrP = make_tensor(tOrP.data(), make_layout(get<0>(l), make_layout(get<1>(l), get<2>(l))));
-    CUTE_STATIC_ASSERT_V(size<2>(tPgP) == _1{});
-    CUTE_STATIC_ASSERT_V(size<1>(tPrP) == size<1>(tPgP));
+    const uint32_t col_idx_limit = max_seqlen_k;
     #pragma unroll
-    for (int mi = 0; mi < size<1>(tPrP); ++mi) {
-        cute::copy(gmem_tiled_copy_P, tPrP(_, mi), tPgP(_, mi, 0));
+    for (int nj = 0; nj < size<1>(rScores); ++nj) {
+        const uint32_t col_idx_base = col_idx_offset + nj * 8;
+        #pragma unroll
+        for (int j = 0; j < size<0>(rScores); ++j) {
+            const uint32_t col_idx = col_idx_base + j;
+            if (col_idx < col_idx_limit) {
+                atomicAdd(gScores_ptr+col_idx, rScores(j,nj));
+                // *(gScores_ptr+col_idx) = col_idx;
+            }
+        }
     }
-#endif
-};
-
+}
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Is_attn_mask, bool Seq_parallel=false, typename Params>
 inline __device__ void reduce_attn_scores_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
-    const bool Is_sparse_attn_mask = params.attn_mask_start_row_indices_ptr != nullptr;
-    const int attn_mask_start_row = params.attn_mask_start_row;
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
 
     // Shared memory.
-    __shared__ int32_t sparse_mask_smem_[Kernel_traits::kBlockN];
     extern __shared__ char smem_[];
 
     // The thread index.
@@ -111,15 +154,9 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
     // constexpr int kNWarps = Kernel_traits::kNWarps;
     constexpr int MMA_N_SdP = kBlockN / decltype(size<1>(typename Kernel_traits::TiledMmaSdP::TiledShape_MNK{}))::value;
     constexpr int AtomLayoutMS = Kernel_traits::AtomLayoutMSdP;
-    constexpr bool Double_buffer = !Kernel_traits::No_double_buffer;
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (n_block * kBlockN >= binfo.actual_seqlen_k || binfo.actual_seqlen_q == 0) return;
-
-    // umiswing: residue is for predication of additional mask gmem access.
-    // Additional mask for varlen qkv is supported, but a varlen mask is not supported.
-    const int m_residue = params.seqlen_q % kBlockM ? params.seqlen_q % kBlockM : kBlockM;
-    const int n_residue = params.seqlen_k % kBlockN ? params.seqlen_k % kBlockN : kBlockN;
 
     const int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
     const int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
@@ -131,18 +168,11 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
     const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q
         + (m_block_max - 1) * kBlockM;
 
-    const uint64_t row_offset_mask = (uint64_t)((bidb * params.mask_head_mod_size
-        + (bidh % params.mask_head_mod_size)) * params.mask_seq_q_mod_size
-        + ((m_block_max - 1) * kBlockM % params.mask_seq_q_mod_size)) * params.seqlen_k
-        + n_block * kBlockN;
-
-    const index_t row_offset_sparse_mask = (bidb * params.mask_head_mod_size + bidh % params.mask_head_mod_size) * params.seqlen_k + n_block * kBlockN;
-
     const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded)
         * params.seqlen_k_rounded;
 
     // (b,n,1,s_k)
-    const index_t offset_reduced_scores = (bidb * params.h + bidh) * params.seqlen_k_rounded;
+    const index_t offset_reduced_scores = (bidb * params.h + bidh) * params.seqlen_k;
 
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -152,11 +182,6 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
                             make_stride(params.k_row_stride, _1{}));
     Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
                               Shape<Int<kBlockM>>{}, Stride<_1>{});
-    Tensor gMask = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_mask_ptr) + row_offset_mask),
-                               Shape<Int<kBlockM>, Int<kBlockN>>{},
-                               make_stride(params.seqlen_k, _1{}));
-    Tensor gSparseMask = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.attn_mask_start_row_indices_ptr) + row_offset_sparse_mask),
-                               Shape<Int<kBlockN>>{});
 
     // umiswing: should it be 16-bit?
     Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<float *>(params.p_ptr) + row_offset_p),
@@ -167,11 +192,8 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQdO{});
 
-    // umiswing: I'm not sure should I keep double buffer?
-    Tensor sK = make_tensor(sQ.data() + (Double_buffer ? 2 : 1) * size(sQ), typename Kernel_traits::SmemLayoutKV{});
+    Tensor sK = make_tensor(sQ.data() + size(sQ), typename Kernel_traits::SmemLayoutKV{});
     Tensor sP = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutPdS{});
-    // sP and sdQ share the same memory so be careful
-    Tensor sSparseMask = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_)), Shape<Int<kBlockN>>{});
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
@@ -182,10 +204,6 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
     Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
 
     typename Kernel_traits::TiledMmaSdP tiled_mma_sdp;
-    auto gmem_thr_copy_P = make_tiled_copy_C_warpcontiguousN<MMA_N_SdP>(typename Kernel_traits::SmemCopyAtomPdS{}, tiled_mma_sdp).get_thread_slice(tidx);
-    Tensor tPgMask = gmem_thr_copy_P.partition_D(gMask);
-    Tensor cMask = make_identity_tensor(shape(gMask));
-    Tensor tPcMask = gmem_thr_copy_P.partition_D(cMask);
 
     auto thr_mma_sdp = tiled_mma_sdp.get_thread_slice(tidx);
     Tensor tSrQ = thr_mma_sdp.partition_fragment_A(sQ);         // (MMA,MMA_N,MMA_K)
@@ -202,12 +220,6 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
     auto smem_tiled_copy_KV = make_tiled_copy_B_warpcontiguousN<MMA_N_SdP>(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_sdp);
     auto smem_thr_copy_KV = smem_tiled_copy_KV.get_thread_slice(tidx);
     Tensor tSsK = smem_thr_copy_KV.partition_S(sK);
-
-    // Partition sP and sdS to match the accumulator partitioning
-    // This has to be tiled_mma_sdp, not tiled_mma_dkv
-    auto smem_tiled_copy_PdS = make_tiled_copy_C_warpcontiguousN<MMA_N_SdP>(typename Kernel_traits::SmemCopyAtomPdS{}, tiled_mma_sdp);
-    auto smem_thr_copy_PdS = smem_tiled_copy_PdS.get_thread_slice(tidx);
-    Tensor tPsP = smem_thr_copy_PdS.partition_D(sP);      // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
     //
     // PREDICATES
@@ -244,14 +256,6 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
         return;
     }
 
-#if 0
-umiswing: comment out the fucking double buffer.
-    if (Double_buffer && m_block % 2 == 1) {  // Double buffer for sQ
-        tQsQ.data() = tQsQ.data() + size(sQ);
-        tSsQ.data() = tSsQ.data() + size(sQ);
-    }
-#endif
-
     if (!Is_first && !Seq_parallel) { __syncthreads(); }
 
 
@@ -270,20 +274,13 @@ umiswing: comment out the fucking double buffer.
     for (int mi = 0; mi < size(lse); ++mi) {
         // Using uint32_t row makes it 10us slower on d=128, not sure why.
         const int row = get<0>(taccScS_row(mi));
-        lse(mi) = Is_even_MN || row < binfo.actual_seqlen_q - m_block * kBlockM ? gLSE(row) : 0;
+        lse(mi) = Is_even_MN || row < binfo.actual_seqlen_q - m_block * kBlockM ? gLSE(row) : INFINITY;
     }
 
     flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
         gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
     );
     flash::cp_async_fence();
-
-    if (Is_sparse_attn_mask) {
-        if (tidx < kBlockN) {
-	        sSparseMask(tidx) = gSparseMask(tidx);
-        }
-	    __syncthreads();
-    }
 
     auto atomMNK = typename decltype(tiled_mma_sdp)::AtomShape_MNK{};
     auto thrVMNK = typename decltype(tiled_mma_sdp)::ThrLayoutVMNK{};
@@ -292,6 +289,7 @@ umiswing: comment out the fucking double buffer.
     auto MMA_N = shape_div(size<1>(shape_MN), size<1>(atomMNK) * size<2>(thrVMNK));
 
     Tensor local_reduced_scores = make_tensor<float>(Shape<Int<2>, Int<MMA_N>>{}); // (2, MMA_N)
+    cute::clear(local_reduced_scores);
 
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
@@ -314,15 +312,17 @@ umiswing: comment out the fucking double buffer.
           }
         }
 
+p0(Is_even_MN);
+p0(kBlockM);
+p0(kBlockN);
+p0(MMA_N);
+p0(acc_s);
+p0(scores);
 if(cute::thread0()) {
-  p(kBlockM);
-  p(kBlockN);
-  p(MMA_N);
-  p(acc_s);
-  p(scores);
-  p(local_reduced_scores);
-  p(tiled_mma_sdp);
+  printf("\nscores(2,3):%f\n",scores(2,3));
 }
+p0(local_reduced_scores);
+p0(tiled_mma_sdp);
 
 // umiswing: write attn scores out for debug
 if (/*Return_softmax=*/true) {
@@ -332,90 +332,26 @@ if (/*Return_softmax=*/true) {
                              binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
                              AtomLayoutMS * 16);
 }
-#if 0
-umiswing: I guess we don't need this.
-        Tensor tPaP = smem_thr_copy_PdS.retile_S(tPrP);     // ((Atom,AtomNum), MMA_N, MMA_N)
-        cute::copy(smem_tiled_copy_PdS, tPaP, tPsP);
-#endif
-        // if (cute::thread0()) { print(tPaP); }
-        // __syncthreads();
-        // if (cute::thread0()) { print(sP); }
 
-        if (Double_buffer && m_block > m_block_min) {  // Double buffer for sQ
-// umiswing: this is a stupid fake double buffer, just for debugging...
+        if (m_block > m_block_min) {
             __syncthreads();
             // Advance gQ
             tQgQ.data() = tQgQ.data() + (-int(kBlockM * params.q_row_stride));
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ);
             flash::cp_async_fence();
-        }
 
-#if 0
-umiswing: we only have one gemm now, should we keep double buffer?
-        if (Double_buffer && m_block > m_block_min) {
-            // Double buffer for sQ
-            const int sQ_offset = m_block % 2 == 0 ? size(sQ) : -size(sQ);
-            tQsQ.data() = tQsQ.data() + sQ_offset;
-            tSsQ.data() = tSsQ.data() + sQ_offset;
-            // Advance gQ
-            tQgQ.data() = tQgQ.data() + (-int(kBlockM * params.q_row_stride));
-            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ);
-            flash::cp_async_fence();
-        }
-#endif
-
-#if 0
-umiswing: do we need to keep this sync?
-        __syncthreads(); // Need syncthreads since we're writing to the same sdO location
-#endif
-
-        if (m_block > m_block_min) {
             gLSE.data() = gLSE.data() + (-int(kBlockM));
             #pragma unroll
             for (int mi = 0; mi < size(lse); ++mi) { lse(mi) = gLSE(get<0>(taccScS_row(mi))); }
         }
-
-        if (!Is_last) {
-        } else {
-        }
-
-#if 0
-umiswing: do we need to keep double buffer?
-        if (Double_buffer) {  // Double buffer for sQ
-        }
-#endif
-#if 0
-// umiswing: actually we don't need this branch right now.
-        if (!Double_buffer && m_block > m_block_min) {
-            __syncthreads();
-            // Advance gQ
-            tQgQ.data() = tQgQ.data() + (-int(kBlockM * params.q_row_stride));
-            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ);
-            flash::cp_async_fence();
-        }
-#endif
-
-#if 0
-umiswing: still, I don't think we need this shits.
-        if (Is_last) {
-            __syncthreads();
-        }
-#endif
-
     }
+
+p0(binfo.actual_seqlen_k);
 
     write_reduced_scores(local_reduced_scores,
                          reinterpret_cast<float *>(params.reduced_scores) + offset_reduced_scores,
                          n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                          binfo.actual_seqlen_k);
-
-    // Epilogue
-
-    // We need syncthreads here since we're writing to the same location as sK and sV.
-    // Without syncthreads, some thread might modify the location of sK while another thread
-    // is reading it for dQ gemm, leading to a race condition.
-    // If Is_last, there's already a __syncthreads() at the end of the loop.
-    if (!Is_last) { __syncthreads(); }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

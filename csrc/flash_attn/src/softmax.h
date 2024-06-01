@@ -292,49 +292,6 @@ inline __device__ void apply_attn_mask(
     }
 }
 
-template <typename Engine, typename Layout, typename T>
-inline __device__ void write_attn_scores(Tensor<Engine, Layout> &tensor, T * const gScores_ptr, const uint32_t col_idx_offset_,
-                                         const uint32_t max_seqlen_k, const uint32_t row_idx_offset_,
-                                         const uint32_t warp_row_stride) {
-    // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
-    static_assert(Layout::rank == 2, "Only support 2D Tensor");
-    const uint32_t lane_id = threadIdx.x % 32;
-    // const uint32_t row_idx_offset = row_idx_offset_ + lane_id / 4;
-    const uint32_t row_idx_offset = row_idx_offset_;
-    const uint32_t col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
-    #pragma unroll
-    for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
-        const uint32_t row_idx_base = row_idx_offset + mi * warp_row_stride;
-        #pragma unroll
-        for (int i = 0; i < size<0, 0>(tensor); ++i) {
-            const uint32_t row_idx = row_idx_base + i * 8;
-            // const uint32_t col_idx_limit = std::min(max_seqlen_k, row_idx + 1);
-            const uint32_t col_idx_limit = max_seqlen_k;
-            #pragma unroll
-            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-                const uint32_t col_idx_base = col_idx_offset + nj * 8;
-                #pragma unroll
-                for (int j = 0; j < size<1, 0>(tensor); ++j) {
-                    const uint32_t col_idx = col_idx_base + j;
-                    if (col_idx < col_idx_limit) {
-                        // *(gScores_ptr + col_idx + row_idx*max_seqlen_k) = row_idx+col_idx;
-                        *(gScores_ptr + col_idx + row_idx*max_seqlen_k) = tensor(make_coord(i, mi), make_coord(j, nj));
-                        // *(gScores_ptr + col_idx) = col_idx;
-                    }
-                    if (col_idx >= col_idx_limit) {
-                        // tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
-                    }
-                }
-            }
-            // if (cute::thread0()) {
-            //     printf("mi = %d, i = %d, row_idx = %d, max_seqlen_k = %d\n", mi, i, row_idx, max_seqlen_k);
-            //     print(tensor(make_coord(i, mi), _));
-            //     // print(tensor(_, j + nj * size<1, 0>(tensor)));
-            // }
-        }
-    }
-}
-
 template <bool encode_dropout_in_sign_bit=false, typename Engine, typename Layout>
 inline __device__ void apply_dropout(Tensor<Engine, Layout> &tensor, uint8_t p_dropout_in_uint8_t,
                                      unsigned long long seed, unsigned long long offset,

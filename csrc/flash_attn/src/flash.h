@@ -163,4 +163,4 @@ template<typename T, int Headdim> void run_mha_fwd_(Flash_fwd_params &params, cu
 
 template<typename T, int Headdim> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream, const bool configure);
 
-template<typename T, int Headdim> void run_reduce_(Reduce_attn_scores_params &params, cudaStream_t stream, const bool configure);
+template<typename T, int Headdim> void run_reduce_(Reduce_attn_scores_params &params, cudaStream_t stream);

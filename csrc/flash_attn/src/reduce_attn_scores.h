@@ -5,36 +5,14 @@
 
 #include <cutlass/cutlass.h>
 #include <cutlass/array.h>
-#include <cutlass/numeric_types.h>
-#include <cutlass/numeric_conversion.h>
 
 #include "block_info.h"
 #include "kernel_traits.h"
 #include "utils.h"
 #include "softmax.h"
-#include "philox.cuh"
 namespace flash {
 
 using namespace cute;
-
-#define p(x,sync) \
-do { \
-  if(sync) \
-    __syncthreads(); \
-  printf("\n%s\n",#x); \
-  if(sync) \
-    __syncthreads(); \
-  print(x); \
-  if(sync) \
-    __syncthreads(); \
-} while(false)
-
-#define p0(x) \
-do { \
-  if(cute::thread0()) { \
-    p(x,false); \
-  } \
-} while(false)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -65,9 +43,13 @@ make_tiled_copy_B_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename Engine, typename Layout, typename T>
-inline __device__ void write_attn_scores(Tensor<Engine, Layout> &tensor, T * const gScores_ptr, const uint32_t col_idx_offset_,
-                                         const uint32_t max_seqlen_k, const uint32_t row_idx_offset_,
+template <typename Engine, typename Layout>
+inline __device__ void write_attn_scores(Tensor<Engine, Layout> &tensor,
+                                         float * const gScores_ptr,
+                                         const uint32_t max_seqlen_q,
+                                         const uint32_t max_seqlen_k,
+                                         const uint32_t row_idx_offset_,
+                                         const uint32_t col_idx_offset_,
                                          const uint32_t warp_row_stride) {
     // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
     static_assert(Layout::rank == 2, "Only support 2D Tensor");
@@ -75,35 +57,25 @@ inline __device__ void write_attn_scores(Tensor<Engine, Layout> &tensor, T * con
     // const uint32_t row_idx_offset = row_idx_offset_ + lane_id / 4;
     const uint32_t row_idx_offset = row_idx_offset_;
     const uint32_t col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+    const uint32_t row_idx_limit = max_seqlen_q;
+    const uint32_t col_idx_limit = max_seqlen_k;
     #pragma unroll
     for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
         const uint32_t row_idx_base = row_idx_offset + mi * warp_row_stride;
         #pragma unroll
         for (int i = 0; i < size<0, 0>(tensor); ++i) {
             const uint32_t row_idx = row_idx_base + i * 8;
-            // const uint32_t col_idx_limit = std::min(max_seqlen_k, row_idx + 1);
-            const uint32_t col_idx_limit = max_seqlen_k;
             #pragma unroll
             for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                 const uint32_t col_idx_base = col_idx_offset + nj * 8;
                 #pragma unroll
                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
                     const uint32_t col_idx = col_idx_base + j;
-                    if (col_idx < col_idx_limit) {
-                        // *(gScores_ptr + col_idx + row_idx*max_seqlen_k) = row_idx+col_idx;
+                    if (row_idx < row_idx_limit && col_idx < col_idx_limit) {
                         *(gScores_ptr + col_idx + row_idx*max_seqlen_k) = tensor(make_coord(i, mi), make_coord(j, nj));
-                        // *(gScores_ptr + col_idx) = col_idx;
-                    }
-                    if (col_idx >= col_idx_limit) {
-                        // tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
                 }
             }
-            // if (cute::thread0()) {
-            //     printf("mi = %d, i = %d, row_idx = %d, max_seqlen_k = %d\n", mi, i, row_idx, max_seqlen_k);
-            //     print(tensor(make_coord(i, mi), _));
-            //     // print(tensor(_, j + nj * size<1, 0>(tensor)));
-            // }
         }
     }
 }
@@ -135,7 +107,7 @@ inline __device__ void write_reduced_scores(Tensor<Engine, Layout> &rScores,
 }
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Is_attn_mask, bool Seq_parallel=false, typename Params>
+template<typename Kernel_traits, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void reduce_attn_scores_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -159,7 +131,6 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
     if (n_block * kBlockN >= binfo.actual_seqlen_k || binfo.actual_seqlen_q == 0) return;
 
     const int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
-    const int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
 
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
@@ -168,8 +139,8 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
     const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q
         + (m_block_max - 1) * kBlockM;
 
-    const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded)
-        * params.seqlen_k_rounded;
+    const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q)
+        * params.seqlen_k;
 
     // (b,n,1,s_k)
     const index_t offset_reduced_scores = (bidb * params.h + bidh) * params.seqlen_k;
@@ -182,12 +153,6 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
                             make_stride(params.k_row_stride, _1{}));
     Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
                               Shape<Int<kBlockM>>{}, Stride<_1>{});
-
-    // umiswing: should it be 16-bit?
-    Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<float *>(params.p_ptr) + row_offset_p),
-                            Shape<Int<kBlockM>, Int<kBlockN>>{},
-                            // umiswing: i don't think it should be rounded.
-                            make_stride(params.seqlen_k, _1{}));
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQdO{});
@@ -245,24 +210,11 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
     // Prologue
 
     int m_block = m_block_max - 1;
-    int m_block_min = !Is_causal ? 0 : (n_block * kBlockN) / kBlockM;
-
-    // umiswing: handle with the early exit case, write 0 to the reduced attn scores?
-    // We might need to exit early and write 0 to dK and dV.
-    // Otherwise we get wrong result for the case where we don't enter the for loop.
-    // And we might read OOB elements from gQ and gdO.
-    // TODO: what if we're not parallelizing, do we need to compute dot_do_o?
-    if (Is_causal && m_block < m_block_min) {
-        return;
-    }
-
-    if (!Is_first && !Seq_parallel) { __syncthreads(); }
-
+    int m_block_min = 0;
 
     flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
         gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM
     );
-
 
     Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});    // (BLK_M,BLK_N) -> (blk_m,blk_n)
     Tensor taccScS = thr_mma_sdp.partition_C(caccS);                           // (MMA,MMA_N,MMA_N)
@@ -300,41 +252,34 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
         flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
                     smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
-        // umiswing: I think it should be Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (row=(2, MMA_M), col=(2, MMA_N))? Just check gemm() in utils.h
+        // umiswing: I think it should be Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (row=(2, MMA_M), col=(2, MMA_N)). Just check gemm() in utils.h
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+
         // Compute the exponential value.
         flash::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);
 
-        // umiswing: add a fucking assert.
+        if (Return_softmax) {
+            flash::write_attn_scores(scores,
+                                     reinterpret_cast<float *>(params.p_ptr) + row_offset_p,
+                                     binfo.actual_seqlen_q,
+                                     binfo.actual_seqlen_k,
+                                     m_block * kBlockM + get<0>(taccScS_row(0)),
+                                     n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                                     AtomLayoutMS * 16);
+        }
+
+        CUTE_STATIC_ASSERT_V(size(local_reduced_scores) == size<1>(scores));
+        static_assert(decltype(size<0>(local_reduced_scores))::value == decltype(size<1,0>(scores))::value);
+        static_assert(decltype(size<1>(local_reduced_scores))::value == decltype(size<1,1>(scores))::value);
+        #pragma unroll
         for(int n=0; n < size<1>(scores); ++n) {
+          #pragma unroll
           for(int m=0;m<size<0>(scores);++m) {
             local_reduced_scores(n) += scores(m,n);
           }
         }
 
-p0(Is_even_MN);
-p0(kBlockM);
-p0(kBlockN);
-p0(MMA_N);
-p0(acc_s);
-p0(scores);
-if(cute::thread0()) {
-  printf("\nscores(2,3):%f\n",scores(2,3));
-}
-p0(local_reduced_scores);
-p0(tiled_mma_sdp);
-
-// umiswing: write attn scores out for debug
-if (/*Return_softmax=*/true) {
-    flash::write_attn_scores(scores,
-                             reinterpret_cast<Element *>(params.p_ptr) + row_offset_p,
-                             n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                             binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
-                             AtomLayoutMS * 16);
-}
-
         if (m_block > m_block_min) {
-            __syncthreads();
             // Advance gQ
             tQgQ.data() = tQgQ.data() + (-int(kBlockM * params.q_row_stride));
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ);
@@ -346,8 +291,6 @@ if (/*Return_softmax=*/true) {
         }
     }
 
-p0(binfo.actual_seqlen_k);
-
     write_reduced_scores(local_reduced_scores,
                          reinterpret_cast<float *>(params.reduced_scores) + offset_reduced_scores,
                          n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
@@ -356,8 +299,7 @@ p0(binfo.actual_seqlen_k);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Is_attn_mask, bool Is_deterministic>
-// inline __device__ void reduce_attn_scores_seqk_parallel(const Reduce_attn_scores_params &params) {
+template<typename Kernel_traits, bool Is_even_MN, bool Is_even_K, bool Return_softmax>
 __global__ void reduce_attn_scores_seqk_parallel(const Reduce_attn_scores_params params) {
     const int n_block = blockIdx.x;
     // The block index for the batch.
@@ -365,15 +307,8 @@ __global__ void reduce_attn_scores_seqk_parallel(const Reduce_attn_scores_params
     // The block index for the head.
     const int bidh = blockIdx.z;
     constexpr int kBlockN = Kernel_traits::kBlockN;
-    if (Is_deterministic) {  // params.num_splits == 1, means grid.x = 1, blockIdx.x = 0;
-        int loop_step_x = 0;
-        for(int i = 0; i < params.seqlen_k; i+= kBlockN) {
-           reduce_attn_scores_1colblock<Kernel_traits, Is_causal, Is_even_MN, Is_even_K, false, false, Is_attn_mask, /*Seq_parallel=*/true>(params, bidb, bidh, loop_step_x);
-           loop_step_x += 1;
-        }
-    } else {
-        reduce_attn_scores_1colblock<Kernel_traits, Is_causal, Is_even_MN, Is_even_K, false, false, Is_attn_mask, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
-    }
+
+    reduce_attn_scores_1colblock<Kernel_traits, Is_even_MN, Is_even_K, Return_softmax>(params, bidb, bidh, n_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

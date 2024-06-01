@@ -90,6 +90,11 @@ const char *flash_attn_error() {
           ASSERT_CHECK(is_sm80 || is_sm90);                                                \
       }
 
+#define CHECK_REDUCE_EXECTUABLE(__seqlen_q, __seqlen_k) \
+      const void * attn_mask = nullptr;                 \
+      const int64_t * mask_dims = nullptr;              \
+      CHECK_BWD_EXECTUABLE(__seqlen_q, __seqlen_k)
+
 void set_params_fprop_strided(Flash_fwd_params &params,
                       // sizes
                       const size_t b,
@@ -525,24 +530,24 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     });
 }
 
-void run_reduce_attn_scores(Reduce_attn_scores_params &params, cudaStream_t stream, const bool configure) {
+void run_reduce_attn_scores(Reduce_attn_scores_params &params, cudaStream_t stream) {
     FP16_SWITCH(!params.is_bf16, [&] {
         if (params.d <= 32) {
-            run_reduce_<elem_type, 32>(params, stream, configure);
+            run_reduce_<elem_type, 32>(params, stream);
         } else if (params.d <= 64) {
-            run_reduce_<elem_type, 64>(params, stream, configure);
+            run_reduce_<elem_type, 64>(params, stream);
         } else if (params.d <= 96) {
-            run_reduce_<elem_type, 96>(params, stream, configure);
+            run_reduce_<elem_type, 96>(params, stream);
         } else if (params.d <= 128) {
-            run_reduce_<elem_type, 128>(params, stream, configure);
+            run_reduce_<elem_type, 128>(params, stream);
         } else if (params.d <= 160) {
-            run_reduce_<elem_type, 160>(params, stream, configure);
+            run_reduce_<elem_type, 160>(params, stream);
         } else if (params.d <= 192) {
-            run_reduce_<elem_type, 192>(params, stream, configure);
+            run_reduce_<elem_type, 192>(params, stream);
         } else if (params.d <= 224) {
-          run_reduce_<elem_type, 224>(params, stream, configure);
+          run_reduce_<elem_type, 224>(params, stream);
         } else if (params.d <= 256) {
-          run_reduce_<elem_type, 256>(params, stream, configure);
+          run_reduce_<elem_type, 256>(params, stream);
         }
     });
 }
@@ -594,7 +599,6 @@ bool flash_attn_fwd(const void * const q,
                     const int v_batch_stride,
                     const int o_batch_stride) {
     FLASHATTNLIB_BEGIN_FUNC
-std::cout<<"\nreach flash_attn_fwd"<<std::endl;
     const bool is_dropout = p_dropout > 0.0;
     const int mask_head_mod_size = attn_mask ? mask_dims[1] : attn_mask_start_row_indices ? attn_mask_start_row_indices_dims[1] : 0;
     const int mask_seq_q_mod_size = attn_mask ? mask_dims[2] : 0;
@@ -1073,50 +1077,34 @@ bool flash_attn_varlen_bwd(const void * const dout,
 
 }
 
-bool reduce_attn_scores(
-                    const void * const q,
-                    const void * const k,
-                    const void * const softmax_lse,
-                    void * const reduced_scores,
-                    // umiswing: write attn scores to softmax_ptr, just for debugging.
-                    void * const softmax_ptr,
-                    const int batch_size,
-                    const int seqlen_q,
-                    const int seqlen_k,
-                    const int seqlen_q_rounded,
-                    const int seqlen_k_rounded,
-                    const int num_heads,
-                    const int num_heads_k,
-                    const int head_size,
-                    const int head_size_rounded,
-                    const float softmax_scale,
-                    const float softmax_unscale,
-                    const bool is_causal,
-                    const bool return_softmax,
-                    const bool is_bf16,
-                    const int num_splits,
-                    cudaStream_t stream,
-                    const void * const attn_mask,
-                    const int64_t * const mask_dims,
-                    const void * const attn_mask_start_row_indices,
-                    const int64_t * const attn_mask_start_row_indices_dims,
-                    const int attn_mask_start_row,
-                    const int q_row_stride,
-                    const int k_row_stride,
-                    const int q_head_stride,
-                    const int k_head_stride,
-                    const int o_row_stride,
-                    const int o_head_stride,
-                    const int q_batch_stride,
-                    const int k_batch_stride,
-                    const int o_batch_stride) {
+bool reduce_attn_scores(const void * const q,
+                        const void * const k,
+                        const void * const softmax_lse,
+                        void * const reduced_scores,
+                        void * const softmax_ptr,
+                        const int batch_size,
+                        const int seqlen_q,
+                        const int seqlen_k,
+                        const int num_heads,
+                        const int num_heads_k,
+                        const int head_size,
+                        const float softmax_scale,
+                        const bool return_softmax,
+                        const bool is_bf16,
+                        const int num_splits,
+                        cudaStream_t stream,
+                        const int q_row_stride,
+                        const int k_row_stride,
+                        const int o_row_stride,
+                        const int q_head_stride,
+                        const int k_head_stride,
+                        const int o_head_stride,
+                        const int q_batch_stride,
+                        const int k_batch_stride,
+                        const int o_batch_stride) {
     FLASHATTNLIB_BEGIN_FUNC
-std::cout << "\nreach reduce_attn_scores()" << std::endl;
-std::cout << "\nq pointer:" << q << std::endl;
-    const int mask_head_mod_size = attn_mask ? mask_dims[1] : attn_mask_start_row_indices ? attn_mask_start_row_indices_dims[1] : 0;
-    const int mask_seq_q_mod_size = attn_mask ? mask_dims[2] : 0;
 
-    CHECK_BWD_EXECTUABLE(seqlen_q, seqlen_k)
+    CHECK_REDUCE_EXECTUABLE(seqlen_q, seqlen_k)
 
     // bool loop = seqlen_k > blocksize_c;
     // TODO: change later, for now set to true for simplicity
@@ -1124,77 +1112,63 @@ std::cout << "\nq pointer:" << q << std::endl;
 
     Reduce_attn_scores_params params;
 
-std::cout << "\nbefore set params" << std::endl;
     set_params_dgrad_strided(params,
-                     batch_size,
-                     seqlen_q, seqlen_k,
-                     seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
-                     head_size, head_size_rounded,
-                     const_cast<void *>(q),
-                     const_cast<void *>(k),
-                     /*v=*/nullptr,
-                     const_cast<void *>(reduced_scores),
-                     /*dout=*/nullptr,
-                     /*dq=*/nullptr,
-                     /*dk=*/nullptr,
-                     /*dv=*/nullptr,
-                     /*cu_seqlens_q_d=*/nullptr,
-                     /*cu_seqlens_k_d=*/nullptr,
-                     /*dq_accum_d=*/nullptr,
-                     /*dk_accum_d=*/nullptr,
-                     /*dv_accum_d=*/nullptr,
-                     const_cast<void *>(softmax_lse),
-                     /*dsoftmax_sum_d=*/nullptr,
-                     /*p_dropout=*/0.0f,
-                     softmax_scale,
-                     softmax_unscale,
-                     is_causal,
-                     is_bf16,
-                     q_row_stride,
-                     k_row_stride,
-                     /*v_row_stride=*/0,
-                     q_head_stride,
-                     k_head_stride,
-                     /*v_head_stride=*/0,
-                     o_row_stride,
-                     o_head_stride,
-                     q_batch_stride,
-                     k_batch_stride,
-                     /*v_batch_stride=*/0,
-                     o_batch_stride,
-                     /*dq_row_stride=*/0,
-                     /*dk_row_stride=*/0,
-                     /*dv_row_stride=*/0,
-                     /*dq_head_stride=*/0,
-                     /*dk_head_stride=*/0,
-                     /*dv_head_stride=*/0,
-                     /*do_row_stride=*/0,
-                     /*do_head_stride=*/0,
-                     /*dq_batch_stride=*/0,
-                     /*dk_batch_stride=*/0,
-                     /*dv_batch_stride=*/0,
-                     /*do_batch_stride=*/0,
-                     /*varlen_padded_input=*/false,
-                     num_splits,
-                     const_cast<void *>(attn_mask),
-                     const_cast<void *>(attn_mask_start_row_indices),
-                     attn_mask_start_row,
-                     mask_head_mod_size,
-                     mask_seq_q_mod_size);
+                             batch_size,
+                             seqlen_q, seqlen_k,
+                             /*seqlen_q_rounded=*/0, /*seqlen_k_rounded=*/0,
+                             num_heads, num_heads_k,
+                             head_size, /*head_size_rounded=*/0,
+                             const_cast<void *>(q),
+                             const_cast<void *>(k),
+                             /*v=*/nullptr,
+                             const_cast<void *>(reduced_scores),
+                             /*dout=*/nullptr,
+                             /*dq=*/nullptr,
+                             /*dk=*/nullptr,
+                             /*dv=*/nullptr,
+                             /*cu_seqlens_q_d=*/nullptr,
+                             /*cu_seqlens_k_d=*/nullptr,
+                             /*dq_accum_d=*/nullptr,
+                             /*dk_accum_d=*/nullptr,
+                             /*dv_accum_d=*/nullptr,
+                             const_cast<void *>(softmax_lse),
+                             /*dsoftmax_sum_d=*/nullptr,
+                             /*p_dropout=*/0.0f,
+                             softmax_scale,
+                             /*softmax_unscale=*/0,
+                             /*is_causal=*/false,
+                             is_bf16,
+                             q_row_stride,
+                             k_row_stride,
+                             /*v_row_stride=*/0,
+                             q_head_stride,
+                             k_head_stride,
+                             /*v_head_stride=*/0,
+                             o_row_stride,
+                             o_head_stride,
+                             q_batch_stride,
+                             k_batch_stride,
+                             /*v_batch_stride=*/0,
+                             o_batch_stride,
+                             /*dq_row_stride=*/0,
+                             /*dk_row_stride=*/0,
+                             /*dv_row_stride=*/0,
+                             /*dq_head_stride=*/0,
+                             /*dk_head_stride=*/0,
+                             /*dv_head_stride=*/0,
+                             /*do_row_stride=*/0,
+                             /*do_head_stride=*/0,
+                             /*dq_batch_stride=*/0,
+                             /*dk_batch_stride=*/0,
+                             /*dv_batch_stride=*/0,
+                             /*do_batch_stride=*/0);
 
     params.reduced_scores = reduced_scores;
     params.p_ptr = softmax_ptr;
-std::cout<<"\nbefore launch"<<std::endl;;
-std::cout << "\nparams.q_ptr:" << params.q_ptr << std::endl;
 
     auto launch = &run_reduce_attn_scores;
-    // auto launch = &run_mha_fwd;
 
-    launch(params, stream, /*configure=*/false);
-cudaDeviceSynchronize();
-
-std::cout<<"\nafter launch sync"<<std::endl;
+    launch(params, stream);
     
     return true;
     

@@ -13,14 +13,15 @@ set(CUTLASS_3_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cutlass)
 
 set(FA2_SOURCES_CU
      flash_attn/src/cuda_utils.cu
-     flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim128_fp16_sm80.cu
+     #[[flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu
      flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu
      flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu
      flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu
      flash_attn/src/flash_fwd_hdim96_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu
+     flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu]]
      flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu
+     #[[flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu
      flash_attn/src/flash_fwd_hdim160_fp16_sm80.cu
      flash_attn/src/flash_fwd_hdim160_bf16_sm80.cu
      flash_attn/src/flash_fwd_hdim192_fp16_sm80.cu
@@ -44,7 +45,7 @@ set(FA2_SOURCES_CU
      flash_attn/src/flash_bwd_hdim224_fp16_sm80.cu
      flash_attn/src/flash_bwd_hdim224_bf16_sm80.cu
      flash_attn/src/flash_bwd_hdim256_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu
+     flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu]]
   )
 
 add_library(flashattn SHARED
@@ -56,14 +57,14 @@ target_include_directories(flashattn PRIVATE
     ${CUTLASS_3_DIR}/include)
 
 set(FA1_SOURCES_CU
-    flash_attn_with_bias_and_mask/flash_attn_with_bias_mask.cu
+    #[[flash_attn_with_bias_and_mask/flash_attn_with_bias_mask.cu
     flash_attn_with_bias_and_mask/src/cuda_utils.cu
     flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim32.cu
     flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim64.cu
     flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim128.cu
     flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim32.cu
     flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim64.cu
-    flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim128.cu
+    flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim128.cu]]
     flash_attn_with_bias_and_mask/src/utils.cu)
 
 add_library(flashattn_with_bias_mask STATIC
@@ -113,6 +114,8 @@ target_compile_options(flashattn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
   --expt-relaxed-constexpr
   --expt-extended-lambda
   --use_fast_math
+  # -Xptxas="-v"
+  # -dc
   "${FA_GENCODE_OPTION}"
   >)
 

@@ -20,17 +20,17 @@ void run_reduce_seqk_parallel(Reduce_attn_scores_params &params, cudaStream_t st
     // a multiple of kBlockN, we'll need to apply mask in the loop.
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_q % Kernel_traits::kBlockM == 0 && params.seqlen_k % Kernel_traits::kBlockN == 0;
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
-    constexpr int smem_size_dq_dk_dv = Kernel_traits::kSmemSize1colblock;
+    constexpr int smem_size = Kernel_traits::kSmemSize;
     const bool return_softmax = params.p_ptr != nullptr;
     BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
         BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
             BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
                     auto kernel = &flash::reduce_attn_scores_seqk_parallel<Kernel_traits, IsEvenMNConst, IsEvenKConst, ReturnSoftmaxConst>;
-                    if (smem_size_dq_dk_dv >= 48 * 1024)  {
+                    if (smem_size >= 48 * 1024)  {
                         C10_CUDA_CHECK(cudaFuncSetAttribute(
-                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
+                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                     }
-                    kernel<<<grid_n, Kernel_traits::kNThreads, smem_size_dq_dk_dv, stream>>>(params);
+                    kernel<<<grid_n, Kernel_traits::kNThreads, smem_size, stream>>>(params);
                     C10_CUDA_KERNEL_LAUNCH_CHECK();
             });
         });

@@ -386,17 +386,8 @@ template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_,
                                                AtomLayoutMSdP_, AtomLayoutNdKV, AtomLayoutMdQ,
                                                Is_V_in_regs_, No_double_buffer_, elem_type>>
 struct Reduce_kernel_traits : public Base {
-    static constexpr int kBlockN = kBlockN_;
-    static constexpr int kNThreads = kNWarps_ * 32;
-    static constexpr int kGmemElemsPerLoad = Base::kGmemElemsPerLoad;
-    static constexpr int kGmemThreadsPerRowP = kBlockN / kGmemElemsPerLoad;
-    static_assert(kNThreads % kGmemThreadsPerRowP == 0, "kNThreads must be a multiple of kGmemThreadsPerRowP");
-    using GmemLayoutAtomP = Layout<Shape <Int<kNThreads / kGmemThreadsPerRowP>, Int<kGmemThreadsPerRowP>>,
-                                   Stride<Int<kGmemThreadsPerRowP>, _1>>;
-    using GmemTiledCopyP = decltype(
-        make_tiled_copy(Copy_Atom<DefaultCopy, elem_type>{},
-                        GmemLayoutAtomP{},
-                        Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
+    using Element = typename Base::Element;
+    static constexpr int kSmemSize = (size(typename Base::SmemLayoutQdO{}) + size(typename Base::SmemLayoutKV{})) * sizeof(Element);
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

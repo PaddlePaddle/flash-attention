@@ -158,7 +158,6 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
                             typename Kernel_traits::SmemLayoutQdO{});
 
     Tensor sK = make_tensor(sQ.data() + size(sQ), typename Kernel_traits::SmemLayoutKV{});
-    Tensor sP = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutPdS{});
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);

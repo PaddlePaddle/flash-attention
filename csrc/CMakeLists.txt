@@ -13,15 +13,30 @@ set(CUTLASS_3_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cutlass)
 
 set(FA2_SOURCES_CU
      flash_attn/src/cuda_utils.cu
+     flash_attn/src/reduce_config/reduce_hdim32_fp16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim32_bf16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim64_fp16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim64_bf16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim96_fp16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim96_bf16_sm80.cu
      flash_attn/src/reduce_config/reduce_hdim128_fp16_sm80.cu
-     #[[flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim128_bf16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim160_fp16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim160_bf16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim192_fp16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim192_bf16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim224_fp16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim224_bf16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim256_fp16_sm80.cu
+     flash_attn/src/reduce_config/reduce_hdim256_bf16_sm80.cu
+     flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu
      flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu
      flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu
      flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu
      flash_attn/src/flash_fwd_hdim96_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu]]
+     flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu
      flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu
-     #[[flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu
+     flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu
      flash_attn/src/flash_fwd_hdim160_fp16_sm80.cu
      flash_attn/src/flash_fwd_hdim160_bf16_sm80.cu
      flash_attn/src/flash_fwd_hdim192_fp16_sm80.cu
@@ -45,7 +60,7 @@ set(FA2_SOURCES_CU
      flash_attn/src/flash_bwd_hdim224_fp16_sm80.cu
      flash_attn/src/flash_bwd_hdim224_bf16_sm80.cu
      flash_attn/src/flash_bwd_hdim256_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu]]
+     flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu
   )
 
 add_library(flashattn SHARED

@@ -72,14 +72,14 @@ target_include_directories(flashattn PRIVATE
     ${CUTLASS_3_DIR}/include)
 
 set(FA1_SOURCES_CU
-    #[[flash_attn_with_bias_and_mask/flash_attn_with_bias_mask.cu
+    flash_attn_with_bias_and_mask/flash_attn_with_bias_mask.cu
     flash_attn_with_bias_and_mask/src/cuda_utils.cu
     flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim32.cu
     flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim64.cu
     flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim128.cu
     flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim32.cu
     flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim64.cu
-    flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim128.cu]]
+    flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim128.cu
     flash_attn_with_bias_and_mask/src/utils.cu)
 
 add_library(flashattn_with_bias_mask STATIC

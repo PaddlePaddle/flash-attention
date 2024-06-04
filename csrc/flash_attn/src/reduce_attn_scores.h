@@ -278,6 +278,7 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
           }
         }
 
+        __syncthreads();
         if (m_block > m_block_min) {
             // Advance gQ
             tQgQ.data() = tQgQ.data() + (-int(kBlockM * params.q_row_stride));

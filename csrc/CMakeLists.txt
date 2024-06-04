@@ -129,8 +129,6 @@ target_compile_options(flashattn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
   --expt-relaxed-constexpr
   --expt-extended-lambda
   --use_fast_math
-  # -Xptxas="-v"
-  # -dc
   "${FA_GENCODE_OPTION}"
   >)
 

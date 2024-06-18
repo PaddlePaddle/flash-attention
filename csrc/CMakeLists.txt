@@ -13,22 +13,22 @@ set(CUTLASS_3_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cutlass)
 
 set(FA2_SOURCES_CU
      flash_attn/src/cuda_utils.cu
-     flash_attn/src/reduce_config/reduce_hdim32_fp16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim32_bf16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim64_fp16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim64_bf16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim96_fp16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim96_bf16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim128_fp16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim128_bf16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim160_fp16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim160_bf16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim192_fp16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim192_bf16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim224_fp16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim224_bf16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim256_fp16_sm80.cu
-     flash_attn/src/reduce_config/reduce_hdim256_bf16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim32_fp16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim32_bf16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim64_fp16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim64_bf16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim96_fp16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim96_bf16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim128_fp16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim128_bf16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim160_fp16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim160_bf16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim192_fp16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim192_bf16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim224_fp16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim224_bf16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim256_fp16_sm80.cu
+     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim256_bf16_sm80.cu
      flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu
      flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu
      flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu

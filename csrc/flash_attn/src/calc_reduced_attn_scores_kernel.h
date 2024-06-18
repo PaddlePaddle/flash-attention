@@ -10,9 +10,17 @@
 #include "kernel_traits.h"
 #include "utils.h"
 #include "softmax.h"
-namespace flash {
+#include "flash.h"
+namespace reduced_scores {
 
 using namespace cute;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct Params : public Flash_bwd_params {
+    void *__restrict__  reduced_scores;
+};
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -108,7 +116,8 @@ inline __device__ void write_reduced_scores(Tensor<Engine, Layout> &rScores,
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
-inline __device__ void reduce_attn_scores_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
+inline __device__ void run_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
+    using namespace flash;
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -258,13 +267,13 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
         flash::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);
 
         if (Return_softmax) {
-            flash::write_attn_scores(scores,
-                                     reinterpret_cast<float *>(params.p_ptr) + row_offset_p,
-                                     binfo.actual_seqlen_q,
-                                     binfo.actual_seqlen_k,
-                                     m_block * kBlockM + get<0>(taccScS_row(0)),
-                                     n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                                     AtomLayoutMS * 16);
+            write_attn_scores(scores,
+                              reinterpret_cast<float *>(params.p_ptr) + row_offset_p,
+                              binfo.actual_seqlen_q,
+                              binfo.actual_seqlen_k,
+                              m_block * kBlockM + get<0>(taccScS_row(0)),
+                              n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                              AtomLayoutMS * 16);
         }
 
         CUTE_STATIC_ASSERT_V(size(local_reduced_scores) == size<1>(scores));
@@ -300,7 +309,7 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, bool Is_even_MN, bool Is_even_K, bool Return_softmax>
-__global__ void reduce_attn_scores_seqk_parallel(const Reduce_attn_scores_params params) {
+__global__ void run_seqk_parallel(const Params params) {
     const int n_block = blockIdx.x;
     // The block index for the batch.
     const int bidb = blockIdx.y;
@@ -308,8 +317,8 @@ __global__ void reduce_attn_scores_seqk_parallel(const Reduce_attn_scores_params
     const int bidh = blockIdx.z;
     constexpr int kBlockN = Kernel_traits::kBlockN;
 
-    reduce_attn_scores_1colblock<Kernel_traits, Is_even_MN, Is_even_K, Return_softmax>(params, bidb, bidh, n_block);
+    run_1colblock<Kernel_traits, Is_even_MN, Is_even_K, Return_softmax>(params, bidb, bidh, n_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-} // namespace flash
+} // namespace reduced_scores

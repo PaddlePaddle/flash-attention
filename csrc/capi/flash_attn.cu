@@ -13,7 +13,7 @@
 #include "cutlass/bfloat16.h"
 #include "cutlass/half.h"
 
-#include "src/reduce_config/reduce_launch_template.h"
+#include "src/calc_reduced_attn_scores_dispatch/launch_template.h"
 
 #include <cmath>
 #include <limits>
@@ -90,9 +90,9 @@ const char *flash_attn_error() {
           ASSERT_CHECK(is_sm80 || is_sm90);                                                \
       }
 
-#define CHECK_REDUCE_EXECTUABLE(__seqlen_q, __seqlen_k) \
-      const void * attn_mask = nullptr;                 \
-      const int64_t * mask_dims = nullptr;              \
+#define CHECK_CALC_REDUCED_SCORES_EXECTUABLE(__seqlen_q, __seqlen_k) \
+      const void * attn_mask = nullptr;                              \
+      const int64_t * mask_dims = nullptr;                           \
       CHECK_BWD_EXECTUABLE(__seqlen_q, __seqlen_k)
 
 void set_params_fprop_strided(Flash_fwd_params &params,
@@ -530,24 +530,25 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     });
 }
 
-void run_reduce_attn_scores(Reduce_attn_scores_params &params, cudaStream_t stream) {
+void run_calc_reduced_attn_scores(reduced_scores::Params &params, cudaStream_t stream) {
+    using namespace reduced_scores;
     FP16_SWITCH(!params.is_bf16, [&] {
         if (params.d <= 32) {
-            run_reduce_<elem_type, 32>(params, stream);
+            run_<elem_type, 32>(params, stream);
         } else if (params.d <= 64) {
-            run_reduce_<elem_type, 64>(params, stream);
+            run_<elem_type, 64>(params, stream);
         } else if (params.d <= 96) {
-            run_reduce_<elem_type, 96>(params, stream);
+            run_<elem_type, 96>(params, stream);
         } else if (params.d <= 128) {
-            run_reduce_<elem_type, 128>(params, stream);
+            run_<elem_type, 128>(params, stream);
         } else if (params.d <= 160) {
-            run_reduce_<elem_type, 160>(params, stream);
+            run_<elem_type, 160>(params, stream);
         } else if (params.d <= 192) {
-            run_reduce_<elem_type, 192>(params, stream);
+            run_<elem_type, 192>(params, stream);
         } else if (params.d <= 224) {
-          run_reduce_<elem_type, 224>(params, stream);
+          run_<elem_type, 224>(params, stream);
         } else if (params.d <= 256) {
-          run_reduce_<elem_type, 256>(params, stream);
+          run_<elem_type, 256>(params, stream);
         }
     });
 }
@@ -1077,40 +1078,40 @@ bool flash_attn_varlen_bwd(const void * const dout,
 
 }
 
-bool reduce_attn_scores(const void * const q,
-                        const void * const k,
-                        const void * const softmax_lse,
-                        void * const reduced_scores,
-                        void * const softmax_ptr,
-                        const int batch_size,
-                        const int seqlen_q,
-                        const int seqlen_k,
-                        const int num_heads,
-                        const int num_heads_k,
-                        const int head_size,
-                        const float softmax_scale,
-                        const bool return_softmax,
-                        const bool is_bf16,
-                        const int num_splits,
-                        cudaStream_t stream,
-                        const int q_row_stride,
-                        const int k_row_stride,
-                        const int o_row_stride,
-                        const int q_head_stride,
-                        const int k_head_stride,
-                        const int o_head_stride,
-                        const int q_batch_stride,
-                        const int k_batch_stride,
-                        const int o_batch_stride) {
+bool calc_reduced_attn_scores(const void * const q,
+                              const void * const k,
+                              const void * const softmax_lse,
+                              void * const reduced_scores,
+                              void * const softmax_ptr,
+                              const int batch_size,
+                              const int seqlen_q,
+                              const int seqlen_k,
+                              const int num_heads,
+                              const int num_heads_k,
+                              const int head_size,
+                              const float softmax_scale,
+                              const bool return_softmax,
+                              const bool is_bf16,
+                              const int num_splits,
+                              cudaStream_t stream,
+                              const int q_row_stride,
+                              const int k_row_stride,
+                              const int o_row_stride,
+                              const int q_head_stride,
+                              const int k_head_stride,
+                              const int o_head_stride,
+                              const int q_batch_stride,
+                              const int k_batch_stride,
+                              const int o_batch_stride) {
     FLASHATTNLIB_BEGIN_FUNC
 
-    CHECK_REDUCE_EXECTUABLE(seqlen_q, seqlen_k)
+    CHECK_CALC_REDUCED_SCORES_EXECTUABLE(seqlen_q, seqlen_k)
 
     // bool loop = seqlen_k > blocksize_c;
     // TODO: change later, for now set to true for simplicity
     const bool loop = true;
 
-    Reduce_attn_scores_params params;
+    reduced_scores::Params params;
 
     set_params_dgrad_strided(params,
                              batch_size,
@@ -1165,11 +1166,10 @@ bool reduce_attn_scores(const void * const q,
 
     params.reduced_scores = reduced_scores;
     params.p_ptr = softmax_ptr;
-
-    auto launch = &run_reduce_attn_scores;
+    auto launch = &run_calc_reduced_attn_scores;
 
     launch(params, stream);
-    
+
     return true;
     
     FLASHATTNLIB_END_FUNC

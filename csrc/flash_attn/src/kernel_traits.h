@@ -379,15 +379,17 @@ struct Flash_bwd_kernel_traits : public Base {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_,
-         int AtomLayoutMSdP_=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=2,
-         bool Is_V_in_regs_=false, bool No_double_buffer_=false, typename elem_type=cutlass::half_t,
-         typename Base=Flash_bwd_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_,
-                                               AtomLayoutMSdP_, AtomLayoutNdKV, AtomLayoutMdQ,
-                                               Is_V_in_regs_, No_double_buffer_, elem_type>>
-struct Reduce_kernel_traits : public Base {
-    using Element = typename Base::Element;
-    static constexpr int kSmemSize = (size(typename Base::SmemLayoutQdO{}) + size(typename Base::SmemLayoutKV{})) * sizeof(Element);
-};
+namespace reduced_scores {
+  template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_,
+           int AtomLayoutMSdP_=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=2,
+           bool Is_V_in_regs_=false, bool No_double_buffer_=false, typename elem_type=cutlass::half_t,
+           typename Base=Flash_bwd_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_,
+                                                 AtomLayoutMSdP_, AtomLayoutNdKV, AtomLayoutMdQ,
+                                                 Is_V_in_regs_, No_double_buffer_, elem_type>>
+  struct Kernel_traits : public Base {
+      using Element = typename Base::Element;
+      static constexpr int kSmemSize = (size(typename Base::SmemLayoutQdO{}) + size(typename Base::SmemLayoutKV{})) * sizeof(Element);
+  };
+} // namespace reduced_scores
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

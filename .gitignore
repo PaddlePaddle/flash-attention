@@ -1,0 +1,9 @@
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+build*
+
+# vscode
+.vscode

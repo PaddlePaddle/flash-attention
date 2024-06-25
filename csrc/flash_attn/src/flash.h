@@ -109,8 +109,22 @@ struct Flash_fwd_params : public Qkv_params {
     int mask_seq_q_mod_size;
 
     bool varlen_padded_input = false;
-    void * __restrict__ attn_mask_start_row_indices_ptr;
-    int attn_mask_start_row;
+    void * __restrict__ flashmask_downstart_ptr = nullptr;
+    void * __restrict__ flashmask_upend_ptr = nullptr;
+    void * __restrict__ flashmask_downend_ptr = nullptr;
+    void * __restrict__ flashmask_upstart_ptr = nullptr;
+    int *__restrict__ flashmask_maxmin_ptr = nullptr;
+    int *__restrict__ flashmask_upend_nblockmax = nullptr;
+    int *__restrict__ flashmask_upend_nblockmin = nullptr;
+    int *__restrict__ flashmask_downstart_nblockmax = nullptr;
+    int *__restrict__ flashmask_downstart_nblockmin = nullptr;
+    int *__restrict__ flashmask_downend_nblockmax = nullptr;
+    int *__restrict__ flashmask_downend_nblockmin = nullptr;
+    int *__restrict__ flashmask_upstart_nblockmax = nullptr;
+    int *__restrict__ flashmask_upstart_nblockmin = nullptr;
+    int h_sparsemask;
+    int h_h_sparsemask_ratio;
+    bool enable_mask_bypass;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -64,10 +64,12 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream, 
     const bool is_attn_mask = params.attn_mask_ptr != nullptr;
     const bool is_deterministic = params.num_splits == 1;
     // printf("smem_size_dq_dk_dv = %d\n", smem_size_dq_dk_dv);
+#if 0
     if (params.flashmask_downend_ptr != nullptr) {
         // bypass is not supported for flashmask_downend
         params.enable_mask_bypass = false;
     }
+#endif
     prepare_sparsemask<Kernel_traits>(params, stream);
     BOOL_SWITCH(params.is_causal, IsCausalConst, [&] {
         BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {

@@ -204,7 +204,7 @@ inline __device__ void apply_sparse_mask_causal(Tensor<Engine, Layout> &tensor, 
                     if (col_idx >= col_idx_limit) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
-                    else if (col_idx < col_idx_limit - 1 && row_idx >= start_row) {
+                    else if (col_idx < col_idx_limit && row_idx >= start_row) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
                 }
@@ -241,7 +241,7 @@ inline __device__ void apply_sparse_mask_causal_withend(Tensor<Engine, Layout> &
                     if (col_idx >= col_idx_limit) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
-                    else if (col_idx < col_idx_limit - 1 && row_idx >= start_row && row_idx < end_row) {
+                    else if (col_idx < col_idx_limit && row_idx >= start_row && row_idx < end_row) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
                 }

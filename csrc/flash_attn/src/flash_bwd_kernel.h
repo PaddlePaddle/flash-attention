@@ -75,7 +75,7 @@ make_tiled_copy_C_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
 
 template <int THREADS_PER_ROW, typename Engine0, typename Layout0,
           typename Engine1, typename Layout1, typename Engine2, typename Layout2>
-inline __device__ void dot_do_o(Tensor<Engine0, Layout0> const &do_, Tensor<Engine0, Layout0> const &o,
+__forceinline__ __device__ void dot_do_o(Tensor<Engine0, Layout0> const &do_, Tensor<Engine0, Layout0> const &o,
                                 Tensor<Engine1, Layout1> &dP_sum, Tensor<Engine2, Layout2> &sdPsum,
                                 const int gdP_col_stride, const float scale) {
     static_assert(Layout0::rank == 3, "Only support 3D Tensor");
@@ -425,7 +425,7 @@ inline __device__ void convert_dKV(const Params &params) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Is_attn_mask, bool Seq_parallel=false, typename Params>
-inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
+__forceinline__ __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     const bool Is_sparse_attn_mask = params.flashmask_downstart_ptr != nullptr;
     int flashmask_startrow = 0;
@@ -438,6 +438,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     __shared__ int32_t sparse_mask_smem_[Kernel_traits::kBlockN];
     __shared__ int32_t sparse_mask_smem_up[Kernel_traits::kBlockN];
     __shared__ int32_t sparse_mask_smem_downend[Kernel_traits::kBlockN];
+    __shared__ int32_t sparse_mask_smem_upstart[Kernel_traits::kBlockN];
     extern __shared__ char smem_[];
 
     // The thread index.
@@ -480,6 +481,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     const int *gSparseMaskDownEndMin =
         reinterpret_cast<int32_t *>(params.flashmask_downend_nblockmin) +
         row_offset_sparsemask_nblock;
+    const int* gSparseMaskUpStartMax = reinterpret_cast<int32_t*>(params.flashmask_upstart_nblockmax) + row_offset_sparsemask_nblock;
+    const int* gSparseMaskUpStartMin = reinterpret_cast<int32_t*>(params.flashmask_upstart_nblockmin) + row_offset_sparsemask_nblock;
 
     int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
     const bool flashmask_has_end = params.flashmask_downend_ptr != nullptr;
@@ -487,13 +490,36 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     const bool enable_mask_bypass = params.enable_mask_bypass;
 
-    if (Is_sparse_attn_mask && enable_mask_bypass) {
+    int flashmask_downstartmax = std::numeric_limits<int>::max();
+    int flashmask_downendmin = 0;
+    int flashmask_upendmin = 0;
+    int flashmask_upstartmax = std::numeric_limits<int>::max();
+
+    if(params.flashmask_downstart_nblockmax != nullptr)
+        flashmask_downstartmax = gSparseMaskDownMax[n_block];
+    if(params.flashmask_downend_nblockmin != nullptr)
+        flashmask_downendmin = gSparseMaskDownEndMin[n_block];
+    if(params.flashmask_upend_nblockmin != nullptr)
+        flashmask_upendmin = gSparseMaskUpMin[n_block];
+    if(params.flashmask_upstart_nblockmax != nullptr)
+        flashmask_upstartmax = gSparseMaskUpStartMax[n_block];
+
+#define SPARSE_MASKED_DOWN \
+    (((m_block * kBlockM) >= flashmask_downstartmax) && (!flashmask_has_end || (m_block + 1) * kBlockM < flashmask_downendmin))
+
+#define SPARSE_MASKED_UP \
+    (!Is_causal && (m_block + 1) * kBlockM < flashmask_upendmin && (!flashmask_has_end || m_block * kBlockM >= flashmask_upstartmax))
+
+#define SPARSE_MASKED \
+    (SPARSE_MASKED_DOWN || SPARSE_MASKED_UP)
+
+    if (Is_sparse_attn_mask && enable_mask_bypass && !flashmask_has_end) {
       m_block_max = min(m_block_max,
                         cute::ceil_div(gSparseMaskDownMax[n_block], kBlockM));
     /*
       flashmask_has_end && enable_mask_bypass is not support now
       if (flashmask_has_end) {
-        if(flashmask_bwd_state == 1){
+        if(flashmask_bwd_state == 1) {
             m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
         }
       }
@@ -564,6 +590,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                                Shape<Int<kBlockN>>{});
     Tensor gSparseMaskDownEnd = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.flashmask_downend_ptr) + row_offset_sparse_mask),
                                Shape<Int<kBlockN>>{});
+    Tensor gSparseMaskUpStart = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.flashmask_upstart_ptr) + row_offset_sparse_mask),
+                               Shape<Int<kBlockN>>{});
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQdO{});
@@ -590,6 +618,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor sSparseMask = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_)), Shape<Int<kBlockN>>{});
     Tensor sSparseMaskUp = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_up)), Shape<Int<kBlockN>>{});
     Tensor sSparseMaskDownEnd = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_downend)), Shape<Int<kBlockN>>{});
+    Tensor sSparseMaskUpStart = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_upstart)), Shape<Int<kBlockN>>{});
     Tensor sdPsum = make_tensor(make_smem_ptr(reinterpret_cast<float2 *>((sP.data() + cute::max(size(sP), size(sdQ))).get())),
                                 Shape<Int<Kernel_traits::kSmemdPsumCount / 2>>{});
 
@@ -738,13 +767,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     int m_block = m_block_max - 1;
     int m_block_min = !Is_causal ? 0 : (n_block * kBlockN) / kBlockM;
-    if(Is_sparse_attn_mask  && enable_mask_bypass){
+    if(Is_sparse_attn_mask && enable_mask_bypass && !flashmask_has_end) {
       if (!Is_causal) {
         m_block_min = max(m_block_min, gSparseMaskUpMin[n_block] / kBlockM);
       }
       /*
-      if (flashmask_has_end){
-        if(flashmask_bwd_state == 1){
+      if (flashmask_has_end) {
+        if(flashmask_bwd_state == 1) {
             m_block_min = gSparseMaskDownEndMin[n_block] / kBlockM;
             m_block_min =
                 max(m_block_min,
@@ -756,7 +785,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     }
 
     /*
-    if(flashmask_has_end && flashmask_bwd_state == 1 && m_block < m_block_min){
+    if(flashmask_has_end && flashmask_bwd_state == 1 && m_block < m_block_min) {
         return;
         // do nothing because stage0 has done them.
     }
@@ -881,10 +910,15 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     if (Is_sparse_attn_mask) {
         if (tidx < kBlockN) {
 	        sSparseMask(tidx) = gSparseMask(tidx);
-            if(!Is_causal)
+            if(!Is_causal) {
                 sSparseMaskUp(tidx) = gSparseMaskUp(tidx);
-            if(flashmask_has_end)
+                if(flashmask_has_end) {
+                    sSparseMaskUpStart(tidx) = gSparseMaskUpStart(tidx);
+                }
+            }
+            if(flashmask_has_end) {
                 sSparseMaskDownEnd(tidx) = gSparseMaskDownEnd(tidx);
+            }
         }
 	    __syncthreads();
     }
@@ -912,8 +946,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         //     cute::copy(smem_tiled_copy_KV, tSsK(_, _, k), tSrK_copy_view(_, _, k));
         // }
         // if (cute::thread0()) { print(tSrK); }
-        flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
-                    smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
+
+        if (!SPARSE_MASKED) {
+            flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
+                        smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
+        }
 
         // Reshape acc_s from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
@@ -934,10 +971,45 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         }
         if (!Is_causal) {
             if (Is_sparse_attn_mask && 
-                ((m_block + 1) * kBlockM >= flashmask_startrow || m_block * kBlockM < flashmask_upendrow)){
-                flash::apply_sparse_mask(scores, sSparseMask, sSparseMaskUp, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16, binfo.actual_seqlen_k,
-                                         m_block * kBlockM + get<0>(taccScS_row(0)),
-                                         AtomLayoutMS * 16, n_block * kBlockN);
+                ((m_block + 1) * kBlockM >= flashmask_startrow || m_block * kBlockM < flashmask_upendrow)) {
+                if(flashmask_has_end) {
+                     flash::apply_sparse_mask(
+                             scores,
+                             sSparseMask,
+                             sSparseMaskDownEnd,
+                             n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                             binfo.actual_seqlen_k,
+                             m_block * kBlockM + get<0>(taccScS_row(0)),
+                             AtomLayoutMS * 16,
+                             n_block * kBlockN,
+                             /*pairwise*/true
+                     );
+                     flash::apply_sparse_mask(
+                             scores,
+                             sSparseMaskUpStart,
+                             sSparseMaskUp,
+                             n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                             binfo.actual_seqlen_k,
+                             m_block * kBlockM + get<0>(taccScS_row(0)),
+                             AtomLayoutMS * 16,
+                             n_block * kBlockN,
+                             /*pairwise*/true
+                     );
+                }
+                else {
+                     flash::apply_sparse_mask(
+                             scores,
+                             sSparseMask,
+                             sSparseMaskUp,
+                             n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                             binfo.actual_seqlen_k,
+                             m_block * kBlockM + get<0>(taccScS_row(0)),
+                             AtomLayoutMS * 16,
+                             n_block * kBlockN,
+                             /*pairwise*/false
+                     );
+                }
+
             } else if (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k) {
                 flash::apply_mask(scores, binfo.actual_seqlen_k,
                                   n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16);
@@ -988,7 +1060,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         }
         // if (cute::thread(32, 0)) { print(scores); }
         // Compute the exponential value.
-        flash::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);
+
+        if (!SPARSE_MASKED) {
+            flash::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);
+        }
         if (Is_dropout) {
             uint32_t warp_id = tidx / 32;
             uint32_t block_row_idx = m_block * (kBlockM / 16) + warp_id % AtomLayoutMS;
@@ -1031,21 +1106,23 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         // if (cute::thread0()) { print(dP_sum); }
 
-        flash::gemm</*A_in_regs=*/false, /*B_in_regs=*/Kernel_traits::Is_V_in_regs>(
-            acc_dp, tdPrdO, tdPrV, tdPsdO, tdPsV, tiled_mma_sdp,
-            smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV
-        );
-
         // Reshape acc_dp from (MMA=4, MMA_N, MMA_N) to (col=(2, MMA_N), row=(2, MMA_N))
         Tensor dS = make_tensor(acc_dp.data(), scores.layout());
-        auto pointwise_mult = [](float p, float dp, float d) {
-            return p * (!Is_dropout || p >= 0 ? dp - d : d);
-        };
-        #pragma unroll
-        for (int mi = 0; mi < size<0>(dS); ++mi) {
+
+        if (!SPARSE_MASKED) {
+            flash::gemm</*A_in_regs=*/false, /*B_in_regs=*/Kernel_traits::Is_V_in_regs>(
+                acc_dp, tdPrdO, tdPrV, tdPsdO, tdPsV, tiled_mma_sdp,
+                smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV
+            );
+            auto pointwise_mult = [](float p, float dp, float d) {
+                return p * (!Is_dropout || p >= 0 ? dp - d : d);
+            };
             #pragma unroll
-            for (int ni = 0; ni < size<1>(dS); ++ni) {
-                dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi));
+            for (int mi = 0; mi < size<0>(dS); ++mi) {
+                #pragma unroll
+                for (int ni = 0; ni < size<1>(dS); ++ni) {
+                    dS(mi, ni) = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi));
+                }
             }
         }
         // if (cute::thread0()) { print(dS); }
@@ -1087,8 +1164,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // flash::gemm_A_in_regs(acc_dv, tdVrPt, tdVrdO, tdVsdOt, tiled_mma_dkv, smem_thr_copy_QdOt);
         // Tensor tdKrdSt = make_tensor(tdSrdS.data(), tdVrPt.layout());
         // flash::gemm_A_in_regs(acc_dk, tdKrdSt, tdKrQt, tdKsQt, tiled_mma_dkv, smem_thr_copy_QdOt);
-        flash::gemm(acc_dv, tdVrPt, tdVrdO, tdVsPt, tdVsdOt, tiled_mma_dkv,
-                    smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt);
+
+        if (!SPARSE_MASKED) {
+            flash::gemm(acc_dv, tdVrPt, tdVrdO, tdVsPt, tdVsdOt, tiled_mma_dkv,
+                        smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt);
+        }
         // if (cute::thread0() && n_block == 0 && m_block == 0) { print(tdVrPt); }
         // if (cute::thread0()) { print(acc_dv); }
 
@@ -1107,8 +1187,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             }
         }
 
-        flash::gemm(acc_dq, tdQrdS, tdQrKt, tdQsdS, tdQsKt, tiled_mma_dq,
-                    smem_tiled_copy_dS, smem_tiled_copy_Kt, smem_thr_copy_dS, smem_thr_copy_Kt);
+        if (!SPARSE_MASKED) {
+            flash::gemm(acc_dq, tdQrdS, tdQrKt, tdQsdS, tdQsKt, tiled_mma_dq,
+                        smem_tiled_copy_dS, smem_tiled_copy_Kt, smem_thr_copy_dS, smem_thr_copy_Kt);
+        }
         // if (cute::thread0()) { print(acc_dq); }
 
         if (m_block > m_block_min) {
@@ -1146,8 +1228,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             cute::copy(smem_tiled_copy_dQ, taccdQrdQ, taccdQsdQ);
         }
 
-        flash::gemm(acc_dk, tdKrdSt, tdKrQt, tdKsdSt, tdKsQt, tiled_mma_dkv,
-                    smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt);
+        if (!SPARSE_MASKED) {
+            flash::gemm(acc_dk, tdKrdSt, tdKrQt, tdKsdSt, tdKsQt, tiled_mma_dkv,
+                        smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt);
+        }
         // if (cute::thread0()) { print(acc_dk); }
         if (Double_buffer) {  // Double buffer for sQ
             tdKsQt.data() = tdKsQt.data() + (m_block % 2 == 0 ? size(sQ) : -size(sQ));

@@ -250,10 +250,16 @@ inline __device__ void apply_sparse_mask_causal_withend(Tensor<Engine, Layout> &
     }
 }
 
-template <typename Engine, typename Layout, typename Engine1, typename Layout1,  typename Engine2, typename Layout2>
-inline __device__ void apply_sparse_mask(Tensor<Engine, Layout> &tensor, Tensor<Engine1, Layout1> &attn_mask_start_row_indices, Tensor<Engine2, Layout2> &attn_mask_end_row_indices,  const uint32_t col_idx_offset_,
-                                         const uint32_t max_seqlen_k, const uint32_t row_idx_offset_,
-                                         const uint32_t warp_row_stride, const uint32_t mask_col_idx_offset) {
+template <typename Engine, typename Layout, typename Engine1, typename Layout1>
+__forceinline__ __device__ void apply_sparse_mask(Tensor<Engine, Layout> &tensor,
+                                         Tensor<Engine1, Layout1> &attn_mask_startrow_indices,
+                                         Tensor<Engine1, Layout1> &attn_mask_endrow_indices,
+                                         const uint32_t col_idx_offset_,
+                                         const uint32_t max_seqlen_k,
+                                         const uint32_t row_idx_offset_,
+                                         const uint32_t warp_row_stride,
+                                         const uint32_t mask_col_idx_offset,
+                                         const bool pairwise) {
     // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
     static_assert(Layout::rank == 2, "Only support 2D Tensor");
     const uint32_t lane_id = threadIdx.x % 32;
@@ -266,21 +272,25 @@ inline __device__ void apply_sparse_mask(Tensor<Engine, Layout> &tensor, Tensor<
         #pragma unroll
         for (int j = 0; j < size<1, 0>(tensor); ++j) {
             const uint32_t col_idx = col_idx_base + j;
-            const uint32_t start_row = attn_mask_start_row_indices(col_idx - mask_col_idx_offset);
-            const uint32_t end_row = attn_mask_end_row_indices(col_idx - mask_col_idx_offset);
+            const uint32_t startrow = attn_mask_startrow_indices(col_idx - mask_col_idx_offset);
+            const uint32_t endrow = attn_mask_endrow_indices(col_idx - mask_col_idx_offset);
+
             #pragma unroll
             for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
                 const uint32_t row_idx_base = row_idx_offset + mi * warp_row_stride;
                 #pragma unroll
                 for (int i = 0; i < size<0, 0>(tensor); ++i) {
-                  const uint32_t row_idx = row_idx_base + i * 8;
-                  if (col_idx >= max_seqlen_k) {
-                    tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
-                  } else if (row_idx >= start_row) {
-                    tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
-                  } else if (row_idx < end_row) {
-                    tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
-                  }
+                    const uint32_t row_idx = row_idx_base + i * 8;
+
+                    if (col_idx >= max_seqlen_k) {
+                      tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                    } else if (pairwise && (row_idx >= startrow && row_idx < endrow)) {
+                      tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                    } else if (!pairwise && row_idx >= startrow) {
+                      tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                    } else if (!pairwise && row_idx < endrow) {
+                      tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                    }
                 }
             }
         }

@@ -119,7 +119,7 @@ inline __device__ void write_softmax_to_gmem(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_N, bool Is_even_K, bool Return_softmax, bool Is_attn_mask, bool Is_equal_seq_qk, typename Params>
-inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
+__forceinline__ __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     const bool Is_sparse_attn_mask = params.flashmask_downstart_ptr != nullptr;
 
@@ -131,6 +131,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     __shared__ int32_t sparse_mask_smem_[Kernel_traits::kBlockN];
     __shared__ int32_t sparse_mask_smem_up[Kernel_traits::kBlockN];
     __shared__ int32_t sparse_mask_smem_downend[Kernel_traits::kBlockN];
+    __shared__ int32_t sparse_mask_smem_upstart[Kernel_traits::kBlockN];
     extern __shared__ char smem_[];
 
     // The thread index.
@@ -207,13 +208,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor gSparseMaskUp = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.flashmask_upend_ptr) + row_offset_sparse_mask),
                                Shape<Int<kBlockN>>{});
     Tensor gSparseMaskDownEnd = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.flashmask_downend_ptr) + row_offset_sparse_mask),
-                               Shape<Int<kBlockN>>{});                  
+                               Shape<Int<kBlockN>>{});
+    Tensor gSparseMaskUpStart = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.flashmask_upstart_ptr) + row_offset_sparse_mask),
+                               Shape<Int<kBlockN>>{});
     const int* gSparseMaskDownMax = reinterpret_cast<int32_t*>(params.flashmask_downstart_nblockmax) + row_offset_sparsemask_nblock;
     const int* gSparseMaskDownMin = reinterpret_cast<int32_t*>(params.flashmask_downstart_nblockmin) + row_offset_sparsemask_nblock;
     const int* gSparseMaskUpMax = reinterpret_cast<int32_t*>(params.flashmask_upend_nblockmax) + row_offset_sparsemask_nblock;
     const int* gSparseMaskUpMin = reinterpret_cast<int32_t*>(params.flashmask_upend_nblockmin) + row_offset_sparsemask_nblock;
     const int* gSparseMaskDownEndMax = reinterpret_cast<int32_t*>(params.flashmask_downend_nblockmax) + row_offset_sparsemask_nblock;
     const int* gSparseMaskDownEndMin = reinterpret_cast<int32_t*>(params.flashmask_downend_nblockmin) + row_offset_sparsemask_nblock;
+    const int* gSparseMaskUpStartMax = reinterpret_cast<int32_t*>(params.flashmask_upstart_nblockmax) + row_offset_sparsemask_nblock;
+    const int* gSparseMaskUpStartMin = reinterpret_cast<int32_t*>(params.flashmask_upstart_nblockmin) + row_offset_sparsemask_nblock;
     const bool enable_mask_bypass = params.enable_mask_bypass;
     const bool flashmask_has_end = params.flashmask_downend_ptr != nullptr;
 
@@ -228,6 +233,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor sSparseMask = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_)), Shape<Int<kBlockN>>{});
     Tensor sSparseMaskUp = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_up)), Shape<Int<kBlockN>>{});
     Tensor sSparseMaskDownEnd = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_downend)), Shape<Int<kBlockN>>{});
+    Tensor sSparseMaskUpStart = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_upstart)), Shape<Int<kBlockN>>{});
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
@@ -380,7 +386,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 #define SPARSE_MASKED_DOWN(N_BLOCK) \
     (((m_block * kBlockM) >= gSparseMaskDownMax[(N_BLOCK)]) && (!flashmask_has_end || (m_block + 1) * kBlockM < gSparseMaskDownEndMin[(N_BLOCK)]))
 #define SPARSE_MASKED_UP(N_BLOCK) \
-    (!Is_causal && (m_block + 1) * kBlockM < gSparseMaskUpMin[(N_BLOCK)])
+    (!Is_causal && (m_block + 1) * kBlockM < gSparseMaskUpMin[(N_BLOCK)] && (!flashmask_has_end || m_block * kBlockM >= gSparseMaskUpStartMax[(N_BLOCK)]))
 #define SPARSE_MASKED(N_BLOCK) \
     (SPARSE_MASKED_DOWN(N_BLOCK) || SPARSE_MASKED_UP(N_BLOCK))
     constexpr int n_masking_steps = Is_causal ? cute::ceil_div(kBlockM, kBlockN) : 1;
@@ -431,18 +437,49 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
               if (tidx < kBlockN) {
                 sSparseMask(tidx) = gSparseMask(tidx);
                 sSparseMaskUp(tidx) = gSparseMaskUp(tidx);
+                if(flashmask_has_end) {
+                    sSparseMaskUpStart(tidx) = gSparseMaskUpStart(tidx);
+                    sSparseMaskDownEnd(tidx) = gSparseMaskDownEnd(tidx);
+                }
               }
               __syncthreads();
-              flash::apply_sparse_mask(
-                  scores,
-                  sSparseMask,
-                  sSparseMaskUp,
-                  n_block * kBlockN,
-                  binfo.actual_seqlen_k,
-                  // m_block * kBlockM + get<0>(idx_row(0)),
-                  m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-                  kNWarps * 16,
-                  n_block * kBlockN);
+              if(flashmask_has_end) {
+                   flash::apply_sparse_mask(
+                           scores,
+                           sSparseMask,
+                           sSparseMaskDownEnd,
+                           n_block * kBlockN,
+                           binfo.actual_seqlen_k,
+                           m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                           kNWarps * 16,
+                           n_block * kBlockN,
+                           /*pairwise*/true
+                   );
+                   flash::apply_sparse_mask(
+                           scores,
+                           sSparseMaskUpStart,
+                           sSparseMaskUp,
+                           n_block * kBlockN,
+                           binfo.actual_seqlen_k,
+                           m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                           kNWarps * 16,
+                           n_block * kBlockN,
+                           /*pairwise*/true
+                   );
+              }
+              else {
+                   flash::apply_sparse_mask(
+                           scores,
+                           sSparseMask,
+                           sSparseMaskUp,
+                           n_block * kBlockN,
+                           binfo.actual_seqlen_k,
+                           m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                           kNWarps * 16,
+                           n_block * kBlockN,
+                           /*pairwise*/false
+                   );
+              }
               // m_block * kBlockM + (tidx / 32) * 16, kNWarps * 16);
               // m_block * kBlockM + (tidx / 32) * (kBlockM / kNWarps), 16);
           } else if (!Is_even_N) {
@@ -465,7 +502,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                   (m_block + 1) * kBlockM >= gSparseMaskDownMin[n_block])) {
                 if (tidx < kBlockN) {
                   sSparseMask(tidx) = gSparseMask(tidx);
-                  if(flashmask_has_end){
+                  if(flashmask_has_end) {
                     sSparseMaskDownEnd(tidx) = gSparseMaskDownEnd(tidx);
                   }
                 }
@@ -506,13 +543,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             }
         }
 
-        if (!Is_attn_mask && Is_sparse_attn_mask){
+        if (!Is_attn_mask && Is_sparse_attn_mask) {
             gSparseMask.data() = gSparseMask.data() + (-kBlockN);
-            if(flashmask_has_end){
+            if(flashmask_has_end) {
                 gSparseMaskDownEnd.data() = gSparseMaskDownEnd.data() + (-kBlockN);
             }
-            if (!Is_causal)
+            if (!Is_causal) {
                 gSparseMaskUp.data() = gSparseMaskUp.data() + (-kBlockN);
+                if(flashmask_has_end) {
+                    gSparseMaskUpStart.data() = gSparseMaskUpStart.data() + (-kBlockN);
+                }
+            }
         }
 
         flash::cp_async_wait<0>();
@@ -535,11 +576,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
-        if(Is_sparse_attn_mask){
+        if(Is_sparse_attn_mask) {
             // We must check inf if use sparse_attn_mask
             masking_step == 0
                 ? softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/true>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2)
-                : softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/true>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);        }
+                : softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/true>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
+        }
         else{
             masking_step == 0
                 ? softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_attn_mask>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2)
@@ -588,8 +630,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
             gSparseMask.data() = gSparseMask.data() + (-kBlockN);
             gSparseMaskDownEnd.data() = gSparseMaskDownEnd.data() + (-kBlockN);
-            if (!Is_causal)
+            if (!Is_causal) {
                 gSparseMaskUp.data() = gSparseMaskUp.data() + (-kBlockN);
+                gSparseMaskUpStart.data() = gSparseMaskUpStart.data() + (-kBlockN);
+            }
             if (Return_softmax) 
                 tPgP.data() = tPgP.data() + (-kBlockN);
             continue;
@@ -641,21 +685,52 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             (!enable_mask_bypass ||
              (m_block + 1) * kBlockM >= gSparseMaskDownMin[n_block] ||
              m_block * kBlockM < gSparseMaskUpMax[n_block])) {
-          if (tidx < kBlockN) {
-            sSparseMask(tidx) = gSparseMask(tidx);
-            sSparseMaskUp(tidx) = gSparseMaskUp(tidx);
-          }
-          __syncthreads();
-          flash::apply_sparse_mask(
-              scores,
-              sSparseMask,
-              sSparseMaskUp,
-              n_block * kBlockN,
-              binfo.actual_seqlen_k,
-              // m_block * kBlockM + get<0>(idx_row(0)),
-              m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
-              kNWarps * 16,
-              n_block * kBlockN);
+             if (tidx < kBlockN) {
+                sSparseMask(tidx) = gSparseMask(tidx);
+                sSparseMaskUp(tidx) = gSparseMaskUp(tidx);
+                if(flashmask_has_end) {
+                    sSparseMaskUpStart(tidx) = gSparseMaskUpStart(tidx);
+                    sSparseMaskDownEnd(tidx) = gSparseMaskDownEnd(tidx);
+                }
+              }
+              __syncthreads();
+              if(flashmask_has_end) {
+                   flash::apply_sparse_mask(
+                           scores,
+                           sSparseMask,
+                           sSparseMaskDownEnd,
+                           n_block * kBlockN,
+                           binfo.actual_seqlen_k,
+                           m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                           kNWarps * 16,
+                           n_block * kBlockN,
+                           /*pairwise*/true
+                   );
+                   flash::apply_sparse_mask(
+                           scores,
+                           sSparseMaskUpStart,
+                           sSparseMaskUp,
+                           n_block * kBlockN,
+                           binfo.actual_seqlen_k,
+                           m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                           kNWarps * 16,
+                           n_block * kBlockN,
+                           /*pairwise*/true
+                   );
+              }
+              else {
+                   flash::apply_sparse_mask(
+                           scores,
+                           sSparseMask,
+                           sSparseMaskUp,
+                           n_block * kBlockN,
+                           binfo.actual_seqlen_k,
+                           m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+                           kNWarps * 16,
+                           n_block * kBlockN,
+                           /*pairwise*/false
+                   );
+              }
           // m_block * kBlockM + (tidx / 32) * 16, kNWarps * 16);
           // m_block * kBlockM + (tidx / 32) * (kBlockM / kNWarps), 16);
         } else if (!Is_attn_mask && Is_causal && Is_sparse_attn_mask &&
@@ -663,7 +738,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                     (m_block + 1) * kBlockM >= gSparseMaskDownMin[n_block])) {
           if (tidx < kBlockN) {
             sSparseMask(tidx) = gSparseMask(tidx);
-            if(flashmask_has_end){
+            if(flashmask_has_end) {
                 sSparseMaskDownEnd(tidx) = gSparseMaskDownEnd(tidx);
             }
           }
@@ -695,14 +770,18 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         if (!Is_attn_mask && Is_sparse_attn_mask) {
           gSparseMask.data() = gSparseMask.data() + (-kBlockN);
-          if(flashmask_has_end){
+          if(flashmask_has_end) {
             gSparseMaskDownEnd.data() = gSparseMaskDownEnd.data() + (-kBlockN);
           }
-          if (!Is_causal)
+          if (!Is_causal) {
             gSparseMaskUp.data() = gSparseMaskUp.data() + (-kBlockN);
+            if(flashmask_has_end) {
+                gSparseMaskUpStart.data() = gSparseMaskUpStart.data() + (-kBlockN);
+            }
+          }
         }
 
-        if(Is_sparse_attn_mask){
+        if(Is_sparse_attn_mask) {
           softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/true>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
         } else if (Is_equal_seq_qk) {
           softmax_rescale_o</*Is_first=*/false>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);

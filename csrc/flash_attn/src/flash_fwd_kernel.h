@@ -413,9 +413,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (Is_attn_mask) {
-            flash::apply_attn_mask<Kernel_traits::TiledMma>(scores, tPgMask, tPcMask,
-                                                            m_block == m_block_max - 1 ? m_residue : params.seqlen_q,
-                                                            n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
+             flash::apply_attn_mask<Kernel_traits::TiledMma>(scores, tPgMask, tPcMask,
+                                                            params.seqlen_q,
+                                                            params.seqlen_k,
                                                             params.unscale_softmax);
             tPgMask.data() = tPgMask.data() + (-kBlockN);
         }
@@ -632,8 +632,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         if (Is_attn_mask) {
             flash::apply_attn_mask<Kernel_traits::TiledMma>(scores, tPgMask, tPcMask,
-                                                            m_block == m_block_max - 1 ? m_residue : params.seqlen_q,
-                                                            n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
+                                                            params.seqlen_q,
+                                                            params.seqlen_k,
                                                             params.unscale_softmax);
             tPgMask.data() = tPgMask.data() + (-kBlockN);
         }

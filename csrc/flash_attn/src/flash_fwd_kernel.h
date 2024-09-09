@@ -147,11 +147,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const BlockInfo</*Varlen=*/!Is_even_N> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q || binfo.actual_seqlen_k == 0) return;
 
-    // umiswing: residue is for predication of additional mask gmem access.
-    // Additional mask for varlen qkv is supported, but a varlen mask is not supported.
-    const int m_residue = params.seqlen_q % kBlockM ? params.seqlen_q % kBlockM : kBlockM;
-    const int n_residue = params.seqlen_k % kBlockN ? params.seqlen_k % kBlockN : kBlockN;
-
     const int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
 
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
@@ -175,7 +170,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
     const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
         + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
-
     const uint64_t row_offset_mask = (uint64_t)((bidb * params.mask_head_mod_size
         + (bidh % params.mask_head_mod_size)) * params.mask_seq_q_mod_size
         + (m_block * kBlockM % params.mask_seq_q_mod_size)) * params.seqlen_k
@@ -413,9 +407,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (Is_attn_mask) {
-            flash::apply_attn_mask<Kernel_traits::TiledMma>(scores, tPgMask, tPcMask,
-                                                            m_block == m_block_max - 1 ? m_residue : params.seqlen_q,
-                                                            n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
+             flash::apply_attn_mask<Kernel_traits::TiledMma>(scores, tPgMask, tPcMask,
+                                                            params.seqlen_q,
+                                                            params.seqlen_k,
                                                             params.unscale_softmax);
             tPgMask.data() = tPgMask.data() + (-kBlockN);
         }
@@ -631,9 +625,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (Is_attn_mask) {
-            flash::apply_attn_mask<Kernel_traits::TiledMma>(scores, tPgMask, tPcMask,
-                                                            m_block == m_block_max - 1 ? m_residue : params.seqlen_q,
-                                                            n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
+             flash::apply_attn_mask<Kernel_traits::TiledMma>(scores, tPgMask, tPcMask,
+                                                            params.seqlen_q,
+                                                            params.seqlen_k,
                                                             params.unscale_softmax);
             tPgMask.data() = tPgMask.data() + (-kBlockN);
         }

@@ -9,8 +9,10 @@ execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
 
 set(CUTLASS_3_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cutlass)
 
+
+find_package(PythonInterp REQUIRED)
 execute_process(
-    COMMAND python flash_attn/src/generate_kernels.py -o flash_attn/src
+    COMMAND "${PYTHON_EXECUTABLE}" flash_attn/src/generate_kernels.py -o flash_attn/src
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     RESULT_VARIABLE result
     OUTPUT_VARIABLE output

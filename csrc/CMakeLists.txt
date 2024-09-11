@@ -7,189 +7,46 @@ execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
                 RESULT_VARIABLE GIT_SUBMOD_RESULT)
 
-add_definitions("-DFLASH_ATTN_WITH_TORCH=0")
-
 set(CUTLASS_3_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cutlass)
 
-set(FA2_SOURCES_CU
-     flash_attn/src/cuda_utils.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim32_fp16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim32_bf16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim64_fp16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim64_bf16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim96_fp16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim96_bf16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim128_fp16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim128_bf16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim160_fp16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim160_bf16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim192_fp16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim192_bf16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim224_fp16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim224_bf16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim256_fp16_sm80.cu
-     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim256_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_bf16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_bf16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_fp16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_fp16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim128_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_bf16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_bf16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_fp16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_fp16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim160_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_bf16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_bf16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_fp16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_fp16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim192_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_bf16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_bf16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_fp16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_fp16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim224_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_bf16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_bf16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_fp16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_fp16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim256_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_bf16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_bf16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_fp16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_fp16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim32_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_bf16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_bf16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_fp16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_fp16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim64_fp16_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_bf16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_bf16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_bf16_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_fp16_causal_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_fp16_densemask_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_bwd_hdim96_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_bf16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_bf16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_fp16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_fp16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_bf16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_bf16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_fp16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_fp16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim160_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_bf16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_bf16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_fp16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_fp16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim192_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_bf16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_bf16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_fp16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_fp16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim224_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_bf16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_bf16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_fp16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_fp16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim256_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim32_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim32_bf16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim32_bf16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim32_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim32_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim32_fp16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim32_fp16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim32_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_bf16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_bf16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_fp16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_fp16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_bf16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_bf16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_bf16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_bf16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_fp16_causal_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_fp16_causal_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_fp16_densemask_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_fp16_flashmask_sm80.cu
-     flash_attn/src/flash_fwd_hdim96_fp16_sm80.cu
-  )
+execute_process(
+    COMMAND python flash_attn/src/generate_kernels.py -o flash_attn/src
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE result
+    OUTPUT_VARIABLE output
+    ERROR_VARIABLE error
+)
+
+if(NOT result EQUAL 0)
+    message(STATUS "Generating FA2 Python script error: ${error}")
+    message(FATAL_ERROR "Generating FA2 Python script execution failed with exit code ${result}")
+endif()
+
+file(GLOB FA2_SOURCES_CU_SOURCES "flash_attn/src/*.cu")
+
+message(STATUS "Auto generated CUDA source files: ${FA2_SOURCES_CU_SOURCES}")
+
+set(FA2_REDUCE_ATTNSCORE_SOURCES_CU
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim32_fp16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim32_bf16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim64_fp16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim64_bf16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim96_fp16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim96_bf16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim128_fp16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim128_bf16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim160_fp16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim160_bf16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim192_fp16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim192_bf16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim224_fp16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim224_bf16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim256_fp16_sm80.cu
+    flash_attn/src/calc_reduced_attn_scores_dispatch/hdim256_bf16_sm80.cu
+)
+
+# merge FA2 cu sources
+set(FA2_SOURCES_CU ${FA2_REDUCE_ATTNSCORE_SOURCES_CU} ${FA2_SOURCES_CU_SOURCES})
 
 add_library(flashattn SHARED
     capi/flash_attn.cu

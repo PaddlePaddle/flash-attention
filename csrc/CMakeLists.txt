@@ -22,11 +22,12 @@ if(NOT result EQUAL 0)
     message(FATAL_ERROR "Generating FA2 Python script execution failed with exit code ${result}")
 endif()
 
-file(GLOB FA2_SOURCES_CU_SOURCES "flash_attn/src/*.cu")
+file(GLOB FA2_SOURCES_CU_SOURCES "flash_attn/src/*_sm80.cu")
 
 message(STATUS "Auto generated CUDA source files: ${FA2_SOURCES_CU_SOURCES}")
 
 set(FA2_REDUCE_ATTNSCORE_SOURCES_CU
+    flash_attn/src/cuda_utils.cu
     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim32_fp16_sm80.cu
     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim32_bf16_sm80.cu
     flash_attn/src/calc_reduced_attn_scores_dispatch/hdim64_fp16_sm80.cu

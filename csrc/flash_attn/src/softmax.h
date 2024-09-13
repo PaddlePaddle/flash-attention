@@ -372,6 +372,8 @@ inline __device__ void apply_attn_mask(
     for (int i = 0; i < size(tPrScores); ++i) {
         if (elem_less(tPcMask(i), make_coord(seqlen_q, seqlen_k))) {
             tPrScores(i) = tPrScores(i) + tPgMask(i) * unscale_softmax;
+        } else {
+            tPrScores(i) = -INFINITY;
         }
     }
 }

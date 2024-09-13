@@ -1116,17 +1116,16 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_MN, bool Is_even_K, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params, const int bidb, const int bidh, const int n_block) {
 
-    int flashmask_startrow = 0;
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
 
     // Shared memory.
-    __shared__ int32_t sparse_mask_smem_[Kernel_traits::kBlockN];
-    __shared__ int32_t sparse_mask_smem_up[Kernel_traits::kBlockN];
-    __shared__ int32_t sparse_mask_smem_downend[Kernel_traits::kBlockN];
-    __shared__ int32_t sparse_mask_smem_upstart[Kernel_traits::kBlockN];
+    __shared__ int32_t flash_mask_ltstart_smem_[Kernel_traits::kBlockN];
+    __shared__ int32_t flash_mask_ltend_smem_[Kernel_traits::kBlockN];
+    __shared__ int32_t flash_mask_utstart_smem_[Kernel_traits::kBlockN];
+    __shared__ int32_t flash_mask_utend_smem_[Kernel_traits::kBlockN];
     extern __shared__ char smem_[];
 
     // The thread index.
@@ -1143,80 +1142,76 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (n_block * kBlockN >= binfo.actual_seqlen_k || binfo.actual_seqlen_q == 0) return;
 
-    // umiswing: residue is for predication of additional mask gmem access.
-    // Additional mask for varlen qkv is supported, but a varlen mask is not supported.
-    const int m_residue = params.seqlen_q % kBlockM ? params.seqlen_q % kBlockM : kBlockM;
-    const int n_residue = params.seqlen_k % kBlockN ? params.seqlen_k % kBlockN : kBlockN;
-
     const index_t row_offset_sparsemask_nblock =
         (bidb * params.h_sparsemask + bidh / params.h_h_sparsemask_ratio) *
         cute::ceil_div(params.seqlen_k, kBlockN);
-    const int *gSparseMaskDownMax =
+    const int *gFlashMaskLTStartMax =
         reinterpret_cast<int32_t *>(params.flashmask_downstart_nblockmax) +
         row_offset_sparsemask_nblock;
-    const int *gSparseMaskDownMin =
+    const int *gFlashMaskLTStartMin =
         reinterpret_cast<int32_t *>(params.flashmask_downstart_nblockmin) +
         row_offset_sparsemask_nblock;
-    const int *gSparseMaskUpMax =
+    const int *gFlashMaskUTEndMax =
         reinterpret_cast<int32_t *>(params.flashmask_upend_nblockmax) +
         row_offset_sparsemask_nblock;
-    const int *gSparseMaskUpMin =
+    const int *gFlashMaskUTEndMin =
         reinterpret_cast<int32_t *>(params.flashmask_upend_nblockmin) +
         row_offset_sparsemask_nblock;
-    const int *gSparseMaskDownEndMax =
+    const int *gFlashMaskLTEndMax =
         reinterpret_cast<int32_t *>(params.flashmask_downend_nblockmax) +
         row_offset_sparsemask_nblock;
-    const int *gSparseMaskDownEndMin =
+    const int *gFlashMaskLTEndMin =
         reinterpret_cast<int32_t *>(params.flashmask_downend_nblockmin) +
         row_offset_sparsemask_nblock;
-    const int* gSparseMaskUpStartMax = reinterpret_cast<int32_t*>(params.flashmask_upstart_nblockmax) + row_offset_sparsemask_nblock;
-    const int* gSparseMaskUpStartMin = reinterpret_cast<int32_t*>(params.flashmask_upstart_nblockmin) + row_offset_sparsemask_nblock;
+    const int* gFlashMaskUTStartMax = reinterpret_cast<int32_t*>(params.flashmask_upstart_nblockmax) + row_offset_sparsemask_nblock;
+    const int* gFlashMaskUTStartMin = reinterpret_cast<int32_t*>(params.flashmask_upstart_nblockmin) + row_offset_sparsemask_nblock;
 
     int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
-    const bool flashmask_has_end = params.flashmask_downend_ptr != nullptr;
-    int flashmask_upendrow = params.seqlen_q;
-
+    const bool flashmask_lt_has_end = params.flashmask_downend_ptr != nullptr;
+    const bool flashmask_ut_has_start = params.flashmask_upstart_ptr != nullptr;
     const bool enable_mask_bypass = params.enable_mask_bypass;
 
-    int flashmask_downstartmax = std::numeric_limits<int>::max();
-    int flashmask_downendmin = 0;
-    int flashmask_upendmin = 0;
-    int flashmask_upstartmax = std::numeric_limits<int>::max();
+    int flashmask_ltstart_min = 0;
+    int flashmask_ltstart_max = params.seqlen_q;
+    int flashmask_ltend_min = 0;
+    int flashmask_ltend_max = params.seqlen_q;
+    int flashmask_utstart_min = 0;
+    int flashmask_utstart_max = params.seqlen_q;
+    int flashmask_utend_min = 0;
+    int flashmask_utend_max = params.seqlen_q;
 
-    if(params.flashmask_downstart_nblockmax != nullptr)
-        flashmask_downstartmax = gSparseMaskDownMax[n_block];
-    if(params.flashmask_downend_nblockmin != nullptr)
-        flashmask_downendmin = gSparseMaskDownEndMin[n_block];
-    if(params.flashmask_upend_nblockmin != nullptr)
-        flashmask_upendmin = gSparseMaskUpMin[n_block];
-    if(params.flashmask_upstart_nblockmax != nullptr)
-        flashmask_upstartmax = gSparseMaskUpStartMax[n_block];
+    if (params.flashmask_downstart_nblockmin != nullptr)
+        flashmask_ltstart_min = gFlashMaskLTStartMin[n_block];
+    if (params.flashmask_downstart_nblockmax != nullptr)
+        flashmask_ltstart_max = gFlashMaskLTStartMax[n_block];
+    if (params.flashmask_downend_nblockmin != nullptr)
+        flashmask_ltend_min = gFlashMaskLTEndMin[n_block];
+    if (params.flashmask_downend_nblockmax != nullptr)
+        flashmask_ltend_max = gFlashMaskLTEndMax[n_block];
+    if (params.flashmask_upstart_nblockmin != nullptr)
+        flashmask_utstart_min = gFlashMaskUTStartMin[n_block];
+    if (params.flashmask_upstart_nblockmax != nullptr)
+        flashmask_utstart_max = gFlashMaskUTStartMax[n_block];
+    if (params.flashmask_upend_nblockmin != nullptr)
+        flashmask_utend_min = gFlashMaskUTEndMin[n_block];
+    if (params.flashmask_upend_nblockmax != nullptr)
+        flashmask_utend_max = gFlashMaskUTEndMax[n_block];
 
 #define SPARSE_MASKED_DOWN \
-    (((m_block * kBlockM) >= flashmask_downstartmax) && (!flashmask_has_end || (m_block + 1) * kBlockM < flashmask_downendmin))
+    (((m_block * kBlockM) >= flashmask_ltstart_max) && (!flashmask_lt_has_end || (m_block + 1) * kBlockM <= flashmask_ltend_min))
 
 #define SPARSE_MASKED_UP \
-    (!Is_causal && (m_block + 1) * kBlockM < flashmask_upendmin && (!flashmask_has_end || m_block * kBlockM >= flashmask_upstartmax))
+    (!Is_causal && (m_block + 1) * kBlockM <= flashmask_utend_min && (!flashmask_ut_has_start || m_block * kBlockM >= flashmask_utstart_max))
 
 #define SPARSE_MASKED \
     (SPARSE_MASKED_DOWN || SPARSE_MASKED_UP)
 
-    if (!flashmask_has_end) {
-      m_block_max = min(m_block_max,
-                        cute::ceil_div(gSparseMaskDownMax[n_block], kBlockM));
-    /*
-      flashmask_has_end && enable_mask_bypass is not support now
-      if (flashmask_has_end) {
-        if(flashmask_bwd_state == 1) {
-            m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
-        }
+    if (true/*Is_flashmask*/ && enable_mask_bypass) {
+      if (!flashmask_lt_has_end || (flashmask_lt_has_end && gFlashMaskLTEndMin[n_block] >= binfo.actual_seqlen_q)) {
+          m_block_max = min(m_block_max,
+                            cute::ceil_div(gFlashMaskLTStartMax[n_block], kBlockM));
       }
-    */
-      flashmask_startrow = gSparseMaskDownMin[n_block];
-      if (params.flashmask_upend_ptr != nullptr)
-        flashmask_upendrow = gSparseMaskUpMax[n_block];
     }
-    const int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
 
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
@@ -1272,13 +1267,13 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
     Tensor gMask = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_mask_ptr) + row_offset_mask),
                                Shape<Int<kBlockM>, Int<kBlockN>>{},
                                make_stride(params.seqlen_k, _1{}));
-    Tensor gSparseMask = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.flashmask_downstart_ptr) + row_offset_sparse_mask),
+    Tensor gFlashMaskLTStart = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.flashmask_downstart_ptr) + row_offset_sparse_mask),
                                Shape<Int<kBlockN>>{});
-    Tensor gSparseMaskUp = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.flashmask_upend_ptr) + row_offset_sparse_mask),
+    Tensor gFlashMaskLTEnd = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.flashmask_downend_ptr) + row_offset_sparse_mask),
                                Shape<Int<kBlockN>>{});
-    Tensor gSparseMaskDownEnd = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.flashmask_downend_ptr) + row_offset_sparse_mask),
+    Tensor gFlashMaskUTStart = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.flashmask_upstart_ptr) + row_offset_sparse_mask),
                                Shape<Int<kBlockN>>{});
-    Tensor gSparseMaskUpStart = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.flashmask_upstart_ptr) + row_offset_sparse_mask),
+    Tensor gFlashMaskUTEnd = make_tensor(make_gmem_ptr(reinterpret_cast<int32_t *>(params.flashmask_upend_ptr) + row_offset_sparse_mask),
                                Shape<Int<kBlockN>>{});
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
@@ -1303,10 +1298,12 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
     Tensor sPtNoSwizzle = make_tensor(sP.data(), typename Kernel_traits::SmemLayoutPdStransposedNoSwizzle{});
     // sP and sdQ share the same memory so be careful
     Tensor sdQ = make_tensor(sP.data(), typename Kernel_traits::SmemLayoutdQ{});
-    Tensor sSparseMask = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_)), Shape<Int<kBlockN>>{});
-    Tensor sSparseMaskUp = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_up)), Shape<Int<kBlockN>>{});
-    Tensor sSparseMaskDownEnd = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_downend)), Shape<Int<kBlockN>>{});
-    Tensor sSparseMaskUpStart = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(sparse_mask_smem_upstart)), Shape<Int<kBlockN>>{});
+
+    Tensor sFlashMaskLTStart = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(flash_mask_ltstart_smem_)), Shape<Int<kBlockN>>{});
+    Tensor sFlashMaskLTEnd = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(flash_mask_ltend_smem_)), Shape<Int<kBlockN>>{});
+    Tensor sFlashMaskUTStart = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(flash_mask_utstart_smem_)), Shape<Int<kBlockN>>{});
+    Tensor sFlashMaskUTEnd = make_tensor(make_smem_ptr(reinterpret_cast<int32_t *>(flash_mask_utend_smem_)), Shape<Int<kBlockN>>{});
+
     Tensor sdPsum = make_tensor(make_smem_ptr(reinterpret_cast<float2 *>((sP.data() + cute::max(size(sP), size(sdQ))).get())),
                                 Shape<Int<Kernel_traits::kSmemdPsumCount / 2>>{});
 
@@ -1455,29 +1452,12 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
 
     int m_block = m_block_max - 1;
     int m_block_min = !Is_causal ? 0 : (n_block * kBlockN) / kBlockM;
-    if(!flashmask_has_end) {
-      if (!Is_causal) {
-        m_block_min = max(m_block_min, gSparseMaskUpMin[n_block] / kBlockM);
-      }
-      /*
-      if (flashmask_has_end) {
-        if(flashmask_bwd_state == 1) {
-            m_block_min = gSparseMaskDownEndMin[n_block] / kBlockM;
-            m_block_min =
-                max(m_block_min,
-                    min(cute::ceil_div(binfo.actual_seqlen_q, kBlockM),
-                        cute::ceil_div(gSparseMaskDownMax[n_block], kBlockM)));
-        }
-      }
-      */
-    }
 
-    /*
-    if(flashmask_has_end && flashmask_bwd_state == 1 && m_block < m_block_min) {
-        return;
-        // do nothing because stage0 has done them.
+    if (true/*Is_flashmask*/ && enable_mask_bypass) {
+      if (!Is_causal && (!flashmask_ut_has_start || (flashmask_ut_has_start && gFlashMaskUTStartMax[n_block] <= 0))) {
+          m_block_min = max(m_block_min, gFlashMaskUTEndMin[n_block] / kBlockM);
+      }
     }
-    */
 
     // We might need to exit early and write 0 to dK and dV.
     // Otherwise we get wrong result for the case where we don't enter the for loop.
@@ -1597,15 +1577,15 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
 
     if (true/*Is_flashmask*/) {
         if (tidx < kBlockN) {
-	        sSparseMask(tidx) = gSparseMask(tidx);
+	        sFlashMaskLTStart(tidx) = gFlashMaskLTStart(tidx);
             if(!Is_causal) {
-                sSparseMaskUp(tidx) = gSparseMaskUp(tidx);
-                if(flashmask_has_end) {
-                    sSparseMaskUpStart(tidx) = gSparseMaskUpStart(tidx);
+                sFlashMaskUTEnd(tidx) = gFlashMaskUTEnd(tidx);
+                if(flashmask_ut_has_start) {
+                    sFlashMaskUTStart(tidx) = gFlashMaskUTStart(tidx);
                 }
             }
-            if(flashmask_has_end) {
-                sSparseMaskDownEnd(tidx) = gSparseMaskDownEnd(tidx);
+            if(flashmask_lt_has_end) {
+                sFlashMaskLTEnd(tidx) = gFlashMaskLTEnd(tidx);
             }
         }
 	    //__syncthreads();
@@ -1652,12 +1632,12 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
         // So we need to mask out the elements beyond actual_seqlen_k.
         if (!Is_causal) {
             if (true/*Is_flashmask*/ && 
-                ((m_block + 1) * kBlockM >= flashmask_startrow || m_block * kBlockM < flashmask_upendrow)) {
-                if(flashmask_has_end) {
+                (((m_block + 1) * kBlockM > flashmask_ltstart_min && m_block * kBlockM < flashmask_ltend_max) || (m_block * kBlockM < flashmask_utend_max && (m_block + 1) * kBlockM > flashmask_utstart_min))) {
+                if(flashmask_ut_has_start) {
                      flash::apply_sparse_mask(
                              scores,
-                             sSparseMask,
-                             sSparseMaskDownEnd,
+                             sFlashMaskLTStart,
+                             sFlashMaskLTEnd,
                              n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                              binfo.actual_seqlen_k,
                              m_block * kBlockM + get<0>(taccScS_row(0)),
@@ -1667,8 +1647,8 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
                      );
                      flash::apply_sparse_mask(
                              scores,
-                             sSparseMaskUpStart,
-                             sSparseMaskUp,
+                             sFlashMaskUTStart,
+                             sFlashMaskUTEnd,
                              n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                              binfo.actual_seqlen_k,
                              m_block * kBlockM + get<0>(taccScS_row(0)),
@@ -1680,8 +1660,8 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
                 else {
                      flash::apply_sparse_mask(
                              scores,
-                             sSparseMask,
-                             sSparseMaskUp,
+                             sFlashMaskLTStart,
+                             sFlashMaskUTEnd,
                              n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                              binfo.actual_seqlen_k,
                              m_block * kBlockM + get<0>(taccScS_row(0)),
@@ -1702,22 +1682,22 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
             // But we still want to mask out elements not beyond actual_seqlen_k.
 
             if (true/*Is_flashmask*/ &&
-                (m_block + 1) * kBlockM >= flashmask_startrow) {
-              if (flashmask_has_end)
+                (m_block + 1) * kBlockM > flashmask_ltstart_min && m_block * kBlockM < flashmask_ltend_max) {
+              if (flashmask_lt_has_end) {
                 flash::apply_sparse_mask_causal_withend(
                     scores,
-                    sSparseMask,
-                    sSparseMaskDownEnd,
+                    sFlashMaskLTStart,
+                    sFlashMaskLTEnd,
                     n_block * kBlockN +
                         (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                     binfo.actual_seqlen_k,
                     m_block * kBlockM + get<0>(taccScS_row(0)),
                     AtomLayoutMS * 16,
                     n_block * kBlockN);
-              else {
+              } else {
                 flash::apply_sparse_mask_causal(
                     scores,
-                    sSparseMask,
+                    sFlashMaskLTStart,
                     n_block * kBlockN +
                         (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                     binfo.actual_seqlen_k,

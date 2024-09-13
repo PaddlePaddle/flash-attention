@@ -1171,31 +1171,14 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
     const bool flashmask_ut_has_start = params.flashmask_upstart_ptr != nullptr;
     const bool enable_mask_bypass = params.enable_mask_bypass;
 
-    int flashmask_ltstart_min = 0;
-    int flashmask_ltstart_max = params.seqlen_q;
-    int flashmask_ltend_min = 0;
-    int flashmask_ltend_max = params.seqlen_q;
-    int flashmask_utstart_min = 0;
-    int flashmask_utstart_max = params.seqlen_q;
-    int flashmask_utend_min = 0;
-    int flashmask_utend_max = params.seqlen_q;
-
-    if (params.flashmask_downstart_nblockmin != nullptr)
-        flashmask_ltstart_min = gFlashMaskLTStartMin[n_block];
-    if (params.flashmask_downstart_nblockmax != nullptr)
-        flashmask_ltstart_max = gFlashMaskLTStartMax[n_block];
-    if (params.flashmask_downend_nblockmin != nullptr)
-        flashmask_ltend_min = gFlashMaskLTEndMin[n_block];
-    if (params.flashmask_downend_nblockmax != nullptr)
-        flashmask_ltend_max = gFlashMaskLTEndMax[n_block];
-    if (params.flashmask_upstart_nblockmin != nullptr)
-        flashmask_utstart_min = gFlashMaskUTStartMin[n_block];
-    if (params.flashmask_upstart_nblockmax != nullptr)
-        flashmask_utstart_max = gFlashMaskUTStartMax[n_block];
-    if (params.flashmask_upend_nblockmin != nullptr)
-        flashmask_utend_min = gFlashMaskUTEndMin[n_block];
-    if (params.flashmask_upend_nblockmax != nullptr)
-        flashmask_utend_max = gFlashMaskUTEndMax[n_block];
+    const int flashmask_ltstart_min = params.flashmask_downstart_nblockmin != nullptr ? gFlashMaskLTStartMin[n_block] : 0;
+    const int flashmask_ltstart_max = params.flashmask_downstart_nblockmax != nullptr ? gFlashMaskLTStartMax[n_block] : params.seqlen_q;
+    const int flashmask_ltend_min = params.flashmask_downend_nblockmin != nullptr ? gFlashMaskLTEndMin[n_block] : 0;
+    const int flashmask_ltend_max = params.flashmask_downend_nblockmax != nullptr ? gFlashMaskLTEndMax[n_block] : params.seqlen_q;
+    const int flashmask_utstart_min = params.flashmask_upstart_nblockmin != nullptr ? gFlashMaskUTStartMin[n_block] : 0;
+    const int flashmask_utstart_max = params.flashmask_upstart_nblockmax != nullptr ? gFlashMaskUTStartMax[n_block] : params.seqlen_q;
+    const int flashmask_utend_min = params.flashmask_upend_nblockmin != nullptr ? gFlashMaskUTEndMin[n_block] : 0;
+    const int flashmask_utend_max = params.flashmask_upend_nblockmax != nullptr ? gFlashMaskUTEndMax[n_block] : params.seqlen_q;
 
 #define SPARSE_MASKED_DOWN \
     (((m_block * kBlockM) >= flashmask_ltstart_max) && (!flashmask_lt_has_end || (m_block + 1) * kBlockM <= flashmask_ltend_min))
@@ -1207,9 +1190,9 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
     (SPARSE_MASKED_DOWN || SPARSE_MASKED_UP)
 
     if (true/*Is_flashmask*/ && enable_mask_bypass) {
-      if (!flashmask_lt_has_end || (flashmask_lt_has_end && gFlashMaskLTEndMin[n_block] >= binfo.actual_seqlen_q)) {
+      if (!flashmask_lt_has_end || (flashmask_lt_has_end && flashmask_ltend_min >= binfo.actual_seqlen_q)) {
           m_block_max = min(m_block_max,
-                            cute::ceil_div(gFlashMaskLTStartMax[n_block], kBlockM));
+                            cute::ceil_div(flashmask_ltstart_max, kBlockM));
       }
     }
 
@@ -1454,8 +1437,8 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
     int m_block_min = !Is_causal ? 0 : (n_block * kBlockN) / kBlockM;
 
     if (true/*Is_flashmask*/ && enable_mask_bypass) {
-      if (!Is_causal && (!flashmask_ut_has_start || (flashmask_ut_has_start && gFlashMaskUTStartMax[n_block] <= 0))) {
-          m_block_min = max(m_block_min, gFlashMaskUTEndMin[n_block] / kBlockM);
+      if (!Is_causal && (!flashmask_ut_has_start || (flashmask_ut_has_start && flashmask_utstart_max <= 0))) {
+          m_block_min = max(m_block_min, flashmask_utend_min / kBlockM);
       }
     }
 
@@ -1631,7 +1614,7 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
         // when we multiply with dP and convert to fp16, resulting in Inf in dS and NaNs in dQ.
         // So we need to mask out the elements beyond actual_seqlen_k.
         if (!Is_causal) {
-            if (true/*Is_flashmask*/ && 
+            if (true/*Is_flashmask*/ &&
                 (((m_block + 1) * kBlockM > flashmask_ltstart_min && m_block * kBlockM < flashmask_ltend_max) || (m_block * kBlockM < flashmask_utend_max && (m_block + 1) * kBlockM > flashmask_utstart_min))) {
                 if(flashmask_ut_has_start) {
                      flash::apply_sparse_mask(

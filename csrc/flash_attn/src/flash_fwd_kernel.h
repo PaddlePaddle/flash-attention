@@ -1342,7 +1342,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_flashmask(const Params &p
         // for rows outside actual_seqlen_k. So those rows could have Inf / NaN, and the matmul
         // can produce Inf / NaN.
         if (!Is_causal) {
-          if (true/*Is_flashmask*/ && (!enable_mask_bypass || 
+          if (true/*Is_flashmask*/ && (!enable_mask_bypass ||
                 (((m_block + 1) * kBlockM > gFlashMaskLTStartMin[n_block] && (!flashmask_ut_has_start || m_block * kBlockM < gFlashMaskLTEndMax[n_block])) || 
                     (m_block * kBlockM < gFlashMaskUTEndMax[n_block] && (!flashmask_ut_has_start || (m_block + 1) * kBlockM > gFlashMaskUTStartMin[n_block]))))) {
 
@@ -1588,7 +1588,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_flashmask(const Params &p
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
-        if (!Is_causal && true/*Is_flashmask*/ && (!enable_mask_bypass || 
+        if (!Is_causal && true/*Is_flashmask*/ && (!enable_mask_bypass ||
               (((m_block + 1) * kBlockM > gFlashMaskLTStartMin[n_block] && (!flashmask_ut_has_start || m_block * kBlockM < gFlashMaskLTEndMax[n_block])) || 
                   (m_block * kBlockM < gFlashMaskUTEndMax[n_block] && (!flashmask_ut_has_start || (m_block + 1) * kBlockM > gFlashMaskUTStartMin[n_block]))))) {
 

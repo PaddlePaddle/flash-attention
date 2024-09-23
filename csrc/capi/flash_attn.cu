@@ -200,7 +200,7 @@ void set_params_fprop_strided(Flash_fwd_params &params,
     params.flashmask_downend_ptr = flashmask_downend_ptr;
     params.flashmask_upstart_ptr = flashmask_upstart_ptr;
     params.flashmask_maxmin_ptr = static_cast<int*>(flashmask_maxmin_ptr);
-    params.enable_mask_bypass = seqlen_q >= 1024;
+    params.enable_mask_bypass = true;
     if(flashmask_downstart_ptr != nullptr || flashmask_upend_ptr != nullptr) {
         params.h_sparsemask = mask_head_mod_size;
         params.h_h_sparsemask_ratio = h / mask_head_mod_size;

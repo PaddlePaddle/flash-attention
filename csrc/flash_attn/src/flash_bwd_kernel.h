@@ -1436,12 +1436,17 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
     int m_block = m_block_max - 1;
     int m_block_min = !Is_causal ? 0 : (n_block * kBlockN) / kBlockM;
 
-    int m_skip_block = 0;
+    int m_skip_lt_block = 0;
+    int m_skip_ut_block = 0;
     if (true/*Is_flashmask*/ && enable_mask_bypass) {
       if (!Is_causal && (!flashmask_ut_has_start || (flashmask_ut_has_start && flashmask_utstart_max <= 0))) {
           m_block_min = max(m_block_min, flashmask_utend_min / kBlockM);
-      } else if (!Is_causal && flashmask_ut_has_start && flashmask_utstart_max > 0) {
-          m_skip_block = flashmask_utend_min / kBlockM - flashmask_utstart_max / kBlockM - 1;
+      }
+      if (!Is_causal && flashmask_ut_has_start && flashmask_utstart_max > 0) {
+          m_skip_ut_block = flashmask_utend_min / kBlockM - flashmask_utstart_max / kBlockM - 1;
+      }
+      if (flashmask_lt_has_end && flashmask_ltend_min < binfo.actual_seqlen_q ) {
+          m_skip_lt_block = flashmask_ltend_min / kBlockM - flashmask_ltstart_max / kBlockM - 1;
       }
     }
 
@@ -1586,9 +1591,10 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
     int double_buffer_cnt = m_block;
     for (; m_block >= m_block_min; --m_block, --double_buffer_cnt) {
         int next_move_blocks = 1;
-        if (m_skip_block >= 0 && !Is_causal && m_block == flashmask_utend_min / kBlockM) {
-            next_move_blocks += m_skip_block;
-        }
+        if (m_skip_ut_block >= 0 && !Is_causal && m_block == flashmask_utend_min / kBlockM)
+            next_move_blocks += m_skip_ut_block;
+        if (m_skip_lt_block >= 0 && m_block == flashmask_ltend_min / kBlockM)
+            next_move_blocks += m_skip_lt_block;
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
         clear(acc_s);
         cute::cp_async_wait<0>();
@@ -1919,8 +1925,11 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
             }
         }
 
-        if (m_skip_block >= 0 && !Is_causal && m_block == flashmask_utend_min / kBlockM) {
-            m_block -= m_skip_block;
+        if (m_skip_lt_block >= 0 && m_block == flashmask_ltend_min / kBlockM)
+            m_block -= m_skip_lt_block;
+
+        if (m_skip_ut_block >= 0 && !Is_causal && m_block == flashmask_utend_min / kBlockM) {
+            m_block -= m_skip_ut_block;
         }
     }
 

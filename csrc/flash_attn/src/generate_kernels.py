@@ -78,8 +78,8 @@ class Kernel:
 def get_all_kernels() -> List[Kernel]:
     for direction in ["fwd", "bwd"]:
         for dtype, head_dim, is_causal, is_densemask, is_flashmask, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, IS_CAUSAL, IS_DENSEMASK, IS_FLASHMASK, SM):
-            if is_causal == 'true' and is_densemask == 'true':
-                continue
+            # if is_causal == 'true' and is_densemask == 'true':
+            #     continue
             if is_densemask == 'true' and is_flashmask == 'true':
                 continue
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, is_causal=is_causal, is_densemask=is_densemask, is_flashmask=is_flashmask, direction=direction)

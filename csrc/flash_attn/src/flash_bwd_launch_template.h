@@ -67,7 +67,8 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream, 
     BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
         BOOL_SWITCH(is_even_K, IsEvenKConst, [&] {
                 BOOL_SWITCH(is_deterministic, Is_deterministic, [&] {
-                    auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenMNConst, IsEvenKConst, Is_densemask && !Is_causal, Is_deterministic, Is_flashmask>;
+                    // auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenMNConst, IsEvenKConst, Is_densemask && !Is_causal, Is_deterministic, Is_flashmask>;
+                    auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenMNConst, IsEvenKConst, Is_densemask, Is_deterministic, Is_flashmask>;
                     // auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenMNConst, true>;
                     if (smem_size_dq_dk_dv >= 48 * 1024)  {
                         C10_CUDA_CHECK(cudaFuncSetAttribute(

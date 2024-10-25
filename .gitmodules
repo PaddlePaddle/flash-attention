@@ -4,3 +4,6 @@
 [submodule "csrc/flash_attn_with_bias_and_mask/cutlass"]
 	path = csrc/flash_attn_with_bias_and_mask/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
+[submodule "csrc/flash_attn_v3/cutlass"]
+	path = csrc/flash_attn_v3/cutlass
+	url = https://github.com/NVIDIA/cutlass.git

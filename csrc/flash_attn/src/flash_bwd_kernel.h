@@ -2033,11 +2033,11 @@ __forceinline__ __device__ void compute_dq_dk_dv_1colblock_densemask(const Param
     const int m_residue = params.seqlen_q % kBlockM ? params.seqlen_q % kBlockM : kBlockM;
     const int n_residue = params.seqlen_k % kBlockN ? params.seqlen_k % kBlockN : kBlockN;
 
-
     int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
-
-
     const int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
+
+    const int oob_m_block_max = m_block_max;
+    const int oob_n_block_max = n_block_max;
 
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
@@ -2419,8 +2419,8 @@ __forceinline__ __device__ void compute_dq_dk_dv_1colblock_densemask(const Param
         // So we need to mask out the elements beyond actual_seqlen_k.
         if (true) {
             flash::apply_attn_mask<Kernel_traits::TiledMmaSdP>(scores, tPgMask, tPcMask,
-                                                               m_block == m_block_max - 1 ? m_residue : params.seqlen_q,
-                                                               n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
+                                                               m_block == oob_m_block_max - 1 ? m_residue : params.seqlen_q,
+                                                               n_block == oob_n_block_max - 1 ? n_residue : params.seqlen_k,
                                                                params.unscale_softmax);
             tPgMask.data() = tPgMask.data() + (-kBlockM * params.seqlen_k);
         }

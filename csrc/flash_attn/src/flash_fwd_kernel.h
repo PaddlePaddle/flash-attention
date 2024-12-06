@@ -614,6 +614,8 @@ inline __device__ void compute_attn_1rowblock_densemask(const Params &params, co
     const int m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
 
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
+    const int oob_m_block_max = m_block_max;
+    const int oob_n_block_max = n_block_max;
     if (Is_causal) {
         n_block_max = std::min(n_block_max, cute::ceil_div((m_block + 1) * kBlockM, kBlockN));
         // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
@@ -845,8 +847,8 @@ inline __device__ void compute_attn_1rowblock_densemask(const Params &params, co
 
         if (true/*Is_densemask*/) {
             flash::apply_attn_mask<Kernel_traits::TiledMma>(scores, tPgMask, tPcMask,
-                                                            m_block == m_block_max - 1 ? m_residue : params.seqlen_q,
-                                                            n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
+                                                            m_block == oob_m_block_max - 1 ? m_residue : params.seqlen_q,
+                                                            n_block == oob_n_block_max - 1 ? n_residue : params.seqlen_k,
                                                             params.unscale_softmax);
             tPgMask.data() = tPgMask.data() + (-kBlockN);
         }
@@ -933,8 +935,8 @@ inline __device__ void compute_attn_1rowblock_densemask(const Params &params, co
 
         if (true/*Is_densemask*/) {
             flash::apply_attn_mask<Kernel_traits::TiledMma>(scores, tPgMask, tPcMask,
-                                                            m_block == m_block_max - 1 ? m_residue : params.seqlen_q,
-                                                            n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
+                                                            m_block == oob_m_block_max - 1 ? m_residue : params.seqlen_q,
+                                                            n_block == oob_n_block_max - 1 ? n_residue : params.seqlen_k,
                                                             params.unscale_softmax);
             tPgMask.data() = tPgMask.data() + (-kBlockN);
         }

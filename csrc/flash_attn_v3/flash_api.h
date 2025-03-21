@@ -8,128 +8,176 @@
 extern "C" {
 #endif
 
-bool flash_attn_v3_fwd(const void * const q,         // batch_size x seqlen_q x num_heads x head_size
-                    const void * const k,         // batch_size x seqlen_k x num_heads_k x head_size
-                    const void * const v,         // batch_size x seqlen_k x num_heads_k x head_size
-                    void * const rng_state,
-                    void * const out,
-                    void * const softmax_ptr,
-                    void * const softmax_lse_ptr,
-                    const int batch_size,
-                    const int seqlen_q,
-                    const int seqlen_k,
-                    const int seqlen_q_rounded,
-                    const int seqlen_k_rounded,
-                    const int num_heads,
-                    const int num_heads_k,
-                    const int head_size,
-                    const int head_size_rounded,
-                    const float p_dropout,
-                    const float softmax_scale,
-                    const float softmax_unscale,
-                    const bool is_causal,
-                    const bool return_softmax,
-                    const bool is_bf16,
-                    cudaStream_t stream,
-                    uint64_t seed,
-                    uint64_t offset,
-                    const void * const attn_mask,
-                    const int64_t * const mask_dims,
-                    const void * const flashmask_downstart_ptr,
-                    const void * const flashmask_downend_ptr,
-                    const void * const flashmask_upend_ptr,
-                    const void * const flashmask_upstart_ptr,
-                    const void * const flashmask_maxmin_ptr,
-                    const int64_t * const flashmask_dims,
-                    const int q_batch_stride,
-                    const int k_batch_stride,
-                    const int v_batch_stride,
-                    const int q_row_stride,
-                    const int k_row_stride,
-                    const int v_row_stride,
-                    const int q_head_stride,
-                    const int k_head_stride,
-                    const int v_head_stride,
-                    const int o_batch_stride,
-                    const int o_row_stride,
-                    const int o_head_stride,
-                    const bool is_e4m3,
-                    void * tile_count_semaphore,
-                    const float * const descale_q_ptr,
-                    const float * const descale_k_ptr,
-                    const float * const descale_v_ptr,
-                    const bool use_gqa_packing);
+typedef struct Flash_fwd_params Flash_fwd_params;
 
-bool flash_attn_v3_bwd(const void * const dout,  // batch_size x seqlen_q x num_heads, x head_size_og
-                    const void * const q,   // batch_size x seqlen_q x num_heads x head_size
-                    const void * const k,   // batch_size x seqlen_k x num_heads_k x head_size
-                    const void * const v,   // batch_size x seqlen_k x num_heads_k x head_size
-                    const void * const out,   // batch_size x seqlen_q x num_heads x head_size
-                    const void * const softmax_d,
-                    const void * const softmax_lse,     // b x h x seqlen_q
-                    const void * const softmax_lse_log2,
-                    void * const rng_state,
-                    void * const dq,   // batch_size x seqlen_q x num_heads x head_size
-                    void * const dk,   // batch_size x seqlen_k x num_heads_k x head_size
-                    void * const dv,   // batch_size x seqlen_k x num_heads_k x head_size
-                    void * const dq_accum,
-                    const int batch_size,
-                    const int seqlen_q,
-                    const int seqlen_k,
-                    const int seqlen_q_rounded,
-                    const int seqlen_k_rounded,
-                    const int num_heads,
-                    const int num_heads_k,
-                    const int head_size,
-                    const int head_size_rounded,
-                    const float p_dropout,         // probability to drop
-                    const float softmax_scale,
-                    const float softmax_unscale,
-                    const bool is_causal,
-                    const bool is_bf16,
-                    const int num_splits,
-                    const bool deterministic,
-                    cudaStream_t stream,
-                    uint64_t seed,
-                    uint64_t offset,
-                    const void * const attn_mask,
-                    const int64_t * const mask_dims,
-                    const void * const flashmask_downstart_ptr,
-                    const void * const flashmask_downend_ptr,
-                    const void * const flashmask_upend_ptr,
-                    const void * const flashmask_upstart_ptr,
-                    const void * const flashmask_maxmin_ptr,
-                    const int64_t * const flashmask_dims,
-                    const int q_batch_stride,
-                    const int k_batch_stride,
-                    const int v_batch_stride,
-                    const int q_row_stride,
-                    const int k_row_stride,
-                    const int v_row_stride,
-                    const int q_head_stride,
-                    const int k_head_stride,
-                    const int v_head_stride,
-                    const int o_batch_stride,
-                    const int o_row_stride,
-                    const int o_head_stride,
-                    const int dq_batch_stride,
-                    const int dk_batch_stride,
-                    const int dv_batch_stride,
-                    const int dq_row_stride,
-                    const int dk_row_stride,
-                    const int dv_row_stride,
-                    const int dq_head_stride,
-                    const int dk_head_stride,
-                    const int dv_head_stride,
-                    const int do_batch_stride,
-                    const int do_row_stride,
-                    const int do_head_stride,
-                    void * dq_semaphore);
+Flash_fwd_params* fa3_create_params_handle();
+void fa3_destroy_fwd_params_handle(Flash_fwd_params* params_handle);
+void fa3_run_mha_fwd_combine(Flash_fwd_params* params_handle, cudaStream_t stream, bool enable_pdl=false);
+void fa3_run_mha_fwd(Flash_fwd_params* params_handle, cudaStream_t stream);
+bool fa3_get_pagedkv_tma(Flash_fwd_params* params_handle);
+bool fa3_get_pack_gqa(Flash_fwd_params* params_handle);
+bool fa3_get_num_splits(Flash_fwd_params* params_handle);
 
-void flash_attn_set_error(const char *msg);
+#define DECLARE_GETTER_SETTER(type, member) \
+type fa3_params_get_##member(const Flash_fwd_params* params_handle); \
+void fa3_params_set_##member(Flash_fwd_params* params_handle, const type value);
 
-const char *flash_attn_error();
+// The QKV matrices.
+DECLARE_GETTER_SETTER(void *, q_ptr)
+DECLARE_GETTER_SETTER(void *, k_ptr)
+DECLARE_GETTER_SETTER(void *, v_ptr)
 
+// The stride between rows of the Q, K and V matrices.
+DECLARE_GETTER_SETTER(int64_t, q_batch_stride)
+DECLARE_GETTER_SETTER(int64_t, k_batch_stride)
+DECLARE_GETTER_SETTER(int64_t, v_batch_stride)
+DECLARE_GETTER_SETTER(int64_t, q_row_stride)
+DECLARE_GETTER_SETTER(int64_t, k_row_stride)
+DECLARE_GETTER_SETTER(int64_t, v_row_stride)
+DECLARE_GETTER_SETTER(int64_t, q_head_stride)
+DECLARE_GETTER_SETTER(int64_t, k_head_stride)
+DECLARE_GETTER_SETTER(int64_t, v_head_stride)
+DECLARE_GETTER_SETTER(int64_t, v_dim_stride)
+
+// The number of heads.
+DECLARE_GETTER_SETTER(int, h)
+DECLARE_GETTER_SETTER(int, h_k)
+
+// The O matrix (output).
+DECLARE_GETTER_SETTER(void *, o_ptr)
+DECLARE_GETTER_SETTER(void *, oaccum_ptr)
+
+// The stride between rows of O.
+DECLARE_GETTER_SETTER(int64_t, o_batch_stride)
+DECLARE_GETTER_SETTER(int64_t, o_row_stride)
+DECLARE_GETTER_SETTER(int64_t, o_head_stride)
+
+// The pointer to the softmax sum.
+DECLARE_GETTER_SETTER(void *, softmax_lse_ptr)
+DECLARE_GETTER_SETTER(void *, softmax_lseaccum_ptr)
+
+// For FP8 scaling
+DECLARE_GETTER_SETTER(float *, q_descale_ptr)
+DECLARE_GETTER_SETTER(float *, k_descale_ptr)
+DECLARE_GETTER_SETTER(float *, v_descale_ptr)
+DECLARE_GETTER_SETTER(int64_t, q_descale_batch_stride)
+DECLARE_GETTER_SETTER(int64_t, q_descale_head_stride)
+DECLARE_GETTER_SETTER(int64_t, k_descale_batch_stride)
+DECLARE_GETTER_SETTER(int64_t, k_descale_head_stride)
+DECLARE_GETTER_SETTER(int64_t, v_descale_batch_stride)
+DECLARE_GETTER_SETTER(int64_t, v_descale_head_stride)
+
+// The dimensions.
+DECLARE_GETTER_SETTER(int, b)
+DECLARE_GETTER_SETTER(int, seqlen_q)
+DECLARE_GETTER_SETTER(int, seqlen_k)
+DECLARE_GETTER_SETTER(int, seqlen_knew)
+DECLARE_GETTER_SETTER(int, d)
+DECLARE_GETTER_SETTER(int, seqlen_q_rounded)
+DECLARE_GETTER_SETTER(int, seqlen_k_rounded)
+DECLARE_GETTER_SETTER(int, d_rounded)
+DECLARE_GETTER_SETTER(int, rotary_dim)
+DECLARE_GETTER_SETTER(int, total_q)
+DECLARE_GETTER_SETTER(int, total_k)
+DECLARE_GETTER_SETTER(int, total_knew)
+DECLARE_GETTER_SETTER(int, b_k)
+DECLARE_GETTER_SETTER(int, dv)
+DECLARE_GETTER_SETTER(int, dv_rounded)
+
+// The scaling factors for the kernel.
+DECLARE_GETTER_SETTER(float, scale_softmax)
+DECLARE_GETTER_SETTER(float, softcap)
+
+// array of length b+1 holding starting offset of each sequence.
+DECLARE_GETTER_SETTER(int *, cu_seqlens_q)
+DECLARE_GETTER_SETTER(int *, cu_seqlens_k)
+DECLARE_GETTER_SETTER(int *, cu_seqlens_knew)
+DECLARE_GETTER_SETTER(int *, leftpad_k)
+
+// If provided, the actual length of each q/k sequence.
+DECLARE_GETTER_SETTER(int *, seqused_q)
+DECLARE_GETTER_SETTER(int *, seqused_k)
+
+// The stride between rows of Oaccum.
+DECLARE_GETTER_SETTER(int64_t, oaccum_split_stride)
+DECLARE_GETTER_SETTER(int64_t, oaccum_batch_stride)
+DECLARE_GETTER_SETTER(int64_t, oaccum_row_stride)
+DECLARE_GETTER_SETTER(int64_t, oaccum_head_stride)
+
+// The stride between rows of LSEaccum.
+DECLARE_GETTER_SETTER(int64_t, lseaccum_split_stride)
+DECLARE_GETTER_SETTER(int64_t, lseaccum_batch_stride)
+DECLARE_GETTER_SETTER(int64_t, lseaccum_head_stride)
+
+// The K_new and V_new matrices.
+DECLARE_GETTER_SETTER(void *, knew_ptr)
+DECLARE_GETTER_SETTER(void *, vnew_ptr)
+
+// The stride between rows of the Q, K and V matrices.
+DECLARE_GETTER_SETTER(int64_t, knew_batch_stride)
+DECLARE_GETTER_SETTER(int64_t, vnew_batch_stride)
+DECLARE_GETTER_SETTER(int64_t, knew_row_stride)
+DECLARE_GETTER_SETTER(int64_t, vnew_row_stride)
+DECLARE_GETTER_SETTER(int64_t, knew_head_stride)
+DECLARE_GETTER_SETTER(int64_t, vnew_head_stride)
+
+DECLARE_GETTER_SETTER(void *, qv_ptr)
+DECLARE_GETTER_SETTER(int64_t, qv_batch_stride)
+DECLARE_GETTER_SETTER(int64_t, qv_row_stride)
+DECLARE_GETTER_SETTER(int64_t, qv_head_stride)
+
+// The cos and sin matrices for rotary embedding.
+DECLARE_GETTER_SETTER(void *, rotary_cos_ptr)
+DECLARE_GETTER_SETTER(void *, rotary_sin_ptr)
+
+// The indices to index into the KV cache.
+DECLARE_GETTER_SETTER(int *, kv_batch_idx)
+
+// Paged KV cache
+DECLARE_GETTER_SETTER(int *, page_table)
+DECLARE_GETTER_SETTER(int64_t, page_table_batch_stride)
+DECLARE_GETTER_SETTER(int, page_size)
+DECLARE_GETTER_SETTER(int, num_pages)
+DECLARE_GETTER_SETTER(bool, pagedkv_tma)
+
+// The dropout probability (probability of keeping an activation).
+DECLARE_GETTER_SETTER(float, p_dropout)
+// uint32_t p_dropout_in_uint;
+// uint16_t p_dropout_in_uint16_t;
+DECLARE_GETTER_SETTER(uint8_t, p_dropout_in_uint8_t)
+
+// Scale factor of 1 / (1 - p_dropout).
+DECLARE_GETTER_SETTER(float, rp_dropout)
+
+// Local window size
+DECLARE_GETTER_SETTER(int, window_size_left)
+DECLARE_GETTER_SETTER(int, window_size_right)
+
+// Pointer to the RNG seed (idx 0) and offset (idx 1).
+DECLARE_GETTER_SETTER(uint64_t *, rng_state)
+
+DECLARE_GETTER_SETTER(bool, is_bf16)
+DECLARE_GETTER_SETTER(bool, is_fp32)
+DECLARE_GETTER_SETTER(bool, is_e4m3)
+DECLARE_GETTER_SETTER(bool, is_causal)
+DECLARE_GETTER_SETTER(bool, is_local)
+
+DECLARE_GETTER_SETTER(bool, is_rotary_interleaved)
+
+DECLARE_GETTER_SETTER(int, num_splits)  // For split-KV version
+DECLARE_GETTER_SETTER(bool, pack_gqa)
+
+DECLARE_GETTER_SETTER(int, num_splits)  // For split-KV version
+DECLARE_GETTER_SETTER(bool, pack_gqa)
+
+DECLARE_GETTER_SETTER(int *, tile_count_semaphore)
+// int * __restrict__ num_m_blocks_ptr;
+// int * __restrict__ num_n_blocks_ptr;
+DECLARE_GETTER_SETTER(int *, num_splits_dynamic_ptr)
+DECLARE_GETTER_SETTER(bool, skip_scheduler_metadata_computation)
+
+DECLARE_GETTER_SETTER(int, arch)
+DECLARE_GETTER_SETTER(int, num_sm)
 #ifdef __cplusplus
 }
 #endif

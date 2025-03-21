@@ -148,17 +148,19 @@ if(NOT SKIP_BUILD_FA)
   
   if(WITH_FLASHATTN_V3)
     execute_process(
-        COMMAND "${PYTHON_EXECUTABLE}" flash_attn_v3/generate_kernels.py -o flash_attn_v3
+        COMMAND "${PYTHON_EXECUTABLE}" flash_attn_v3/generate_kernels.py -o flash_attn_v3/instantiations
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         RESULT_VARIABLE result
         OUTPUT_VARIABLE output
         ERROR_VARIABLE error
     )
-    file(GLOB FA3_SOURCES_CU_SOURCES "flash_attn_v3/*_sm90.cu")
+    # file(GLOB FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/*_sm90.cu")
+    file(GLOB FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/flash_fwd_hdim*_sm90.cu")
     message(STATUS "Auto generated CUDA source files: ${FA3_SOURCES_CU_SOURCES}")
     add_library(flashattnv3 SHARED
-        flash_attn_v3/cuda_utils.cu
         flash_attn_v3/flash_api.cu
+        flash_attn_v3/flash_fwd_combine.cu
+        flash_attn_v3/flash_prepare_scheduler.cu
         ${FA3_SOURCES_CU_SOURCES}
       )
   
@@ -168,27 +170,29 @@ if(NOT SKIP_BUILD_FA)
       )
   
     target_compile_options(flashattnv3 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
-      -w
-      -Wno-abi
+      # -w
+      # -Wno-abi
       -Xcompiler="-fPIC"
       -Xcompiler="-O3"
       -std=c++17
-      -U__CUDA_NO_HALF_OPERATORS__
-      -U__CUDA_NO_HALF_CONVERSIONS__
-      -U__CUDA_NO_BFLOAT16_OPERATORS__
-      -U__CUDA_NO_BFLOAT16_CONVERSIONS__
-      -U__CUDA_NO_BFLOAT162_OPERATORS__
-      -U__CUDA_NO_BFLOAT162_CONVERSIONS__
-      -DCUTE_ARCH_MMA_SM90A_ENABLE
-      --expt-relaxed-constexpr
-      --expt-extended-lambda
+      --ftemplate-backtrace-limit=0
       --use_fast_math
-      #--ptxas-options=-v
-      #--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage
+      --resource-usage
       -lineinfo
-      -DCUTLASS_DEBUG_TRACE_LEVEL=0
-      -DNDEBUG
+      -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED # Necessary for the WGMMA shapes that we use
+      -DCUTLASS_ENABLE_GDC_FOR_SM90 # For PDL
+      -DCUTLASS_DEBUG_TRACE_LEVEL=0 # Can toggle for debugging
+      -DNDEBUG # Important, otherwise performance is severely impacted
       -gencode arch=compute_90a,code=sm_90a
+
+      # -U__CUDA_NO_HALF_OPERATORS__
+      # -U__CUDA_NO_HALF_CONVERSIONS__
+      # -U__CUDA_NO_BFLOAT16_OPERATORS__
+      # -U__CUDA_NO_BFLOAT16_CONVERSIONS__
+      # -U__CUDA_NO_BFLOAT162_OPERATORS__
+      # -U__CUDA_NO_BFLOAT162_CONVERSIONS__
+      --expt-relaxed-constexpr
+      # --expt-extended-lambda
       >)
   
     INSTALL(TARGETS flashattnv3

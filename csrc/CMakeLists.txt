@@ -154,13 +154,228 @@ if(NOT SKIP_BUILD_FA)
         OUTPUT_VARIABLE output
         ERROR_VARIABLE error
     )
+
+    # Assume options or variables are defined elsewhere in the CMake project
+    # You can define them for testing purposes like this:
+    option(DISABLE_FP16 "Disable FP16" OFF)
+    option(DISABLE_FP8 "Disable FP8" OFF)
+    option(DISABLE_HDIM64 "Disable HDIM64" OFF)
+    option(DISABLE_HDIM96 "Disable HDIM96" OFF)
+    option(DISABLE_HDIM128 "Disable HDIM128" OFF)
+    option(DISABLE_HDIM192 "Disable HDIM192" OFF)
+    option(DISABLE_HDIM256 "Disable HDIM256" OFF)
+    option(DISABLE_SPLIT "Disable Split" OFF)
+    option(DISABLE_PAGEDKV "Disable PagedKV" OFF)
+    option(DISABLE_SOFTCAP "Disable Softcap" OFF)
+    option(DISABLE_PACKGQA "Disable PackGQA" OFF)
+    option(DISABLE_BACKWARD "Disable Backward" OFF)
+    option(DISABLE_SM8X "Disable SM8x" OFF)
+
+    if(DISABLE_FP16)
+      add_compile_definitions(FLASHATTENTION_DISABLE_FP16)
+    endif()
+
+    if(DISABLE_FP8)
+      add_compile_definitions(FLASHATTENTION_DISABLE_FP8)
+    endif()
+
+    if(DISABLE_HDIM64)
+      add_compile_definitions(FLASHATTENTION_DISABLE_HDIM64)
+    endif()
+
+    if(DISABLE_HDIM96)
+      add_compile_definitions(FLASHATTENTION_DISABLE_HDIM96)
+    endif()
+
+    if(DISABLE_HDIM128)
+      add_compile_definitions(FLASHATTENTION_DISABLE_HDIM128)
+    endif()
+
+    if(DISABLE_HDIM192)
+      add_compile_definitions(FLASHATTENTION_DISABLE_HDIM192)
+    endif()
+
+    if(DISABLE_HDIM256)
+      add_compile_definitions(FLASHATTENTION_DISABLE_HDIM256)
+    endif()
+
+    if(DISABLE_SPLIT)
+      add_compile_definitions(FLASHATTENTION_DISABLE_SPLIT)
+    endif()
+
+    if(DISABLE_PAGEDKV)
+      add_compile_definitions(FLASHATTENTION_DISABLE_PAGEDKV)
+    endif()
+
+    if(DISABLE_SOFTCAP)
+      add_compile_definitions(FLASHATTENTION_DISABLE_SOFTCAP)
+    endif()
+
+    if(DISABLE_PACKGQA)
+      add_compile_definitions(FLASHATTENTION_DISABLE_PACKGQA)
+    endif()
+
+    if(DISABLE_BACKWARD)
+      add_compile_definitions(FLASHATTENTION_DISABLE_BACKWARD)
+    endif()
+
+    if(DISABLE_SM8X)
+      add_compile_definitions(FLASHATTENTION_DISABLE_SM8X)
+    endif()
+
+    set(DTYPE_FWD_SM80 "bf16")
+    if(NOT DISABLE_FP16)
+        list(APPEND DTYPE_FWD_SM80 "fp16")
+    endif()
+
+    set(DTYPE_FWD_SM90 "bf16")
+    if(NOT DISABLE_FP16)
+        list(APPEND DTYPE_FWD_SM90 "fp16")
+    endif()
+    if(NOT DISABLE_FP8)
+        list(APPEND DTYPE_FWD_SM90 "e4m3")
+    endif()
+    
+    set(DTYPE_BWD "bf16")
+    if(NOT DISABLE_FP16)
+        list(APPEND DTYPE_BWD "fp16")
+    endif()
+
+    set(HEAD_DIMENSIONS_BWD)
+    if(NOT DISABLE_HDIM64)
+        list(APPEND HEAD_DIMENSIONS_BWD 64)
+    endif()
+    if(NOT DISABLE_HDIM96)
+        list(APPEND HEAD_DIMENSIONS_BWD 96)
+    endif()
+    if(NOT DISABLE_HDIM128)
+        list(APPEND HEAD_DIMENSIONS_BWD 128)
+    endif()
+    if(NOT DISABLE_HDIM192)
+        list(APPEND HEAD_DIMENSIONS_BWD 192)
+    endif()
+    if(NOT DISABLE_HDIM256)
+        list(APPEND HEAD_DIMENSIONS_BWD 256)
+    endif()
+
+    # set(HEAD_DIMENSIONS_FWD "all" "diff")
+    set(HEAD_DIMENSIONS_FWD "all" "diff")
+    set(HEAD_DIMENSIONS_FWD_SM80 ${HEAD_DIMENSIONS_BWD})
+    
+    set(SPLIT "__EMPTY__")
+    if(NOT DISABLE_SPLIT)
+        list(APPEND SPLIT "_split")
+    endif()
+    
+    set(PAGEDKV "__EMPTY__")
+    if(NOT DISABLE_PAGEDKV)
+        list(APPEND PAGEDKV "_paged")
+    endif()
+    
+    set(SOFTCAP "__EMPTY__")
+    if(NOT DISABLE_SOFTCAP)
+        list(APPEND SOFTCAP "_softcap")
+    endif()
+    
+    set(SOFTCAP_ALL)
+    if(DISABLE_SOFTCAP)
+        set(SOFTCAP_ALL "__EMPTY__")
+    else()
+        set(SOFTCAP_ALL "_softcapall")
+    endif()
+    
+    set(PACKGQA "__EMPTY__")
+    if(NOT DISABLE_PACKGQA)
+        list(APPEND PACKGQA "_packgqa")
+    endif()
+
+    set(sources_fwd_sm80)
+    foreach(hdim ${HEAD_DIMENSIONS_FWD_SM80})
+        foreach(dtype ${DTYPE_FWD_SM80})
+            foreach(split ${SPLIT})
+                foreach(paged ${PAGEDKV})
+                    foreach(softcap ${SOFTCAP_ALL})
+                        set(name "flash_attn_v3/instantiations/flash_fwd_hdim${hdim}_${dtype}${paged}${split}${softcap}_sm80.cu")
+                        string(REPLACE "__EMPTY__" "" refine_name "${name}")
+                        list(APPEND sources_fwd_sm80 "${refine_name}")
+                    endforeach()
+                endforeach()
+            endforeach()
+        endforeach()
+    endforeach()
+    
+    set(sources_fwd_sm90)
+    foreach(hdim ${HEAD_DIMENSIONS_FWD})
+        foreach(dtype ${DTYPE_FWD_SM90})
+            foreach(split ${SPLIT})
+                foreach(paged ${PAGEDKV})
+                    foreach(softcap ${SOFTCAP})
+                        foreach(packgqa ${PACKGQA})
+                            if(packgqa STREQUAL "__EMPTY__" OR (paged STREQUAL "__EMPTY__" AND split STREQUAL "__EMPTY__"))
+                                set(name "flash_attn_v3/instantiations/flash_fwd_hdim${hdim}_${dtype}${paged}${split}${softcap}${packgqa}_sm90.cu")
+                                string(REPLACE "__EMPTY__" "" refine_name "${name}")
+                                list(APPEND sources_fwd_sm90 "${refine_name}")
+                            endif()
+                        endforeach()
+                    endforeach()
+                endforeach()
+            endforeach()
+        endforeach()
+    endforeach()
+
+    message(STATUS "wsm debug ${sources_fwd_sm90}")
+    
+    set(sources_bwd_sm80)
+    foreach(hdim ${HEAD_DIMENSIONS_BWD})
+        foreach(dtype ${DTYPE_BWD})
+            foreach(softcap ${SOFTCAP})
+                set(name "flash_attn_v3/instantiations/flash_bwd_hdim${hdim}_${dtype}${softcap}_sm80.cu")
+                string(REPLACE "__EMPTY__" "" refine_name "${name}")
+                list(APPEND sources_bwd_sm80 "${refine_name}")
+            endforeach()
+        endforeach()
+    endforeach()
+    
+    set(sources_bwd_sm90)
+    foreach(hdim ${HEAD_DIMENSIONS_BWD})
+        foreach(dtype ${DTYPE_BWD})
+            foreach(softcap ${SOFTCAP_ALL})
+                set(name "flash_attn_v3/instantiations/flash_bwd_hdim${hdim}_${dtype}${softcap}_sm90.cu")
+                string(REPLACE "__EMPTY__" "" refine_name "${name}")
+                list(APPEND sources_bwd_sm90 "${refine_name}")
+            endforeach()
+        endforeach()
+    endforeach()
+
+    if(DISABLE_BACKWARD)
+        set(sources_bwd_sm80 "")
+        set(sources_bwd_sm90 "")
+    endif()
+    
+    set(FA3_SOURCES_CU_SOURCES "flash_attn_v3/flash_api.cu")
+    if(NOT DISABLE_SM8X)
+        list(APPEND FA3_SOURCES_CU_SOURCES ${sources_fwd_sm80})
+    endif()
+    list(APPEND FA3_SOURCES_CU_SOURCES ${sources_fwd_sm90})
+    if(NOT DISABLE_SM8X)
+        list(APPEND FA3_SOURCES_CU_SOURCES ${sources_bwd_sm80})
+    endif()
+    list(APPEND FA3_SOURCES_CU_SOURCES ${sources_bwd_sm90})
+    
+    if(NOT DISABLE_SPLIT)
+        list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/flash_fwd_combine.cu")
+    endif()
+    
+    list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/flash_prepare_scheduler.cu")
+
     # file(GLOB FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/*_sm90.cu")
-    file(GLOB FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/flash_fwd_hdim*_sm90.cu")
+    # file(GLOB FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/flash_fwd_hdim*_sm90.cu")
+    # file(GLOB FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/*_softcapall_sm90.cu")
     message(STATUS "Auto generated CUDA source files: ${FA3_SOURCES_CU_SOURCES}")
     add_library(flashattnv3 SHARED
-        flash_attn_v3/flash_api.cu
-        flash_attn_v3/flash_fwd_combine.cu
-        flash_attn_v3/flash_prepare_scheduler.cu
+        # flash_attn_v3/flash_api.cu
+        # flash_attn_v3/flash_fwd_combine.cu
+        # flash_attn_v3/flash_prepare_scheduler.cu
         ${FA3_SOURCES_CU_SOURCES}
       )
   

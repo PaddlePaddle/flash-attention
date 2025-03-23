@@ -286,7 +286,24 @@ Flash_fwd_params* fa3_create_params_handle() {
   return params_handle;
 }
 
+Flash_bwd_params* fa3_create_bwd_params_handle() {
+  Flash_bwd_params* params_handle = (Flash_bwd_params*)malloc(sizeof(Flash_bwd_params));
+  if(params_handle) {
+    *params_handle = Flash_bwd_params{};
+  }
+  return params_handle;
+}
+
+Flash_fwd_params* fa3_cast_to_fwd_params_handle(Flash_bwd_params* params_handle) {
+  return static_cast<Flash_fwd_params*>(params_handle);
+}
+
 void fa3_destroy_fwd_params_handle(Flash_fwd_params* params_handle) {
+    PADDLE_CHECK(params_handle, "params_handle is nullptr");
+    free(params_handle);
+}
+
+void fa3_destroy_bwd_params_handle(Flash_bwd_params* params_handle) {
     PADDLE_CHECK(params_handle, "params_handle is nullptr");
     free(params_handle);
 }
@@ -311,13 +328,15 @@ bool fa3_get_pack_gqa(Flash_fwd_params* params_handle) {
     return get_pack_gqa(*params_handle);
 }
 
-bool fa3_get_num_splits(Flash_fwd_params* params_handle) {
+int fa3_get_num_splits(Flash_fwd_params* params_handle) {
     return get_num_splits(*params_handle);
 }
 
 #define DEFINE_GETTER_SETTER(type, member) \
 type fa3_params_get_##member(const Flash_fwd_params* params_handle) { return params_handle->member; } \
-void fa3_params_set_##member(Flash_fwd_params* params_handle, type value) { params_handle->member = value; }
+void fa3_params_set_##member(Flash_fwd_params* params_handle, type value) { params_handle->member = value; } \
+type fa3_bwd_params_get_##member(const Flash_bwd_params* params_handle) { return params_handle->member; } \
+void fa3_bwd_params_set_##member(Flash_bwd_params* params_handle, type value) { params_handle->member = value; }
 
 // The QKV matrices.
 DEFINE_GETTER_SETTER(void *, q_ptr)
@@ -472,6 +491,50 @@ DEFINE_GETTER_SETTER(bool, skip_scheduler_metadata_computation)
 
 DEFINE_GETTER_SETTER(int, arch)
 DEFINE_GETTER_SETTER(int, num_sm)
+
+#define DEFINE_BWD_GETTER_SETTER(type, member) \
+type fa3_bwd_params_get_##member(const Flash_bwd_params* params_handle) { return params_handle->member; } \
+void fa3_bwd_params_set_##member(Flash_bwd_params* params_handle, type value) { params_handle->member = value; }
+
+// The dO and dQKV matrices.
+DEFINE_BWD_GETTER_SETTER(void *, do_ptr)
+DEFINE_BWD_GETTER_SETTER(void *, dq_ptr)
+DEFINE_BWD_GETTER_SETTER(void *, dk_ptr)
+DEFINE_BWD_GETTER_SETTER(void *, dv_ptr)
+
+// To accumulate dQ
+DEFINE_BWD_GETTER_SETTER(void *, dq_accum_ptr)
+DEFINE_BWD_GETTER_SETTER(void *, dk_accum_ptr)
+DEFINE_BWD_GETTER_SETTER(void *, dv_accum_ptr)
+
+// // To accumulate dK and dV in case we're splitting the bwd along seqlen_q
+// dimension void *__restrict__ dk_accum_ptr; void *__restrict__
+// dv_accum_ptr;
+
+// The stride between rows of the dO, dQ, dK and dV matrices.
+DEFINE_BWD_GETTER_SETTER(int64_t, do_batch_stride)
+DEFINE_BWD_GETTER_SETTER(int64_t, do_row_stride)
+DEFINE_BWD_GETTER_SETTER(int64_t, do_head_stride)
+DEFINE_BWD_GETTER_SETTER(int64_t, dq_batch_stride)
+DEFINE_BWD_GETTER_SETTER(int64_t, dk_batch_stride)
+DEFINE_BWD_GETTER_SETTER(int64_t, dv_batch_stride)
+DEFINE_BWD_GETTER_SETTER(int64_t, dq_row_stride)
+DEFINE_BWD_GETTER_SETTER(int64_t, dk_row_stride)
+DEFINE_BWD_GETTER_SETTER(int64_t, dv_row_stride)
+DEFINE_BWD_GETTER_SETTER(int64_t, dq_head_stride)
+DEFINE_BWD_GETTER_SETTER(int64_t, dk_head_stride)
+DEFINE_BWD_GETTER_SETTER(int64_t, dv_head_stride)
+
+// The pointer to the softmax d sum.
+DEFINE_BWD_GETTER_SETTER(void *, dsoftmax_sum)
+DEFINE_BWD_GETTER_SETTER(void *, softmax_lse_log2_ptr)
+
+DEFINE_BWD_GETTER_SETTER(int *, dq_semaphore)
+DEFINE_BWD_GETTER_SETTER(int *, dk_semaphore)
+DEFINE_BWD_GETTER_SETTER(int *, dv_semaphore)
+
+DEFINE_BWD_GETTER_SETTER(bool, deterministic)
+DEFINE_BWD_GETTER_SETTER(int64_t, dq_accum_split_stride)
 
 #ifdef __cplusplus
 }

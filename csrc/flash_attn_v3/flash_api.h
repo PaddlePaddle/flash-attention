@@ -9,18 +9,25 @@ extern "C" {
 #endif
 
 typedef struct Flash_fwd_params Flash_fwd_params;
+typedef struct Flash_bwd_params Flash_bwd_params;
 
 Flash_fwd_params* fa3_create_params_handle();
+Flash_bwd_params* fa3_create_bwd_params_handle();
+Flash_fwd_params* fa3_cast_to_fwd_params_handle(Flash_bwd_params* params_handle);
 void fa3_destroy_fwd_params_handle(Flash_fwd_params* params_handle);
+void fa3_destroy_bwd_params_handle(Flash_bwd_params* params_handle);
 void fa3_run_mha_fwd_combine(Flash_fwd_params* params_handle, cudaStream_t stream, bool enable_pdl=false);
 void fa3_run_mha_fwd(Flash_fwd_params* params_handle, cudaStream_t stream);
 bool fa3_get_pagedkv_tma(Flash_fwd_params* params_handle);
 bool fa3_get_pack_gqa(Flash_fwd_params* params_handle);
-bool fa3_get_num_splits(Flash_fwd_params* params_handle);
+int fa3_get_num_splits(Flash_fwd_params* params_handle);
+void fa3_run_mha_bwd(Flash_bwd_params* params_handle, cudaStream_t stream);
 
 #define DECLARE_GETTER_SETTER(type, member) \
 type fa3_params_get_##member(const Flash_fwd_params* params_handle); \
-void fa3_params_set_##member(Flash_fwd_params* params_handle, const type value);
+void fa3_params_set_##member(Flash_fwd_params* params_handle, const type value); \
+type fa3_bwd_params_get_##member(const Flash_bwd_params* params_handle); \
+void fa3_bwd_params_set_##member(Flash_bwd_params* params_handle, type value);
 
 // The QKV matrices.
 DECLARE_GETTER_SETTER(void *, q_ptr)
@@ -178,6 +185,51 @@ DECLARE_GETTER_SETTER(bool, skip_scheduler_metadata_computation)
 
 DECLARE_GETTER_SETTER(int, arch)
 DECLARE_GETTER_SETTER(int, num_sm)
+
+
+#define DECLARE_BWD_GETTER_SETTER(type, member) \
+type fa3_bwd_params_get_##member(const Flash_bwd_params* params_handle); \
+void fa3_bwd_params_set_##member(Flash_bwd_params* params_handle, type value);
+
+// The dO and dQKV matrices.
+DECLARE_BWD_GETTER_SETTER(void *, do_ptr)
+DECLARE_BWD_GETTER_SETTER(void *, dq_ptr)
+DECLARE_BWD_GETTER_SETTER(void *, dk_ptr)
+DECLARE_BWD_GETTER_SETTER(void *, dv_ptr)
+
+// To accumulate dQ
+DECLARE_BWD_GETTER_SETTER(void *, dq_accum_ptr)
+DECLARE_BWD_GETTER_SETTER(void *, dk_accum_ptr)
+DECLARE_BWD_GETTER_SETTER(void *, dv_accum_ptr)
+
+// // To accumulate dK and dV in case we're splitting the bwd along seqlen_q
+// dimension void *__restrict__ dk_accum_ptr; void *__restrict__
+// dv_accum_ptr;
+
+// The stride between rows of the dO, dQ, dK and dV matrices.
+DECLARE_BWD_GETTER_SETTER(int64_t, do_batch_stride)
+DECLARE_BWD_GETTER_SETTER(int64_t, do_row_stride)
+DECLARE_BWD_GETTER_SETTER(int64_t, do_head_stride)
+DECLARE_BWD_GETTER_SETTER(int64_t, dq_batch_stride)
+DECLARE_BWD_GETTER_SETTER(int64_t, dk_batch_stride)
+DECLARE_BWD_GETTER_SETTER(int64_t, dv_batch_stride)
+DECLARE_BWD_GETTER_SETTER(int64_t, dq_row_stride)
+DECLARE_BWD_GETTER_SETTER(int64_t, dk_row_stride)
+DECLARE_BWD_GETTER_SETTER(int64_t, dv_row_stride)
+DECLARE_BWD_GETTER_SETTER(int64_t, dq_head_stride)
+DECLARE_BWD_GETTER_SETTER(int64_t, dk_head_stride)
+DECLARE_BWD_GETTER_SETTER(int64_t, dv_head_stride)
+
+// The pointer to the softmax d sum.
+DECLARE_BWD_GETTER_SETTER(void *, dsoftmax_sum)
+DECLARE_BWD_GETTER_SETTER(void *, softmax_lse_log2_ptr)
+
+DECLARE_BWD_GETTER_SETTER(int *, dq_semaphore)
+DECLARE_BWD_GETTER_SETTER(int *, dk_semaphore)
+DECLARE_BWD_GETTER_SETTER(int *, dv_semaphore)
+
+DECLARE_BWD_GETTER_SETTER(bool, deterministic)
+DECLARE_BWD_GETTER_SETTER(int64_t, dq_accum_split_stride)
 #ifdef __cplusplus
 }
 #endif

@@ -140,7 +140,9 @@ void set_params_fprop_strided(Flash_fwd_params &params,
                       void * flashmask_upstart_ptr = nullptr,
                       void * flashmask_maxmin_ptr = nullptr,
                       int mask_head_mod_size = 0,
-                      int mask_seq_q_mod_size = 0) {
+                      int mask_seq_q_mod_size = 0,
+                      const bool unpadded_lse = false,
+                      const int total_q = 0) {
     // Reset the parameters
     memset(&params, 0, sizeof(params));
 
@@ -226,6 +228,8 @@ void set_params_fprop_strided(Flash_fwd_params &params,
     ASSERT_CHECK(p_dropout < 1.f);
 
     params.is_causal = is_causal;
+    params.unpadded_lse = unpadded_lse;
+    params.total_q = total_q;
 }
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
@@ -475,7 +479,9 @@ void set_params_dgrad_strided(Flash_bwd_params &params,
                       void * flashmask_upstart_ptr = nullptr,
                       void * flashmask_maxmin_ptr = nullptr,
                       int mask_head_mod_size = 0,
-                      int mask_seq_q_mod_size = 0) {
+                      int mask_seq_q_mod_size = 0,
+                      const bool unpadded_lse = false,
+                      const int total_q = 0) {
 
     set_params_fprop_strided(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -501,7 +507,9 @@ void set_params_dgrad_strided(Flash_bwd_params &params,
                      flashmask_upstart_ptr,
                      flashmask_maxmin_ptr,
                      mask_head_mod_size,
-                     mask_seq_q_mod_size);
+                     mask_seq_q_mod_size,
+                     unpadded_lse,
+                     total_q);
 
     // Set the pointers and strides.
     params.do_ptr = dout;
@@ -665,7 +673,9 @@ bool flash_attn_fwd(const void * const q,
                      const_cast<void*>(flashmask_upstart_ptr),
                      const_cast<void *>(flashmask_maxmin_ptr),
                      mask_head_mod_size,
-                     mask_seq_q_mod_size);
+                     mask_seq_q_mod_size,
+                     /*unpadded_lse*/false,
+                     /*total_q*/0);
 
     params.rng_state = static_cast<uint64_t*>(rng_state);
 
@@ -724,7 +734,9 @@ bool flash_attn_varlen_fwd(const void * const q,
                            const int k_batch_stride,
                            const int v_batch_stride,
                            const int o_batch_stride,
-                           bool varlen_padded_input) {
+                           bool varlen_padded_input,
+                           const bool unpadded_lse,
+                           const int total_q) {
     FLASHATTNLIB_BEGIN_FUNC
     const bool is_dropout = p_dropout > 0.0;
     const int mask_head_mod_size = attn_mask ? mask_dims[1] : 0;
@@ -771,8 +783,9 @@ bool flash_attn_varlen_fwd(const void * const q,
                      nullptr,
                      nullptr,
                      mask_head_mod_size,
-                     mask_seq_q_mod_size
-                                         );
+                     mask_seq_q_mod_size,
+                     unpadded_lse,
+                     total_q);
     
     params.rng_state = static_cast<uint64_t*>(rng_state);
 
@@ -935,7 +948,9 @@ bool flash_attn_bwd(const void * const dout,
                      const_cast<void*>(flashmask_upstart_ptr),
                      const_cast<void *>(flashmask_maxmin_ptr),
                      mask_head_mod_size,
-                     mask_seq_q_mod_size);
+                     mask_seq_q_mod_size,
+                     /*unpadded_lse*/false,
+                     /*total_q*/0);
 
     auto launch = &run_mha_bwd;
     
@@ -1013,7 +1028,9 @@ bool flash_attn_varlen_bwd(const void * const dout,
                            const int dk_batch_stride,
                            const int dv_batch_stride,
                            const int do_batch_stride,
-                           const bool varlen_padded_input) {
+                           const bool varlen_padded_input,
+                           const bool unpadded_lse,
+                           const int total_q) {
     FLASHATTNLIB_BEGIN_FUNC
     const bool is_dropout = p_dropout > 0.0;
     const int mask_head_mod_size = attn_mask ? mask_dims[1] : 0;
@@ -1084,7 +1101,9 @@ bool flash_attn_varlen_bwd(const void * const dout,
                      nullptr,
                      nullptr,
                      mask_head_mod_size,
-                     mask_seq_q_mod_size);
+                     mask_seq_q_mod_size,
+                     unpadded_lse,
+                     total_q);
 
     auto launch = &run_mha_bwd;
 
@@ -1188,7 +1207,9 @@ bool calc_reduced_attn_scores(const void * const q,
                              /*dq_batch_stride=*/0,
                              /*dk_batch_stride=*/0,
                              /*dv_batch_stride=*/0,
-                             /*do_batch_stride=*/0);
+                             /*do_batch_stride=*/0,
+                             /*unpadded_lse=*/false,
+                             /*total_q=*/0);
 
     params.reduced_scores = reduced_scores;
     params.p_ptr = softmax_ptr;

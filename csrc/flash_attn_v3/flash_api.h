@@ -11,8 +11,10 @@ extern "C" {
 typedef struct Flash_fwd_params Flash_fwd_params;
 typedef struct Flash_bwd_params Flash_bwd_params;
 
-Flash_fwd_params* fa3_create_params_handle();
+Flash_fwd_params* fa3_create_fwd_params_handle();
 Flash_bwd_params* fa3_create_bwd_params_handle();
+void fa3_clear_fwd_params_handle(Flash_fwd_params* params_handle);
+void fa3_clear_bwd_params_handle(Flash_bwd_params* params_handle);
 Flash_fwd_params* fa3_cast_to_fwd_params_handle(Flash_bwd_params* params_handle);
 void fa3_destroy_fwd_params_handle(Flash_fwd_params* params_handle);
 void fa3_destroy_bwd_params_handle(Flash_bwd_params* params_handle);
@@ -24,8 +26,8 @@ int fa3_get_num_splits(Flash_fwd_params* params_handle);
 void fa3_run_mha_bwd(Flash_bwd_params* params_handle, cudaStream_t stream);
 
 #define DECLARE_GETTER_SETTER(type, member) \
-type fa3_params_get_##member(const Flash_fwd_params* params_handle); \
-void fa3_params_set_##member(Flash_fwd_params* params_handle, const type value); \
+type fa3_fwd_params_get_##member(const Flash_fwd_params* params_handle); \
+void fa3_fwd_params_set_##member(Flash_fwd_params* params_handle, const type value); \
 type fa3_bwd_params_get_##member(const Flash_bwd_params* params_handle); \
 void fa3_bwd_params_set_##member(Flash_bwd_params* params_handle, type value);
 

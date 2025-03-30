@@ -258,7 +258,6 @@ if(NOT SKIP_BUILD_FA)
         list(APPEND HEAD_DIMENSIONS_BWD 256)
     endif()
 
-    # set(HEAD_DIMENSIONS_FWD "all" "diff")
     set(HEAD_DIMENSIONS_FWD "all" "diff")
     set(HEAD_DIMENSIONS_FWD_SM80 ${HEAD_DIMENSIONS_BWD})
     
@@ -323,8 +322,6 @@ if(NOT SKIP_BUILD_FA)
         endforeach()
     endforeach()
 
-    message(STATUS "wsm debug ${sources_fwd_sm90}")
-    
     set(sources_bwd_sm80)
     foreach(hdim ${HEAD_DIMENSIONS_BWD})
         foreach(dtype ${DTYPE_BWD})
@@ -368,14 +365,8 @@ if(NOT SKIP_BUILD_FA)
     
     list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/flash_prepare_scheduler.cu")
 
-    # file(GLOB FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/*_sm90.cu")
-    # file(GLOB FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/flash_fwd_hdim*_sm90.cu")
-    # file(GLOB FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/*_softcapall_sm90.cu")
     message(STATUS "Auto generated CUDA source files: ${FA3_SOURCES_CU_SOURCES}")
     add_library(flashattnv3 SHARED
-        # flash_attn_v3/flash_api.cu
-        # flash_attn_v3/flash_fwd_combine.cu
-        # flash_attn_v3/flash_prepare_scheduler.cu
         ${FA3_SOURCES_CU_SOURCES}
       )
   
@@ -385,8 +376,6 @@ if(NOT SKIP_BUILD_FA)
       )
   
     target_compile_options(flashattnv3 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
-      # -w
-      # -Wno-abi
       -Xcompiler="-fPIC"
       -Xcompiler="-O3"
       -std=c++17
@@ -399,15 +388,7 @@ if(NOT SKIP_BUILD_FA)
       -DCUTLASS_DEBUG_TRACE_LEVEL=0 # Can toggle for debugging
       -DNDEBUG # Important, otherwise performance is severely impacted
       -gencode arch=compute_90a,code=sm_90a
-
-      # -U__CUDA_NO_HALF_OPERATORS__
-      # -U__CUDA_NO_HALF_CONVERSIONS__
-      # -U__CUDA_NO_BFLOAT16_OPERATORS__
-      # -U__CUDA_NO_BFLOAT16_CONVERSIONS__
-      # -U__CUDA_NO_BFLOAT162_OPERATORS__
-      # -U__CUDA_NO_BFLOAT162_CONVERSIONS__
       --expt-relaxed-constexpr
-      # --expt-extended-lambda
       >)
   
     INSTALL(TARGETS flashattnv3

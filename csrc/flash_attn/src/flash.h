@@ -69,9 +69,11 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The pointer to the softmax sum.
     void * __restrict__ softmax_lse_ptr;
+    // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
+    bool unpadded_lse;
 
     // The dimensions.
-    int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded;
+    int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, total_q;
 
     // The scaling factors for the kernel.
     float scale_softmax;

@@ -236,38 +236,38 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             if (!params.is_bf16) {
                 #ifndef FLASHATTENTION_DISABLE_FP16
                 #ifndef FLASHATTENTION_DISABLE_HDIM64
-                if (params.d <= 64) { return run_mha_bwd_<Arch, cutlass::half_t, 64, Has_softcap>(params, stream); }
+                if (params.d_rounded <= 64) { return run_mha_bwd_<Arch, cutlass::half_t, 64, Has_softcap>(params, stream); }
                 #endif
                 #ifndef FLASHATTENTION_DISABLE_HDIM96
-                if (params.d <= 96) { return run_mha_bwd_<Arch, cutlass::half_t, 96, Has_softcap>(params, stream); }
+                if (params.d_rounded <= 96) { return run_mha_bwd_<Arch, cutlass::half_t, 96, Has_softcap>(params, stream); }
                 #endif
                 #ifndef FLASHATTENTION_DISABLE_HDIM128
-                if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::half_t, 128, Has_softcap>(params, stream); }
+                if (params.d_rounded <= 128) { return run_mha_bwd_<Arch, cutlass::half_t, 128, Has_softcap>(params, stream); }
                 #endif
                 #ifndef FLASHATTENTION_DISABLE_HDIM192
-                if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::half_t, 192, Has_softcap>(params, stream); }
+                if (params.d_rounded <= 192) { return run_mha_bwd_<Arch, cutlass::half_t, 192, Has_softcap>(params, stream); }
                 #endif
                 #ifndef FLASHATTENTION_DISABLE_HDIM256
-                if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::half_t, 256, Has_softcap>(params, stream); }
+                if (params.d_rounded <= 256) { return run_mha_bwd_<Arch, cutlass::half_t, 256, Has_softcap>(params, stream); }
                 #endif
                 #else
                 PADDLE_CHECK(false, "This flash attention build does not support FP16.");
                 #endif
             } else {
                 #ifndef FLASHATTENTION_DISABLE_HDIM64
-                if (params.d <= 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, Has_softcap>(params, stream); }
+                if (params.d_rounded <= 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, Has_softcap>(params, stream); }
                 #endif
                 #ifndef FLASHATTENTION_DISABLE_HDIM96
-                if (params.d <= 96) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 96, Has_softcap>(params, stream); }
+                if (params.d_rounded <= 96) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 96, Has_softcap>(params, stream); }
                 #endif
                 #ifndef FLASHATTENTION_DISABLE_HDIM128
-                if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 128, Has_softcap>(params, stream); }
+                if (params.d_rounded <= 128) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 128, Has_softcap>(params, stream); }
                 #endif
                 #ifndef FLASHATTENTION_DISABLE_HDIM192
-                if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap>(params, stream); }
+                if (params.d_rounded <= 192) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap>(params, stream); }
                 #endif
                 #ifndef FLASHATTENTION_DISABLE_HDIM256
-                if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap>(params, stream); }
+                if (params.d_rounded <= 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap>(params, stream); }
                 #endif
             }
         });

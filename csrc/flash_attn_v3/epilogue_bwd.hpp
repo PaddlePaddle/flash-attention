@@ -87,7 +87,7 @@ struct CollectiveEpilogueBwd {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutdKV>, SmemAlignmentdKV> smem_dv;
     };
 
-    using ShapedKV = cute::Shape<int64_t, int32_t, int32_t, int32_t>;  // (seqlen_k, d, head, batch)
+    using ShapedKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen_k, d, head, batch)
     using StridedKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
 
     using TMA_dKV = std::conditional_t<

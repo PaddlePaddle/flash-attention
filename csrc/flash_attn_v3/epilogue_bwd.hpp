@@ -87,7 +87,7 @@ struct CollectiveEpilogueBwd {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutdKV>, SmemAlignmentdKV> smem_dv;
     };
 
-    using ShapedKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen_k, d, head, batch)
+    using ShapedKV = cute::Shape<int64_t, int32_t, int32_t, int32_t>;  // (seqlen_k, d, head, batch)
     using StridedKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
 
     using TMA_dKV = std::conditional_t<
@@ -350,7 +350,7 @@ struct CollectiveEpilogueBwdGQA {
     };
     using TensorStorage = std::conditional_t<Use_TMA, TensorStorageTMA, TensorStorageSTG>;
 
-    using ShapedKV = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_k_rounded * d, head, batch)
+    using ShapedKV = cute::Shape<int64_t, int32_t, int32_t>;  // (seqlen_k_rounded * d, head, batch)
     using StridedKV = cute::Stride<_1, int64_t, int64_t>;
 
     // Host side kernel arguments
@@ -420,8 +420,8 @@ struct CollectiveEpilogueBwdGQA {
         bool const is_varlen = Varlen && params.cu_seqlens;
         Tensor mdKaccum = make_tensor(make_gmem_ptr(params.ptr_dKaccum), params.shape_dKaccum, params.stride_dKaccum)(_, bidh_kv, !is_varlen ? bidb : 0);
         Tensor mdVaccum = make_tensor(make_gmem_ptr(params.ptr_dVaccum), params.shape_dKaccum, params.stride_dVaccum)(_, bidh_kv, !is_varlen ? bidb : 0);
-        Tensor gdKaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdKaccum), Shape<Int<kBlockN * kHeadDim>>{}, make_coord(n_block));  // (M * K)
-        Tensor gdVaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdVaccum), Shape<Int<kBlockN * kHeadDim>>{}, make_coord(n_block));  // (M * K)
+        Tensor gdKaccum = local_tile(domain_offset(make_coord(int64_t{seqlen_info.offset_padded} * int64_t{kHeadDim}), mdKaccum), Shape<Int<kBlockN * kHeadDim>>{}, make_coord(n_block));  // (M * K)
+        Tensor gdVaccum = local_tile(domain_offset(make_coord(int64_t{seqlen_info.offset_padded} * int64_t{kHeadDim}), mdVaccum), Shape<Int<kBlockN * kHeadDim>>{}, make_coord(n_block));  // (M * K)
 
         R2STiledCopydKVaccum r2s_tiled_copy_dKVaccum;
         auto r2s_thr_copy_dKVaccum = r2s_tiled_copy_dKVaccum.get_thread_slice(thread_idx);

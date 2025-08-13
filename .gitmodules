@@ -7,3 +7,6 @@
 [submodule "csrc/flash_attn_v3/cutlass"]
 	path = csrc/flash_attn_v3/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
+[submodule "csrc/flashmask_v2/cutlass"]
+	path = csrc/flashmask_v2/cutlass
+	url = https://github.com/NVIDIA/cutlass.git

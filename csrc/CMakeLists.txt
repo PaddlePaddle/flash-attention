@@ -397,6 +397,219 @@ if(NOT SKIP_BUILD_FA)
     INSTALL(FILES flash_attn_v3/flash_api.h DESTINATION "include" RENAME flashv3_api.h)
   endif()
 
+  if(WITH_FLASHATTN_V3) 
+    execute_process(
+        COMMAND "${PYTHON_EXECUTABLE}" flashmask_v2/generate_kernels.py -o flashmask_v2/instantiations
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE result
+        OUTPUT_VARIABLE output
+        ERROR_VARIABLE error
+    )
+
+    option(DISABLE_FLASHMASK_V2_FP16 "Disable FP16 for flashmask_v2" ON)
+    option(DISABLE_FLASHMASK_V2_FP8 "Disable FP8 for flashmask_v2" ON)
+    option(DISABLE_FLASHMASK_V2_HDIM64 "Disable HDIM64 for flashmask_v2" OFF)
+    option(DISABLE_FLASHMASK_V2_HDIM96 "Disable HDIM96 for flashmask_v2" ON)
+    option(DISABLE_FLASHMASK_V2_HDIM128 "Disable HDIM128 for flashmask_v2" OFF)
+    option(DISABLE_FLASHMASK_V2_HDIM192 "Disable HDIM192 for flashmask_v2" ON)
+    option(DISABLE_FLASHMASK_V2_HDIM256 "Disable HDIM256 for flashmask_v2" ON)
+    option(DISABLE_FLASHMASK_V2_SPLIT "Disable Split for flashmask_v2" ON)
+    option(DISABLE_FLASHMASK_V2_PAGEDKV "Disable PagedKV for flashmask_v2" ON)
+    option(DISABLE_FLASHMASK_V2_SOFTCAP "Disable Softcap for flashmask_v2" ON)
+    option(DISABLE_FLASHMASK_V2_PACKGQA "Disable PackGQA for flashmask_v2" ON)
+    option(DISABLE_FLASHMASK_V2_BACKWARD "Disable Backward for flashmask_v2" OFF)
+    option(DISABLE_FLASHMASK_V2_SM8X "Disable SM8x for flashmask_v2" ON)
+
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "Generating flashmask_v2 Python script execution failed with exit code ${result}: ${error}")
+    endif()
+
+    # 以 flashmask_v2 为前缀的变量逻辑
+    set(FLASHMASKV2_DTYPE_FWD_SM80 "bf16")
+    if(NOT DISABLE_FLASHMASK_V2_FP16)
+        list(APPEND FLASHMASKV2_DTYPE_FWD_SM80 "fp16")
+    endif()
+
+    set(FLASHMASKV2_DTYPE_FWD_SM90 "bf16")
+    if(NOT DISABLE_FLASHMASK_V2_FP16)
+        list(APPEND FLASHMASKV2_DTYPE_FWD_SM90 "fp16")
+    endif()
+    if(NOT DISABLE_FLASHMASK_V2_FP8)
+        list(APPEND FLASHMASKV2_DTYPE_FWD_SM90 "e4m3")
+    endif()
+
+    set(FLASHMASKV2_DTYPE_BWD "bf16")
+    if(NOT DISABLE_FLASHMASK_V2_FP16)
+        list(APPEND FLASHMASKV2_DTYPE_BWD "fp16")
+    endif()
+
+    set(FLASHMASKV2_HEAD_DIMENSIONS_BWD)
+    if(NOT DISABLE_FLASHMASK_V2_HDIM64)
+        list(APPEND FLASHMASKV2_HEAD_DIMENSIONS_BWD 64)
+    endif()
+    if(NOT DISABLE_FLASHMASK_V2_HDIM96)
+        list(APPEND FLASHMASKV2_HEAD_DIMENSIONS_BWD 96)
+    endif()
+    if(NOT DISABLE_FLASHMASK_V2_HDIM128)
+        list(APPEND FLASHMASKV2_HEAD_DIMENSIONS_BWD 128)
+    endif()
+    if(NOT DISABLE_FLASHMASK_V2_HDIM192)
+        list(APPEND FLASHMASKV2_HEAD_DIMENSIONS_BWD 192)
+    endif()
+    if(NOT DISABLE_FLASHMASK_V2_HDIM256)
+        list(APPEND FLASHMASKV2_HEAD_DIMENSIONS_BWD 256)
+    endif()
+
+    set(FLASHMASKV2_HEAD_DIMENSIONS_FWD "all" "diff")
+    set(FLASHMASKV2_HEAD_DIMENSIONS_FWD_SM80 ${FLASHMASKV2_HEAD_DIMENSIONS_BWD})
+
+    set(FLASHMASKV2_SPLIT "__EMPTY__")
+    if(NOT DISABLE_FLASHMASK_V2_SPLIT)
+        list(APPEND FLASHMASKV2_SPLIT "_split")
+    endif()
+
+    set(FLASHMASKV2_PAGEDKV "__EMPTY__")
+    if(NOT DISABLE_FLASHMASK_V2_PAGEDKV)
+        list(APPEND FLASHMASKV2_PAGEDKV "_paged")
+    endif()
+
+    set(FLASHMASKV2_SOFTCAP "__EMPTY__")
+    if(NOT DISABLE_FLASHMASK_V2_SOFTCAP)
+        list(APPEND FLASHMASKV2_SOFTCAP "_softcap")
+    endif()
+
+    set(FLASHMASKV2_SOFTCAP_ALL)
+    if(DISABLE_FLASHMASK_V2_SOFTCAP)
+        set(FLASHMASKV2_SOFTCAP_ALL "__EMPTY__")
+    else()
+        set(FLASHMASKV2_SOFTCAP_ALL "_softcapall")
+    endif()
+
+    set(FLASHMASKV2_PACKGQA "__EMPTY__")
+    if(NOT DISABLE_FLASHMASK_V2_PACKGQA)
+        list(APPEND FLASHMASKV2_PACKGQA "_packgqa")
+    endif()
+
+    set(flashmaskv2_sources_fwd_sm80)
+    foreach(hdim ${FLASHMASKV2_HEAD_DIMENSIONS_FWD_SM80})
+        foreach(dtype ${FLASHMASKV2_DTYPE_FWD_SM80})
+            foreach(split ${FLASHMASKV2_SPLIT})
+                foreach(paged ${FLASHMASKV2_PAGEDKV})
+                    foreach(softcap ${FLASHMASKV2_SOFTCAP_ALL})
+                        set(name "flashmask_v2/instantiations/flash_fwd_hdim${hdim}_${dtype}${paged}${split}${softcap}_sm80.cu")
+                        string(REPLACE "__EMPTY__" "" refine_name "${name}")
+                        list(APPEND flashmaskv2_sources_fwd_sm80 "${refine_name}")
+                    endforeach()
+                endforeach()
+            endforeach()
+        endforeach()
+    endforeach()
+    
+    set(flashmaskv2_sources_fwd_sm90)
+    foreach(hdim ${FLASHMASKV2_HEAD_DIMENSIONS_FWD})
+        foreach(dtype ${FLASHMASKV2_DTYPE_FWD_SM90})
+            foreach(split ${FLASHMASKV2_SPLIT})
+                foreach(paged ${FLASHMASKV2_PAGEDKV})
+                    foreach(softcap ${FLASHMASKV2_SOFTCAP})
+                        foreach(packgqa ${FLASHMASKV2_PACKGQA})
+                            if(packgqa STREQUAL "__EMPTY__" OR (paged STREQUAL "__EMPTY__" AND split STREQUAL "__EMPTY__"))
+                                set(name "flashmask_v2/instantiations/flash_fwd_hdim${hdim}_${dtype}${paged}${split}${softcap}${packgqa}_sm90.cu")
+                                string(REPLACE "__EMPTY__" "" refine_name "${name}")
+                                list(APPEND flashmaskv2_sources_fwd_sm90 "${refine_name}")
+                            endif()
+                        endforeach()
+                    endforeach()
+                endforeach()
+            endforeach()
+        endforeach()
+    endforeach()
+
+    set(flashmaskv2_sources_bwd_sm80)
+    foreach(hdim ${FLASHMASKV2_HEAD_DIMENSIONS_BWD})
+        foreach(dtype ${FLASHMASKV2_DTYPE_BWD})
+            foreach(softcap ${FLASHMASKV2_SOFTCAP})
+                set(name "flashmask_v2/instantiations/flash_bwd_hdim${hdim}_${dtype}${softcap}_sm80.cu")
+                string(REPLACE "__EMPTY__" "" refine_name "${name}")
+                list(APPEND flashmaskv2_sources_bwd_sm80 "${refine_name}")
+            endforeach()
+        endforeach()
+    endforeach()
+    
+    set(flashmaskv2_sources_bwd_sm90)
+    foreach(hdim ${FLASHMASKV2_HEAD_DIMENSIONS_BWD})
+        foreach(dtype ${FLASHMASKV2_DTYPE_BWD})
+            foreach(softcap ${FLASHMASKV2_SOFTCAP_ALL})
+                set(name "flashmask_v2/instantiations/flash_bwd_hdim${hdim}_${dtype}${softcap}_sm90.cu")
+                string(REPLACE "__EMPTY__" "" refine_name "${name}")
+                list(APPEND flashmaskv2_sources_bwd_sm90 "${refine_name}")
+            endforeach()
+        endforeach()
+    endforeach()
+    
+    if(DISABLE_FLASHMASK_V2_BACKWARD)
+        set(flashmaskv2_sources_bwd_sm80 "")
+        set(flashmaskv2_sources_bwd_sm90 "")
+    endif()
+
+    #TODO:change
+
+    set(flashmaskv2_sources_fwd_sm80 "")
+    set(flashmaskv2_sources_fwd_sm90 "")
+    
+    set(FLASHMASKV2_SOURCES_CU_SOURCES "flashmask_v2/flash_api.cu")
+    if(NOT DISABLE_FLASHMASK_V2_SM8X)
+        list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES ${flashmaskv2_sources_fwd_sm80})
+    endif()
+    list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES ${flashmaskv2_sources_fwd_sm90})
+    if(NOT DISABLE_FLASHMASK_V2_SM8X)
+        list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES ${flashmaskv2_sources_bwd_sm80})
+    endif()
+    list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES ${flashmaskv2_sources_bwd_sm90})
+    
+    if(NOT DISABLE_FLASHMASK_V2_SPLIT)
+        list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES "flashmask_v2/flash_fwd_combine.cu")
+    endif()
+    
+    list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES "flashmask_v2/flash_prepare_scheduler.cu")
+
+    list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES "flashmask_v2/instantiations/flash_fwd_hdim128_bf16_sm90.cu" 
+                                                "flashmask_v2/instantiations/flash_fwd_hdim64_bf16_sm90.cu")
+
+    message(STATUS "Auto generated CUDA source files for flashmask_v2: ${FLASHMASKV2_SOURCES_CU_SOURCES}")
+
+    # 3. 添加动态库
+    add_library(flashmaskv2 SHARED
+        ${FLASHMASKV2_SOURCES_CU_SOURCES}
+    )
+
+    target_include_directories(flashmaskv2 PRIVATE
+        flashmask_v2
+        flashmask_v2/cutlass/include
+    )
+
+    target_compile_options(flashmaskv2 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+      -Xcompiler="-fPIC"
+      -Xcompiler="-O3"
+      -std=c++17
+      --ftemplate-backtrace-limit=0
+      --use_fast_math
+      --resource-usage
+      -lineinfo
+      -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED # Necessary for the WGMMA shapes that we use
+      -DCUTLASS_ENABLE_GDC_FOR_SM90 # For PDL
+      -DCUTLASS_DEBUG_TRACE_LEVEL=0 # Can toggle for debugging
+      -DNDEBUG # Important, otherwise performance is severely impacted
+      -gencode arch=compute_90a,code=sm_90a
+      --expt-relaxed-constexpr
+      >)
+
+    INSTALL(TARGETS flashmaskv2
+        LIBRARY DESTINATION "lib")
+
+    INSTALL(FILES flashmask_v2/flash_api.h DESTINATION "include" RENAME flashmaskv2_api.h)
+
+  endif()
+
 else()
   INSTALL(FILES capi/flash_attn.h DESTINATION "include")
   INSTALL(FILES flash_attn_v3/flash_api.h DESTINATION "include" RENAME flashv3_api.h)

@@ -67,7 +67,7 @@ const char *flash_attn_error() {
 #define CHECK_FWD_EXECTUABLE(__seqlen_q, __seqlen_k)                     \
       auto dprops = at::cuda::getCurrentDeviceProperties();              \
       const bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;     \
-      const bool is_sm90 = dprops->major == 9 && dprops->minor == 0;     \
+      const bool is_sm90 = dprops->major >= 9;                           \
       ASSERT_CHECK(is_sm8x || is_sm90);                                  \
       ASSERT_CHECK(batch_size > 0);                                      \
       ASSERT_CHECK(head_size % 8 == 0);                                  \

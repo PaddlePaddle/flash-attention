@@ -95,7 +95,9 @@ bool flash_attn_varlen_fwd(const void * const q,  // total_q x num_heads x head_
                            const int k_batch_stride,
                            const int v_batch_stride,
                            const int o_batch_stride,
-                           bool varlen_padded_input);
+                           bool varlen_padded_input,
+                           const bool unpadded_lse,
+                           const int total_q);
 
 bool flash_attn_bwd(const void * const dout,  // batch_size x seqlen_q x num_heads, x head_size_og
                     const void * const q,   // batch_size x seqlen_q x num_heads x head_size
@@ -218,7 +220,9 @@ bool flash_attn_varlen_bwd(const void * const dout,  // total_q x num_heads, x h
                            const int dk_batch_stride,
                            const int dv_batch_stride,
                            const int do_batch_stride,
-                           const bool varlen_padded_input);
+                           const bool varlen_padded_input,
+                           const bool unpadded_lse,
+                           const int total_q);
 
 bool calc_reduced_attn_scores(const void * const q,
                               const void * const k,

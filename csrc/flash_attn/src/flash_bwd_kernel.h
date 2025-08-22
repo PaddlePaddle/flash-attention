@@ -134,7 +134,8 @@ __forceinline__ __device__ void compute_dot_do_o(const Params &params) {
     const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
         + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
     const index_t row_offset_dq_accum = ((bidb * params.h + bidh) * params.seqlen_q_rounded + m_block * kBlockM) * params.d_rounded;
-    const index_t row_offset_dpsum = (bidb * params.h + bidh) * params.seqlen_q_rounded + m_block * kBlockM;
+    const index_t row_offset_dpsum = params.unpadded_lse ? bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb) + m_block * kBlockM
+        : (bidb * params.h + bidh) * params.seqlen_q_rounded + m_block * kBlockM;
 
     Tensor gdO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.do_ptr) + row_offset_do),
                              Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -465,10 +466,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         + (m_block_max - 1) * kBlockM * params.dq_row_stride + bidh * params.dq_head_stride;
     const index_t row_offset_dq_accum = ((bidb * params.h + bidh) * params.seqlen_q_rounded
                                          + (m_block_max - 1) * kBlockM) * params.d_rounded;
-    const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q
-        + (m_block_max - 1) * kBlockM;
-    const index_t row_offset_dpsum = (bidb * params.h + bidh) * params.seqlen_q_rounded
-        + (m_block_max - 1) * kBlockM;
+    const index_t row_offset_lse = params.unpadded_lse ? bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb) + (m_block_max - 1) * kBlockM
+        : (bidb * params.h + bidh) * params.seqlen_q + (m_block_max - 1) * kBlockM;
+    const index_t row_offset_dpsum = params.unpadded_lse ? bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb) + (m_block_max - 1) * kBlockM
+        : (bidb * params.h + bidh) * params.seqlen_q_rounded + (m_block_max - 1) * kBlockM;
 
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -1210,10 +1211,10 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
         + (m_block_max - 1) * kBlockM * params.dq_row_stride + bidh * params.dq_head_stride;
     const index_t row_offset_dq_accum = ((bidb * params.h + bidh) * params.seqlen_q_rounded
                                          + (m_block_max - 1) * kBlockM) * params.d_rounded;
-    const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q
-        + (m_block_max - 1) * kBlockM;
-    const index_t row_offset_dpsum = (bidb * params.h + bidh) * params.seqlen_q_rounded
-        + (m_block_max - 1) * kBlockM;
+    const index_t row_offset_lse = params.unpadded_lse ? bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb) + (m_block_max - 1) * kBlockM
+        : (bidb * params.h + bidh) * params.seqlen_q + (m_block_max - 1) * kBlockM;
+    const index_t row_offset_dpsum = params.unpadded_lse ? bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb) + (m_block_max - 1) * kBlockM
+        : (bidb * params.h + bidh) * params.seqlen_q_rounded + (m_block_max - 1) * kBlockM;
 
     const uint64_t row_offset_mask = (uint64_t)((bidb * params.mask_head_mod_size
         + (bidh % params.mask_head_mod_size)) * params.mask_seq_q_mod_size
@@ -2053,10 +2054,10 @@ __forceinline__ __device__ void compute_dq_dk_dv_1colblock_densemask(const Param
         + (m_block_max - 1) * kBlockM * params.dq_row_stride + bidh * params.dq_head_stride;
     const index_t row_offset_dq_accum = ((bidb * params.h + bidh) * params.seqlen_q_rounded
                                          + (m_block_max - 1) * kBlockM) * params.d_rounded;
-    const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q
-        + (m_block_max - 1) * kBlockM;
-    const index_t row_offset_dpsum = (bidb * params.h + bidh) * params.seqlen_q_rounded
-        + (m_block_max - 1) * kBlockM;
+    const index_t row_offset_lse = params.unpadded_lse ? bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb) + (m_block_max - 1) * kBlockM
+        : (bidb * params.h + bidh) * params.seqlen_q + (m_block_max - 1) * kBlockM;
+    const index_t row_offset_dpsum = params.unpadded_lse ? bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb) + (m_block_max - 1) * kBlockM
+        : (bidb * params.h + bidh) * params.seqlen_q_rounded + (m_block_max - 1) * kBlockM;
 
     const uint64_t row_offset_mask = (uint64_t)((bidb * params.mask_head_mod_size
         + (bidh % params.mask_head_mod_size)) * params.mask_seq_q_mod_size
@@ -2767,7 +2768,8 @@ inline __device__ void compute_dq_dk_dv_1rowblock(const Params &params, const in
     // We'll advance gdKaccum and gdVaccum before the first write.
     const index_t row_offset_dkv_accum = ((bidb * params.h_k + (bidh / params.h_h_k_ratio)) * params.seqlen_k_rounded
                                           + n_block_max * kBlockN) * params.d_rounded;
-    const index_t row_offset_lse = (bidb * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+    const index_t row_offset_lse = params.unpadded_lse ? bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb) + m_block * kBlockM
+        : (bidb * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
 
     // We assume that params.d == kHeadDim for now
     Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),

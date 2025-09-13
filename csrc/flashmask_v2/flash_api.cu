@@ -42,7 +42,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                     SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
                         if (!params.is_e4m3) {
                             if (params.is_bf16) {
-                                #ifndef FLASHATTENTION_DISABLE_HDIM64
+                                #ifndef FLASHMASK_V2_DISABLE_HDIM64
                                 if (params.d <= 64) {
                                     if (params.dv > 64 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
@@ -52,13 +52,13 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                     }
                                 }
                                 #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM96
+                                #ifndef FLASHMASK_V2_DISABLE_HDIM96
                                 if (params.d <= 96) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 96, 96, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM128
+                                #ifndef FLASHMASK_V2_DISABLE_HDIM128
                                 if (params.d <= 128) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM192
+                                #ifndef FLASHMASK_V2_DISABLE_HDIM192
                                 if (params.d <= 192) {
                                     if (params.dv <= 128 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
@@ -67,12 +67,12 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                     }
                                 }
                                 #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM256
+                                #ifndef FLASHMASK_V2_DISABLE_HDIM256
                                 if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
                             } else {
-                                #ifndef FLASHATTENTION_DISABLE_FP16
-                                #ifndef FLASHATTENTION_DISABLE_HDIM64
+                                #ifndef FLASHMASK_V2_DISABLE_FP16
+                                #ifndef FLASHMASK_V2_DISABLE_HDIM64
                                 if (params.d <= 64) {
                                     if (params.dv > 64 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
@@ -82,13 +82,13 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                     }
                                 }
                                 #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM96
+                                #ifndef FLASHMASK_V2_DISABLE_HDIM96
                                 if (params.d <= 96) { return run_mha_fwd_<Arch, cutlass::half_t, 96, 96, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM128
+                                #ifndef FLASHMASK_V2_DISABLE_HDIM128
                                 if (params.d <= 128) { return run_mha_fwd_<Arch, cutlass::half_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM192
+                                #ifndef FLASHMASK_V2_DISABLE_HDIM192
                                 if (params.d <= 192) {
                                     if (params.dv <= 128 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
@@ -97,7 +97,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                     }
                                 }
                                 #endif
-                                #ifndef FLASHATTENTION_DISABLE_HDIM256
+                                #ifndef FLASHMASK_V2_DISABLE_HDIM256
                                 if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::half_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
                                 #else
@@ -105,17 +105,17 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 #endif
                             }
                         } else {
-                            #ifndef FLASHATTENTION_DISABLE_FP8
-                            #ifndef FLASHATTENTION_DISABLE_HDIM64
+                            #ifndef FLASHMASK_V2_DISABLE_FP8
+                            #ifndef FLASHMASK_V2_DISABLE_HDIM64
                             if (params.d <= 64) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                             #endif
-                            #ifndef FLASHATTENTION_DISABLE_HDIM96
+                            #ifndef FLASHMASK_V2_DISABLE_HDIM96
                             if (params.d <= 96) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 96, 96, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                             #endif
-                            #ifndef FLASHATTENTION_DISABLE_HDIM128
+                            #ifndef FLASHMASK_V2_DISABLE_HDIM128
                             if (params.d <= 128) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                             #endif
-                            #ifndef FLASHATTENTION_DISABLE_HDIM192
+                            #ifndef FLASHMASK_V2_DISABLE_HDIM192
                             if (params.d <= 192) {
                                 if (params.dv <= 128 && Arch == 90) {
                                     return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
@@ -124,7 +124,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 }
                             }
                             #endif
-                            #ifndef FLASHATTENTION_DISABLE_HDIM256
+                            #ifndef FLASHMASK_V2_DISABLE_HDIM256
                             if (params.d <= 256) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                             #endif
                             #else
@@ -138,7 +138,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl=false) {
-    #ifndef FLASHATTENTION_DISABLE_SPLIT
+    #ifndef FLASHMASK_V2_DISABLE_SPLIT
     // If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
     // so that kBlockM is smaller and we have more parallelism.
     if (params.is_fp32) {
@@ -180,7 +180,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation and binary size.
     // Has little effect on speed.
     if (params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1) { return true; }
-    #ifdef FLASHATTENTION_DISABLE_PACKGQA
+    #ifdef FLASHMASK_V2_DISABLE_PACKGQA
     return false;
     #else
     // params.page_table must already be set
@@ -193,7 +193,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
 }
 
 inline int get_num_splits(Flash_fwd_params const& params) {
-    #ifdef FLASHATTENTION_DISABLE_SPLIT
+    #ifdef FLASHMASK_V2_DISABLE_SPLIT
     return 1;
     #else
     // Always enable PackGQA for Split
@@ -224,7 +224,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
-    #ifndef FLASHATTENTION_DISABLE_BACKWARD
+    #ifndef FLASHMASK_V2_DISABLE_BACKWARD
         // FP16_SWITCH(!params.is_bf16, [&] {
         //     HEADDIM_SWITCH(params.d, [&] {
         //         run_mha_bwd_<elem_type, kHeadDim>(params, stream);
@@ -234,39 +234,39 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     ARCH_SWITCH(params.arch, Arch, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
             if (!params.is_bf16) {
-                #ifndef FLASHATTENTION_DISABLE_FP16
-                #ifndef FLASHATTENTION_DISABLE_HDIM64
+                #ifndef FLASHMASK_V2_DISABLE_FP16
+                #ifndef FLASHMASK_V2_DISABLE_HDIM64
                 if (params.d <= 64) { return run_mha_bwd_<Arch, cutlass::half_t, 64, Has_softcap>(params, stream); }
                 #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM96
+                #ifndef FLASHMASK_V2_DISABLE_HDIM96
                 if (params.d <= 96) { return run_mha_bwd_<Arch, cutlass::half_t, 96, Has_softcap>(params, stream); }
                 #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM128
+                #ifndef FLASHMASK_V2_DISABLE_HDIM128
                 if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::half_t, 128, Has_softcap>(params, stream); }
                 #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM192
+                #ifndef FLASHMASK_V2_DISABLE_HDIM192
                 if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::half_t, 192, Has_softcap>(params, stream); }
                 #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM256
+                #ifndef FLASHMASK_V2_DISABLE_HDIM256
                 if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::half_t, 256, Has_softcap>(params, stream); }
                 #endif
                 #else
                 PADDLE_CHECK(false, "This flash attention build does not support FP16.");
                 #endif
             } else {
-                #ifndef FLASHATTENTION_DISABLE_HDIM64
+                #ifndef FLASHMASK_V2_DISABLE_HDIM64
                 if (params.d <= 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, Has_softcap>(params, stream); }
                 #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM96
+                #ifndef FLASHMASK_V2_DISABLE_HDIM96
                 if (params.d <= 96) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 96, Has_softcap>(params, stream); }
                 #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM128
+                #ifndef FLASHMASK_V2_DISABLE_HDIM128
                 if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 128, Has_softcap>(params, stream); }
                 #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM192
+                #ifndef FLASHMASK_V2_DISABLE_HDIM192
                 if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap>(params, stream); }
                 #endif
-                #ifndef FLASHATTENTION_DISABLE_HDIM256
+                #ifndef FLASHMASK_V2_DISABLE_HDIM256
                 if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap>(params, stream); }
                 #endif
                 PADDLE_CHECK(false, "This flash attention build does not support ");

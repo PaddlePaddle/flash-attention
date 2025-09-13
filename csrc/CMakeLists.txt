@@ -420,6 +420,58 @@ if(NOT SKIP_BUILD_FA)
     option(DISABLE_FLASHMASK_V2_BACKWARD "Disable Backward for flashmask_v2" OFF)
     option(DISABLE_FLASHMASK_V2_SM8X "Disable SM8x for flashmask_v2" ON)
 
+    if(DISABLE_FLASHMASK_V2_FP16)
+      add_compile_definitions(FLASHMASK_V2_DISABLE_FP16)
+    endif()
+
+    if(DISABLE_FLASHMASK_V2_FP8)
+      add_compile_definitions(FLASHMASK_V2_DISABLE_FP8)
+    endif()
+
+    if(DISABLE_FLASHMASK_V2_HDIM64)
+      add_compile_definitions(FLASHMASK_V2_DISABLE_HDIM64)
+    endif()
+
+    if(DISABLE_FLASHMASK_V2_HDIM96)
+      add_compile_definitions(FLASHMASK_V2_DISABLE_HDIM96)
+    endif()
+
+    if(DISABLE_FLASHMASK_V2_HDIM128)
+      add_compile_definitions(FLASHMASK_V2_DISABLE_HDIM128)
+    endif()
+
+    if(DISABLE_FLASHMASK_V2_HDIM192)
+      add_compile_definitions(FLASHMASK_V2_DISABLE_HDIM192)
+    endif()
+
+    if(DISABLE_FLASHMASK_V2_HDIM256)
+      add_compile_definitions(FLASHMASK_V2_DISABLE_HDIM256)
+    endif()
+
+    if(DISABLE_FLASHMASK_V2_SPLIT)
+      add_compile_definitions(FLASHMASK_V2_DISABLE_SPLIT)
+    endif()
+
+    if(DISABLE_FLASHMASK_V2_PAGEDKV)
+      add_compile_definitions(FLASHMASK_V2_DISABLE_PAGEDKV)
+    endif()
+
+    if(DISABLE_FLASHMASK_V2_SOFTCAP)
+      add_compile_definitions(FLASHMASK_V2_DISABLE_SOFTCAP)
+    endif()
+
+    if(DISABLE_FLASHMASK_V2_PACKGQA)
+      add_compile_definitions(FLASHMASK_V2_DISABLE_PACKGQA)
+    endif()
+
+    if(DISABLE_FLASHMASK_V2_BACKWARD)
+      add_compile_definitions(FLASHMASK_V2_DISABLE_BACKWARD)
+    endif()
+
+    if(DISABLE_FLASHMASK_V2_SM8X)
+      add_compile_definitions(FLASHMASK_V2_DISABLE_SM8X)
+    endif()
+
     if(NOT result EQUAL 0)
         message(FATAL_ERROR "Generating flashmask_v2 Python script execution failed with exit code ${result}: ${error}")
     endif()

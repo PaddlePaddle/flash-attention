@@ -27,7 +27,7 @@
     }                                                                                            \
   }()
 
-#ifdef FLASHATTENTION_DISABLE_LOCAL
+#ifdef FLASHMASK_V2_DISABLE_LOCAL
   #define CAUSAL_LOCAL_SWITCH(CAUSAL_COND, LOCAL_COND, CAUSAL_CONST_NAME, LOCAL_CONST_NAME, ...) \
     [&] {                                                                                        \
       constexpr static bool LOCAL_CONST_NAME = false;                                            \
@@ -58,7 +58,7 @@
     }()
 #endif
 
-#ifdef FLASHATTENTION_DISABLE_SOFTCAP
+#ifdef FLASHMASK_V2_DISABLE_SOFTCAP
   #define SOFTCAP_SWITCH(COND, CONST_NAME, ...)                                                  \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -68,7 +68,7 @@
   #define SOFTCAP_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHATTENTION_DISABLE_PAGEDKV
+#ifdef FLASHMASK_V2_DISABLE_PAGEDKV
   #define PAGEDKV_SWITCH(COND, CONST_NAME, ...)                                                  \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -78,7 +78,7 @@
   #define PAGEDKV_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHATTENTION_DISABLE_SPLIT
+#ifdef FLASHMASK_V2_DISABLE_SPLIT
   #define SPLIT_SWITCH(COND, CONST_NAME, ...)                                                    \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -88,7 +88,7 @@
   #define SPLIT_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHATTENTION_DISABLE_APPENDKV
+#ifdef FLASHMASK_V2_DISABLE_APPENDKV
   #define APPENDKV_SWITCH(COND, CONST_NAME, ...)                                                 \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -98,7 +98,7 @@
   #define APPENDKV_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHATTENTION_DISABLE_PACKGQA
+#ifdef FLASHMASK_V2_DISABLE_PACKGQA
   #define PACKGQA_SWITCH(COND, CONST_NAME, ...)                                                  \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -108,7 +108,7 @@
   #define PACKGQA_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHATTENTION_DISABLE_VARLEN
+#ifdef FLASHMASK_V2_DISABLE_VARLEN
   #define VARLEN_SWITCH(COND, CONST_NAME, ...)                                                   \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -118,7 +118,7 @@
   #define VARLEN_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHATTENTION_DISABLE_CLUSTER
+#ifdef FLASHMASK_V2_DISABLE_CLUSTER
   #define CLUSTER_SWITCH(COND, CONST_NAME, ...)                                                  \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -128,7 +128,7 @@
   #define CLUSTER_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHATTENTION_DISABLE_SM8x
+#ifdef FLASHMASK_V2_DISABLE_SM8x
   #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
   [&] {                                                                                          \
     constexpr static int ARCH_NAME = 90;                                                         \
@@ -150,7 +150,7 @@
   }()
 #endif
 
-#ifndef FLASHATTENTION_ENABLE_VCOLMAJOR
+#ifndef FLASHMASK_V2_ENABLE_VCOLMAJOR
   #define VCOLMAJOR_SWITCH(COND, CONST_NAME, ...)                                                \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \

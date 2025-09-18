@@ -1420,14 +1420,19 @@ struct CollectiveMainloopFwdSm90 {
       static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
       #pragma unroll
-      for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
-        int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+      for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+        int const col_idx = get<Col>(tScS_rowcol(_0{}, n)); // col_idx within a block
+        int lts = s_lt_start[col_idx];
+        int lte = lt_end_ptr == nullptr ? size<0>(tSrS_rowcol) : s_lt_end[col_idx];
+        int uts = ut_start_ptr == nullptr ? size<0>(tSrS_rowcol) : s_ut_start[col_idx];
+        int ute = ut_end_ptr == nullptr ? size<0>(tSrS_rowcol) : s_ut_end[col_idx];
         #pragma unroll
-        for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-          int const col_idx = get<Col>(tScS_rowcol(m, n)); // col_idx within a block
-          if(row_idx >= s_lt_start[col_idx] && (lt_end_ptr == nullptr || row_idx < s_lt_end[col_idx]))
+        for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+          int const row_idx = get<Row>(tScS_rowcol(m, n)) + m_block * kBlockM;
+          if(row_idx >= lts && row_idx < lte)
               tSrS_rowcol(m, n) = -INFINITY;
-          if((ut_start_ptr == nullptr || row_idx >= s_ut_start[col_idx]) && (ut_end_ptr != nullptr && row_idx < s_ut_end[col_idx]))
+
+          if(row_idx >= uts && row_idx < ute)
               tSrS_rowcol(m, n) = -INFINITY;
         }
       }

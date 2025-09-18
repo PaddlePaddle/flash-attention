@@ -218,6 +218,7 @@ class PreemptivePersistentTileScheduler {
     // In PPT, NumConsumerThreads is the total number of threads for (KV load and computation pipeline), and for FlashMask V2
     // it will be the #threads for (wg_id = 0, wp_id = 0) + (wg_id > 0, wp_id = *). The NumProducerThreads is simply 96 (hard-coded).
     static_assert(NumProducerThreads == 96, "PreemptivePersistentTileScheduler has incorrect producer thread num.");
+    static constexpr int NumThreads = NumConsumerThreads + NumConsumerThreads;
 public:
     using SharedStorage = int;
 
@@ -296,15 +297,14 @@ public:
         // this is a kick-off for the whole producer (producer waits for TileCountSmemEmpty), otherwise we will have a dead-lock, also
         // this init_consumer can only be called in consumer warps, otherwise we will have more arriving threads than needed
         // NumConsumerThreads: including (wg_id = 0, warp_id = 0: KV load) and (wg_id > 0, warp_id = *: computation) 
-        flash::named_barrier_arrive(NumConsumerThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+        flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
     }
 
     CUTLASS_DEVICE
     void
     prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {
-        // TODO(heqianyue): for simple flashmask, we might be able to get rid of mod
         // only producer will call this method
-        if ((threadIdx.x % NumProducerThreads) == 0) {
+        if (threadIdx.x == 96) {    // hard-coded, since n_block producer threads are in [32, 128)
             // the next job we are going to process: number of currently blocks done
             current_work.tile_idx = atomicAdd(params.tile_count_semaphore, 1);
         }
@@ -317,17 +317,18 @@ public:
         if constexpr (IsProducerWarp) {
             // only threadIdx.x == 96 has the correct `current_work.tile_idx` (see prefetch next_work)
             // so there is no need to use shfl_sync to broadcast. Also shfl cannot broadcast across warps
-            flash::named_barrier_sync(NumConsumerThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
-            if ((threadIdx.x % NumProducerThreads) == 0) {
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            if (threadIdx.x == 96) {    // hard-coded, since n_block producer threads are in [32, 128)
                 *tile_count_smem = current_work.tile_idx;
             }
-            // Sync all the producers
-            flash::named_barrier_arrive(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            // Sync all the producers in case some of the producers return before the smem is updated
+            flash::named_barrier_sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::NBlockProducer) /*id*/);
             return {*tile_count_smem};
         } else {
-            flash::named_barrier_sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
             int tile_idx = *tile_count_smem;
-            flash::named_barrier_arrive(NumConsumerThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
             return {tile_idx};
         }
     }

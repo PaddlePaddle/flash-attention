@@ -58,6 +58,7 @@ enum class FwdNamedBarriers {
     AppendKV = 7,
     QueryRotated = 8,
     PFull = 9,
+    NBlockProducer = 10,
     PEmpty = 6,  // HACK: PEmpty is only used when we don't have 3 WGs
     FlashMaskNBlock = 7, // HACK: share with AppendKV
     FlashMaskApply = 8, // HACK: share with FlashMaskQK

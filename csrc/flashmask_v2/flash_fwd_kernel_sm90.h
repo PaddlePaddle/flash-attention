@@ -262,7 +262,11 @@ public:
         if (warp_group_idx == 0 && warp_idx_in_warpgroup != 0) { // n_block generator
           cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
           cutlass::PipelineState<CollectiveMainloop::kNBlockStages> n_block_pipe_write = cutlass::make_producer_start_state<MainloopPipelineNBlock>();
-          for (auto work_tile_info = scheduler.get_initial_work(params.scheduler); work_tile_info.is_valid(params.scheduler); work_tile_info = scheduler.get_next_work(params.scheduler, work_tile_info)) {
+          // Manually specify the scheduler role: producer. For StaticPersistentTileSch, passing template args won't change the behavior
+          for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler); 
+               work_tile_info.is_valid(params.scheduler); 
+               work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)
+          ) {
               auto block_coord = work_tile_info.get_block_coord(params.scheduler);
               int const m_block = get<0>(block_coord);
               int const bidh = get<1>(block_coord);
@@ -283,6 +287,8 @@ public:
               // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
               if constexpr (Is_causal || Is_local || Varlen || Split) {
                   if (n_block_max <= n_block_min) {
+                      // skipping, don't forget to fetch us the next work!
+                      scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                       continue;
                   }
               }
@@ -308,7 +314,13 @@ public:
                   pipeline_n_block.producer_commit(n_block_pipe_write);
                   ++n_block_pipe_write;
                 }
-            }
+              }
+              // heqianyue note: the execution time of reverse_chunk for loop will be influenced by the workload of computation pipeline
+              // therefore, **works with more partially/fully masked block** will have longer execution time for this producer. So, the 
+              // interval between two consecutive `get_next_work` of this producer will increase, thus lowering the frequency of preemptive 
+              // scheduling. However, since there is double-buffer, the for-loop execution time of reverse_chunk is only a rough estimator for
+              // the workload of computation pipeline, but I think it is good enough.
+              scheduler.prefetch_next_work(params.scheduler, work_tile_info);
           }
         } else {
           // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
@@ -412,12 +424,17 @@ public:
             static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
             static_assert(SingleProducerWarp);
 
+            scheduler.init_consumer();      // in case `return`, and there will be dead-lock
             if constexpr (SingleProducerWarp) {
               if (warp_idx_in_warpgroup != 0) { return; }
             }
 
-            if (!SingleProducerWarp && warp_idx_in_warpgroup != 0) { scheduler.init_consumer(); }
-
+            // useless, static persistent and single tile both implement dummy function here
+            // for PPT scheduler, we can not do anything here. So in summary, we should comment this. 
+            // Also, the following line will never be executed, since `warp_idx_in_warpgroup` is always 0 in this branch
+            // if (!SingleProducerWarp && warp_idx_in_warpgroup != 0) { scheduler.init_consumer(); }
+            
+            // TODO(heqianyue): What does this do? I don't want this to disrupt sync
             cutlass::arch::wait_on_dependent_grids();
 
             // Load Q, K, V
@@ -455,7 +472,7 @@ public:
 
             int work_idx = 0;
             CUTLASS_PRAGMA_NO_UNROLL
-            for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
+            for (auto work_tile_info = scheduler.get_initial_work(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
                  // get_next_work will be called before the epilogue
                  ) {

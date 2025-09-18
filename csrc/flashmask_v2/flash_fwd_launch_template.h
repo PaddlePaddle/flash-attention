@@ -61,7 +61,15 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // However, if Varlen (e.g., during decode where we have max_seqlens), using PersistentScheduler is better
     // since we'll avoid launching a bunch of thread blocks that immediately exit.
     // On Sm80, noncausal persistent seems a bit slower.
-    using Scheduler = flash::StaticPersistentTileScheduler<Split>;
+    static constexpr int _NumProducerThreads = cutlass::NumThreadsPerWarpGroup - cutlass::NumThreadsPerWarp;      // expect: 96
+    static constexpr int _NumConsumerThreads = CollectiveMainloop::NumMmaThreads + cutlass::NumThreadsPerWarpGroup - _NumProducerThreads;    // expect: 384 - 96
+    using Scheduler = std::conditional_t<
+        false, // Arch >= 90,
+        flash::PreemptivePersistentTileScheduler<_NumConsumerThreads, _NumProducerThreads, Split>,
+        flash::StaticPersistentTileScheduler<Split>
+    >;
+    printf("[FA] NumProducerThreads: %d, NumConsumerThreads: %d\n", _NumProducerThreads, _NumConsumerThreads);
+
     using AttnKernel = std::conditional_t<
         Arch >= 90,
         flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
@@ -147,6 +155,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.cu_seqlens_q, params.seqused_q
     };
 
+    if constexpr (Arch >= 90) {
+        prepare_preemptive_scheduler(params, stream, params.num_sm);
+    }
+
     int qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q * qhead_per_khead, get<0>(TileShape_MNK{}));
     num_blocks_m = cutlass::round_up(num_blocks_m, size<0>(ClusterShape{}));
@@ -192,6 +204,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
+        printf("[FA Preemptive] FlashMask kernel launch...\n");
         flash::flashmask_kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
                                            Arch >= 90 && Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);
     }

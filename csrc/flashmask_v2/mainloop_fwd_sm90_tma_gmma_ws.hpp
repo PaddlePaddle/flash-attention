@@ -1423,9 +1423,9 @@ struct CollectiveMainloopFwdSm90 {
       for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
         int const col_idx = get<Col>(tScS_rowcol(_0{}, n)); // col_idx within a block
         int lts = s_lt_start[col_idx];
-        int lte = lt_end_ptr == nullptr ? size<0>(tSrS_rowcol) : s_lt_end[col_idx];
-        int uts = ut_start_ptr == nullptr ? size<0>(tSrS_rowcol) : s_ut_start[col_idx];
-        int ute = ut_end_ptr == nullptr ? size<0>(tSrS_rowcol) : s_ut_end[col_idx];
+        int lte = lt_end_ptr == nullptr ? INT_MAX : s_lt_end[col_idx];
+        int uts = ut_start_ptr == nullptr ? INT_MIN : s_ut_start[col_idx];
+        int ute = ut_end_ptr == nullptr ? INT_MIN : s_ut_end[col_idx];
         #pragma unroll
         for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
           int const row_idx = get<Row>(tScS_rowcol(m, n)) + m_block * kBlockM;

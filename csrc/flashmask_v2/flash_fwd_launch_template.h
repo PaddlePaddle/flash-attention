@@ -68,7 +68,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         flash::PreemptivePersistentTileScheduler<_NumConsumerThreads, _NumProducerThreads, Split>,
         flash::StaticPersistentTileScheduler<Split>
     >;
-    printf("[FA] NumProducerThreads: %d, NumConsumerThreads: %d\n", _NumProducerThreads, _NumConsumerThreads);
 
     using AttnKernel = std::conditional_t<
         Arch >= 90,
@@ -204,7 +203,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
-        printf("[FA Preemptive] FlashMask kernel launch...\n");
         flash::flashmask_kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
                                            Arch >= 90 && Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);
     }

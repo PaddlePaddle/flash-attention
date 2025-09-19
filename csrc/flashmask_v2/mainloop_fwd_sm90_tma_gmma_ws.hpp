@@ -808,7 +808,7 @@ struct CollectiveMainloopFwdSm90 {
                      int32_t* const flashmask_maxmin_smem,
                      int32_t* const n_block_smem_,
                      bool* const partially_masked_smem_) {
-      int const m_block = get<0>(block_coord);
+      int m_block = get<0>(block_coord);
       int const bidh = get<1>(block_coord);
       int const bidb = get<2>(block_coord);
       int const split_idx = get<3>(block_coord);
@@ -818,6 +818,7 @@ struct CollectiveMainloopFwdSm90 {
 
       static constexpr int kBlockM = get<0>(TileShape_MNK{});
       static constexpr int kBlockN = get<1>(TileShape_MNK{});
+      m_block *= kBlockM;
 
       constexpr int threads_num = 96;
       static_assert(threads_num == 96, "generate_n_block only support running with 3 warps");
@@ -864,8 +865,10 @@ struct CollectiveMainloopFwdSm90 {
         bool fully_masked = true;
         bool partially_masked;
         if(n_block >= n_block_min && n_block < n_block_max && idx >= 0) {
-          prefix_sum = 1;
-          fully_masked = false;
+          // TODO(heqianyue): do the following ptrs have pattern? Like being null or not in pairs?
+          // Are these ptrs so randomized in validity?
+          // Also, can we optimize the following by vectorization, employing wider bit load and store? 
+          // Maybe not, ptr validity might not be the same, the reg count should also be considered
           if(params.lt_start_nblockmax != nullptr)
             lt_start_max = s_lt_start_max[idx];
           if(params.lt_start_nblockmin != nullptr)
@@ -886,53 +889,49 @@ struct CollectiveMainloopFwdSm90 {
           if(params.ut_end_nblockmin != nullptr)
             ut_end_min = s_ut_end_min[idx];
 
-          if(m_block * kBlockM >= lt_start_max && (m_block + 1) * kBlockM <= lt_end_min) {
-              prefix_sum = 0;
-              fully_masked = true;
-          }
-          if(m_block * kBlockM >= ut_start_max && (m_block + 1) * kBlockM <= ut_end_min) {
-              prefix_sum = 0;
-              fully_masked = true;
-          }
-          if(m_block * kBlockM < lt_end_max && (m_block + 1) * kBlockM > lt_start_min)
-              partially_masked = true;
-          else if(m_block * kBlockM < ut_end_max && (m_block + 1) * kBlockM > ut_start_min)
-              partially_masked = true;
-          else
-              partially_masked = false;
+          fully_masked = (m_block >= lt_start_max && (m_block + kBlockM) <= lt_end_min) ||
+                         (m_block >= ut_start_max && (m_block + kBlockM) <= ut_end_min);
+          prefix_sum = int(!fully_masked);
+          
+          partially_masked = (m_block < lt_end_max && (m_block + kBlockM) > lt_start_min) ||
+                             (m_block < ut_end_max && (m_block + kBlockM) > ut_start_min);
         }
 
+        // Be careful, following two lines might increase reg count
+        const int warp_id_ = thread_idx >> 5;
+        const int lane_id_ = thread_idx & 31;
         // warp-wide prefix-sum
         #pragma unroll
         for(int i=1; i<32; i*=2) {
           int tmp_prefix_sum = __shfl_up_sync(0xffffffff, prefix_sum, i);
-          prefix_sum = thread_idx % 32 >= i ? prefix_sum + tmp_prefix_sum : prefix_sum;
+          prefix_sum = lane_id_ >= i ? prefix_sum + tmp_prefix_sum : prefix_sum;
         }
 
         // inter-warp prefix-sum
         if constexpr (threads_num == 96) {
-          if(thread_idx % 32 == 31) {
-            s_prefix_sum[thread_idx / 32] = prefix_sum;
+          
+          if(lane_id_ == 31) {
+            s_prefix_sum[warp_id_] = prefix_sum;
           }
 
           cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
           
-          if(thread_idx / 32 == 1) {
+          // Currently, we use only 3 warps, so (warp_id_ <= 2) is always true, we can remove it from the predicate 
+          if(warp_id_ >= 1) {
             prefix_sum += s_prefix_sum[0];
-          } else if(thread_idx / 32 == 2) {
-            prefix_sum += s_prefix_sum[0];
-            prefix_sum += s_prefix_sum[1];
+            if (warp_id_ == 2) {
+                prefix_sum += s_prefix_sum[1];
+                if (lane_id_ == 31) s_prefix_sum[2] = prefix_sum;
+            }
           }
         }
 
+        // TODO(heqianyue): can we vectorize this store? I think this is a reasonable way to cut down bank conflict
         if(!fully_masked) {
           n_block_smem_[valid_n_block_num + prefix_sum - 1] = n_block;
           partially_masked_smem_[valid_n_block_num + prefix_sum - 1] = partially_masked;
         }
         if constexpr (threads_num == 96) {
-          if(thread_idx / 32 == 2 && thread_idx % 32 == 31) {
-            s_prefix_sum[2] = prefix_sum;
-          }
           cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
           valid_n_block_num += s_prefix_sum[2];
           cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
@@ -940,10 +939,10 @@ struct CollectiveMainloopFwdSm90 {
       }
       n_block_smem_[valid_n_block_num] = end_flag;
 
-      if(valid_n_block_num == 0 && end_flag == Flashmask_n_block_chunk_end) {
-        return false;
-      }
-      return true;
+      // if(valid_n_block_num == 0 && end_flag == Flashmask_n_block_chunk_end) {
+      //   return false;
+      // }
+      return valid_n_block_num != 0 || end_flag != Flashmask_n_block_chunk_end;
     }
 
     template <typename SharedStorage>

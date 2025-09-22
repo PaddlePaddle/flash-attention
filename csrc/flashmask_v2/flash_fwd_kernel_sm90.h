@@ -213,8 +213,6 @@ public:
         __shared__ __align__(16) int32_t flashmask_maxmin_smem[8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
         __shared__ int32_t n_block_smem[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
 
-        __shared__ bool partially_masked_smem[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
-
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
 
@@ -308,8 +306,7 @@ public:
                                           reverse_chunk_idx,
                                           reverse_chunk_idx == num_chunk - 1 ? CollectiveMainloop::Flashmask_n_block_finish : CollectiveMainloop::Flashmask_n_block_chunk_end,
                                           flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
-                                          n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
-                                          partially_masked_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
+                                          n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
                 if (valid_chunk) {
                   pipeline_n_block.producer_commit(n_block_pipe_write);
                   ++n_block_pipe_write;
@@ -452,7 +449,7 @@ public:
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_write,
                               n_block_pipe_read,
                               shared_storage, seqlen_info, block_coord, work_idx,
-                              flashmask_smem_, n_block_smem, partially_masked_smem);
+                              flashmask_smem_, n_block_smem);
             }
 
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
@@ -497,13 +494,13 @@ public:
                         params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_read,
                         n_block_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                        flashmask_smem_, n_block_smem, partially_masked_smem);
+                        flashmask_smem_, n_block_smem);
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
                             params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                            flashmask_smem_, n_block_smem, partially_masked_smem);
+                            flashmask_smem_, n_block_smem);
                     } else {
                         tile_valid = mainloop.mma_pv(
                             params.mainloop, pipeline_v, pipeline_n_block, smem_pipe_read,

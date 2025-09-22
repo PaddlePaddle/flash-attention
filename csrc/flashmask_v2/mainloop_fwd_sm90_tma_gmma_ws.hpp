@@ -1163,38 +1163,56 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (Is_flashmask) {
                 pipeline_flashmask_apply.producer_acquire(smem_pipe_write);
                 if(mask_encode_n_block_smem_[n_block_idx] >= 0) {
-                     int row_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen_info.seqlen_k;
-
-                  for(int64_t idx = thread_idx; idx < kBlockN  && n_block * kBlockN + idx < seqlen_info.seqlen_k; idx += NumProducerThreads) {
-                    if(params.lt_start_ptr != nullptr) {
-                      asm volatile(
+                  const int row_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen_info.seqlen_k;
+                  const int nb_mul_kBN = n_block * kBlockN;
+                  if (params.ut_start_ptr != nullptr) {
+                    for(int64_t idx = thread_idx; idx < kBlockN && nb_mul_kBN + idx < seqlen_info.seqlen_k; idx += NumProducerThreads) {
+                        asm volatile(
                         "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
-                          ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + idx)),
-                            "l"(params.lt_start_ptr + row_offset + n_block * kBlockN + idx),
+                            ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + idx)),
+                            "l"(params.lt_start_ptr + row_offset + nb_mul_kBN + idx),
+                            "n"(4));
+                        asm volatile(
+                        "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                          ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + kBlockN + idx)),
+                            "l"(params.lt_end_ptr + row_offset + nb_mul_kBN + idx),
+                            "n"(4));
+                        asm volatile(
+                        "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                          ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + 2 * kBlockN + idx)),
+                            "l"(params.ut_start_ptr + row_offset + nb_mul_kBN + idx),
+                            "n"(4));
+                        asm volatile(
+                        "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                          ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + 3 * kBlockN + idx)),
+                            "l"(params.ut_end_ptr + row_offset + nb_mul_kBN + idx),
                             "n"(4));
                     }
-                    if(params.lt_end_ptr != nullptr) {
-                      asm volatile(
+                  } else {
+                    for(int64_t idx = thread_idx; idx < kBlockN  && nb_mul_kBN + idx < seqlen_info.seqlen_k; idx += NumProducerThreads) {
+                        asm volatile(
                         "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
-                          ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + + kBlockN + idx)),
-                            "l"(params.lt_end_ptr + row_offset + n_block * kBlockN + idx),
+                            ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + idx)),
+                            "l"(params.lt_start_ptr + row_offset + nb_mul_kBN + idx),
                             "n"(4));
-                    }
-
-                    if(params.ut_start_ptr != nullptr) {
-                      asm volatile(
-                        "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
-                          ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + + 2 * kBlockN + idx)),
-                            "l"(params.ut_start_ptr + row_offset + n_block * kBlockN + idx),
-                            "n"(4));
-                    }
-
-                    if(params.ut_end_ptr != nullptr) {
-                      asm volatile(
-                        "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
-                          ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + + 3 * kBlockN + idx)),
-                            "l"(params.ut_end_ptr + row_offset + n_block * kBlockN + idx),
-                            "n"(4));
+                        
+                        if constexpr (Is_causal) {
+                            if(params.lt_end_ptr != nullptr) {
+                                asm volatile(
+                                    "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                                    ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + kBlockN + idx)),
+                                        "l"(params.lt_end_ptr + row_offset + nb_mul_kBN + idx),
+                                        "n"(4));
+                            }
+                        } else {
+                            if(params.ut_end_ptr != nullptr) {
+                                asm volatile(
+                                    "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                                    ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + 3 * kBlockN + idx)),
+                                        "l"(params.ut_end_ptr + row_offset + nb_mul_kBN + idx),
+                                        "n"(4));
+                            }
+                        }
                     }
                   }
                   asm volatile("cp.async.commit_group;\n" ::);
@@ -1405,9 +1423,15 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
-  template <typename TiledMma, typename Engine, typename Layout>
+  enum MaskApplyDispatchTag {
+    SINGLE_PTR = 0x0,       // lt_start is always valid
+    DUAL_PTR = 0x1,         // two ptrs, with one more lt_end or ut_end
+    FULL_PTR = 0x2          // all four ptrs
+  };
+
+  template <typename TiledMma, MaskApplyDispatchTag tag, typename Engine, typename Layout>
   CUTLASS_DEVICE
-  void flashmask_apply(Tensor<Engine, Layout> &tSrS, int const m_block, int const thread_idx, int const index, int32_t* const flashmask_smem_,
+  void flashmask_apply(Tensor<Engine, Layout> &tSrS, int m_block, int const thread_idx, int const index, int32_t* const flashmask_smem_,
                        int32_t* const lt_start_ptr, int32_t* const lt_end_ptr,
                        int32_t* const ut_start_ptr, int32_t* const ut_end_ptr) {
       auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
@@ -1418,28 +1442,69 @@ struct CollectiveMainloopFwdSm90 {
       Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
 
       static constexpr int Row = 0, Col = 1;
-
-      int32_t* s_lt_start = flashmask_smem_ + 4 * kBlockN * index;
-      int32_t* s_lt_end = flashmask_smem_ + 4 * kBlockN * index + kBlockN;
-      int32_t* s_ut_start = flashmask_smem_ + 4 * kBlockN * index + 2 * kBlockN;
-      int32_t* s_ut_end = flashmask_smem_ + 4 * kBlockN * index + 3 * kBlockN;
       static constexpr int kBlockN = get<1>(TileShape_MNK{});
-
-      #pragma unroll
-      for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-        int const col_idx = get<Col>(tScS_rowcol(_0{}, n)); // col_idx within a block
-        int lts = s_lt_start[col_idx];
-        int lte = lt_end_ptr == nullptr ? INT_MAX : s_lt_end[col_idx];
-        int uts = ut_start_ptr == nullptr ? INT_MIN : s_ut_start[col_idx];
-        int ute = ut_end_ptr == nullptr ? INT_MIN : s_ut_end[col_idx];
+      const int32_t* const s_lt_start = flashmask_smem_ + 4 * kBlockN * index;
+      m_block *= kBlockM;
+      if constexpr (tag == MaskApplyDispatchTag::SINGLE_PTR) {
         #pragma unroll
-        for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
-          int const row_idx = get<Row>(tScS_rowcol(m, n)) + m_block * kBlockM;
-          if(row_idx >= lts && row_idx < lte)
-              tSrS_rowcol(m, n) = -INFINITY;
+        for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+            int const col_idx = get<Col>(tScS_rowcol(_0{}, n)); // col_idx within a block
+            int lts = s_lt_start[col_idx] - m_block;
+            #pragma unroll
+            for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                int const row_idx = get<Row>(tScS_rowcol(m, n));
+                if(row_idx >= lts) tSrS_rowcol(m, n) = -INFINITY;
+            }
+        }
+        return;
+      } else if constexpr (tag == MaskApplyDispatchTag::FULL_PTR) {
+        const int32_t* const s_lt_end = flashmask_smem_ + 4 * kBlockN * index + kBlockN;
+        const int32_t* const s_ut_start = flashmask_smem_ + 4 * kBlockN * index + 2 * kBlockN;
+        const int32_t* const s_ut_end = flashmask_smem_ + 4 * kBlockN * index + 3 * kBlockN;
 
-          if(row_idx >= uts && row_idx < ute)
-              tSrS_rowcol(m, n) = -INFINITY;
+        #pragma unroll
+        for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+            int const col_idx = get<Col>(tScS_rowcol(_0{}, n)); // col_idx within a block
+            int lts = s_lt_start[col_idx] - m_block;
+            int lte = s_lt_end[col_idx] - m_block;
+            int uts = s_ut_start[col_idx] - m_block;
+            int ute = s_ut_end[col_idx] - m_block;
+            #pragma unroll
+            for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                int const row_idx = get<Row>(tScS_rowcol(m, n));
+                if((row_idx >= lts && row_idx < lte) || (row_idx >= uts && row_idx < ute))
+                    tSrS_rowcol(m, n) = -INFINITY;
+            }
+        }
+      } else {
+        if constexpr (Is_causal) {
+            const int32_t* const s_lt_end = flashmask_smem_ + 4 * kBlockN * index + kBlockN;
+            #pragma unroll
+            for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                int const col_idx = get<Col>(tScS_rowcol(_0{}, n)); // col_idx within a block
+                int lts = s_lt_start[col_idx] - m_block;
+                int lte = s_lt_end[col_idx] - m_block;
+                #pragma unroll
+                for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                    int const row_idx = get<Row>(tScS_rowcol(m, n));
+                    if(row_idx >= lts && row_idx < lte)
+                        tSrS_rowcol(m, n) = -INFINITY;
+                }
+            }
+        } else {
+            const int32_t* const s_ut_end = flashmask_smem_ + 4 * kBlockN * index + 3 * kBlockN;
+            #pragma unroll
+            for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                int const col_idx = get<Col>(tScS_rowcol(_0{}, n)); // col_idx within a block
+                int lts = s_lt_start[col_idx] - m_block;
+                int ute = s_ut_end[col_idx] - m_block;
+                #pragma unroll
+                for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                    int const row_idx = get<Row>(tScS_rowcol(m, n));
+                    if((row_idx >= lts) || (row_idx < ute))
+                        tSrS_rowcol(m, n) = -INFINITY;
+                }
+            }
         }
       }
     }
@@ -1671,9 +1736,21 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr(Is_flashmask) {
               consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
               if (mask_encode_n_block_smem_[n_block_idx] >= 0) {
-                flashmask_apply<TiledMmaQK>(tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
-                                            params.lt_start_ptr, params.lt_end_ptr,
-                                            params.ut_start_ptr, params.ut_end_ptr);
+                if (params.ut_start_ptr) {
+                    flashmask_apply<TiledMmaQK, MaskApplyDispatchTag::FULL_PTR>(
+                                tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
+                                params.lt_start_ptr, params.lt_end_ptr,
+                                params.ut_start_ptr, params.ut_end_ptr);
+                } else if (params.lt_end_ptr || params.ut_end_ptr) {
+                    flashmask_apply<TiledMmaQK, MaskApplyDispatchTag::DUAL_PTR>(
+                                tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
+                                params.lt_start_ptr, params.lt_end_ptr,
+                                nullptr, params.ut_end_ptr);
+                } else {
+                    flashmask_apply<TiledMmaQK, MaskApplyDispatchTag::SINGLE_PTR>(
+                                tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
+                                params.lt_start_ptr, nullptr, nullptr, nullptr);
+                }
               }
               pipeline_flashmask_apply.consumer_release(smem_pipe_read);
             }
@@ -1726,8 +1803,19 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (Is_flashmask) {
                   consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
                   if (mask_encode_n_block_smem_[n_block_idx] >= 0) {
-                    flashmask_apply<TiledMmaQK>(tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
-                                                params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr);
+                    if (params.ut_start_ptr) {
+                        flashmask_apply<TiledMmaQK, MaskApplyDispatchTag::FULL_PTR>(
+                                    tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
+                                    params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr);
+                    } else if (params.lt_end_ptr || params.ut_end_ptr) {
+                        flashmask_apply<TiledMmaQK, MaskApplyDispatchTag::DUAL_PTR>(
+                                    tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
+                                    params.lt_start_ptr, params.lt_end_ptr, nullptr, params.ut_end_ptr);
+                    } else {
+                        flashmask_apply<TiledMmaQK, MaskApplyDispatchTag::SINGLE_PTR>(
+                                    tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
+                                    params.lt_start_ptr, nullptr, nullptr, nullptr);
+                    }
                   }
                   pipeline_flashmask_apply.consumer_release(smem_pipe_read);
                 }

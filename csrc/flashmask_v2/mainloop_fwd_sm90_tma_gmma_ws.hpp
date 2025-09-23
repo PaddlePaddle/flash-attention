@@ -787,7 +787,6 @@ struct CollectiveMainloopFwdSm90 {
                      int32_t* const flashmask_maxmin_smem,
                      int32_t* const mask_encode_n_block_smem_) {
       int m_block = get<0>(block_coord);
-      int const bidh = get<1>(block_coord);
       int const bidb = get<2>(block_coord);
       int const split_idx = get<3>(block_coord);
       auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
@@ -815,64 +814,90 @@ struct CollectiveMainloopFwdSm90 {
       int32_t ut_end_max = INT_MIN;
       int32_t ut_end_min = INT_MIN;
       
-      int32_t* s_lt_start_max = flashmask_maxmin_smem;
-      int32_t* s_lt_start_min = flashmask_maxmin_smem + Flashmask_n_block_buffer_length;
-      
-      int32_t* s_lt_end_max = flashmask_maxmin_smem + 2 * Flashmask_n_block_buffer_length;
-      int32_t* s_lt_end_min = flashmask_maxmin_smem + 3 * Flashmask_n_block_buffer_length;
-      
-      int32_t* s_ut_start_max = flashmask_maxmin_smem + 4 * Flashmask_n_block_buffer_length;
-      int32_t* s_ut_start_min = flashmask_maxmin_smem + 5 * Flashmask_n_block_buffer_length;
-      
-      int32_t* s_ut_end_max = flashmask_maxmin_smem + 6 * Flashmask_n_block_buffer_length;
-      int32_t* s_ut_end_min = flashmask_maxmin_smem + 7 * Flashmask_n_block_buffer_length;
+      const int32_t* const s_lt_start_max = flashmask_maxmin_smem;
+      const int32_t* const s_lt_start_min = flashmask_maxmin_smem + Flashmask_n_block_buffer_length;
 
+      const int32_t *s_lt_end_max = nullptr, *s_lt_end_min = nullptr, *s_ut_start_max = nullptr, 
+              *s_ut_start_min = nullptr, *s_ut_end_max = nullptr, *s_ut_end_min = nullptr;
+
+      const auto tag = [&params]() {
+        if (params.ut_start_ptr)
+            return PtrExistDispatchTag::FULL_PTR;
+        else if (params.lt_end_ptr || params.ut_end_ptr)
+            return PtrExistDispatchTag::DUAL_PTR;
+        return PtrExistDispatchTag::SINGLE_PTR;
+      }();
+              
+      if (tag == PtrExistDispatchTag::FULL_PTR) {
+        s_lt_end_max = s_lt_start_min + Flashmask_n_block_buffer_length;
+        s_lt_end_min = s_lt_end_max + Flashmask_n_block_buffer_length;
+
+        s_ut_start_max = s_lt_end_min + Flashmask_n_block_buffer_length;
+        s_ut_start_min = s_ut_start_max + Flashmask_n_block_buffer_length;
+
+        s_ut_end_max = s_ut_start_min + Flashmask_n_block_buffer_length;
+        s_ut_end_min = s_ut_end_max + Flashmask_n_block_buffer_length;
+      } else if (tag == PtrExistDispatchTag::DUAL_PTR) {
+        if constexpr (Is_causal) {
+            s_lt_end_max = s_lt_start_min + Flashmask_n_block_buffer_length;
+            s_lt_end_min = s_lt_end_max + Flashmask_n_block_buffer_length;
+        } else {
+            s_ut_end_max = flashmask_maxmin_smem + 6 * Flashmask_n_block_buffer_length;
+            s_ut_end_min = s_ut_end_max + Flashmask_n_block_buffer_length;
+        }
+      }
+      
       int32_t valid_n_block_num = 0;
 
       const int32_t nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
-
-      int32_t base_offset = std::max(nblock_seqlen - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_valid_length, 0);
+      const int32_t base_offset = std::max(nblock_seqlen - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_valid_length, 0);
 
       // explanation for the loop condition:
       // -2, -1,  0,  1,  2
       // t4, t3, t2, t1, t0
       // although t4 and t3 are oob, they should not exit the loop, otherwise, the prefix-sum inside the loop will hang, just keep a default value is fine
-      for(int32_t idx = Flashmask_n_block_buffer_valid_length - 1 - thread_idx % threads_num; idx >= (0 - (threads_num - Flashmask_n_block_buffer_valid_length % threads_num)); idx -= threads_num) {
+      for(int32_t idx = Flashmask_n_block_buffer_valid_length - 1 - thread_idx % threads_num; 
+          idx >= (0 - (threads_num - Flashmask_n_block_buffer_valid_length % threads_num)); idx -= threads_num
+      ) {
         int32_t n_block = base_offset + idx;
         int prefix_sum = 0;
         bool fully_masked = true;
         bool partially_masked;
         if(n_block >= n_block_min && n_block < n_block_max && idx >= 0) {
-          // TODO(heqianyue): do the following ptrs have pattern? Like being null or not in pairs?
-          // Are these ptrs so randomized in validity?
-          // Also, can we optimize the following by vectorization, employing wider bit load and store? 
-          // Maybe not, ptr validity might not be the same, the reg count should also be considered
-          if(params.lt_start_nblockmax != nullptr)
+            // TODO(heqianyue): this might be vectorized?
             lt_start_max = s_lt_start_max[idx];
-          if(params.lt_start_nblockmin != nullptr)
             lt_start_min = s_lt_start_min[idx];
 
-          if(params.lt_end_nblockmax != nullptr)
-            lt_end_max = s_lt_end_max[idx];
-          if(params.lt_end_nblockmin != nullptr)
-            lt_end_min = s_lt_end_min[idx];
+            if (tag == PtrExistDispatchTag::FULL_PTR) {
+                lt_end_max = s_lt_end_max[idx];
+                lt_end_min = s_lt_end_min[idx];
+                ut_start_max = s_ut_start_max[idx];
+                ut_start_min = s_ut_start_min[idx];
+                ut_end_max = s_ut_end_max[idx];
+                ut_end_min = s_ut_end_min[idx];
 
-          if(params.ut_start_nblockmax != nullptr)
-            ut_start_max = s_ut_start_max[idx];
-          if(params.ut_start_nblockmin != nullptr)
-            ut_start_min = s_ut_start_min[idx];
-
-          if(params.ut_end_nblockmax != nullptr)          
-            ut_end_max = s_ut_end_max[idx];
-          if(params.ut_end_nblockmin != nullptr)
-            ut_end_min = s_ut_end_min[idx];
-
-          fully_masked = (m_block >= lt_start_max && (m_block + kBlockM) <= lt_end_min) ||
-                         (m_block >= ut_start_max && (m_block + kBlockM) <= ut_end_min);
-          prefix_sum = int(!fully_masked);
-          
-          partially_masked = (m_block < lt_end_max && (m_block + kBlockM) > lt_start_min) ||
-                             (m_block < ut_end_max && (m_block + kBlockM) > ut_start_min);
+                fully_masked = (m_block >= lt_start_max && (m_block + kBlockM) <= lt_end_min) ||
+                            (m_block >= ut_start_max && (m_block + kBlockM) <= ut_end_min);
+                partially_masked = (m_block < lt_end_max && (m_block + kBlockM) > lt_start_min) ||
+                                (m_block < ut_end_max && (m_block + kBlockM) > ut_start_min);
+            } else if (tag == PtrExistDispatchTag::DUAL_PTR) {
+                if constexpr (Is_causal) {
+                    lt_end_max = s_lt_end_max[idx];
+                    lt_end_min = s_lt_end_min[idx];
+                    fully_masked = m_block >= lt_start_max && (m_block + kBlockM) <= lt_end_min;
+                    partially_masked = m_block < lt_end_max && (m_block + kBlockM) > lt_start_min;
+                } else {
+                    ut_end_max = s_ut_end_max[idx];
+                    ut_end_min = s_ut_end_min[idx];
+                    fully_masked = (m_block >= lt_start_max) || ((m_block + kBlockM) <= ut_end_min);
+                    partially_masked = ((m_block + kBlockM) > lt_start_min) || (m_block < ut_end_max);
+                }
+            } else {
+                fully_masked = m_block >= lt_start_max;
+                partially_masked = (m_block + kBlockM) > lt_start_min;
+            }
+            
+            prefix_sum = int(!fully_masked);
         }
 
         // Be careful, following two lines might increase reg count
@@ -914,10 +939,6 @@ struct CollectiveMainloopFwdSm90 {
         }
       }
       mask_encode_n_block_smem_[valid_n_block_num] = end_flag;
-
-      // if(valid_n_block_num == 0 && end_flag == Flashmask_n_block_chunk_end) {
-      //   return false;
-      // }
       return valid_n_block_num != 0 || end_flag != Flashmask_n_block_chunk_end;
     }
 

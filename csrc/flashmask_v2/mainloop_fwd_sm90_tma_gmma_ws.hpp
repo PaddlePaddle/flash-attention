@@ -73,7 +73,8 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
-    static constexpr int Flashmask_max_seqlen_k = 16 * 1024;
+    static constexpr int Flashmask_max_seqlen_k = 8 * 1024;
+    static constexpr int ProducerThreadNum = 96;
 
     static constexpr int Flashmask_n_block_buffer_length = ((Flashmask_max_seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4 + 4;
     static constexpr int Flashmask_n_block_buffer_valid_length = Flashmask_n_block_buffer_length - 4;
@@ -667,8 +668,6 @@ struct CollectiveMainloopFwdSm90 {
                  cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
                  int32_t reverse_chunk_idx, // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0]
                  int32_t* const flashmask_maxmin_smem) {
-        constexpr int threads_num = 96;
-        static_assert(threads_num == 96, "load_max_min only support running with 3 warp");
 
         int32_t bidh = get<1>(block_coord);
         int32_t bidb = get<2>(block_coord);
@@ -709,7 +708,7 @@ struct CollectiveMainloopFwdSm90 {
 
         if (tag == PtrExistDispatchTag::FULL_PTR) {
             // how to fix oob?
-            for(int64_t idx = thread_idx; idx < length / 4 && (offset + idx * 4) >= 0; idx += threads_num) {
+            for(int64_t idx = thread_idx; idx < length / 4 && (offset + idx * 4) >= 0; idx += ProducerThreadNum) {
                 // lt start is always valid in flashmask (otherwise it is a bug)
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmax, 0);
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmin, 1);
@@ -721,7 +720,7 @@ struct CollectiveMainloopFwdSm90 {
                 CP_ASYNC_SMEM_INT4(ut_end_nblockmax, 6);
                 CP_ASYNC_SMEM_INT4(ut_end_nblockmin, 7);
             }
-            for(int64_t idx = thread_idx + length / 4 * 4; idx < length && (offset + idx >= 0); idx += threads_num) {
+            for(int64_t idx = thread_idx + length / 4 * 4; idx < length && (offset + idx >= 0); idx += ProducerThreadNum) {
                 CP_ASYNC_SMEM(lt_start_nblockmax, 0);
                 CP_ASYNC_SMEM(lt_start_nblockmin, 1);
                 CP_ASYNC_SMEM(lt_end_nblockmax, 2);
@@ -733,7 +732,7 @@ struct CollectiveMainloopFwdSm90 {
                 CP_ASYNC_SMEM(ut_end_nblockmin, 7);
             }
         } else if (tag == PtrExistDispatchTag::DUAL_PTR) {
-            for(int64_t idx = thread_idx; idx < length / 4 && (offset + idx * 4) >= 0; idx += threads_num) {
+            for(int64_t idx = thread_idx; idx < length / 4 && (offset + idx * 4) >= 0; idx += ProducerThreadNum) {
                 // lt start is always valid in flashmask (otherwise it is a bug)
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmax, 0);
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmin, 1);
@@ -746,7 +745,7 @@ struct CollectiveMainloopFwdSm90 {
                     CP_ASYNC_SMEM_INT4(ut_end_nblockmin, 7);
                 }   
             }
-            for(int64_t idx = thread_idx + length / 4 * 4; idx < length && (offset + idx >= 0); idx += threads_num) {
+            for(int64_t idx = thread_idx + length / 4 * 4; idx < length && (offset + idx >= 0); idx += ProducerThreadNum) {
                 CP_ASYNC_SMEM(lt_start_nblockmax, 0);
                 CP_ASYNC_SMEM(lt_start_nblockmin, 1);
                 // check: paddle/phi/kernels/gpu/flash_attn_v3_kernel.cu (#L2073-L2119)
@@ -759,12 +758,12 @@ struct CollectiveMainloopFwdSm90 {
                 }   
             }
         } else {
-            for(int64_t idx = thread_idx; idx < length / 4 && (offset + idx * 4) >= 0; idx += threads_num) {
+            for(int64_t idx = thread_idx; idx < length / 4 && (offset + idx * 4) >= 0; idx += ProducerThreadNum) {
                 // lt start is always valid in flashmask (otherwise it is a bug)
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmax, 0);
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmin, 1);
             }
-            for(int64_t idx = thread_idx + length / 4 * 4; idx < length && (offset + idx >= 0); idx += threads_num) {
+            for(int64_t idx = thread_idx + length / 4 * 4; idx < length && (offset + idx >= 0); idx += ProducerThreadNum) {
                 CP_ASYNC_SMEM(lt_start_nblockmax, 0);
                 CP_ASYNC_SMEM(lt_start_nblockmin, 1);
             }
@@ -775,7 +774,7 @@ struct CollectiveMainloopFwdSm90 {
         asm volatile("cp.async.commit_group;\n" ::);
         asm volatile("cp.async.wait_group 0;\n" ::);
 
-        cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
+        cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
     }
 
     CUTLASS_DEVICE bool
@@ -797,8 +796,6 @@ struct CollectiveMainloopFwdSm90 {
       static constexpr int kBlockN = get<1>(TileShape_MNK{});
       m_block *= kBlockM;
 
-      constexpr int threads_num = 96;
-      static_assert(threads_num == 96, "generate_n_block only support running with 3 warps");
       int const thread_idx = threadIdx.x - 32;
 
       __shared__ int s_prefix_sum[4];
@@ -856,8 +853,8 @@ struct CollectiveMainloopFwdSm90 {
       // -2, -1,  0,  1,  2
       // t4, t3, t2, t1, t0
       // although t4 and t3 are oob, they should not exit the loop, otherwise, the prefix-sum inside the loop will hang, just keep a default value is fine
-      for(int32_t idx = Flashmask_n_block_buffer_valid_length - 1 - thread_idx % threads_num; 
-          idx >= (0 - (threads_num - Flashmask_n_block_buffer_valid_length % threads_num)); idx -= threads_num
+      for(int32_t idx = Flashmask_n_block_buffer_valid_length - 1 - thread_idx % ProducerThreadNum; 
+          idx >= (0 - (ProducerThreadNum - Flashmask_n_block_buffer_valid_length % ProducerThreadNum)); idx -= ProducerThreadNum
       ) {
         int32_t n_block = base_offset + idx;
         int prefix_sum = 0;
@@ -911,32 +908,27 @@ struct CollectiveMainloopFwdSm90 {
         }
 
         // inter-warp prefix-sum
-        if constexpr (threads_num == 96) {
-          
-          if(lane_id_ == 31) {
+        if(lane_id_ == 31) {
             s_prefix_sum[warp_id_] = prefix_sum;
-          }
+        }
 
-          cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
-          
-          // Currently, we use only 3 warps, so (warp_id_ <= 2) is always true, we can remove it from the predicate 
-          if(warp_id_ >= 1) {
+        cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
+        
+        // Currently, we use only 3 warps, so (warp_id_ <= 2) is always true, we can remove it from the predicate 
+        if(warp_id_ >= 1) {
             prefix_sum += s_prefix_sum[0];
             if (warp_id_ == 2) {
                 prefix_sum += s_prefix_sum[1];
                 if (lane_id_ == 31) s_prefix_sum[2] = prefix_sum;
             }
-          }
         }
 
         // if not fully masked or not partially masked: unmasked, useless (no need to compute)
         if(!fully_masked)
           mask_encode_n_block_smem_[valid_n_block_num + prefix_sum - 1] = partially_masked ? n_block : (-n_block - 1);
-        if constexpr (threads_num == 96) {
-          cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
-          valid_n_block_num += s_prefix_sum[2];
-          cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
-        }
+        cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
+        valid_n_block_num += s_prefix_sum[2];
+        cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
       }
       mask_encode_n_block_smem_[valid_n_block_num] = end_flag;
       return valid_n_block_num != 0 || end_flag != Flashmask_n_block_chunk_end;
@@ -957,7 +949,8 @@ struct CollectiveMainloopFwdSm90 {
          cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
          int &work_idx,
          int32_t* const flashmask_smem_,
-         const int32_t* const n_block_smem
+         const int32_t* const n_block_smem,
+         const int cppl_stage
          ) {
         // some of these are captured in lambda so can't use structured binding
         int const m_block = get<0>(block_coord);
@@ -1153,7 +1146,7 @@ struct CollectiveMainloopFwdSm90 {
         int n_block = n_block_max;
         int32_t n_block_idx = 0;
 
-        const int32_t* mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+        const int32_t* mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * (n_block_pipe_read.index() + cppl_stage);
 
         auto load_flashmask = [&] (auto const& smem_pipe_write) {
             if constexpr (Is_flashmask) {
@@ -1341,7 +1334,7 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_n_block.consumer_release(n_block_pipe_read);
             ++n_block_pipe_read;
             n_block_wait(pipeline_n_block, n_block_pipe_read);
-            mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+            mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * (n_block_pipe_read.index() + cppl_stage);
             n_block_idx = 0;
             n_block = n_block_getter(0);
           }
@@ -1516,7 +1509,8 @@ struct CollectiveMainloopFwdSm90 {
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage,
         int32_t* const flashmask_smem_,
-        const int32_t* const n_block_smem
+        const int32_t* const n_block_smem,
+        const int cppl_stage
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -1615,7 +1609,7 @@ struct CollectiveMainloopFwdSm90 {
         int n_block = n_block_max;
 
         consumer_wait(pipeline_n_block, n_block_pipe_read);
-        const int32_t* mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+        const int32_t* mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * (n_block_pipe_read.index() + cppl_stage);
 
         int n_block_idx = 0;
         auto n_block_getter = [&mask_encode_n_block_smem_](int32_t index) {
@@ -1845,7 +1839,7 @@ struct CollectiveMainloopFwdSm90 {
                     pipeline_n_block.consumer_release(n_block_pipe_read);
                     ++n_block_pipe_read;
                     consumer_wait(pipeline_n_block, n_block_pipe_read);
-                    mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+                    mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * (n_block_pipe_read.index() + cppl_stage);
                     n_block_idx = 0;
                     n_block = n_block_getter(0);
                   }
@@ -1862,7 +1856,7 @@ struct CollectiveMainloopFwdSm90 {
                 pipeline_n_block.consumer_release(n_block_pipe_read);
                 ++n_block_pipe_read;
                 consumer_wait(pipeline_n_block, n_block_pipe_read);
-                mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+                mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * (n_block_pipe_read.index() + cppl_stage);
                 n_block_idx = 0;
                 n_block = n_block_getter(0);
               }
@@ -1880,7 +1874,7 @@ struct CollectiveMainloopFwdSm90 {
                     pipeline_n_block.consumer_release(n_block_pipe_read);
                     ++n_block_pipe_read;
                     consumer_wait(pipeline_n_block, n_block_pipe_read);
-                    mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+                    mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * (n_block_pipe_read.index() + cppl_stage);
                     n_block_idx = 0;
                     n_block = n_block_getter(0);
                   }

@@ -133,10 +133,12 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
         params.num_splits_dynamic_ptr, enable_pdl);
 }
 
-void prepare_preemptive_scheduler(Flash_fwd_params &params, cudaStream_t stream, int num_sm) {
+void prepare_preemptive_scheduler(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx) {
     if (params.tile_count_semaphore == nullptr) {
         CHECK_CUDA(cudaGetSymbolAddress((void**)&params.tile_count_semaphore, semaphore_storage));
     }
+    if (is_dual_pptx)
+        num_sm *= 2;        // double buffer PPTX will have 2 * num_sm static scheduling
     flash::prepare_preemptive_scheduler_kernel<<<1 /*grid*/, 32 /*block*/, 0, stream>>>(
         params.tile_count_semaphore,
         num_sm);

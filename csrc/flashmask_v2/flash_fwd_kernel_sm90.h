@@ -121,7 +121,7 @@ public:
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
             alignas(16) typename CollectiveMainloop::MainloopPipelineNBlock::SharedStorage pipeline_n_block;
             alignas(16) typename CollectiveMainloop::MainloopPipelineFlashMaskApply::SharedStorage pipeline_flashmask_apply;
-            alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
+            alignas(16) typename TileScheduler::SharedStorage smem_scheduler[2];
         } pipelines;
 
     };
@@ -210,8 +210,15 @@ public:
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-        __shared__ __align__(16) int32_t flashmask_maxmin_smem[8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
-        __shared__ int32_t n_block_smem[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        __shared__ __align__(16) int32_t flashmask_maxmin_smem[2 * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        __shared__ int32_t n_block_smem[2 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+
+        if constexpr (true) {       // substitute to type traits
+            // no need to sync the following since the store will be visible due to barriers in DualPPTX
+            if (threadIdx.x < 2) {
+                shared_storage.pipelines.smem_scheduler[threadIdx.x] = -1;
+            }
+        }
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
@@ -296,6 +303,7 @@ public:
               const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_valid_length -1) / CollectiveMainloop::Flashmask_n_block_buffer_valid_length;
               // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
               bool valid_chunk = true;
+              const int cppl_stage = (scheduler.template stage<true>()) << 1;      // coarse pipeline stage
               for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
                 if (valid_chunk) {
                   pipeline_n_block.producer_acquire(n_block_pipe_write);
@@ -306,8 +314,8 @@ public:
                                           block_coord,
                                           reverse_chunk_idx,
                                           reverse_chunk_idx == num_chunk - 1 ? CollectiveMainloop::Flashmask_n_block_finish : CollectiveMainloop::Flashmask_n_block_chunk_end,
-                                          flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
-                                          n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
+                                          flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),
+                                          n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage));
                 if (valid_chunk) {
                   pipeline_n_block.producer_commit(n_block_pipe_write);
                   ++n_block_pipe_write;
@@ -441,10 +449,11 @@ public:
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
                 };
+                const int cppl_stage = scheduler.stage() << 1;
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_write,
                               n_block_pipe_read,
                               shared_storage, seqlen_info, block_coord, work_idx,
-                              flashmask_smem_, n_block_smem);
+                              flashmask_smem_, n_block_smem, cppl_stage);
             }
 
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
@@ -483,18 +492,19 @@ public:
                 // Attention output (GEMM-II) accumulator.
                 Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 bool tile_valid;
+                const int cppl_stage = scheduler.stage() << 1;
                 if constexpr (!LargeHeadDimV) {
                     tile_valid = mainloop.mma(
                         params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_read,
                         n_block_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                        flashmask_smem_, n_block_smem);
+                        flashmask_smem_, n_block_smem, cppl_stage);
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
                             params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                            flashmask_smem_, n_block_smem);
+                            flashmask_smem_, n_block_smem, cppl_stage);
                     } else {
                         tile_valid = mainloop.mma_pv(
                             params.mainloop, pipeline_v, pipeline_n_block, smem_pipe_read,

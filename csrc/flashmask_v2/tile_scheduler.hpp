@@ -336,20 +336,20 @@ public:
 };
 
 template<int NumConsumerThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=96, bool Split=false>
-class PreemptivePersistentTileExecutionScheduler {
+class DualPreemptivePersistentTileExecutionScheduler {
     // **PPT** scheduler: performs correct synchronization for producer (generate_n_block) and consumer (KV load and computation pipeline)
     // This scheduler has the same coordinate computation logic as StaticPersistentTileSch, the difference is that
     // we employ a preemptive scheduling strategy based on a rough estimation of the workload for the consumer
     // In PPT, NumConsumerThreads is the total number of threads for (KV load and computation pipeline), and for FlashMask V2
     // it will be the #threads for (wg_id = 0, wp_id = 0) + (wg_id > 0, wp_id = *). The NumProducerThreads is simply 96 (hard-coded).
-    static_assert(NumProducerThreads == 96, "PreemptivePersistentTileScheduler has incorrect producer thread num.");
+    static_assert(NumProducerThreads == 96, "DualPPTX Scheduler has incorrect producer thread num.");
     static constexpr int NumThreads = NumConsumerThreads + NumProducerThreads;
 public:
     using SharedStorage = int;
 
 protected:
     SharedStorage* const tile_count_smem;
-
+    uint32_t sch_stage_;
 public:
 
     // Device side kernel params
@@ -398,12 +398,12 @@ public:
     };
 
     CUTLASS_DEVICE
-    PreemptivePersistentTileExecutionScheduler(SharedStorage* const smem_scheduler) : tile_count_smem(smem_scheduler) {};
+    DualPreemptivePersistentTileExecutionScheduler(SharedStorage* const smem_scheduler) : tile_count_smem(smem_scheduler) {}
 
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
     WorkTileInfo
-    get_initial_work(Params const& params) const {
+    get_initial_work(Params const& params) {
         // when all the blocks (SMs) done initializing and no SM has done the first task, tile_count_semaphore will be
         // at least `gridDim.x`, then, we just let prefetch_next_work and non-deterministic schedule (workload-related) take over 
 
@@ -413,17 +413,19 @@ public:
         // prefetch_next_work even before SM2 calls get_initial_work, then SM1 will risk computing the same block as SM2.
 
         // for the initial work: assign deterministically
+        if constexpr (IsProducerWarp) {
+            sch_stage_ = 0;  // producer initial state is 0, since the first get_next, producer should sync full-1 (dual)
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+        } else {
+            sch_stage_ = 1;  // consumer initial state is 1, since the first get_next, producer should sync empty-0 (non-dual)
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFullDual) /*id*/);
+        }
         return {int(blockIdx.x)};
     }
 
     CUTLASS_DEVICE
     void
-    init_consumer() const {
-        // this is a kick-off for the whole producer (producer waits for TileCountSmemEmpty), otherwise we will have a dead-lock, also
-        // this init_consumer can only be called in consumer warps, otherwise we will have more arriving threads than needed
-        // NumConsumerThreads: including (wg_id = 0, warp_id = 0: KV load) and (wg_id > 0, warp_id = *: computation) 
-        flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
-    }
+    init_consumer() const { /* Init is done in get_initial work, therefore no need to repeat. */ }
 
     CUTLASS_DEVICE
     void
@@ -434,24 +436,46 @@ public:
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
     WorkTileInfo
-    get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+    get_next_work(Params const& params, WorkTileInfo const& current_work) {
+        // change state immediately, since we are to get next work
+        // Note that for the return value: except from the initial work, PPT always dynamic schedules
+        // Dual PPTX will have static schedule for only twice: get initial work and the first time get_next_work
+        // This is intentional, since in the first get_next_work, smem is not fully ready.
         if constexpr (IsProducerWarp) {
+            sch_stage_ = 0x1 ^ sch_stage_;
             // only threadIdx.x == 96 has the correct `current_work.tile_idx` (see prefetch next_work)
             // so there is no need to use shfl_sync to broadcast. Also shfl cannot broadcast across warps
-            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
-            int tile_idx = *tile_count_smem;
-            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) + (sch_stage_ << 4) /*id*/);
+            int tile_idx = tile_count_smem[sch_stage_];
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 4) /*id*/);
             // Sync all the producers in case some of the producers return before the smem is updated
-            return {tile_idx};
+            return {tile_idx >= 0 ? tile_idx : int(blockIdx.x + gridDim.x)};
         } else {
+            // for example: 
+            // the 1st get_next_work of consumer: load from 1, and atomicAdd store to 0 
+            //      load from 1 not initialized, use blockIdx.x + gridDim.x (static scheduling)
+            // the 2nd get_next_work of consumer: load from 0, and atomicAdd store to 1
+            //      load from 0 initialized: the 3rd consumer work ID is correctly set 
+            int tile_idx = tile_count_smem[sch_stage_];
+            sch_stage_ = 0x1 ^ sch_stage_;
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 4) /*id*/);
             if (threadIdx.x == NumConsumerThreads) {    // thread 288 hard-coded, since n_block consumer threads are in [128, 384)
-                *tile_count_smem = atomicAdd(params.tile_count_semaphore, 1);
+                tile_count_smem[sch_stage_] = atomicAdd(params.tile_count_semaphore, 1);
             }
-            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
-            int tile_idx = *tile_count_smem;
-            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
-            return {tile_idx};
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) + (sch_stage_ << 4) /*id*/);
+            return {tile_idx >= 0 ? tile_idx : int(blockIdx.x + gridDim.x)};
         }
+    }
+
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    uint32_t stage() const noexcept {
+        // producer always returns the current stage, while consumer returns 1 - current stage
+        // so that consumer can always have valid input
+        if constexpr (IsProducerWarp)
+            return sch_stage_;
+        else
+            return 0x1 ^ sch_stage_;
     }
 };
 

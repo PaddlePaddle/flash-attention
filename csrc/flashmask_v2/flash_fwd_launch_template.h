@@ -65,7 +65,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr int _NumConsumerThreads = CollectiveMainloop::NumMmaThreads + cutlass::NumThreadsPerWarpGroup - _NumProducerThreads;    // expect: 384 - 96
     using Scheduler = std::conditional_t<
         Arch >= 90,
-        flash::PreemptivePersistentTileExecutionScheduler<_NumConsumerThreads, _NumProducerThreads, Split>,
+        flash::DualPreemptivePersistentTileExecutionScheduler<_NumConsumerThreads, _NumProducerThreads, Split>,
         flash::StaticPersistentTileScheduler<Split>
     >;
 
@@ -155,7 +155,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     };
 
     if constexpr (Arch >= 90) {
-        prepare_preemptive_scheduler(params, stream, params.num_sm);
+        prepare_preemptive_scheduler(params, stream, params.num_sm, true);
     }
 
     int qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);

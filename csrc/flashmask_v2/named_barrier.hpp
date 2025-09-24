@@ -59,6 +59,8 @@ enum class FwdNamedBarriers {
     QueryRotated = 8,
     PFull = 9,
     NBlockProducer = 10,
+    TileCountSmemEmptyDual = 18,        // 2 + (1 << 4, = 16)
+    TileCountSmemFullDual = 19,         // 3 + (1 << 4, = 16)
     PEmpty = 6,  // HACK: PEmpty is only used when we don't have 3 WGs
     FlashMaskNBlock = 7, // HACK: share with AppendKV
     FlashMaskApply = 8, // HACK: share with FlashMaskQK

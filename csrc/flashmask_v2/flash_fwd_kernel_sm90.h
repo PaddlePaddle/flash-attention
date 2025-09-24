@@ -261,6 +261,7 @@ public:
           cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
           cutlass::PipelineState<CollectiveMainloop::kNBlockStages> n_block_pipe_write = cutlass::make_producer_start_state<MainloopPipelineNBlock>();
           // Manually specify the scheduler role: producer. For StaticPersistentTileSch, passing template args won't change the behavior
+          scheduler.init_consumer();
           for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler); 
                work_tile_info.is_valid(params.scheduler); 
                work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)
@@ -421,15 +422,9 @@ public:
             static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
             static_assert(SingleProducerWarp);
 
-            scheduler.init_consumer();      // in case `return`, and there will be dead-lock
             if constexpr (SingleProducerWarp) {
               if (warp_idx_in_warpgroup != 0) { return; }
             }
-
-            // useless, static persistent and single tile both implement dummy function here
-            // for PPT scheduler, we can not do anything here. So in summary, we should comment this. 
-            // Also, the following line will never be executed, since `warp_idx_in_warpgroup` is always 0 in this branch
-            // if (!SingleProducerWarp && warp_idx_in_warpgroup != 0) { scheduler.init_consumer(); }
             
             // TODO(heqianyue): What does this do? I don't want this to disrupt sync
             cutlass::arch::wait_on_dependent_grids();
@@ -464,7 +459,6 @@ public:
             // We don't need separate variables smem_pipe_release_k and smem_pipe_release_v
             // (like in Cutlass's gemm) because the read and release pipeline states are always the same.
 
-            scheduler.init_consumer();
             mainloop.mma_init();
 
             int work_idx = 0;

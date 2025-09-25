@@ -445,9 +445,11 @@ public:
             sch_stage_ = 0x1 ^ sch_stage_;
             // only threadIdx.x == 96 has the correct `current_work.tile_idx` (see prefetch next_work)
             // so there is no need to use shfl_sync to broadcast. Also shfl cannot broadcast across warps
-            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) + (sch_stage_ << 3) /*id*/);
+            flash::named_barrier_sync(NumThreads, 
+                    static_cast<uint32_t>(sch_stage_ ? FwdNamedBarriers::TileCountSmemFullDual : FwdNamedBarriers::TileCountSmemFull) /*id*/);
             int tile_idx = tile_count_smem[sch_stage_];
-            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 3) /*id*/);
+            flash::named_barrier_arrive(NumThreads, 
+                    static_cast<uint32_t>(sch_stage_ ? FwdNamedBarriers::TileCountSmemEmptyDual : FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
             // Sync all the producers in case some of the producers return before the smem is updated
             return {tile_idx >= 0 ? tile_idx : int(blockIdx.x + gridDim.x)};
         } else {
@@ -458,11 +460,13 @@ public:
             //      load from 0 initialized: the 3rd consumer work ID is correctly set 
             int tile_idx = tile_count_smem[sch_stage_];
             sch_stage_ = 0x1 ^ sch_stage_;
-            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 3) /*id*/);
+            flash::named_barrier_sync(NumThreads, 
+                    static_cast<uint32_t>(sch_stage_ ? FwdNamedBarriers::TileCountSmemEmptyDual : FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
             if (threadIdx.x == NumConsumerThreads) {    // thread 288 hard-coded, since n_block consumer threads are in [128, 384)
                 tile_count_smem[sch_stage_] = atomicAdd(params.tile_count_semaphore, 1);
             }
-            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) + (sch_stage_ << 3) /*id*/);
+            flash::named_barrier_arrive(NumThreads, 
+                    static_cast<uint32_t>(sch_stage_ ? FwdNamedBarriers::TileCountSmemFullDual : FwdNamedBarriers::TileCountSmemFull) /*id*/);
             return {tile_idx >= 0 ? tile_idx : int(blockIdx.x + gridDim.x)};
         }
     }

@@ -49,21 +49,19 @@ static void named_barrier_arrive(uint32_t num_threads, cutlass::arch::ReservedNa
 
 enum class FwdNamedBarriers {
     QueryEmpty = 0,
-    ProducerWG = 1,
+    ProducerWG = 1,             // ProducerWG is only used in Transpose_V, so it is currently not used
     TileCountSmemEmpty = 2,
     TileCountSmemFull = 3,
     WarpSchedulerWG1 = 4,
     WarpSchedulerWG2 = 5,
     WarpSchedulerWG3 = 6,
-    AppendKV = 7,
+    FlashMaskNBlock = 7,        // AppendKV is not used in FlashMask V2
     QueryRotated = 8,
     PFull = 9,
-    TileCountSmemEmptyDual = 10,        // 2 + (1 << 3, = 8)
-    TileCountSmemFullDual = 11,         // 3 + (1 << 3, = 8)
-    NBlockProducer = 10,    // HACK: NBlockProducer is only used in PPTScheduler
-    PEmpty = 6,  // HACK: PEmpty is only used when we don't have 3 WGs
-    FlashMaskNBlock = 7, // HACK: share with AppendKV
-    FlashMaskApply = 8, // HACK: share with FlashMaskQK
+    TileCountSmemEmptyDual = 1, // HACK: ProducerWG is useless in FlashMask currently, reuse
+    TileCountSmemFullDual = 10, // HACK: 10 + 6 --> we will simplicity use barrier 0 (syncthreads bar)
+    NBlockProducer = 7,         // HACK: NBlockProducer is only used in PPTScheduler
+    PEmpty = 6,                 // HACK: PEmpty is only used when we don't have 3 WGs
 };
 
 enum class BwdNamedBarriers {

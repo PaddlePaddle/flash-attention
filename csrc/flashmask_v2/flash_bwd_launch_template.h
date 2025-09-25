@@ -29,7 +29,8 @@ template <int Arch, int kHeadDim, int kBlockM, int kBlockN, typename Element,
           int Stages_dO=2, int Stages_dS_or_QSm80=2,
           bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
           int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-          bool V_in_regs=false,bool Is_flashmask>
+          bool V_in_regs=false,bool Is_flashmask,
+          bool Has_lt_end=false, bool Has_ut_start=false, bool Has_ut_end=false>
 void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     // printf("point3\n");
     // flash::print_addr_value<<<1, 1,0,stream>>>(params.lt_start_ptr, 0);
@@ -93,7 +94,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         Arch >= 90,
         flash::CollectiveMainloopBwdSm90<Stages, Stages_dO, Stages_dS, ClusterShape, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm90,
             Is_causal, Is_local, Has_softcap, Varlen, Deterministic,
-            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Is_flashmask>,
+            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Is_flashmask, Has_lt_end, Has_ut_start, Has_ut_end>,
         flash::CollectiveMainloopBwdSm80<Stages, Stages_dO, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm80,
             Is_causal, Is_local, Has_softcap, Varlen, Deterministic,
             SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>
@@ -345,24 +346,26 @@ template<int Arch, typename T, int kBlockM, int kBlockN, int kHeadDim, bool Is_c
          int Stages_dO=2, int Stages_dS_or_QSm80=2,
          bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
          int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-         bool V_in_regs=false,bool Is_flashmask_>
+         bool V_in_regs=false,bool Is_flashmask_,
+         bool Has_lt_end_=false, bool Has_ut_start_=false, bool Has_ut_end_=false>
 void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
     VARLEN_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
         BOOL_SWITCH(params.h != params.h_k, GQA, [&] {
 //             BOOL_SWITCH(params.deterministic, Deterministic, [&] {
             // run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen, false, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);   
-                run_flash_bwd<Arch, kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, false /*Deterministic*/, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Is_flashmask_>(params, stream);
+                run_flash_bwd<Arch, kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, false /*Deterministic*/, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Is_flashmask_, Has_lt_end_, Has_ut_start_, Has_ut_end_>(params, stream);
 //             });
         });
     });
 }
 
 
-template<int Arch, typename T, bool Has_softcap>
+template<int Arch, typename T, bool Has_softcap, bool Is_causal>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
     // printf("point2-1\n");
+    static constexpr bool Is_local = false;
     BOOL_SWITCH(params.lt_start_ptr != nullptr, Is_flashmask_, [&] {  
-        CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {        
+//        CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {        
             if constexpr (Arch >= 90) {
                 if constexpr (Is_flashmask_ && !Is_causal){
                      run_mha_bwd_dispatch<Arch, T, 64, 96, 64, Is_causal, Is_local, Has_softcap, 2, 2, false, true, false, 2, 1, 2, 1, false, Is_flashmask_>(params, stream);
@@ -382,7 +385,7 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
             } else {
                 run_mha_bwd_dispatch<Arch, T, 128, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, false, false, false, 2, 4, 4, 4, false, Is_flashmask_>(params, stream);
             }
-        });
+//        });
     });
 }
 
@@ -401,24 +404,25 @@ void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
     });
 }
 
-template<int Arch, typename T, bool Has_softcap>
+template<int Arch, typename T, bool Has_softcap, bool Is_causal>
 void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
+    static constexpr bool Is_local = false;
     BOOL_SWITCH(params.lt_start_ptr != nullptr, Is_flashmask_, [&] {
-        CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
+//        CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
+            FLASH_MASK_SWITCH(params.lt_end_ptr != nullptr, params.ut_start_ptr != nullptr, params.ut_end_ptr != nullptr, Has_lt_end, Has_ut_start, Has_ut_end, [&] {
             if constexpr (Arch >= 90) {
-                if constexpr (!Is_causal && Is_flashmask_) {
-                     run_mha_bwd_dispatch<Arch, T, 64, 64, 128, Is_causal, Is_local, Has_softcap, 2, 2, false, true, false, 2, 1, 2, 1, false, Is_flashmask_>(params, stream);
-                }else if constexpr (Is_causal || Is_local || Has_softcap || Is_flashmask_) {
-                    run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1, false, Is_flashmask_>(params, stream);
+                if constexpr (Is_causal || Is_local || Has_softcap) {
+                    run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1, false, Is_flashmask_, Has_lt_end, Has_ut_start, Has_ut_end>(params, stream);
                 } else {
-                    run_mha_bwd_dispatch<Arch, T, 80, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 1, false, Is_flashmask_>(params, stream);
+                    run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 1, false, Is_flashmask_, Has_lt_end, Has_ut_start, Has_ut_end>(params, stream);
                 }
             } else if constexpr (Arch == 86 || Arch == 89) {
                 run_mha_bwd_dispatch<Arch, T, 64, 96, 128, Is_causal, Is_local, Has_softcap, 1, 2, false, false, false, 2, 2, 2, 2, true, Is_flashmask_>(params, stream);
             } else {
                 run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, false, false, false, 2, 2, 2, 2, false, Is_flashmask_>(params, stream);
             }
-        });
+            });
+//        });
     });
 }
 

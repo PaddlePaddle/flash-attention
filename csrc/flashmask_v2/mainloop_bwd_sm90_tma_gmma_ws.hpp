@@ -32,7 +32,8 @@ template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class T
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic,
         bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
         int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-        bool Mma_dP_is_RS=false,bool Is_flashmask=false>
+        bool Mma_dP_is_RS=false,bool Is_flashmask=false,
+        bool Has_lt_end_=false, bool Has_ut_start_=false, bool Has_ut_end_=false>
 struct CollectiveMainloopBwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -50,6 +51,10 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
     static constexpr bool Varlen = Varlen_;
+
+    static constexpr bool Has_lt_end = Has_lt_end_;
+    static constexpr bool Has_ut_start = Has_ut_start_;
+    static constexpr bool Has_ut_end = Has_ut_end_;
 
     static constexpr bool SdP_swapAB = SdP_swapAB_;
     static constexpr bool dKV_swapAB = dKV_swapAB_;
@@ -695,14 +700,16 @@ struct CollectiveMainloopBwdSm90 {
             };
             int loop_end = m_block_max;
             if constexpr(!Is_causal){
-                if(params.ut_start_nblockmax != nullptr){
+                if constexpr (Has_ut_start) {
                     loop_end = (flashmask_mem_[4] -1)/kBlockM ;
                     #pragma unroll (kHeadDim < 256 ? 2 : 1)
                     for (; m_block <= loop_end;++m_block) {
                         process_block(m_block);
                     }
                 }
-                m_block = std::max(m_block,flashmask_mem_[7] /kBlockM); 
+                if constexpr (Has_ut_end) {
+                    m_block = std::max(m_block,flashmask_mem_[7] /kBlockM); 
+                }
             } 
             loop_end = std::min(m_block_max-1,(flashmask_mem_[0] -1)/ kBlockM);
             // printf("flashmask_mem_0,lt_start_nblockmax,n_block: %d, %d, %d\n", flashmask_mem_[0],params.lt_start_nblockmax[n_block],n_block);
@@ -713,7 +720,7 @@ struct CollectiveMainloopBwdSm90 {
                 // printf("producer0 m_block,n_block: %d, %d\n", m_block,n_block);
                 process_block(m_block);
             } 
-            if(params.lt_end_nblockmax != nullptr){
+            if constexpr (Has_lt_end) {
                 m_block = std::max(m_block,flashmask_mem_[3]/kBlockM);      
                 #pragma unroll (kHeadDim < 256 ? 2 : 1)
                 for (; m_block <= m_block_max-1;++m_block) {
@@ -809,7 +816,7 @@ struct CollectiveMainloopBwdSm90 {
         // printf("m_block_max:%d\n", m_block_max);
         int loop_end = m_block_max;
         if constexpr(!Is_causal){
-            if(params.ut_start_nblockmax != nullptr){
+            if constexpr (Has_ut_start) {
                 loop_end = (flashmask_mem_[4] -1)/kBlockM ;
                 #pragma unroll 2
                 for (; m_block <= loop_end;++m_block) {
@@ -835,7 +842,9 @@ struct CollectiveMainloopBwdSm90 {
                     }
                 }
             }
-            m_block = std::max(m_block,flashmask_mem_[7] /kBlockM); 
+            if constexpr (Has_ut_end) {
+                m_block = std::max(m_block,flashmask_mem_[7] /kBlockM); 
+            }
         } 
         loop_end = std::min(m_block_max-1,(flashmask_mem_[0] -1 )/ kBlockM);
         #pragma unroll 2
@@ -861,8 +870,8 @@ struct CollectiveMainloopBwdSm90 {
                 Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
             }
         } 
-        m_block = std::max(m_block,(flashmask_mem_[3]+1)/kBlockM);      
-        if(params.lt_end_nblockmax != nullptr){
+        if constexpr (Has_lt_end) {
+            m_block = std::max(m_block,(flashmask_mem_[3]+1)/kBlockM);      
             #pragma unroll 2
             for (; m_block <= m_block_max-1;++m_block) {
                 if constexpr (Deterministic) {
@@ -886,7 +895,7 @@ struct CollectiveMainloopBwdSm90 {
                     Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
                 }
             }
-        }  
+        }
 
         if constexpr (Is_local && Deterministic) {
             int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
@@ -1265,7 +1274,7 @@ struct CollectiveMainloopBwdSm90 {
         auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
         int loop_end = m_block_max;
         if constexpr(!Is_causal){
-            if(params.ut_start_nblockmax != nullptr){
+            if constexpr (Has_ut_start) {
                 loop_end = std::min(flashmask_mem_[5]/*ut_start_nblockmin*/ / kBlockM,m_block_max);
                 CUTLASS_PRAGMA_NO_UNROLL
                 for (; m_block < loop_end; m_block++) {
@@ -1279,8 +1288,12 @@ struct CollectiveMainloopBwdSm90 {
                     bwd_step(m_block,mask_fn,true,flashmask_index_smem_);
                 }
             }
-            m_block = std::max(m_block,flashmask_mem_[7]/*ut_end_nblockmin*/ / kBlockM); 
-            loop_end = std::min((flashmask_mem_[6]/*ut_end_nblockmax*/-1) / kBlockM, m_block_max-1);
+            if constexpr (Has_ut_end) {
+                m_block = std::max(m_block,flashmask_mem_[7]/*ut_end_nblockmin*/ / kBlockM); 
+                loop_end = std::min((flashmask_mem_[6]/*ut_end_nblockmax*/-1) / kBlockM, m_block_max-1);
+            } else {
+                loop_end = m_block_max - 1;
+            }
             CUTLASS_PRAGMA_NO_UNROLL
             for (; m_block <= loop_end; m_block++) {
                 // if(threadIdx.x == 128) printf("consumer-u-2 m_block,n_block,m_block_max,flashmask_mem_[2]: %d, %d, %d,%d\n", m_block,n_block,m_block_max,flashmask_mem_[6]);
@@ -1300,7 +1313,7 @@ struct CollectiveMainloopBwdSm90 {
             // if(threadIdx.x == 128) printf("consumer-l-1 m_block,n_block, flashmask_mem_[0]: %d, %d, %d\n", m_block,n_block,flashmask_mem_[0]);
             bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
         }
-        if(params.lt_end_nblockmax != nullptr){
+        if constexpr (Has_lt_end) {
             m_block = std::max(m_block,flashmask_mem_[3]/*lt_end_nblockmin*/ / kBlockM);  
             //partial_maskloop_end
             loop_end = std::min((flashmask_mem_[2]/*lt_end_nblockmax*/-1) / kBlockM, m_block_max-1);

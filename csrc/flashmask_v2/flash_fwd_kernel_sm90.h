@@ -308,7 +308,8 @@ public:
                 if (valid_chunk) {
                   pipeline_n_block.producer_acquire(n_block_pipe_write);
                 }
-                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
+                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem + 
+                                      8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage));
                 valid_chunk = mainloop.generate_n_block(params.mainloop,
                                           seqlen_info,
                                           block_coord,

@@ -333,6 +333,9 @@ public:
         }
     }
 
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    uint32_t stage() const noexcept { return 0; }
 };
 
 template<int NumConsumerThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=96, bool Split=false>
@@ -342,6 +345,8 @@ class DualPreemptivePersistentTileExecutionScheduler {
     // we employ a preemptive scheduling strategy based on a rough estimation of the workload for the consumer
     // In PPT, NumConsumerThreads is the total number of threads for (KV load and computation pipeline), and for FlashMask V2
     // it will be the #threads for (wg_id = 0, wp_id = 0) + (wg_id > 0, wp_id = *). The NumProducerThreads is simply 96 (hard-coded).
+
+    // The following static_assert is NOT compulsory, it's just that we found that 64 producer threads performs worse
     static_assert(NumProducerThreads == 96, "DualPPTX Scheduler has incorrect producer thread num.");
     static constexpr int NumThreads = NumConsumerThreads + NumProducerThreads;
 public:
@@ -445,11 +450,9 @@ public:
             sch_stage_ = 0x1 ^ sch_stage_;
             // only threadIdx.x == 96 has the correct `current_work.tile_idx` (see prefetch next_work)
             // so there is no need to use shfl_sync to broadcast. Also shfl cannot broadcast across warps
-            flash::named_barrier_sync(NumThreads, 
-                    static_cast<uint32_t>(sch_stage_ ? FwdNamedBarriers::TileCountSmemFullDual : FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) + (sch_stage_ << 1) /*id*/);
             int tile_idx = tile_count_smem[sch_stage_];
-            flash::named_barrier_arrive(NumThreads, 
-                    static_cast<uint32_t>(sch_stage_ ? FwdNamedBarriers::TileCountSmemEmptyDual : FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 1) /*id*/);
             // Sync all the producers in case some of the producers return before the smem is updated
             return {tile_idx >= 0 ? tile_idx : int(blockIdx.x + gridDim.x)};
         } else {
@@ -460,13 +463,11 @@ public:
             //      load from 0 initialized: the 3rd consumer work ID is correctly set 
             int tile_idx = tile_count_smem[sch_stage_];
             sch_stage_ = 0x1 ^ sch_stage_;
-            flash::named_barrier_sync(NumThreads, 
-                    static_cast<uint32_t>(sch_stage_ ? FwdNamedBarriers::TileCountSmemEmptyDual : FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 1) /*id*/);
             if (threadIdx.x == NumConsumerThreads) {    // thread 288 hard-coded, since n_block consumer threads are in [128, 384)
                 tile_count_smem[sch_stage_] = atomicAdd(params.tile_count_semaphore, 1);
             }
-            flash::named_barrier_arrive(NumThreads, 
-                    static_cast<uint32_t>(sch_stage_ ? FwdNamedBarriers::TileCountSmemFullDual : FwdNamedBarriers::TileCountSmemFull) /*id*/);
+            flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) + (sch_stage_ << 1) /*id*/);
             return {tile_idx >= 0 ? tile_idx : int(blockIdx.x + gridDim.x)};
         }
     }

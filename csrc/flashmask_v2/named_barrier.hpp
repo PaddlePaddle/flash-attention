@@ -49,19 +49,23 @@ static void named_barrier_arrive(uint32_t num_threads, cutlass::arch::ReservedNa
 
 enum class FwdNamedBarriers {
     QueryEmpty = 0,
-    ProducerWG = 1,             // ProducerWG is only used in Transpose_V, so it is currently not used
-    TileCountSmemEmpty = 2,
-    TileCountSmemFull = 3,
-    WarpSchedulerWG1 = 4,
-    WarpSchedulerWG2 = 5,
-    WarpSchedulerWG3 = 6,
-    FlashMaskNBlock = 7,        // AppendKV is not used in FlashMask V2
-    QueryRotated = 8,
-    PFull = 9,
-    TileCountSmemEmptyDual = 1, // HACK: ProducerWG is useless in FlashMask currently, reuse
-    TileCountSmemFullDual = 10, // HACK: 10 + 6 --> we will simplicity use barrier 0 (syncthreads bar)
-    NBlockProducer = 7,         // HACK: NBlockProducer is only used in PPTScheduler
-    PEmpty = 6,                 // HACK: PEmpty is only used when we don't have 3 WGs
+    WarpSchedulerWG1 = 1,
+    WarpSchedulerWG2 = 2,
+    WarpSchedulerWG3 = 3,
+    FlashMaskNBlock = 4,        // AppendKV is not used in FlashMask V2
+    QueryRotated = 5,
+    PFull = 6,
+    TileCountSmemEmpty = 7,
+    TileCountSmemFull = 8,
+    ProducerWG = 9,             // ProducerWG is only used in Transpose_V, so it is currently not used
+    TileCountSmemEmptyDual = 9, // HACK: ProducerWG is useless in FlashMask currently, reuse
+    // HACK: 10 + 6 --> we will simplicity use barrier 0 (syncthreads bar)
+    // This is not safe to use! Since we do not know for sure whether bar.sync 16 is equivalent to bar.sync 0
+    // Even if it is, bar.sync 0 might conflicts with __syncthreads, but if there is no __syncthreads
+    // in the kernel, we will be fine (by far, nearly 20k tests passed)
+    TileCountSmemFullDual = 10,
+    NBlockProducer = 4,         // HACK: NBlockProducer is only used in PPTScheduler
+    PEmpty = 3,                 // HACK: PEmpty is only used when we don't have 3 WGs
 };
 
 enum class BwdNamedBarriers {

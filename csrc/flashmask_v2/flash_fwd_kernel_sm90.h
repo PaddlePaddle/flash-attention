@@ -265,7 +265,7 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0 && warp_idx_in_warpgroup != 0) { // n_block generator
-          cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+          // cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
           cutlass::PipelineState<CollectiveMainloop::kNBlockStages> n_block_pipe_write = cutlass::make_producer_start_state<MainloopPipelineNBlock>();
           // Manually specify the scheduler role: producer. For StaticPersistentTileSch, passing template args won't change the behavior
           scheduler.init_consumer();
@@ -418,7 +418,7 @@ public:
           MainloopPipelineFlashMaskApply pipeline_flashmask_apply(shared_storage.pipelines.pipeline_flashmask_apply, pipeline_params_flashmask_apply);
 
         if (warp_group_idx == 0) {  // Producer
-            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+            // cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
             // might use cp.async to load KV (if PagedKVNonTMA) while AppendKV always uses TMA to load
             // KV_new. Since the pipeline states are different, we have to manually sync to make
@@ -439,8 +439,15 @@ public:
             cutlass::arch::wait_on_dependent_grids();
 
             // Load Q, K, V
+            int counter = 0;
             for (auto work_tile_info = scheduler.get_initial_work(params.scheduler); work_tile_info.is_valid(params.scheduler); work_tile_info = scheduler.get_next_work(params.scheduler, work_tile_info)) {
-
+                if (threadIdx.x == 0) {
+                    printf("[Block: %03d/%03d] Current work_tile_info: %d, counter: %d, sch stage: %u\n", blockIdx.x, gridDim.x, work_tile_info.tile_idx, counter, scheduler.stage());
+                }
+                if (blockIdx.x == 0) {
+                    printf("B0 Current work_tile_info: %d, counter: %d, sch stage: %u\n", work_tile_info.tile_idx, counter, scheduler.stage());
+                }
+                counter ++;
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 SeqlenInfo_t seqlen_info{
                     get<2>(block_coord) /*bidb*/,
@@ -459,7 +466,7 @@ public:
 
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
-            cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+            // cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
             // Initialize matmul objects.
             TiledMmaPV tiled_mma_pv;

@@ -441,11 +441,11 @@ public:
             // Load Q, K, V
             int counter = 0;
             for (auto work_tile_info = scheduler.get_initial_work(params.scheduler); work_tile_info.is_valid(params.scheduler); work_tile_info = scheduler.get_next_work(params.scheduler, work_tile_info)) {
-                if (threadIdx.x == 0) {
-                    printf("[Block: %03d/%03d] Current work_tile_info: %d, counter: %d, sch stage: %u\n", blockIdx.x, gridDim.x, work_tile_info.tile_idx, counter, scheduler.stage());
-                }
+                // if (threadIdx.x == 0) {
+                //     printf("[Block: %03d/%03d] Current work_tile_info: %d, counter: %d, sch stage: %u\n", blockIdx.x, gridDim.x, work_tile_info.tile_idx, counter, scheduler.stage());
+                // }
                 if (blockIdx.x == 0) {
-                    printf("B0 Current work_tile_info: %d, counter: %d, sch stage: %u\n", work_tile_info.tile_idx, counter, scheduler.stage());
+                    printf("[B0 Work] Current work_tile_info: %d, counter: %d, sch stage: %u\n", work_tile_info.tile_idx, counter, scheduler.stage());
                 }
                 counter ++;
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);

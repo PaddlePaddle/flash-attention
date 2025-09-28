@@ -329,12 +329,6 @@ public:
               // the workload of computation pipeline, but I think it is good enough.
               scheduler.prefetch_next_work(params.scheduler, work_tile_info);
           }
-          if (blockIdx.x == TileScheduler::BLOCK_ID) {
-                printf("[End Producer] ThreadIdx.x: %03d / %03d, All work for nblock end.\n", threadIdx.x, params.scheduler.total_blocks);
-          }
-          if (threadIdx.x == 0) {
-                printf("[Notify] End NBlock. BlockIdx.x: %03d / %03d\n", blockIdx.x, gridDim.x);
-          }
         } else {
           // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
           PipelineParamsK pipeline_params_k;
@@ -445,15 +439,7 @@ public:
             cutlass::arch::wait_on_dependent_grids();
 
             // Load Q, K, V
-            int counter = 0;
             for (auto work_tile_info = scheduler.get_initial_work(params.scheduler); work_tile_info.is_valid(params.scheduler); work_tile_info = scheduler.get_next_work(params.scheduler, work_tile_info)) {
-                // if (threadIdx.x == 0) {
-                //     printf("[Block: %03d/%03d] Current work_tile_info: %d, counter: %d, sch stage: %u\n", blockIdx.x, gridDim.x, work_tile_info.tile_idx, counter, scheduler.stage());
-                // }
-                if (blockIdx.x == 0) {
-                    printf("[B0 Work] Current work_tile_info: %d, counter: %d, sch stage: %u\n", work_tile_info.tile_idx, counter, scheduler.stage());
-                }
-                counter ++;
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 SeqlenInfo_t seqlen_info{
                     get<2>(block_coord) /*bidb*/,
@@ -468,12 +454,6 @@ public:
                               n_block_pipe_read,
                               shared_storage, seqlen_info, block_coord, work_idx,
                               flashmask_smem_, n_block_smem, cppl_stage);
-            }
-            if (blockIdx.x == TileScheduler::BLOCK_ID) {
-                printf("[End Consumer] ThreadIdx.x: %03d / %03d, All work for KV load end.\n", threadIdx.x, params.scheduler.total_blocks);
-            }
-            if (threadIdx.x == 0) {
-                printf("[Notify] End KV load. BlockIdx.x: %03d / %03d\n", blockIdx.x, gridDim.x);
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
@@ -540,12 +520,6 @@ public:
                     // Write 0 to gO and -inf to gLSE.
                     epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
                 }
-            }
-            if (blockIdx.x == TileScheduler::BLOCK_ID) {
-                printf("[End Consumer] ThreadIdx.x: %03d / %03d, All work for MMA end.\n", threadIdx.x, params.scheduler.total_blocks);
-            }
-            if (threadIdx.x == 128) {
-                printf("[Notify] End MMA. BlockIdx.x: %03d / %03d\n", blockIdx.x, gridDim.x);
             }
             epilogue.store_tail();
         }

@@ -356,7 +356,6 @@ protected:
     SharedStorage* const tile_count_smem;
     uint32_t sch_stage_;
 public:
-    static constexpr int BLOCK_ID = 8;
     // Device side kernel params
 
     struct Params {
@@ -421,15 +420,9 @@ public:
         if constexpr (IsProducerWarp) {
             sch_stage_ = 0;  // producer initial state is 0, since the first get_next, producer should sync full-1 (dual)
             flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
-            if (blockIdx.x == 0) {
-                printf("[Init] Producer initializing: tid = %d, stage: %u\n", threadIdx.x, sch_stage_);
-            }
         } else {
             sch_stage_ = 1;  // consumer initial state is 1, since the first get_next, producer should sync empty-0 (non-dual)
             flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFullDual) /*id*/);
-            if (blockIdx.x == 0) {
-                printf("[Init] Consumer initializing: tid = %d, stage: %u\n", threadIdx.x, sch_stage_);
-            }
         }
         return {int(blockIdx.x)};
     }
@@ -454,19 +447,8 @@ public:
         // This is intentional, since in the first get_next_work, smem is not fully ready.
         if constexpr (IsProducerWarp) {
             sch_stage_ = 0x1 ^ sch_stage_;
-            // only threadIdx.x == 96 has the correct `current_work.tile_idx` (see prefetch next_work)
-            // so there is no need to use shfl_sync to broadcast. Also shfl cannot broadcast across warps
-            if (blockIdx.x == 0) {
-                printf("[Syn] Producer Thread %d syncing: barrier id = %u, sch_stage_ = %u\n", threadIdx.x, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) + (sch_stage_ << 1), sch_stage_);
-            }
-            // if (threadIdx.x == 96) {
-            //     printf("[Block: %d] Producer Syncing: barrier id = %u, sch_stage_ = %u\n", blockIdx.x, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) + (sch_stage_ << 1), sch_stage_);
-            // }
             flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) + (sch_stage_ << 1) /*id*/);
             int tile_idx = tile_count_smem[sch_stage_];
-            if (blockIdx.x == 0 && threadIdx.x < 64) {
-                printf("[Arr] Producer Thread %d arrive: barrier id = %u, sch_stage_ = %u\n", threadIdx.x, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 1), sch_stage_);
-            }
             flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 1) /*id*/);
             // Sync all the producers in case some of the producers return before the smem is updated
             return {tile_idx >= 0 ? tile_idx : int(blockIdx.x + gridDim.x)};
@@ -478,19 +460,10 @@ public:
             //      load from 0 initialized: the 3rd consumer work ID is correctly set 
             int tile_idx = tile_count_smem[sch_stage_];
             sch_stage_ = 0x1 ^ sch_stage_;
-            if (blockIdx.x == 0) {
-                printf("[Syn] Consumer Thread %d syncing: barrier id = %u, sch_stage_ = %u\n", threadIdx.x, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 1), sch_stage_);
-            }
-            // if (threadIdx.x == 0) {
-            //     printf("[Block: %d] Consumer Syncing: barrier id = %u, sch_stage_ = %u\n", blockIdx.x, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 1), sch_stage_);
-            // }
             if (threadIdx.x == NumConsumerThreads) {    // thread 288 hard-coded, since n_block consumer threads are in [128, 384)
                 tile_count_smem[sch_stage_] = atomicAdd(params.tile_count_semaphore, 1);
             }
             flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 1) /*id*/);
-            if (blockIdx.x == BLOCK_ID) {
-                printf("[Arr] Consumer Thread %03d arrive: barrier id = %u, sch_stage_ = %u\n", threadIdx.x, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) + (sch_stage_ << 1), sch_stage_);
-            }
             flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) + (sch_stage_ << 1) /*id*/);
             return {tile_idx >= 0 ? tile_idx : int(blockIdx.x + gridDim.x)};
         }
@@ -554,7 +527,6 @@ public:
         // swizzle. Instead we want to divide by the remainder.
         int const num_hb_remainder = (args.num_head * args.num_batch) % swizzle;
         int const num_split_blocks = args.num_blocks * (!Split ? 1 : args.num_splits);
-        // printf("num_split_blocks = %d, num_head = %d, num_batch = %d, swizzle = %d, PackGQA = %d, qhead_per_khead = %d, num_hb_remainder = %d\n", num_split_blocks, args.num_head, args.num_batch, swizzle, int(PackGQA), args.qhead_per_khead, num_hb_remainder);
         assert(args.tile_count_semaphore != nullptr);
         return {num_split_blocks * args.num_head * args.num_batch,
                 cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head),

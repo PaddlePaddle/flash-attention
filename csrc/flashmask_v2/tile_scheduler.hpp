@@ -32,8 +32,8 @@ struct TileSchedulerArguments {
 
 template<bool Varlen=false, bool Split=false, bool PackGQA=false, int kBlock=128>
 class SingleTileScheduler {
-
 public:
+    static constexpr bool pipelining = false;
 
     using SharedStorage = int;
 
@@ -130,6 +130,9 @@ public:
         return {0, 0, -1, 0};
     }
 
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    constexpr uint32_t stage() const noexcept { return 0; }
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -138,7 +141,7 @@ template<bool Split=false>
 class StaticPersistentTileScheduler {
 
 public:
-
+    static constexpr bool pipelining = false;
     using SharedStorage = int;
 
     // Device side kernel params
@@ -208,6 +211,9 @@ public:
         return {current_work.tile_idx + int(gridDim.x)};
     }
 
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    constexpr uint32_t stage() const noexcept { return 0; }
 };
 
 template<int NumConsumerThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=96, bool Split=false>
@@ -221,7 +227,7 @@ class PreemptivePersistentTileScheduler {
     static constexpr int NumThreads = NumConsumerThreads + NumProducerThreads;
 public:
     using SharedStorage = int;
-
+    static constexpr bool pipelining = false;
 protected:
     SharedStorage* const tile_count_smem;
 
@@ -335,7 +341,7 @@ public:
 
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
-    uint32_t stage() const noexcept { return 0; }
+    constexpr uint32_t stage() const noexcept { return 0; }
 };
 
 template<int NumConsumerThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=96, bool Split=false>
@@ -351,7 +357,7 @@ class DualPreemptivePersistentTileExecutionScheduler {
     static constexpr int NumThreads = NumConsumerThreads + NumProducerThreads;
 public:
     using SharedStorage = int;
-
+    static constexpr bool pipelining = true;        // DualPPTX has coarse-grained pipelining
 protected:
     SharedStorage* const tile_count_smem;
     uint32_t sch_stage_;
@@ -472,12 +478,12 @@ public:
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
     uint32_t stage() const noexcept {
-        // producer always returns the current stage, while consumer returns 1 - current stage
-        // so that consumer can always have valid input
+        // Returns stage offset: sch_stage_ * 2. Producer always returns the current stage, 
+        // while consumer returns 1 - current stage, so that consumer can always have valid input
         if constexpr (IsProducerWarp)
-            return sch_stage_;
+            return sch_stage_ << 1;
         else
-            return 0x1 ^ sch_stage_;
+            return (0x1 ^ sch_stage_) << 1;
     }
 };
 
@@ -499,7 +505,7 @@ class DynamicPersistentTileScheduler {
 
 public:
     using SharedStorage = int;
-
+    static constexpr bool pipelining = false;
 protected:
     SharedStorage* const tile_count_smem;
 
@@ -623,6 +629,9 @@ public:
         }
     }
 
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    constexpr uint32_t stage() const noexcept { return 0; }
 };
 
 template<int kBlock, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp, bool Split=false, bool PackGQA=false, bool WarpSpecialized=true>
@@ -633,7 +642,7 @@ class VarlenDynamicPersistentTileScheduler {
 
 public:
     using SharedStorage = int4;
-
+    static constexpr bool pipelining = false;
 protected:
     SharedStorage* const work_info_smem;
 
@@ -864,6 +873,9 @@ public:
         }
     }
 
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    constexpr uint32_t stage() const noexcept { return 0; }
 };
 
 } // flash

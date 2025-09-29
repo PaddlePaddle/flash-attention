@@ -50,6 +50,7 @@ public:
     static constexpr bool SameHeadDim = CollectiveMainloop::SameHeadDim;
     static constexpr bool LargeHeadDimV = CollectiveMainloop::LargeHeadDimV;
     static constexpr bool Is_flashmask = CollectiveMainloop::Is_flashmask;
+    static constexpr bool Use_Sch_Pipeline = TileScheduler_::pipelining;
     static_assert(CollectiveMainloop::LargeHeadDimV == CollectiveEpilogue::LargeHeadDimV);
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
 
@@ -121,6 +122,7 @@ public:
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
             alignas(16) typename CollectiveMainloop::MainloopPipelineNBlock::SharedStorage pipeline_n_block;
             alignas(16) typename CollectiveMainloop::MainloopPipelineFlashMaskApply::SharedStorage pipeline_flashmask_apply;
+            // Use_Sch_Pipeline: 2, otherwise: 1, but we made it 2 anyway
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler[2];
         } pipelines;
 
@@ -209,12 +211,12 @@ public:
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
+        static constexpr int num_sch_stage = Use_Sch_Pipeline ? 2 : 1;
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-        __shared__ __align__(16) int32_t flashmask_maxmin_smem[2 * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
-        __shared__ int32_t n_block_smem[2 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        __shared__ __align__(16) int32_t flashmask_maxmin_smem[num_sch_stage * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        __shared__ int32_t n_block_smem[num_sch_stage * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
 
-        if constexpr (true) {       // substitute to type traits
-            // no need to sync the following since the store will be visible due to barriers in DualPPTX
+        if constexpr (Use_Sch_Pipeline) {
             if (threadIdx.x < 2) {
                 shared_storage.pipelines.smem_scheduler[threadIdx.x] = -1;
             }
@@ -268,7 +270,6 @@ public:
           // cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
           cutlass::PipelineState<CollectiveMainloop::kNBlockStages> n_block_pipe_write = cutlass::make_producer_start_state<MainloopPipelineNBlock>();
           // Manually specify the scheduler role: producer. For StaticPersistentTileSch, passing template args won't change the behavior
-          scheduler.init_consumer();
           for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler); 
                work_tile_info.is_valid(params.scheduler); 
                work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)
@@ -303,7 +304,7 @@ public:
               const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_valid_length -1) / CollectiveMainloop::Flashmask_n_block_buffer_valid_length;
               // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
               bool valid_chunk = true;
-              const int cppl_stage = (scheduler.template stage<true>()) << 1;      // coarse pipeline stage
+              const int cppl_stage = scheduler.template stage<true>();      // coarse pipeline stage (offset, 0 or 2)
               for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
                 if (valid_chunk) {
                   pipeline_n_block.producer_acquire(n_block_pipe_write);
@@ -426,11 +427,11 @@ public:
             PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
             PipelineState smem_pipe_write_new = cutlass::make_producer_start_state<MainloopPipelineKVNew>();
 
-
             int work_idx = 0;
             static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
             static_assert(SingleProducerWarp);
 
+            scheduler.init_consumer();
             if constexpr (SingleProducerWarp) {
               if (warp_idx_in_warpgroup != 0) { return; }
             }
@@ -449,7 +450,7 @@ public:
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
                 };
-                const int cppl_stage = scheduler.stage() << 1;
+                const int cppl_stage = scheduler.stage();   // coarse pipeline stage (offset, 0 or 2)
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_write,
                               n_block_pipe_read,
                               shared_storage, seqlen_info, block_coord, work_idx,
@@ -467,6 +468,7 @@ public:
             // We don't need separate variables smem_pipe_release_k and smem_pipe_release_v
             // (like in Cutlass's gemm) because the read and release pipeline states are always the same.
 
+            scheduler.init_consumer();
             mainloop.mma_init();
 
             int work_idx = 0;
@@ -491,7 +493,7 @@ public:
                 // Attention output (GEMM-II) accumulator.
                 Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 bool tile_valid;
-                const int cppl_stage = scheduler.stage() << 1;
+                const int cppl_stage = scheduler.stage();   // coarse pipeline stage (offset, 0 or 2)
                 if constexpr (!LargeHeadDimV) {
                     tile_valid = mainloop.mma(
                         params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_read,

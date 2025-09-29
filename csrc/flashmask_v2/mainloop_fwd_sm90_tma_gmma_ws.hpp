@@ -32,7 +32,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool Is_flashmask_, bool Sch_Pipeline_ = false>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool Is_flashmask_>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -73,7 +73,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
-    static constexpr int Flashmask_max_seqlen_k = 1024 * Sch_Pipeline_ ? 8 : 16;        // scheduler pipelining needs to cut smem in half
+    static constexpr int Flashmask_max_seqlen_k = 1024 * 16;        // scheduler pipelining needs to cut smem in half
     static constexpr int ProducerThreadNum = 96;
 
     static constexpr int Flashmask_n_block_buffer_length = ((Flashmask_max_seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4 + 4;

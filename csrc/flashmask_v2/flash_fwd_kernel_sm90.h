@@ -122,8 +122,8 @@ public:
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
             alignas(16) typename CollectiveMainloop::MainloopPipelineNBlock::SharedStorage pipeline_n_block;
             alignas(16) typename CollectiveMainloop::MainloopPipelineFlashMaskApply::SharedStorage pipeline_flashmask_apply;
-            // Use_Sch_Pipeline: 2, otherwise: 1, but we made it 2 anyway
-            alignas(16) typename TileScheduler::SharedStorage smem_scheduler[2];
+            // Use_Sch_Pipeline: 2, otherwise: 1
+            alignas(16) typename TileScheduler::SharedStorage smem_scheduler[Use_Sch_Pipeline ? 2 : 1];
         } pipelines;
 
     };
@@ -449,11 +449,11 @@ public:
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
                 };
-                const int cppl_stage = scheduler.stage();   // coarse pipeline stage (offset, 0 or 2)
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_write,
                               n_block_pipe_read,
                               shared_storage, seqlen_info, block_coord, work_idx,
-                              flashmask_smem_, n_block_smem, cppl_stage);
+                              flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage());
+                // coarse pipeline stage (offset, 0 or 2)
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
@@ -492,19 +492,18 @@ public:
                 // Attention output (GEMM-II) accumulator.
                 Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 bool tile_valid;
-                const int cppl_stage = scheduler.stage();   // coarse pipeline stage (offset, 0 or 2)
                 if constexpr (!LargeHeadDimV) {
                     tile_valid = mainloop.mma(
                         params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_read,
                         n_block_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                        flashmask_smem_, n_block_smem, cppl_stage);
+                        flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage());
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
                             params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                            flashmask_smem_, n_block_smem, cppl_stage);
+                            flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage());
                     } else {
                         tile_valid = mainloop.mma_pv(
                             params.mainloop, pipeline_v, pipeline_n_block, smem_pipe_read,

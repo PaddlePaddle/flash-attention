@@ -949,8 +949,7 @@ struct CollectiveMainloopFwdSm90 {
          cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
          int &work_idx,
          int32_t* const flashmask_smem_,
-         const int32_t* const n_block_smem,
-         const int cppl_stage
+         const int32_t* const n_block_smem
          ) {
         // some of these are captured in lambda so can't use structured binding
         int const m_block = get<0>(block_coord);
@@ -1146,7 +1145,7 @@ struct CollectiveMainloopFwdSm90 {
         int n_block = n_block_max;
         int32_t n_block_idx = 0;
 
-        const int32_t* mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * (n_block_pipe_read.index() + cppl_stage);
+        const int32_t* mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
 
         auto load_flashmask = [&] (auto const& smem_pipe_write) {
             if constexpr (Is_flashmask) {
@@ -1334,7 +1333,7 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_n_block.consumer_release(n_block_pipe_read);
             ++n_block_pipe_read;
             n_block_wait(pipeline_n_block, n_block_pipe_read);
-            mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * (n_block_pipe_read.index() + cppl_stage);
+            mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
             n_block_idx = 0;
             n_block = n_block_getter(0);
           }
@@ -1509,8 +1508,7 @@ struct CollectiveMainloopFwdSm90 {
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage,
         int32_t* const flashmask_smem_,
-        const int32_t* const n_block_smem,
-        const int cppl_stage
+        const int32_t* const n_block_smem
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -1609,7 +1607,7 @@ struct CollectiveMainloopFwdSm90 {
         int n_block = n_block_max;
 
         consumer_wait(pipeline_n_block, n_block_pipe_read);
-        const int32_t* mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * (n_block_pipe_read.index() + cppl_stage);
+        const int32_t* mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
 
         int n_block_idx = 0;
         auto n_block_getter = [&mask_encode_n_block_smem_](int32_t index) {
@@ -1839,7 +1837,7 @@ struct CollectiveMainloopFwdSm90 {
                     pipeline_n_block.consumer_release(n_block_pipe_read);
                     ++n_block_pipe_read;
                     consumer_wait(pipeline_n_block, n_block_pipe_read);
-                    mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * (n_block_pipe_read.index() + cppl_stage);
+                    mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
                     n_block_idx = 0;
                     n_block = n_block_getter(0);
                   }
@@ -1856,7 +1854,7 @@ struct CollectiveMainloopFwdSm90 {
                 pipeline_n_block.consumer_release(n_block_pipe_read);
                 ++n_block_pipe_read;
                 consumer_wait(pipeline_n_block, n_block_pipe_read);
-                mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * (n_block_pipe_read.index() + cppl_stage);
+                mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
                 n_block_idx = 0;
                 n_block = n_block_getter(0);
               }
@@ -1874,7 +1872,7 @@ struct CollectiveMainloopFwdSm90 {
                     pipeline_n_block.consumer_release(n_block_pipe_read);
                     ++n_block_pipe_read;
                     consumer_wait(pipeline_n_block, n_block_pipe_read);
-                    mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * (n_block_pipe_read.index() + cppl_stage);
+                    mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
                     n_block_idx = 0;
                     n_block = n_block_getter(0);
                   }

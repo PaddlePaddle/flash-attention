@@ -415,7 +415,11 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
                 if constexpr (Is_causal || Is_local || Has_softcap) {
                     run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1, false, Is_flashmask_, Has_lt_end, Has_ut_start>(params, stream);
                 } else {
-                    run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 1, false, Is_flashmask_, Has_lt_end, Has_ut_start>(params, stream);
+                    if (params.seqlen_q >= 8192) {
+                      run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 1, false, Is_flashmask_, Has_lt_end, Has_ut_start>(params, stream);
+                    } else {
+                      run_mha_bwd_dispatch<Arch, T, 64, 64, 128, Is_causal, Is_local, Has_softcap, 2, 2, false, true, false, 2, 1, 2, 1, false, Is_flashmask_, Has_lt_end, Has_ut_start>(params, stream);
+                    }
                 }
             } else if constexpr (Arch == 86 || Arch == 89) {
                 run_mha_bwd_dispatch<Arch, T, 64, 96, 128, Is_causal, Is_local, Has_softcap, 1, 2, false, false, false, 2, 2, 2, 2, true, Is_flashmask_>(params, stream);

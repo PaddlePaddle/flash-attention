@@ -213,7 +213,7 @@ public:
 
         static constexpr int num_sch_stage = Use_Sch_Pipeline ? 2 : 1;
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-        __shared__ __align__(16) int32_t flashmask_maxmin_smem[num_sch_stage * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        __shared__ __align__(128) int32_t flashmask_maxmin_smem[num_sch_stage * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
         __shared__ int32_t n_block_smem[num_sch_stage * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
 
         if constexpr (Use_Sch_Pipeline) {
@@ -305,24 +305,35 @@ public:
               // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
               bool valid_chunk = true;
               const int cppl_stage = scheduler.template stage<true>();      // coarse pipeline stage (offset, 0 or 2)
+
+#define GEN_N_BLOCK_DISPATCH(DispatchTag)                                                                                                                       \
+              valid_chunk = mainloop.generate_n_block<DispatchTag>(params.mainloop,                                                                             \
+                            seqlen_info,                                                                                                                        \
+                            block_coord,                                                                                                                        \
+                            reverse_chunk_idx,                                                                                                                  \
+                            reverse_chunk_idx == num_chunk - 1 ? CollectiveMainloop::Flashmask_n_block_finish : CollectiveMainloop::Flashmask_n_block_chunk_end,\
+                            flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),        \
+                            n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage))
+
               for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
-                if (valid_chunk) {
-                  pipeline_n_block.producer_acquire(n_block_pipe_write);
-                }
-                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem + 
+                if (valid_chunk)
+                    pipeline_n_block.producer_acquire(n_block_pipe_write);
+                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem +
                                       8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage));
-                valid_chunk = mainloop.generate_n_block(params.mainloop,
-                                          seqlen_info,
-                                          block_coord,
-                                          reverse_chunk_idx,
-                                          reverse_chunk_idx == num_chunk - 1 ? CollectiveMainloop::Flashmask_n_block_finish : CollectiveMainloop::Flashmask_n_block_chunk_end,
-                                          flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),
-                                          n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage));
+                if (params.ut_start_ptr) {
+                    GEN_N_BLOCK_DISPATCH(CollectiveMainloop::PtrExistDispatchTag::FULL_PTR);
+                } else if (params.lt_end_ptr || params.ut_end_ptr) {
+                    GEN_N_BLOCK_DISPATCH(CollectiveMainloop::PtrExistDispatchTag::DUAL_PTR);
+                } else {
+                    GEN_N_BLOCK_DISPATCH(CollectiveMainloop::PtrExistDispatchTag::SINGLE_PTR);
+                }
                 if (valid_chunk) {
-                  pipeline_n_block.producer_commit(n_block_pipe_write);
-                  ++n_block_pipe_write;
+                    pipeline_n_block.producer_commit(n_block_pipe_write);
+                    ++n_block_pipe_write;
                 }
               }
+#undef GEN_N_BLOCK_DISPATCH
+              
               // heqianyue note: the execution time of reverse_chunk for loop will be influenced by the workload of computation pipeline
               // therefore, **works with more partially/fully masked block** will have longer execution time for this producer. So, the 
               // interval between two consecutive `get_next_work` of this producer will increase, thus lowering the frequency of preemptive 

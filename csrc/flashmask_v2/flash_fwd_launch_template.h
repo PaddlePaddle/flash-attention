@@ -48,7 +48,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
 
     // if true: use Dual PPTX, else, use PPT
-    static constexpr int Use_Scheduler_Pipeline = true;
+    static constexpr bool No_Scheduler_Pipeline = true;
+    // TODO(heqianyue): headdim = 64 comparison is actually worse for DualPPTX, for unknown reasons
+    static constexpr bool Predicate_for_Headdim = true;
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using TileShape_MNK_PV = cute::Shape<Int<kBlockM>, Int<kHeadDimV>, Int<kBlockN>>;
@@ -65,13 +67,16 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // since we'll avoid launching a bunch of thread blocks that immediately exit.
     // On Sm80, noncausal persistent seems a bit slower.
     static constexpr int _NumProducerThreads = cutlass::NumThreadsPerWarpGroup - cutlass::NumThreadsPerWarp;      // expect: 96
-    static constexpr int _NumConsumerThreads = CollectiveMainloop::NumMmaThreads + cutlass::NumThreadsPerWarpGroup - _NumProducerThreads;       // expect: 384 - 96
+    static constexpr int _NumConsumerThreads = CollectiveMainloop::NumMmaThreads + cutlass::NumThreadsPerWarpGroup - _NumProducerThreads;
+    // TODO(heqianyue): The following Predicate_for_Headdim might be removed in the future. Currently, Dual PPTX cannot be as fast as PPT
+    // in headdim = 64 case, I suspect I've fixed it, but there is no testing facility (9.30 EB5 occupied)
+    // The current logic: only headdim=128 will use Dual PPTX
     using Scheduler = std::conditional_t<
         Arch >= 90,
         std::conditional_t<
-            Use_Scheduler_Pipeline,
-            flash::DualPreemptivePersistentTileExecutionScheduler<_NumConsumerThreads, _NumProducerThreads, Split>,
-            flash::PreemptivePersistentTileScheduler<_NumConsumerThreads, _NumProducerThreads, Split>
+            (Predicate_for_Headdim && (kHeadDimV != 128 || kHeadDim != 128)) || No_Scheduler_Pipeline,
+            flash::PreemptivePersistentTileScheduler<_NumConsumerThreads, _NumProducerThreads, Split>,
+            flash::DualPreemptivePersistentTileExecutionScheduler<_NumConsumerThreads, _NumProducerThreads, Split>
         >,
         flash::StaticPersistentTileScheduler<Split>
     >;

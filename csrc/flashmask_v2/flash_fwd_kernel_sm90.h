@@ -50,6 +50,7 @@ public:
     static constexpr bool SameHeadDim = CollectiveMainloop::SameHeadDim;
     static constexpr bool LargeHeadDimV = CollectiveMainloop::LargeHeadDimV;
     static constexpr bool Is_flashmask = CollectiveMainloop::Is_flashmask;
+    static constexpr bool Use_Sch_Pipeline = TileScheduler_::pipelining;
     static_assert(CollectiveMainloop::LargeHeadDimV == CollectiveEpilogue::LargeHeadDimV);
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
 
@@ -121,7 +122,8 @@ public:
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
             alignas(16) typename CollectiveMainloop::MainloopPipelineNBlock::SharedStorage pipeline_n_block;
             alignas(16) typename CollectiveMainloop::MainloopPipelineFlashMaskApply::SharedStorage pipeline_flashmask_apply;
-            alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
+            // Use_Sch_Pipeline: 2, otherwise: 1
+            alignas(16) typename TileScheduler::SharedStorage smem_scheduler[Use_Sch_Pipeline ? 2 : 1];
         } pipelines;
 
     };
@@ -209,11 +211,16 @@ public:
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
+        static constexpr int num_sch_stage = Use_Sch_Pipeline ? 2 : 1;
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-        __shared__ __align__(16) int32_t flashmask_maxmin_smem[8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
-        __shared__ int32_t n_block_smem[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        __shared__ __align__(16) int32_t flashmask_maxmin_smem[num_sch_stage * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        __shared__ int32_t n_block_smem[num_sch_stage * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
 
-        __shared__ bool partially_masked_smem[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        if constexpr (Use_Sch_Pipeline) {
+            if (threadIdx.x < 2) {
+                shared_storage.pipelines.smem_scheduler[threadIdx.x] = -1;
+            }
+        }
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
@@ -262,7 +269,11 @@ public:
         if (warp_group_idx == 0 && warp_idx_in_warpgroup != 0) { // n_block generator
           cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
           cutlass::PipelineState<CollectiveMainloop::kNBlockStages> n_block_pipe_write = cutlass::make_producer_start_state<MainloopPipelineNBlock>();
-          for (auto work_tile_info = scheduler.get_initial_work(params.scheduler); work_tile_info.is_valid(params.scheduler); work_tile_info = scheduler.get_next_work(params.scheduler, work_tile_info)) {
+          // Manually specify the scheduler role: producer. For StaticPersistentTileSch, passing template args won't change the behavior
+          for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler); 
+               work_tile_info.is_valid(params.scheduler); 
+               work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)
+          ) {
               auto block_coord = work_tile_info.get_block_coord(params.scheduler);
               int const m_block = get<0>(block_coord);
               int const bidh = get<1>(block_coord);
@@ -283,6 +294,8 @@ public:
               // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
               if constexpr (Is_causal || Is_local || Varlen || Split) {
                   if (n_block_max <= n_block_min) {
+                      // skipping, don't forget to fetch us the next work!
+                      scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                       continue;
                   }
               }
@@ -291,24 +304,42 @@ public:
               const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_valid_length -1) / CollectiveMainloop::Flashmask_n_block_buffer_valid_length;
               // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
               bool valid_chunk = true;
+              const int cppl_stage = scheduler.template stage<true>();      // coarse pipeline stage (offset, 0 or 2)
+
+#define GEN_N_BLOCK_DISPATCH(DispatchTag)                                                                                                                       \
+              valid_chunk = mainloop.generate_n_block<DispatchTag>(params.mainloop,                                                                             \
+                            seqlen_info,                                                                                                                        \
+                            block_coord,                                                                                                                        \
+                            reverse_chunk_idx,                                                                                                                  \
+                            reverse_chunk_idx == num_chunk - 1 ? CollectiveMainloop::Flashmask_n_block_finish : CollectiveMainloop::Flashmask_n_block_chunk_end,\
+                            flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),        \
+                            n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage))
+
               for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
-                if (valid_chunk) {
-                  pipeline_n_block.producer_acquire(n_block_pipe_write);
+                if (valid_chunk)
+                    pipeline_n_block.producer_acquire(n_block_pipe_write);
+                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem +
+                                      8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage));
+                if (params.mainloop.ut_start_ptr) {
+                    GEN_N_BLOCK_DISPATCH(CollectiveMainloop::PtrExistDispatchTag::FULL_PTR);
+                } else if (params.mainloop.lt_end_ptr || params.mainloop.ut_end_ptr) {
+                    GEN_N_BLOCK_DISPATCH(CollectiveMainloop::PtrExistDispatchTag::DUAL_PTR);
+                } else {
+                    GEN_N_BLOCK_DISPATCH(CollectiveMainloop::PtrExistDispatchTag::SINGLE_PTR);
                 }
-                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
-                valid_chunk = mainloop.generate_n_block(params.mainloop,
-                                          seqlen_info,
-                                          block_coord,
-                                          reverse_chunk_idx,
-                                          reverse_chunk_idx == num_chunk - 1 ? CollectiveMainloop::Flashmask_n_block_finish : CollectiveMainloop::Flashmask_n_block_chunk_end,
-                                          flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
-                                          n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
-                                          partially_masked_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
                 if (valid_chunk) {
-                  pipeline_n_block.producer_commit(n_block_pipe_write);
-                  ++n_block_pipe_write;
+                    pipeline_n_block.producer_commit(n_block_pipe_write);
+                    ++n_block_pipe_write;
                 }
-            }
+              }
+#undef GEN_N_BLOCK_DISPATCH
+              
+              // heqianyue note: the execution time of reverse_chunk for loop will be influenced by the workload of computation pipeline
+              // therefore, **works with more partially/fully masked block** will have longer execution time for this producer. So, the 
+              // interval between two consecutive `get_next_work` of this producer will increase, thus lowering the frequency of preemptive 
+              // scheduling. However, since there is double-buffer, the for-loop execution time of reverse_chunk is only a rough estimator for
+              // the workload of computation pipeline, but I think it is good enough.
+              scheduler.prefetch_next_work(params.scheduler, work_tile_info);
           }
         } else {
           // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
@@ -407,22 +438,19 @@ public:
             PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
             PipelineState smem_pipe_write_new = cutlass::make_producer_start_state<MainloopPipelineKVNew>();
 
-
             int work_idx = 0;
             static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
             static_assert(SingleProducerWarp);
 
+            scheduler.init_consumer();
             if constexpr (SingleProducerWarp) {
               if (warp_idx_in_warpgroup != 0) { return; }
             }
-
-            if (!SingleProducerWarp && warp_idx_in_warpgroup != 0) { scheduler.init_consumer(); }
-
+            
             cutlass::arch::wait_on_dependent_grids();
 
             // Load Q, K, V
             for (auto work_tile_info = scheduler.get_initial_work(params.scheduler); work_tile_info.is_valid(params.scheduler); work_tile_info = scheduler.get_next_work(params.scheduler, work_tile_info)) {
-
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 SeqlenInfo_t seqlen_info{
                     get<2>(block_coord) /*bidb*/,
@@ -435,9 +463,9 @@ public:
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_write,
                               n_block_pipe_read,
                               shared_storage, seqlen_info, block_coord, work_idx,
-                              flashmask_smem_, n_block_smem, partially_masked_smem);
+                              flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage());
+                // coarse pipeline stage (offset, 0 or 2)
             }
-
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
@@ -455,7 +483,7 @@ public:
 
             int work_idx = 0;
             CUTLASS_PRAGMA_NO_UNROLL
-            for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
+            for (auto work_tile_info = scheduler.get_initial_work(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
                  // get_next_work will be called before the epilogue
                  ) {
@@ -480,13 +508,13 @@ public:
                         params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_read,
                         n_block_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                        flashmask_smem_, n_block_smem, partially_masked_smem);
+                        flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage());
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
                             params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                            flashmask_smem_, n_block_smem, partially_masked_smem);
+                            flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage());
                     } else {
                         tile_valid = mainloop.mma_pv(
                             params.mainloop, pipeline_v, pipeline_n_block, smem_pipe_read,

@@ -5,10 +5,12 @@
 #include "cutlass/fast_math.h"
 #include "cutlass/barrier.h"
 #include "cutlass/arch/barrier.h"
-
 #include "cutlass/arch/grid_dependency_control.h"
+#include "cuda_check.h"
 
 #include "flash.h"
+
+static __device__ int semaphore_storage[1];
 
 namespace flash {
 
@@ -106,6 +108,14 @@ __global__ void prepare_varlen_num_blocks_kernel(
     }
 }
 
+__global__ void prepare_preemptive_scheduler_kernel(
+        int* const tile_count_semaphore,
+        int sm_count) {
+    // There's only 1 block in the grid, so might as well start launching the main attn kernel
+    cutlass::arch::launch_dependent_grids();
+    if (threadIdx.x == 0 && tile_count_semaphore) { *tile_count_semaphore = sm_count; }
+}
+
 } // flash
 
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa,
@@ -121,4 +131,15 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
         params.tile_count_semaphore,
         // params.num_m_blocks_ptr,
         params.num_splits_dynamic_ptr, enable_pdl);
+}
+
+void prepare_preemptive_scheduler(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx) {
+    if (params.tile_count_semaphore == nullptr) {
+        CHECK_CUDA(cudaGetSymbolAddress((void**)&params.tile_count_semaphore, semaphore_storage));
+    }
+    if (is_dual_pptx)
+        num_sm *= 2;        // double buffer PPTX will have 2 * num_sm static scheduling
+    flash::prepare_preemptive_scheduler_kernel<<<1 /*grid*/, 32 /*block*/, 0, stream>>>(
+        params.tile_count_semaphore,
+        num_sm);
 }

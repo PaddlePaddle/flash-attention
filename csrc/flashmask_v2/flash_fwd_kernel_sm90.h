@@ -213,7 +213,7 @@ public:
 
         static constexpr int num_sch_stage = Use_Sch_Pipeline ? 2 : 1;
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-        __shared__ __align__(128) int32_t flashmask_maxmin_smem[num_sch_stage * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        __shared__ __align__(16) int32_t flashmask_maxmin_smem[num_sch_stage * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
         __shared__ int32_t n_block_smem[num_sch_stage * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
 
         if constexpr (Use_Sch_Pipeline) {
@@ -320,9 +320,9 @@ public:
                     pipeline_n_block.producer_acquire(n_block_pipe_write);
                 mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem +
                                       8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage));
-                if (params.ut_start_ptr) {
+                if (params.mainloop.ut_start_ptr) {
                     GEN_N_BLOCK_DISPATCH(CollectiveMainloop::PtrExistDispatchTag::FULL_PTR);
-                } else if (params.lt_end_ptr || params.ut_end_ptr) {
+                } else if (params.mainloop.lt_end_ptr || params.mainloop.ut_end_ptr) {
                     GEN_N_BLOCK_DISPATCH(CollectiveMainloop::PtrExistDispatchTag::DUAL_PTR);
                 } else {
                     GEN_N_BLOCK_DISPATCH(CollectiveMainloop::PtrExistDispatchTag::SINGLE_PTR);

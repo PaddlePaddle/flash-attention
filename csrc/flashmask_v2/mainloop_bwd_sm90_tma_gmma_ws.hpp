@@ -31,9 +31,9 @@ using namespace cute;
 template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic,
         bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
+        bool Is_flashmask, bool Has_lt_end_, bool Has_ut_start_,
         int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-        bool Mma_dP_is_RS=false,bool Is_flashmask=false,
-        bool Has_lt_end_=false, bool Has_ut_start_=false>
+        bool Mma_dP_is_RS=false>
 struct CollectiveMainloopBwdSm90 {
 
     static constexpr int kStages = Stages;

@@ -9,8 +9,11 @@
 // Return {kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap}
 constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         int headdim, int headdim_v, bool is_causal, bool is_local, int element_size=2,
-        bool v_colmajor=false, bool paged_kv_non_TMA=false, bool softcap=false) {
+        bool v_colmajor=false, bool paged_kv_non_TMA=false, bool softcap=false, bool short_seqlen=false) {
     if (element_size == 2) {
+        if (short_seqlen) {
+            return {64, 64, false, true};
+        }
         if (headdim <= 64) {
             bool same_hdim = (headdim == headdim_v);  // if not same hdim, we're targeting hdimv=512
             // return {same_hdim ? 192 : 64, same_hdim ? 128 : 64, same_hdim, same_hdim};

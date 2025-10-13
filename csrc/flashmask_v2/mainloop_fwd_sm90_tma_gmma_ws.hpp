@@ -673,7 +673,6 @@ struct CollectiveMainloopFwdSm90 {
         int32_t bidb = get<2>(block_coord);
         const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
 
-        // row_offset
         const int offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * nblock_seqlen +
             std::max((nblock_seqlen - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_valid_length), 0);
 
@@ -889,7 +888,6 @@ struct CollectiveMainloopFwdSm90 {
             prefix_sum = int(!fully_masked);
         }
 
-        // Be careful, following two lines might increase reg count
         const int warp_id_ = thread_idx >> 5;
         const int lane_id_ = thread_idx & 31;
         // warp-wide prefix-sum
@@ -1293,7 +1291,6 @@ struct CollectiveMainloopFwdSm90 {
         }
         int n_block_prev = n_block;
 
-        // I know what the problem is. We might accidentally extract end or finish without knowing
         n_block = n_block_getter(++n_block_idx);
 
         #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)

@@ -696,18 +696,9 @@ struct CollectiveMainloopFwdSm90 {
                     reinterpret_cast<int4*>(flashmask_maxmin_smem) + Flashmask_n_block_buffer_length / 4 * index + idx)),   \
                   "l"(reinterpret_cast<int4*>(params.src_ptr + offset) + idx),                                              \
                   "n"(16))
-        
-        #define CP_ASYNC_SMEM(src_ptr, index)                                                   \
-            asm volatile(                                                                       \
-              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"                            \
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(                                  \
-                    flashmask_maxmin_smem + Flashmask_n_block_buffer_length * index + idx)),    \
-                  "l"(params.src_ptr + offset + idx),                                           \
-                  "n"(4))
 
         if (tag == PtrExistDispatchTag::FULL_PTR) {
-            // how to fix oob?
-            for(int64_t idx = thread_idx; idx < length / 4; idx += ProducerThreadNum) {
+            for(int64_t idx = thread_idx; idx * 4 < length; idx += ProducerThreadNum) {
                 // lt start is always valid in flashmask (otherwise it is a bug)
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmax, 0);
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmin, 1);
@@ -719,19 +710,8 @@ struct CollectiveMainloopFwdSm90 {
                 CP_ASYNC_SMEM_INT4(ut_end_nblockmax, 6);
                 CP_ASYNC_SMEM_INT4(ut_end_nblockmin, 7);
             }
-            for(int64_t idx = thread_idx + (length & 0xfffffffc); idx < length; idx += ProducerThreadNum) {
-                CP_ASYNC_SMEM(lt_start_nblockmax, 0);
-                CP_ASYNC_SMEM(lt_start_nblockmin, 1);
-                CP_ASYNC_SMEM(lt_end_nblockmax, 2);
-                CP_ASYNC_SMEM(lt_end_nblockmin, 3);
-
-                CP_ASYNC_SMEM(ut_start_nblockmax, 4);
-                CP_ASYNC_SMEM(ut_start_nblockmin, 5);
-                CP_ASYNC_SMEM(ut_end_nblockmax, 6);
-                CP_ASYNC_SMEM(ut_end_nblockmin, 7);
-            }
         } else if (tag == PtrExistDispatchTag::DUAL_PTR) {
-            for(int64_t idx = thread_idx; idx < length / 4; idx += ProducerThreadNum) {
+            for(int64_t idx = thread_idx; 4 * idx < length; idx += ProducerThreadNum) {
                 // lt start is always valid in flashmask (otherwise it is a bug)
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmax, 0);
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmin, 1);
@@ -744,31 +724,14 @@ struct CollectiveMainloopFwdSm90 {
                     CP_ASYNC_SMEM_INT4(ut_end_nblockmin, 7);
                 }   
             }
-            for(int64_t idx = thread_idx + (length & 0xfffffffc); idx < length; idx += ProducerThreadNum) {
-                CP_ASYNC_SMEM(lt_start_nblockmax, 0);
-                CP_ASYNC_SMEM(lt_start_nblockmin, 1);
-                // check: paddle/phi/kernels/gpu/flash_attn_v3_kernel.cu (#L2073-L2119)
-                if constexpr (Is_causal) {
-                    CP_ASYNC_SMEM(lt_end_nblockmax, 2);
-                    CP_ASYNC_SMEM(lt_end_nblockmin, 3);
-                } else {
-                    CP_ASYNC_SMEM(ut_end_nblockmax, 6);
-                    CP_ASYNC_SMEM(ut_end_nblockmin, 7);
-                }   
-            }
         } else {
-            for(int64_t idx = thread_idx; idx < length / 4; idx += ProducerThreadNum) {
+            for(int64_t idx = thread_idx; 4 * idx < length; idx += ProducerThreadNum) {
                 // lt start is always valid in flashmask (otherwise it is a bug)
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmax, 0);
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmin, 1);
             }
-            for(int64_t idx = thread_idx + (length & 0xfffffffc); idx < length; idx += ProducerThreadNum) {
-                CP_ASYNC_SMEM(lt_start_nblockmax, 0);
-                CP_ASYNC_SMEM(lt_start_nblockmin, 1);
-            }
         }
         #undef CP_ASYNC_SMEM_INT4
-        #undef CP_ASYNC_SMEM
 
         asm volatile("cp.async.commit_group;\n" ::);
         asm volatile("cp.async.wait_group 0;\n" ::);

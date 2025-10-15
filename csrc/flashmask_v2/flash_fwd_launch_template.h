@@ -99,7 +99,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
 
     if constexpr (Is_flashmask) {
-        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream);
+        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream, true);
     }
 
     typename CollectiveMainloop::Arguments mainloop_args {

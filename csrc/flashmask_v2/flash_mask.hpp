@@ -54,9 +54,15 @@ namespace flash {
 
 namespace flashmask {
 
-  template<int kBlockN>
+  // make sure the following value is the same with the CooperativeMainLoopImpl
+  // for example, sm90 is 16 * 1024.
+  static constexpr int flashmask_buffer_length = 16 * 1024;
+
+  // Note(heqianyue): this kernel is currently only used for fwd and sm90 (flashmask v3)
+  // for fully aligned minmax with no excessive global sector
+  template<int kBlockN, bool aligned_chunk = false>
   __global__
-  void scanMaxMinKernel(
+  void scanMaxMinChunkedKernel(
       const int *input, int b, int n, int *maxo, int *mino) {
     int bid = threadIdx.y + blockIdx.y * blockDim.y;
     if (bid >= b) {
@@ -64,7 +70,9 @@ namespace flashmask {
     }
     int i_offset = bid * n;
     input = input + i_offset;
-    const int o_n = ((n + kBlockN - 1) / kBlockN + 3) /4 * 4;
+
+    const int nblock_seqlen = ((n + kBlockN - 1) / kBlockN + 3) & 0xfffffffc;  // umiswing: padding for int4 load
+
     // constexpr int nums = kBlockN / 32;  // ensure N % 32 == 0
     constexpr int nums = (kBlockN + 31) / 32;
     int warpId = blockIdx.x;      // ensure blockDim.x == 32
@@ -99,30 +107,63 @@ namespace flashmask {
     maxv = __reduce_max_sync(0xffffffff, maxv);
     minv = __reduce_min_sync(0xffffffff, minv);
     if (tid == 0) {
-      maxo[bid * o_n + warpId] = maxv;
-      mino[bid * o_n + warpId] = minv;
+      if constexpr (aligned_chunk) {
+        // the length of the buffer that actually takes part in computation
+        constexpr int chunk_valid_length = ((flashmask_buffer_length + kBlockN - 1) / kBlockN + 3) & 0xfffffffc;
+        // the padded length for the sake of 128B aligned reading sector (ceil to multiple of 32)
+        constexpr int chunk_padded_length = ((flashmask_buffer_length + kBlockN - 1) / kBlockN + 31) & 0xffffffe0;
+
+        const int num_chunk = (nblock_seqlen + chunk_valid_length - 1) / chunk_valid_length;
+        const int total_length = num_chunk * chunk_padded_length;
+        // TODO(heqianyue): This can be made faster by fast div mod, but I suppose this will not be a bottleneck
+        const int chunk_id = warpId / chunk_valid_length;
+        const int within_chunk_id = warpId % chunk_valid_length;
+
+        // stores chunk (there will be 'padding -- invalid data' on the tail) continuously
+        maxo[bid * total_length + chunk_padded_length * chunk_id + within_chunk_id] = maxv;
+        mino[bid * total_length + chunk_padded_length * chunk_id + within_chunk_id] = minv;
+      } else {
+        // stores data continuously
+        maxo[bid * nblock_seqlen + warpId] = maxv;
+        mino[bid * nblock_seqlen + warpId] = minv;
+      }
     }
   }
 
   template <int kBlockN>
   void scanMaxMinGpu(
-      const int *input, int b, int n, int *maxo, int *mino, cudaStream_t stream) {
+      const int *input, int b, int n, int *maxo, int *mino, cudaStream_t stream, bool use_aligned_chunk = false) {
     // static_assert(kBlockN % 32 == 0, "kBlockN must be a multiple of 32");
     dim3 block(32, 4);
     dim3 grid((n + kBlockN - 1) / kBlockN, (b + 3) / 4);
-    scanMaxMinKernel<kBlockN><<<grid, block, 0, stream>>>(input, b, n, maxo, mino);
+    if (use_aligned_chunk)
+      scanMaxMinChunkedKernel<kBlockN, true><<<grid, block, 0, stream>>>(input, b, n, maxo, mino);
+    else
+      scanMaxMinChunkedKernel<kBlockN, false><<<grid, block, 0, stream>>>(input, b, n, maxo, mino);
   }
 
   template <int kBlockN>
-  void prepare_block_maxmin(Flash_fwd_params &params, cudaStream_t stream) {
+  void prepare_block_maxmin(Flash_fwd_params &params, cudaStream_t stream, bool is_forward = false) {
     if (params.lt_start_ptr == nullptr &&
         params.ut_end_ptr == nullptr) {
       return;
     }
     int *nblock_smask = params.flashmask_maxmin_ptr;
 
-    const int nblock_seqlen = ((params.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
-    const int nblock_masklen = params.b * params.h_flashmask * nblock_seqlen;
+    // only used in forward pass and SM90 (FlashMaskV3)
+    const int nblock_seqlen = ((params.seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc; // umiswing: padding for int4 load
+    int nblock_masklen = 0;
+
+    const bool use_aligned_chunk = params.arch == 90 && is_forward; 
+
+    if (use_aligned_chunk) {
+      constexpr int chunk_valid_length = ((flashmask_buffer_length + kBlockN - 1) / kBlockN + 3) & 0xfffffffc;
+      constexpr int chunk_padded_length = ((flashmask_buffer_length + kBlockN - 1) / kBlockN + 31) & 0xffffffe0;
+      const int num_chunk = (nblock_seqlen + chunk_valid_length - 1) / chunk_valid_length;
+      nblock_masklen = params.b * params.h_flashmask * num_chunk * chunk_padded_length;
+    } else {
+      nblock_masklen = params.b * params.h_flashmask * nblock_seqlen;
+    }
 
     params.lt_start_nblockmax = nblock_smask;
     params.lt_start_nblockmin = nblock_smask + nblock_masklen;
@@ -139,7 +180,8 @@ namespace flashmask {
           params.seqlen_k,
           params.lt_start_nblockmax,
           params.lt_start_nblockmin,
-          stream);
+          stream,
+          use_aligned_chunk);
     } else {
       params.lt_start_nblockmax = nullptr;
       params.lt_start_nblockmin = nullptr;
@@ -151,7 +193,8 @@ namespace flashmask {
                     params.seqlen_k,
                     params.ut_end_nblockmax,
                     params.ut_end_nblockmin,
-                    stream);
+                    stream,
+                    use_aligned_chunk);
     } else {
       params.ut_end_nblockmax = nullptr;
       params.ut_end_nblockmin = nullptr;
@@ -163,7 +206,8 @@ namespace flashmask {
           params.seqlen_k,
           params.lt_end_nblockmax,
           params.lt_end_nblockmin,
-          stream);
+          stream,
+          use_aligned_chunk);
     } else {
       params.lt_end_nblockmax = nullptr;
       params.lt_end_nblockmin = nullptr;
@@ -175,7 +219,8 @@ namespace flashmask {
           params.seqlen_k,
           params.ut_start_nblockmax,
           params.ut_start_nblockmin,
-          stream);
+          stream,
+          use_aligned_chunk);
     } else {
       params.ut_start_nblockmax = nullptr;
       params.ut_start_nblockmin = nullptr;

@@ -697,6 +697,8 @@ struct CollectiveMainloopFwdSm90 {
                   "l"(reinterpret_cast<int4*>(params.src_ptr + offset) + idx),                                              \
                   "n"(16))
 
+        // Note(heqianyue): we make sure that length is the multiple of 4. If this constraint does not hold in the future
+        // one can refer to d0659db5c7 and re-implement the loading of remaining elements
         if (tag == PtrExistDispatchTag::FULL_PTR) {
             for(int64_t idx = thread_idx; idx * 4 < length; idx += ProducerThreadNum) {
                 // lt start is always valid in flashmask (otherwise it is a bug)

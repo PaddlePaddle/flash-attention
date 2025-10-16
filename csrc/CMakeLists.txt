@@ -512,7 +512,8 @@ if(NOT SKIP_BUILD_FA)
         list(APPEND FLASHMASKV2_HEAD_DIMENSIONS_BWD 256)
     endif()
 
-    set(FLASHMASKV2_HEAD_DIMENSIONS_FWD "all" "diff")
+    # Disable diff, not support headdim != headdim_v
+    set(FLASHMASKV2_HEAD_DIMENSIONS_FWD "all")
     set(FLASHMASKV2_HEAD_DIMENSIONS_FWD_SM80 ${FLASHMASKV2_HEAD_DIMENSIONS_BWD})
 
     set(FLASHMASKV2_SPLIT "__EMPTY__")

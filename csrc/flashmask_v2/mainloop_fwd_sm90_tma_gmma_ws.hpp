@@ -756,7 +756,8 @@ struct CollectiveMainloopFwdSm90 {
                      int32_t total_num_chunks,
                      int32_t end_flag,
                      int32_t* const flashmask_maxmin_smem,
-                     int32_t* const mask_encode_n_block_smem_) {
+                     int32_t* const mask_encode_n_block_smem_,
+                     int32_t* const extra_flags) {
       int m_block = get<0>(block_coord);
       int const bidb = get<2>(block_coord);
       int const split_idx = get<3>(block_coord);
@@ -913,7 +914,8 @@ struct CollectiveMainloopFwdSm90 {
          cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
          int &work_idx,
          int32_t* const flashmask_smem_,
-         const int32_t* const n_block_smem
+         const int32_t* const n_block_smem,
+         const int32_t* const extra_flags
          ) {
         // some of these are captured in lambda so can't use structured binding
         int const m_block = get<0>(block_coord);
@@ -1110,6 +1112,7 @@ struct CollectiveMainloopFwdSm90 {
         int32_t n_block_idx = 0;
 
         const int32_t* mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+        const int32_t* extra_flags_smem = extra_flags + n_block_pipe_read.index();
 
         auto load_flashmask = [&] (auto const& smem_pipe_write) {
             if constexpr (Is_flashmask) {
@@ -1182,7 +1185,7 @@ struct CollectiveMainloopFwdSm90 {
             pipeline.consumer_wait(smem_pipe_read, barrier_token);
         };
 
-        auto n_block_getter = [&mask_encode_n_block_smem_](int32_t index) {
+        auto n_block_getter = [&mask_encode_n_block_smem_, &extra_flags_smem](int32_t index) {
             // if val >= 0 or val in [end, finish]: return val, else: return -val - 1
             if (index < Flashmask_n_block_buffer_valid_length) {
                 const int32_t encoded = mask_encode_n_block_smem_[index];
@@ -1304,6 +1307,7 @@ struct CollectiveMainloopFwdSm90 {
             ++n_block_pipe_read;
             n_block_wait(pipeline_n_block, n_block_pipe_read);
             mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+            extra_flags_smem = extra_flags + n_block_pipe_read.index();
             n_block_idx = 0;
             n_block = n_block_getter(0);
           }
@@ -1478,7 +1482,8 @@ struct CollectiveMainloopFwdSm90 {
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage,
         int32_t* const flashmask_smem_,
-        const int32_t* const n_block_smem
+        const int32_t* const n_block_smem,
+        const int32_t* const extra_flags
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -1578,9 +1583,10 @@ struct CollectiveMainloopFwdSm90 {
 
         consumer_wait(pipeline_n_block, n_block_pipe_read);
         const int32_t* mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+        const int32_t* extra_flags_smem = extra_flags + n_block_pipe_read.index();
 
         int n_block_idx = 0;
-        auto n_block_getter = [&mask_encode_n_block_smem_](int32_t index) {
+        auto n_block_getter = [&mask_encode_n_block_smem_, &extra_flags_smem](int32_t index) {
             // if val >= 0 or val in [end, finish]: return val, else: return -val - 1
             if (index < Flashmask_n_block_buffer_valid_length) {
                 const int32_t encoded = mask_encode_n_block_smem_[index];
@@ -1812,6 +1818,7 @@ struct CollectiveMainloopFwdSm90 {
                     ++n_block_pipe_read;
                     consumer_wait(pipeline_n_block, n_block_pipe_read);
                     mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+                    extra_flags_smem = extra_flags + n_block_pipe_read.index();
                     n_block_idx = 0;
                     n_block = n_block_getter(0);
                   }
@@ -1829,6 +1836,7 @@ struct CollectiveMainloopFwdSm90 {
                 ++n_block_pipe_read;
                 consumer_wait(pipeline_n_block, n_block_pipe_read);
                 mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+                extra_flags_smem = extra_flags + n_block_pipe_read.index();
                 n_block_idx = 0;
                 n_block = n_block_getter(0);
               }
@@ -1847,6 +1855,7 @@ struct CollectiveMainloopFwdSm90 {
                     ++n_block_pipe_read;
                     consumer_wait(pipeline_n_block, n_block_pipe_read);
                     mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+                    extra_flags_smem = extra_flags + n_block_pipe_read.index();
                     n_block_idx = 0;
                     n_block = n_block_getter(0);
                   }

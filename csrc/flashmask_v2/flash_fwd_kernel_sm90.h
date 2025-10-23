@@ -213,8 +213,10 @@ public:
 
         static constexpr int num_sch_stage = Use_Sch_Pipeline ? 2 : 1;
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-        __shared__ __align__(16) int32_t flashmask_maxmin_smem[num_sch_stage * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        __shared__ __align__(128) int32_t flashmask_maxmin_smem[num_sch_stage * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
         __shared__ int32_t n_block_smem[num_sch_stage * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        // When n_block_smem is full, we need to store the flag in the following extra flag storage, instead of allocating 4 more elements
+        __shared__ int32_t extra_flags[4];   // if num_sch_stage is 1, we actually only need two (kNBlockStages = 2)
 
         if constexpr (Use_Sch_Pipeline) {
             if (threadIdx.x < 2) {
@@ -465,7 +467,8 @@ public:
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_write,
                               n_block_pipe_read,
                               shared_storage, seqlen_info, block_coord, work_idx,
-                              flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage());
+                              flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage(),
+                              extra_flags + scheduler.stage());
                 // coarse pipeline stage (offset, 0 or 2)
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
@@ -510,13 +513,15 @@ public:
                         params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_read,
                         n_block_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                        flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage());
+                        flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage(),
+                        extra_flags + scheduler.stage());
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
                             params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                            flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage());
+                            flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage(),
+                            extra_flags + scheduler.stage());
                     } else {
                         tile_valid = mainloop.mma_pv(
                             params.mainloop, pipeline_v, pipeline_n_block, smem_pipe_read,

@@ -749,25 +749,18 @@ struct CollectiveMainloopFwdSm90 {
 
     template <PtrExistDispatchTag tag>
     CUTLASS_DEVICE bool
-    generate_n_block(Params const& params,
-                     SeqlenInfo_t const& seqlen_info,
-                     cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
-                     int32_t reverse_chunk_idx, // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0]
-                     int32_t total_num_chunks,
-                     int32_t end_flag,
-                     int32_t* const flashmask_maxmin_smem,
-                     int32_t* const mask_encode_n_block_smem_,
-                     int32_t* const extra_flags) {
-      int m_block = get<0>(block_coord);
-      int const bidb = get<2>(block_coord);
-      int const split_idx = get<3>(block_coord);
-      auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
-          seqlen_info, m_block, bidb, split_idx, params.num_splits,
-          params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
-
+    generate_n_block(int32_t const m_block,
+                     int32_t const reverse_chunk_idx, // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0]
+                     int32_t const total_num_chunks,
+                     int32_t const end_flag,
+                     int32_t const n_block_min,
+                     int32_t const n_block_max,
+                     int32_t const seqlen_q,
+                     int32_t* const __restrict__ flashmask_maxmin_smem,
+                     int32_t* const __restrict__ mask_encode_n_block_smem_,
+                     int32_t* const __restrict__ extra_flags) {
       static constexpr int kBlockM = get<0>(TileShape_MNK{});
       static constexpr int kBlockN = get<1>(TileShape_MNK{});
-      m_block *= kBlockM;
 
       int const thread_idx = threadIdx.x - 32;
 
@@ -816,7 +809,11 @@ struct CollectiveMainloopFwdSm90 {
       // -2, -1,  0,  1,  2
       // t4, t3, t2, t1, t0
       // although t4 and t3 are oob, they should not exit the loop, otherwise, the prefix-sum inside the loop will hang, just keep a default value is fine
-      for(int32_t idx = Flashmask_n_block_buffer_valid_length - 1 - thread_idx % ProducerThreadNum; 
+      const int m_block_s = m_block * kBlockM;
+      // Note(heqianyue): ute/lte will be seqlen_q (at most). Yet if m_block_e > seqlen_q, even if ute/lte are seqlen_q (masked to the end)
+      // we will still consider the block as partially masked, adding unnecessary computation for those fully-masked blocks
+      const int m_block_e = __viaddmin_s32(m_block_s, kBlockM, seqlen_q);       // min(a + b, c)
+      for(int32_t idx = Flashmask_n_block_buffer_valid_length - 1 - thread_idx;         // make sure thread_idx is in range [0, ProducerThreadNum)
           idx >= (0 - (ProducerThreadNum - Flashmask_n_block_buffer_valid_length % ProducerThreadNum)); idx -= ProducerThreadNum
       ) {
         int32_t n_block = base_offset + idx;
@@ -835,25 +832,25 @@ struct CollectiveMainloopFwdSm90 {
                 ut_end_max = s_ut_end_max[idx];
                 ut_end_min = s_ut_end_min[idx];
 
-                fully_masked = (m_block >= lt_start_max && (m_block + kBlockM) <= lt_end_min) ||
-                            (m_block >= ut_start_max && (m_block + kBlockM) <= ut_end_min);
-                partially_masked = (m_block < lt_end_max && (m_block + kBlockM) > lt_start_min) ||
-                                (m_block < ut_end_max && (m_block + kBlockM) > ut_start_min);
+                fully_masked = (m_block_s >= lt_start_max && m_block_e <= lt_end_min) ||
+                            (m_block_s >= ut_start_max && m_block_e <= ut_end_min);
+                partially_masked = (m_block_s < lt_end_max && m_block_e > lt_start_min) ||
+                                (m_block_s < ut_end_max && m_block_e > ut_start_min);
             } else if constexpr (tag == PtrExistDispatchTag::DUAL_PTR) {
                 if constexpr (Is_causal) {
                     lt_end_max = s_lt_end_max[idx];
                     lt_end_min = s_lt_end_min[idx];
-                    fully_masked = m_block >= lt_start_max && (m_block + kBlockM) <= lt_end_min;
-                    partially_masked = m_block < lt_end_max && (m_block + kBlockM) > lt_start_min;
+                    fully_masked = m_block_s >= lt_start_max && m_block_e <= lt_end_min;
+                    partially_masked = m_block_s < lt_end_max && m_block_e > lt_start_min;
                 } else {
                     ut_end_max = s_ut_end_max[idx];
                     ut_end_min = s_ut_end_min[idx];
-                    fully_masked = (m_block >= lt_start_max) || ((m_block + kBlockM) <= ut_end_min);
-                    partially_masked = ((m_block + kBlockM) > lt_start_min) || (m_block < ut_end_max);
+                    fully_masked = (m_block_s >= lt_start_max) || (m_block_e <= ut_end_min);
+                    partially_masked = (m_block_e > lt_start_min) || (m_block_s < ut_end_max);
                 }
             } else {
-                fully_masked = m_block >= lt_start_max;
-                partially_masked = (m_block + kBlockM) > lt_start_min;
+                fully_masked = m_block_s >= lt_start_max;
+                partially_masked = m_block_e > lt_start_min;
             }
             
             prefix_sum = int(!fully_masked);

@@ -232,7 +232,11 @@ public:
             //     printf("producer_num = %d\n", producer_num);
             // }
 
-            int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
+            // TODO(heqianyue): some optimization that can be migrated
+            // 1. schedulers (using dynamic schedulers): including DualPPTX smem buffer support (some labor)
+            // 3. warp group 3, 4 do nothing at all? Can we get rid of them? Put the loader warps to the end
+            // and using only 64 threads
+            int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x >> 5) & 0x03, 0);
             for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
                  work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)) {
@@ -243,30 +247,31 @@ public:
                 if (warp_idx_in_warpgroup == 0) {  // Load K, V, and do TMA on Q and dO
                     PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
                     PipelineState_dO smem_pipe_write_do = cutlass::make_producer_start_state<MainloopPipeline_dO>();
-//                        auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
-//                        auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
-//                        cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                        auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
-                            scheduler.prefetch_next_work(params.scheduler, work_tile_info);
-                        };
-//                        mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
-                        mainloop.load(params.mainloop, pipeline_q, pipeline_do, smem_pipe_write,
-                                      smem_pipe_write_do, shared_storage, scheduler_prefetch, block_coord,flashmask_smem_);
-//                        mainloop.wait_for_release_n_block_info();
+                    // auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
+                    // auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+                    // cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
+                    auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
+                        scheduler.prefetch_next_work(params.scheduler, work_tile_info);
+                    };
+                    // mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
+                    mainloop.load(params.mainloop, pipeline_q, pipeline_do, smem_pipe_write,
+                                smem_pipe_write_do, shared_storage, scheduler_prefetch, block_coord,flashmask_smem_);
+                    // mainloop.wait_for_release_n_block_info();
                     mainloop.load_tail(pipeline_q, pipeline_do, smem_pipe_write, smem_pipe_write_do);
                 } else if (warp_idx_in_warpgroup == 1) {
-//                        auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
-//                        auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
-//                        cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-//                        mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
-                        mainloop.store_dq(params.mainloop, shared_storage, block_coord,flashmask_smem_);
-//                        mainloop.wait_for_release_n_block_info();
-                }else{
-//                        auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
-//                        auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
-//                        cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-//                        mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
-//                        mainloop.wait_for_release_n_block_info();
+                    // auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
+                    // auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+                    // cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
+                    // mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
+                    mainloop.store_dq(params.mainloop, shared_storage, block_coord,flashmask_smem_);
+                    //  mainloop.wait_for_release_n_block_info();
+                } else {
+                    // TODO(heqianyue): Do nothing? If so, can we move producers to the end of the block?
+                    // auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
+                    // auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+                    // cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
+                    // mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
+                    // mainloop.wait_for_release_n_block_info();
                 }
                 mainloop.wait_for_release_n_block_info();
             }
@@ -285,7 +290,7 @@ public:
             mainloop.mma_init();
             scheduler.init_consumer();
 
-            int work_idx = 0;
+            int binary_work_idx = 0;
             CUTLASS_PRAGMA_NO_UNROLL
             for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
@@ -300,8 +305,9 @@ public:
                 mainloop.wait_for_load_n_block_info();
                 bool tile_valid = mainloop.mma(
                     params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,
-                    tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage,flashmask_smem_, flashmask_index_smem_);
+                    tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, binary_work_idx, block_coord, shared_storage,flashmask_smem_, flashmask_index_smem_);
                 if (tile_valid) {
+                    binary_work_idx = 1 - binary_work_idx;
                     epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
                                    threadIdx.x - NumCopyThreads, block_coord);
                 } else {

@@ -811,7 +811,14 @@ struct CollectiveMainloopBwdSm90 {
         // load_n_block_info(n_block, flashmask_mem_, params);
         // printf("m_block:%d", m_block);
         // printf("m_block_max:%d\n", m_block_max);
-        int loop_end = m_block_max;
+        if constexpr (Deterministic) {
+			for (int prefix_m_block=0; prefix_m_block < m_block; prefix_m_block++) {
+                Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, prefix_m_block * num_batch * num_head, n_block);
+                /* Do Nothing, just wait */
+                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, prefix_m_block * num_batch * num_head);
+            }
+        }
+		int loop_end = m_block_max;
         if constexpr(!Is_causal){
             if constexpr (Has_ut_start) {
                 loop_end = (flashmask_mem_[4] -1)/kBlockM ;
@@ -839,8 +846,20 @@ struct CollectiveMainloopBwdSm90 {
                     }
                 }
             }
-            m_block = std::max(m_block,flashmask_mem_[7] /kBlockM); 
-        } 
+        	if constexpr (Deterministic) {
+                int cur_m_block = m_block;
+                m_block = std::max(m_block,flashmask_mem_[7] /kBlockM); 
+                // up mask
+                for (; cur_m_block < m_block; cur_m_block++) {
+                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, cur_m_block * num_batch * num_head, n_block);
+                    /* Do Nothing, just wait */
+                    Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, cur_m_block * num_batch * num_head);
+                }
+            }
+            else {
+                m_block = std::max(m_block,flashmask_mem_[7] /kBlockM); 
+            }
+		} 
         loop_end = std::min(m_block_max-1,(flashmask_mem_[0] -1 )/ kBlockM);
         #pragma unroll 2
         for (; m_block <= loop_end;++m_block) {
@@ -864,6 +883,19 @@ struct CollectiveMainloopBwdSm90 {
             if constexpr (Deterministic) {
                 Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
             }
+        } 
+		if constexpr (Deterministic) {
+            int cur_m_block = m_block;
+            m_block = std::max(m_block,(flashmask_mem_[3]+1)/kBlockM);  
+            // down mask
+            for (; cur_m_block < m_block; cur_m_block++) {
+                Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, cur_m_block * num_batch * num_head, n_block);
+                /* Do Nothing, just wait */
+                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, cur_m_block * num_batch * num_head);
+            }
+        }
+        else {
+            m_block = std::max(m_block,(flashmask_mem_[3]+1)/kBlockM); 
         } 
         if constexpr (Has_lt_end) {
             m_block = std::max(m_block,(flashmask_mem_[3]+1)/kBlockM);      
@@ -891,13 +923,12 @@ struct CollectiveMainloopBwdSm90 {
                 }
             }
         }
-
-        if constexpr (Is_local && Deterministic) {
+		if constexpr (Deterministic) {
             int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
-            #pragma unroll 2
             for (; m_block < m_block_global_max; m_block++) {
-            // for (; m_block < m_block_global_max; m++) {
-                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
+                Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
+                /* Do Nothing, just wait */
+				Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
             }
         }
     }

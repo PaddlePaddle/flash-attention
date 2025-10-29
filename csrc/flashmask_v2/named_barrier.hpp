@@ -72,17 +72,15 @@ enum class BwdNamedBarriers {
     KVEmpty = 0,
     PdS = 1,
     // This needs to match FwdNamedBarriers::TileCountSmemEmpty since TileScheduler uses it
-    TileCountSmemEmpty = 2,
-    TileCountSmemFull = 3,
+    FlashmaskSmemEmpty = 2,
+    FlashmaskSmemFull = 3,
     dQEmptyWG1 = 4,
     dQEmptyWG2 = 5,
     dQEmptyWG3 = 6,
     dQFullWG1 = 7,
     dQFullWG2 = 8,
     dQFullWG3 = 9,
-    FlashmaskProducer = 0, //HACK: KVEmpty sync is unused
-    FlashmaskFull = 2,
-    FlashmaskEmpty = 3,
+    FlashmaskProducer = 0,  // HACK: KVEmpty sync is unused
 };
 
 } // flash

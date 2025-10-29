@@ -6,10 +6,10 @@
 
 namespace flash {
 
-  template <typename TiledMma,int kBlockM, int kBlockN,bool SwapAB, typename Engine, typename Layout>
+  template <typename TiledMma, int kBlockM, int kBlockN, bool SwapAB, typename Engine, typename Layout>
   // CUTLASS_DEVICE
   __device__
-  void apply_flashmask_bwd(Tensor<Engine, Layout> &tSrS, int const thread_idx, int32_t const * flashmask_index_smem_, const int32_t m_block) {
+  void apply_flashmask_bwd(Tensor<Engine, Layout> &tSrS, int const thread_idx, const int32_t* const __restrict__ flashmask_index_smem_, const int32_t m_block) {
 
       // static_assert(!PackGQA);
       // static_assert(!SwapAB);
@@ -22,10 +22,10 @@ namespace flash {
       Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SwapAB>(tScS.layout()));
 
       static constexpr int Row = !SwapAB ? 0 : 1, Col = !SwapAB ? 1 : 0;
-      const int32_t * s_lt_start = flashmask_index_smem_;
-      const int32_t * s_lt_end = flashmask_index_smem_ + kBlockN;
-      const int32_t * s_ut_start = flashmask_index_smem_ + 2 * kBlockN;
-      const int32_t * s_ut_end = flashmask_index_smem_ + 3 * kBlockN;
+      const int32_t* const s_lt_start = flashmask_index_smem_;
+      const int32_t* const s_lt_end = flashmask_index_smem_ + kBlockN;
+      const int32_t* const s_ut_start = flashmask_index_smem_ + 2 * kBlockN;
+      const int32_t* const s_ut_end = flashmask_index_smem_ + 3 * kBlockN;
 
       #pragma unroll
       for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
@@ -39,7 +39,7 @@ namespace flash {
           if(row_idx >= s_lt_start[col_idx] && row_idx < s_lt_end[col_idx]){
               tSrS_rowcol(m, n) = -INFINITY;
               // printf("point1, row_idx:%d, col_idx:%d, thread_idx:%d, tSrS_rowcol(m, n):%f\n", row_idx, col_idx, thread_idx, tSrS_rowcol(m, n));
-            }
+          }
           if(row_idx >= s_ut_start[col_idx] && row_idx < s_ut_end[col_idx]){
               tSrS_rowcol(m, n) = -INFINITY;
             //  printf("point2, row_idx:%d, col_idx:%d, thread_idx:%d, tSrS_rowcol(m, n):%f\n", row_idx, col_idx, thread_idx, tSrS_rowcol(m, n));

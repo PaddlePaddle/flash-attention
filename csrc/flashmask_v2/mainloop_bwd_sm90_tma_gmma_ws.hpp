@@ -491,7 +491,7 @@ struct CollectiveMainloopBwdSm90 {
 
 
     CUTLASS_DEVICE
-    void load_n_block_info( int32_t *  fm_mem, int32_t * flashmask_index_smem_,cute::tuple<int32_t, int32_t, int32_t> block_coord, Params const& params) {
+    void load_n_block_info( int32_t *  fm_mem, int32_t * flashmask_index_smem_, cute::tuple<int32_t, int32_t, int32_t> block_coord, Params const& params) {
         auto [n_block, bidh, bidb] = block_coord;
         int const seqlen = get<0>(params.shape_K);
         int const thread_idx = threadIdx.x;
@@ -501,7 +501,6 @@ struct CollectiveMainloopBwdSm90 {
         int const n_block_seqlen = ((seqlen + kBlockN - 1) / kBlockN + 3) & 0xfffffffc;       // / 4 * 4
         int const bh_offset_block = bh_offset * n_block_seqlen;
 
-        // TODO(heqianyue): Do div computation in here
         if(thread_idx == 0){
             // lt_start is always valid, otherwise this is not a valid flashmask computation instance
             fm_mem[0] = (params.lt_start_nblockmax[bh_offset_block + n_block] - 1) / kBlockM;
@@ -531,7 +530,6 @@ struct CollectiveMainloopBwdSm90 {
         // Note(xhy): kBlockN in fa3 is always less than 128
 
         if (thread_idx < kBlockN) {
-            // TODO(heqianyue): it seems that we will have excessive sectors, since row_offset is not guaranteed to be the multiple of 32 (128B aligned)
             flashmask_index_smem_[thread_idx] = in_range ? params.lt_start_ptr[thread_idx + row_offset] : INT_MIN;
             flashmask_index_smem_[thread_idx + kBlockN] = in_range ? (Has_lt_end ? params.lt_end_ptr[thread_idx + row_offset] : INT_MAX) : INT_MAX;
             flashmask_index_smem_[thread_idx + 2 * kBlockN] = in_range ? (Has_ut_start ? params.ut_start_ptr[thread_idx + row_offset] : (Is_causal ? INT_MAX : INT_MIN)) : INT_MIN;            
@@ -541,36 +539,16 @@ struct CollectiveMainloopBwdSm90 {
         // if(thread_idx < kBlockN) if(bidb ==1 and bidh == 0) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, ut_end_flashmask_index_smem_%d: %d\n", thread_idx,bidb,bidh,n_block,thread_idx + row_offset-seqlen,thread_idx,flashmask_index_smem_[thread_idx + 3 * kBlockN]);
             // if(bidb ==0 and (bidh == 0 or bidh == 2) and n_block * kBlockN + i < seqlen and params.ut_end_ptr != nullptr) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, ut_end_flashmask_index_smem_%d: %d, params.ut_end_ptr_val: %d, params.ut_end_ptr_ptr: %p\n", thread_idx,bidb,bidh,n_block,row_offset,i,flashmask_index_smem_[i + 3 * kBlockN],params.ut_end_ptr[i + row_offset],params.ut_end_ptr + i + row_offset);
         cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskProducer) /*id*/);
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskFull) /*id*/);
-        // printf("pass\n");
     }
 
-    CUTLASS_DEVICE
-    void release_n_block_info() {
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskEmpty) /*id*/);
-    }
-
-    CUTLASS_DEVICE
-    void wait_for_load_n_block_info(){
-        cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskFull) /*id*/);
-    }
-
-
-    CUTLASS_DEVICE
-    void wait_for_release_n_block_info() {
-        cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskEmpty) /*id*/);
-    }
-
-    template <typename SchedulerPrefetch, typename SharedStorage>
+    template <typename SharedStorage>
     CUTLASS_DEVICE void
     load(Params const& params,
          MainloopPipeline pipeline_q,
          MainloopPipeline_dO pipeline_do,
-        //  MainloopPipeline_flashmask pipeline_flashmask,
          PipelineState& smem_pipe_write,
          PipelineState_dO& smem_pipe_write_do,
          SharedStorage &shared_storage,
-         SchedulerPrefetch const& scheduler_prefetch,
          cute::tuple<int32_t, int32_t, int32_t> block_coord,
          int32_t const * const flashmask_mem_
          ) {
@@ -586,7 +564,6 @@ struct CollectiveMainloopBwdSm90 {
         // It's possible to have m_block_max <= m_block_min. Loading Q, K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) {
-                scheduler_prefetch();
                 return;
             }
         }
@@ -686,11 +663,6 @@ struct CollectiveMainloopBwdSm90 {
                 copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
                      tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
 
-                // printf("sdo:\n");
-                // cute::print_tensor(sdO);
-                // printf("\n");
-                // __syncthreads();
-
                 copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
                      gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
                 if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
@@ -725,8 +697,6 @@ struct CollectiveMainloopBwdSm90 {
                 }    
             }
         }
-        scheduler_prefetch(); //xiehaoyang: add sync?
-//         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::Flashmask) /*id*/);
         if constexpr (Q_dO_same_stages) { smem_pipe_write_do = smem_pipe_write; }
     }
 
@@ -903,7 +873,6 @@ struct CollectiveMainloopBwdSm90 {
 
     CUTLASS_DEVICE void
     mma_init() {
-        // We're not currently using this bc we're not using persistent scheduler
         // // Tell producer (warp 0) that smem_k and smem_v are ready
         // cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
@@ -925,13 +894,13 @@ struct CollectiveMainloopBwdSm90 {
         PipelineState_dO& smem_pipe_read_do,
         FrgTensordKV& tdKrdK,
         FrgTensordKV& tdVrdV,
-        int thread_idx,
-        int binary_work_idx,
+        int const thread_idx,
+        int const binary_work_idx,
         cute::tuple<int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage,
-        int32_t const * flashmask_mem_,
-        int32_t const * flashmask_index_smem_
-        ) {
+        const int32_t* const __restrict__ flashmask_mem_,
+        const int32_t* const __restrict__ flashmask_index_smem_
+    ) {
         static_assert(is_rmem<FrgTensordKV>::value, "dK and dV tensor must be rmem resident.");
 
         int n_block = get<0>(block_coord);
@@ -948,7 +917,7 @@ struct CollectiveMainloopBwdSm90 {
             if (m_block_max <= m_block_min) { return false; }
         }
 
-    //    printf("enter consumer threadidx:%d", threadIdx.x);
+        // printf("enter consumer threadidx:%d", threadIdx.x);
         // cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<uint32_t>(BwdNamedBarriers::Flashmask) /*id*/);
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
@@ -1081,7 +1050,7 @@ struct CollectiveMainloopBwdSm90 {
             cute::copy(smem_tiled_copy_V, tdPsV_copy_view, tdPrV_copy_view);
         }
 
-        auto bwd_step = [&](int m_block, auto mask_fn, bool partially_masked, int32_t const * flashmask_index_smem_) {
+        auto bwd_step = [&](int m_block, auto mask_fn, bool partially_masked, const int32_t* const flashmask_index_smem_) {
             Tensor tSrS = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
             consumer_wait(pipeline_q, smem_pipe_read);
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/SdP_swapAB>(tiled_mma_SdP, tSrQ(_, _, _, smem_pipe_read.index()), tSrK, tSrS);
@@ -1108,7 +1077,7 @@ struct CollectiveMainloopBwdSm90 {
             // dtanh needs to happen before masking, otherwise we get 1 - (-inf)^2 = NaN in the dtanh
             auto dtanh = [&] { if constexpr (Has_softcap) return flash::calculate_dtanh(scores); else return nullptr; }();
             mask_fn(tSrS, m_block);
-            if(partially_masked) flash::apply_flashmask_bwd<TiledMmaSdP,kBlockM,kBlockN,SdP_swapAB>(tSrS,thread_idx,flashmask_index_smem_,m_block);
+            if(partially_masked) flash::apply_flashmask_bwd<TiledMmaSdP, kBlockM, kBlockN, SdP_swapAB>(tSrS, thread_idx, flashmask_index_smem_, m_block);
             #pragma unroll
             for (int mi = 0; mi < size<0>(scores); ++mi) {
                 float const lse_scaled = [&] {
@@ -1220,7 +1189,6 @@ struct CollectiveMainloopBwdSm90 {
                     Tensor tdQrdQ_atomic = recast<float4>(r2s_thr_copy_dQaccum.retile_S(tdQrdQ));
                     Tensor tdQgdQaccum_atomic = recast<float4>(tdQgdQaccum(_, _, _, m_block));
                     static_assert(CUTE_STATIC_V(size(tdQrdQ_atomic)) == CUTE_STATIC_V(size(tdQgdQaccum_atomic)));
-                    // TODO(heqianyue): what is the scope of this atomic write? can we make it atomicAdd_block?
                     #pragma unroll
                     for (int i = 0; i < size(tdQrdQ_atomic); ++i) { atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i)); }
                 }
@@ -1240,7 +1208,6 @@ struct CollectiveMainloopBwdSm90 {
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/1, /*SwapAB=*/dKV_swapAB, /*M_slice=*/1>(tiled_mma_dKV, tdVrP_cur, tdVrdO(_, _, _, smem_pipe_read_do_cur.index()), tdVrdV);
                 Tensor tdQrdQ_atomic = recast<float4>(r2s_thr_copy_dQaccum.retile_S(tdQrdQ));
                 Tensor tdQgdQaccum_atomic = recast<float4>(tdQgdQaccum(_, _, _, m_block));
-                // TODO(heqianyue): what is the scope of this atomic write? can we make it atomicAdd_block?
                 #pragma unroll
                 for (int i = 0; i < size(tdQrdQ_atomic) / 2; ++i) { atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i)); }
 
@@ -1250,7 +1217,6 @@ struct CollectiveMainloopBwdSm90 {
                 pipeline_do.consumer_release(smem_pipe_read_do_cur);  // release dO
 
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/0, /*SwapAB=*/dQ_swapAB, /*M_slice=*/1>(tiled_mma_dQ, tdQrdS_cur, tdQrK, tdQrdQ);
-                // TODO(heqianyue): what is the scope of this atomic write? can we make it atomicAdd_block?
                 #pragma unroll
                 for (int i = size(tdQrdQ_atomic) / 2; i < size(tdQrdQ_atomic); ++i) { atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i)); }
 

@@ -10,7 +10,9 @@
 
 #include "flash.h"
 
-static __device__ int semaphore_storage[1];
+// fallback, in case that paddle end does not allocate valid GPU mem for semaphore
+static __device__ int semaphore_storage_fwd[1];
+static __device__ int semaphore_storage_bwd[1];
 
 namespace flash {
 
@@ -135,10 +137,19 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
 
 void prepare_preemptive_scheduler(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx) {
     if (params.tile_count_semaphore == nullptr) {
-        CHECK_CUDA(cudaGetSymbolAddress((void**)&params.tile_count_semaphore, semaphore_storage));
+        CHECK_CUDA(cudaGetSymbolAddress((void**)&params.tile_count_semaphore, semaphore_storage_fwd));
     }
     if (is_dual_pptx)
         num_sm *= 2;        // double buffer PPTX will have 2 * num_sm static scheduling
+    flash::prepare_preemptive_scheduler_kernel<<<1 /*grid*/, 32 /*block*/, 0, stream>>>(
+        params.tile_count_semaphore,
+        num_sm);
+}
+
+void prepare_preemptive_scheduler(Flash_bwd_params &params, cudaStream_t stream, int num_sm) {
+    if (params.tile_count_semaphore == nullptr) {
+        CHECK_CUDA(cudaGetSymbolAddress((void**)&params.tile_count_semaphore, semaphore_storage_bwd));
+    }
     flash::prepare_preemptive_scheduler_kernel<<<1 /*grid*/, 32 /*block*/, 0, stream>>>(
         params.tile_count_semaphore,
         num_sm);

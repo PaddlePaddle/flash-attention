@@ -237,44 +237,41 @@ public:
             // 3. warp group 3, 4 do nothing at all? Can we get rid of them? Put the loader warps to the end
             // and using only 64 threads
             int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x >> 5) & 0x03, 0);
+            PipelineState smem_pipe_write;
+            PipelineState_dO smem_pipe_write_do;
+            if (warp_idx_in_warpgroup == 0) {       // pipeline can only be initialized once, otherwise we will hang with persistent tile scheduler
+                smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
+                smem_pipe_write_do = cutlass::make_producer_start_state<MainloopPipeline_dO>();
+            }
             for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
-                 work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)) {
+                 work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)
+            ) {
                 auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
-                auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+                auto [n_block, bidh, bidb] = block_coord_;
                 cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
+                mainloop.load_n_block_info(flashmask_smem_, flashmask_index_smem_, block_coord, params.mainloop);
+                scheduler.producer_notify();
                 if (warp_idx_in_warpgroup == 0) {  // Load K, V, and do TMA on Q and dO
-                    PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
-                    PipelineState_dO smem_pipe_write_do = cutlass::make_producer_start_state<MainloopPipeline_dO>();
+                    
                     // auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
-                    // auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+                    // auto [n_block, bidh, bidb] = block_coord_;
                     // cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                    auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
-                        scheduler.prefetch_next_work(params.scheduler, work_tile_info);
-                    };
                     // mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
                     mainloop.load(params.mainloop, pipeline_q, pipeline_do, smem_pipe_write,
-                                smem_pipe_write_do, shared_storage, scheduler_prefetch, block_coord,flashmask_smem_);
-                    // mainloop.wait_for_release_n_block_info();
+                                smem_pipe_write_do, shared_storage, block_coord, flashmask_smem_);
                     mainloop.load_tail(pipeline_q, pipeline_do, smem_pipe_write, smem_pipe_write_do);
                 } else if (warp_idx_in_warpgroup == 1) {
                     // auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
-                    // auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+                    // auto [n_block, bidh, bidb] = block_coord_;
                     // cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
                     // mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
-                    mainloop.store_dq(params.mainloop, shared_storage, block_coord,flashmask_smem_);
-                    //  mainloop.wait_for_release_n_block_info();
-                } else {
-                    // TODO(heqianyue): Do nothing? If so, can we move producers to the end of the block?
-                    // auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
-                    // auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
-                    // cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                    // mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
-                    // mainloop.wait_for_release_n_block_info();
+                    mainloop.store_dq(params.mainloop, shared_storage, block_coord, flashmask_smem_);
                 }
-                mainloop.wait_for_release_n_block_info();
+                scheduler.prefetch_next_work(params.scheduler, work_tile_info);
             }
+            // notify the consumer that there is no more work to do
+            scheduler.producer_notify();
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
             // Initialize matmul objects.
@@ -294,15 +291,15 @@ public:
             CUTLASS_PRAGMA_NO_UNROLL
             for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
-                 work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
-                auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
-                auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
-                cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-
+                 work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)
+            ) {
                 // dK and dV output accumulator.
                 Tensor tdKrdK = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
                 Tensor tdVrdV = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
-                mainloop.wait_for_load_n_block_info();
+                auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
+                auto [n_block, bidh, bidb] = block_coord_;
+                cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
+                
                 bool tile_valid = mainloop.mma(
                     params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,
                     tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, binary_work_idx, block_coord, shared_storage,flashmask_smem_, flashmask_index_smem_);
@@ -313,7 +310,7 @@ public:
                 } else {
                     epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord);
                 }
-                mainloop.release_n_block_info();
+                scheduler.consumer_notify();
             }
             epilogue.store_tail();
         }

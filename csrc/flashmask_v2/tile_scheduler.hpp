@@ -14,6 +14,14 @@ namespace flash {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+#define DEFINE_DUMMY_NOTIFY_FUNCS   \
+    CUTLASS_DEVICE                  \
+    void                            \
+    producer_notify() const {}      \
+    CUTLASS_DEVICE                  \
+    void                            \
+    consumer_notify() const {}
+
 // Host side kernel arguments
 struct TileSchedulerArguments {
     // num_head is num_head_q if not PackGQA, else num_head_k
@@ -63,6 +71,8 @@ public:
     get_grid_shape(Params const& params, int num_sm) {
         return {uint32_t(params.num_blocks), uint32_t((!Split ? 1 : params.num_splits) * params.num_head), uint32_t(params.num_batch)};
     }
+
+    DEFINE_DUMMY_NOTIFY_FUNCS
 
     struct WorkTileInfo {
         int block_idx = 0;
@@ -162,6 +172,8 @@ public:
     get_grid_shape(Params const& params, int num_sm) {
         return {uint32_t(num_sm)};
     }
+
+    DEFINE_DUMMY_NOTIFY_FUNCS
 
     struct WorkTileInfo {
         int tile_idx;
@@ -278,6 +290,8 @@ public:
 
     };
 
+    DEFINE_DUMMY_NOTIFY_FUNCS
+
     CUTLASS_DEVICE
     PreemptivePersistentTileScheduler(SharedStorage* const smem_scheduler) : tile_count_smem(smem_scheduler) {};
 
@@ -343,6 +357,118 @@ public:
     CUTLASS_DEVICE
     constexpr uint32_t stage() const noexcept { return 0; }
 };
+
+template<int NumConsumerThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=128>
+class BwdPreemptivePersistentTileScheduler {
+    static constexpr int NumThreads = NumConsumerThreads + NumProducerThreads;
+public:
+    using SharedStorage = int;
+    static constexpr bool pipelining = false;
+protected:
+    SharedStorage* const tile_count_smem;
+
+public:
+
+    // Device side kernel params
+
+    struct Params {
+        int total_blocks;
+        cutlass::FastDivmod m_block_divmod, head_divmod;
+        int* const tile_count_semaphore;
+    };
+
+    static Params
+    to_underlying_arguments(TileSchedulerArguments const& args) {
+        assert(args.tile_count_semaphore != nullptr);
+        return {args.num_blocks * args.num_head * args.num_batch,
+                cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head),
+                args.tile_count_semaphore};
+    }
+
+    static dim3
+    get_grid_shape(Params const& params, int num_sm) {
+        return {uint32_t(num_sm)};
+    }
+
+    struct WorkTileInfo {
+        int tile_idx;
+
+        CUTLASS_DEVICE
+        bool
+        is_valid(Params const& params) const {
+            return tile_idx < params.total_blocks;
+        }
+
+        CUTLASS_DEVICE
+        cute::tuple<int32_t, int32_t, int32_t>
+        get_block_coord(Params const& params) const {
+            int block, bidh, bidb;
+            bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(block, tile_idx));
+            return {block, bidh, bidb};
+        }
+
+    };
+
+    CUTLASS_DEVICE
+    BwdPreemptivePersistentTileScheduler(SharedStorage* const smem_scheduler) : tile_count_smem(smem_scheduler) {};
+
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    WorkTileInfo
+    get_initial_work(Params const& params) const {
+        if constexpr (!IsProducerWarp) {
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskSmemFull) /*id*/);
+        }
+        return {int(blockIdx.x)};
+    }
+
+    CUTLASS_DEVICE
+    void
+    init_consumer() const {
+        // flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskSmemEmpty) /*id*/);
+    }
+
+    CUTLASS_DEVICE
+    void
+    prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {}
+
+    CUTLASS_DEVICE
+    void
+    producer_notify() const {     // notify the consumer that we've written data into the buffer
+        flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskSmemFull) /*id*/);
+    }
+
+    CUTLASS_DEVICE
+    void
+    consumer_notify() const {
+        // sync to make sure (*tile_count_smem) modification is visible to consumers
+        flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskSmemEmpty) /*id*/);
+    }
+
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    WorkTileInfo
+    get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+        if constexpr (IsProducerWarp) {
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskSmemEmpty) /*id*/);
+            // TODO(heqianyue): atomicAdd here?
+            if (threadIdx.x == 0) {    // hard-coded, since n_block producer threads are in [32, 128)
+                // the next job we are going to process: number of currently blocks done
+                *tile_count_smem = atomicAdd(params.tile_count_semaphore, 1);
+            }
+            flash::named_barrier_sync(NumProducerThreads, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskProducer) /*id*/);
+        } else {
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskSmemFull) /*id*/);
+        }
+        // how to make sure consumers can actually get this?
+        return {*tile_count_smem};
+    }
+
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    constexpr uint32_t stage() const noexcept { return 0; }
+};
+
 
 template<int NumConsumerThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=96, bool Split=false>
 class DualPreemptivePersistentTileExecutionScheduler {
@@ -432,6 +558,8 @@ public:
         }
         return {int(blockIdx.x)};
     }
+
+    DEFINE_DUMMY_NOTIFY_FUNCS
 
     CUTLASS_DEVICE
     void
@@ -592,6 +720,8 @@ public:
         return {int(blockIdx.x)};
     }
 
+    DEFINE_DUMMY_NOTIFY_FUNCS
+
     CUTLASS_DEVICE
     void
     init_consumer() const {
@@ -718,6 +848,8 @@ public:
 
     CUTLASS_DEVICE
     VarlenDynamicPersistentTileScheduler(SharedStorage* const smem_scheduler) : work_info_smem(smem_scheduler) {};
+
+    DEFINE_DUMMY_NOTIFY_FUNCS
 
     CUTLASS_DEVICE
     WorkTileInfo

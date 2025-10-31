@@ -39,7 +39,7 @@ namespace flash {
 
           // Note(heqianyue): causal masking will be processed in generic fa-v3 `mask.apply`, so if causal, there is no need to apply mask again
           if constexpr (Is_causal) {
-            if (row_idx >= s_lt_start[col_idx] && row_idx < s_lt_end[col_idx])
+            if (row_idx >= s_lt_start[col_idx] && (Has_lt_end || row_idx < s_lt_end[col_idx]))
                 tSrS_rowcol(m, n) = -INFINITY;
           } else {
             if constexpr (Has_ut_start) {
@@ -50,18 +50,12 @@ namespace flash {
               if (row_idx >= s_ut_start[col_idx] && row_idx < s_ut_end[col_idx])
                   tSrS_rowcol(m, n) = -INFINITY;
             } else {
-              // we actually don't have lt_start, lt_end, nullptr, ut_end, but we still keep this
-              if constexpr (Has_lt_end) {
-                if (row_idx >= s_lt_start[col_idx] && row_idx < s_lt_end[col_idx])
-                    tSrS_rowcol(m, n) = -INFINITY;
-                if (row_idx < s_ut_end[col_idx])
-                    tSrS_rowcol(m, n) = -INFINITY;
-              } else {
+              // Note(heqianyue): we don't have lt_start, lt_end, nullptr and ut_end composition, maybe in the future
+              
                 if (row_idx >= s_lt_start[col_idx])
                     tSrS_rowcol(m, n) = -INFINITY;
                 if (row_idx < s_ut_end[col_idx])
                     tSrS_rowcol(m, n) = -INFINITY;
-              }
             }
           }
         }

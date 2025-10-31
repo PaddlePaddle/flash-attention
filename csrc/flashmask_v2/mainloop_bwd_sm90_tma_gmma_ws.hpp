@@ -531,7 +531,11 @@ struct CollectiveMainloopBwdSm90 {
 
         if (thread_idx < kBlockN) {
             flashmask_index_smem_[thread_idx] = in_range ? params.lt_start_ptr[thread_idx + row_offset] : INT_MAX;
-            flashmask_index_smem_[thread_idx + kBlockN] = in_range ? (Has_lt_end ? params.lt_end_ptr[thread_idx + row_offset] : INT_MAX) : INT_MAX;
+            if constexpr (Has_lt_end) {
+                flashmask_index_smem_[thread_idx + kBlockN] = in_range ? (Has_lt_end ? params.lt_end_ptr[thread_idx + row_offset] : INT_MAX) : INT_MAX;
+            } else {
+                flashmask_index_smem_[thread_idx + kBlockN] = INT_MAX;
+            }
             if constexpr (!Is_causal) {
                 // Note(heqianyue): make sure that `Is_causal` masks are actually causal (no unmasked elements on upper triangle)
                 if constexpr (Has_ut_start) {

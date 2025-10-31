@@ -530,10 +530,16 @@ struct CollectiveMainloopBwdSm90 {
         // Note(xhy): kBlockN in fa3 is always less than 128
 
         if (thread_idx < kBlockN) {
-            flashmask_index_smem_[thread_idx] = in_range ? params.lt_start_ptr[thread_idx + row_offset] : INT_MIN;
+            flashmask_index_smem_[thread_idx] = in_range ? params.lt_start_ptr[thread_idx + row_offset] : INT_MAX;
             flashmask_index_smem_[thread_idx + kBlockN] = in_range ? (Has_lt_end ? params.lt_end_ptr[thread_idx + row_offset] : INT_MAX) : INT_MAX;
-            flashmask_index_smem_[thread_idx + 2 * kBlockN] = in_range ? (Has_ut_start ? params.ut_start_ptr[thread_idx + row_offset] : (Is_causal ? INT_MAX : INT_MIN)) : INT_MIN;            
-            flashmask_index_smem_[thread_idx + 3 * kBlockN] = in_range ? (Is_causal ? (Has_ut_start ? INT_MAX : INT_MIN) : params.ut_end_ptr[thread_idx + row_offset]) : INT_MAX;     
+            if constexpr (!Is_causal) {
+                // Note(heqianyue): make sure that `Is_causal` masks are actually causal (no unmasked elements on upper triangle)
+                if constexpr (Has_ut_start) {
+                    flashmask_index_smem_[thread_idx + 2 * kBlockN] = in_range ? params.ut_start_ptr[thread_idx + row_offset] : INT_MAX;
+                }
+                // if causal, Has_ut_start won't be true, so if 'Is_causal' == true, ut_end loading and int branching can be skipped in its entirity
+                flashmask_index_smem_[thread_idx + 3 * kBlockN] = in_range ? params.ut_end_ptr[thread_idx + row_offset] : INT_MIN;
+            }
         }
 
         // if(thread_idx < kBlockN) if(bidb ==1 and bidh == 0) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, ut_end_flashmask_index_smem_%d: %d\n", thread_idx,bidb,bidh,n_block,thread_idx + row_offset-seqlen,thread_idx,flashmask_index_smem_[thread_idx + 3 * kBlockN]);
@@ -1077,7 +1083,8 @@ struct CollectiveMainloopBwdSm90 {
             // dtanh needs to happen before masking, otherwise we get 1 - (-inf)^2 = NaN in the dtanh
             auto dtanh = [&] { if constexpr (Has_softcap) return flash::calculate_dtanh(scores); else return nullptr; }();
             mask_fn(tSrS, m_block);
-            if(partially_masked) flash::apply_flashmask_bwd<TiledMmaSdP, kBlockM, kBlockN, SdP_swapAB>(tSrS, thread_idx, flashmask_index_smem_, m_block);
+            if(partially_masked) flash::apply_flashmask_bwd<TiledMmaSdP, kBlockM, kBlockN, SdP_swapAB,
+                        Has_lt_end, Has_ut_start, Is_causal>(tSrS, thread_idx, flashmask_index_smem_, m_block);
             #pragma unroll
             for (int mi = 0; mi < size<0>(scores); ++mi) {
                 float const lse_scaled = [&] {
@@ -1242,13 +1249,13 @@ struct CollectiveMainloopBwdSm90 {
                 CUTLASS_PRAGMA_NO_UNROLL
                 for (; m_block < loop_end; m_block++) {
                     // if(threadIdx.x == 128) printf("consumer0 m_block,n_block: %d, %d\n", m_block,n_block);
-                    bwd_step(m_block, mask_fn, false,flashmask_index_smem_);
+                    bwd_step(m_block, mask_fn, false, flashmask_index_smem_);
                 }
                 loop_end = flashmask_mem_[4]/*ut_start_nblockmax*/;
                 CUTLASS_PRAGMA_NO_UNROLL
                 for (; m_block <= loop_end; ++m_block) {
                     // if(threadIdx.x == 128) printf("consumer0 m_block,n_block: %d, %d\n", m_block,n_block);
-                    bwd_step(m_block,mask_fn,true,flashmask_index_smem_);
+                    bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
                 }
             }
             m_block = std::max(m_block, flashmask_mem_[7]/*ut_end_nblockmin*/); 

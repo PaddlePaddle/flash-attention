@@ -1088,7 +1088,7 @@ struct CollectiveMainloopBwdSm90 {
             auto dtanh = [&] { if constexpr (Has_softcap) return flash::calculate_dtanh(scores); else return nullptr; }();
             mask_fn(tSrS, m_block);
             if(partially_masked) flash::apply_flashmask_bwd<TiledMmaSdP, kBlockM, kBlockN, SdP_swapAB,
-                        Has_lt_end, Has_ut_start, Is_causal>(tSrS, thread_idx, flashmask_index_smem_, m_block);
+                        Has_ut_start, Is_causal>(tSrS, thread_idx, flashmask_index_smem_, m_block);
             #pragma unroll
             for (int mi = 0; mi < size<0>(scores); ++mi) {
                 float const lse_scaled = [&] {

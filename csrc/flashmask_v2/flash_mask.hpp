@@ -6,7 +6,7 @@
 
 namespace flash {
 
-  template <typename TiledMma, int kBlockM, int kBlockN, bool SwapAB, bool Has_lt_end, bool Has_ut_start, bool Is_causal, typename Engine, typename Layout>
+  template <typename TiledMma, int kBlockM, int kBlockN, bool SwapAB, bool Has_ut_start, bool Is_causal, typename Engine, typename Layout>
   // CUTLASS_DEVICE
   __device__
   void apply_flashmask_bwd(Tensor<Engine, Layout> &tSrS, int const thread_idx, const int32_t* const __restrict__ flashmask_index_smem_, const int32_t m_block) {
@@ -39,7 +39,13 @@ namespace flash {
 
           // Note(heqianyue): causal masking will be processed in generic fa-v3 `mask.apply`, so if causal, there is no need to apply mask again
           if constexpr (Is_causal) {
-            if (row_idx >= s_lt_start[col_idx] && (Has_lt_end || row_idx < s_lt_end[col_idx]))
+            // Note(heqianyue): if Has_lt_end == false, row_idx < s_lt_end[col_idx] is entirely unnecessary, but if we just
+            // throw it away, for sliding window and document mask, we might have about 3% performance loss
+            // due to if both predicates are present, some of the FSEL instructions are selectively performed
+            // instead of performed unconditionally. Through removing the latter predicate can save a lot of
+            // instructions (193 --> 99), we will actually store more / use more regs. This is basically a 
+            // trade-off for speed and no performance recession
+            if (row_idx >= s_lt_start[col_idx] && row_idx < s_lt_end[col_idx])
                 tSrS_rowcol(m, n) = -INFINITY;
           } else {
             if constexpr (Has_ut_start) {
@@ -51,11 +57,10 @@ namespace flash {
                   tSrS_rowcol(m, n) = -INFINITY;
             } else {
               // Note(heqianyue): we don't have lt_start, lt_end, nullptr and ut_end composition, maybe in the future
-              
-                if (row_idx >= s_lt_start[col_idx])
-                    tSrS_rowcol(m, n) = -INFINITY;
-                if (row_idx < s_ut_end[col_idx])
-                    tSrS_rowcol(m, n) = -INFINITY;
+              if (row_idx >= s_lt_start[col_idx])
+                  tSrS_rowcol(m, n) = -INFINITY;
+              if (row_idx < s_ut_end[col_idx])
+                  tSrS_rowcol(m, n) = -INFINITY;
             }
           }
         }

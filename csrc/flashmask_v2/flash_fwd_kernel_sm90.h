@@ -310,12 +310,11 @@ public:
               const int cppl_stage = scheduler.template stage<true>();      // coarse pipeline stage (offset, 0 or 2)
 
 #define GEN_N_BLOCK_DISPATCH(DispatchTag)                                                                                                                       \
-              valid_chunk = mainloop.generate_n_block<DispatchTag>(params.mainloop,                                                                             \
-                            seqlen_info,                                                                                                                        \
-                            block_coord,                                                                                                                        \
+              valid_chunk = mainloop.generate_n_block<DispatchTag>(get<0>(block_coord),                                                                         \
                             reverse_chunk_idx,                                                                                                                  \
                             num_chunk,                                                                                                                          \
                             reverse_chunk_idx == num_chunk - 1 ? CollectiveMainloop::Flashmask_n_block_finish : CollectiveMainloop::Flashmask_n_block_chunk_end,\
+                            n_block_min, n_block_max, seqlen_info.seqlen_q,                                                                                     \
                             flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),        \
                             n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),                     \
                             extra_flags + n_block_pipe_write.index() + cppl_stage)

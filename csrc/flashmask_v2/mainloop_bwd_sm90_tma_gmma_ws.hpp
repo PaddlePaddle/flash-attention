@@ -489,89 +489,76 @@ struct CollectiveMainloopBwdSm90 {
         cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
     }
 
-    // CUTLASS_DEVICE
-    // void cp_int32_async(int32_t const * const src_ptr, int32_t * des_ptr,int32_t const& n_block,int32_t default_value){
-    //     if(src_ptr != nullptr){
-    //       asm volatile(
-    //         "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
-    //           ::"r"(cutlass::arch::cutlass_get_smem_pointer(des_ptr)),
-    //             "l"(src_ptr + n_block),
-    //             "n"(4));
-    //       asm volatile("cp.async.commit_group;\n" ::);
-    //       asm volatile("cp.async.wait_group 0;\n" ::);
-    //       prin
-    //     }else{
-    //         des_ptr[0] = default_value;
-    //     }
-    // }
 
     CUTLASS_DEVICE
-    void load_n_block_info( int32_t *  fm_mem, int32_t * flashmask_index_smem_,cute::tuple<int32_t, int32_t, int32_t> block_coord, Params const& params){
+    void load_n_block_info( int32_t *  fm_mem, int32_t * flashmask_index_smem_, cute::tuple<int32_t, int32_t, int32_t> block_coord, Params const& params) {
         auto [n_block, bidh, bidb] = block_coord;
         int const seqlen = get<0>(params.shape_K);
         int const thread_idx = threadIdx.x;
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        int bh_offset = bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio;
-        int n_block_seqlen = ((seqlen + kBlockN - 1) / kBlockN + 3) / 4 * 4;
-        int bh_offset_block = bh_offset * n_block_seqlen;
+        int const bh_offset = bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio;
+        int const n_block_seqlen = ((seqlen + kBlockN - 1) / kBlockN + 3) & 0xfffffffc;       // / 4 * 4
+        int const bh_offset_block = bh_offset * n_block_seqlen;
+
         if(thread_idx == 0){
-            fm_mem[0] = params.lt_start_nblockmax == nullptr ? INT_MAX : params.lt_start_nblockmax[bh_offset_block + n_block];
-            fm_mem[1] = params.lt_start_nblockmin == nullptr ? INT_MIN : params.lt_start_nblockmin[bh_offset_block + n_block];
+            // lt_start is always valid, otherwise this is not a valid flashmask computation instance
+            fm_mem[0] = (params.lt_start_nblockmax[bh_offset_block + n_block] - 1) / kBlockM;
+            fm_mem[1] = params.lt_start_nblockmin[bh_offset_block + n_block] / kBlockM;
             // if(bidb ==1 and bidh == 0) printf("params.lt_start_nblockmax: %d, params.lt_start_nblockmin: %d ,n_block: %d\n", fm_mem[0], fm_mem[1], n_block);
-            fm_mem[2] = params.lt_end_nblockmax == nullptr ? INT_MAX : params.lt_end_nblockmax[bh_offset_block + n_block];
-            fm_mem[3] = params.lt_end_nblockmin == nullptr ? INT_MIN : params.lt_end_nblockmin[bh_offset_block + n_block];
-            fm_mem[4] = params.ut_start_nblockmax == nullptr ? INT_MAX : params.ut_start_nblockmax[bh_offset_block + n_block];
-            fm_mem[5] = params.ut_start_nblockmin == nullptr ? INT_MIN : params.ut_start_nblockmin[bh_offset_block + n_block];
-            fm_mem[6] = params.ut_end_nblockmax == nullptr ? INT_MAX : params.ut_end_nblockmax[bh_offset_block + n_block];
-            fm_mem[7] = params.ut_end_nblockmin == nullptr ? INT_MIN : params.ut_end_nblockmin[bh_offset_block + n_block];
+            if constexpr (Has_lt_end) {
+                fm_mem[2] = (params.lt_end_nblockmax[bh_offset_block + n_block] - 1) / kBlockM;
+                fm_mem[3] = params.lt_end_nblockmin[bh_offset_block + n_block] / kBlockM;
+            }
+            if constexpr (Has_ut_start) {
+                fm_mem[4] = (params.ut_start_nblockmax[bh_offset_block + n_block] - 1) / kBlockM;
+                fm_mem[5] = params.ut_start_nblockmin[bh_offset_block + n_block] / kBlockM;
+            }
+            if constexpr (!Is_causal) {
+                fm_mem[6] = (params.ut_end_nblockmax[bh_offset_block + n_block] - 1) / kBlockM;
+                fm_mem[7] = params.ut_end_nblockmin[bh_offset_block + n_block] / kBlockM;
+            }
             // if(bidb ==1 and bidh == 0) printf("params.ut_end_nblockmax: %d, params.ut_end_nblockmin: %d ,n_block: %d\n", fm_mem[6], fm_mem[7], n_block);
             // printf("bidh: %d, bidb: %d, n_block: %d\n", bidh, bidb, n_block);
             // printf("params.h_flashmask: %d, params.h_h_flashmask_ratio: %d,get<0>(params.shape_Q): %d", params.h_flashmask, params.h_h_flashmask_ratio, get<0>(params.shape_Q));
             // int row_offset1 = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen + n_block * kBlockN;
             // printf("row_offset: %d",row_offset1);
         }
-        int row_offset = bh_offset * seqlen + n_block * kBlockN;
+        int const row_offset = bh_offset * seqlen + n_block * kBlockN;
         // if(thread_idx == 0 and n_block == 0) printf("row_offset: %d, bidb: %d,h_flashmask: %d, h_h_flashmask_ratio: %d\n",row_offset,bidb,params.h_flashmask,params.h_h_flashmask_ratio);
-        bool is_oob = n_block * kBlockN + thread_idx >= seqlen;
-        //xhy:kBlockN in fa3 is always less than 128
-        if(thread_idx < kBlockN) flashmask_index_smem_[thread_idx] = is_oob ? INT_MIN : (params.lt_start_ptr == nullptr ? (params.lt_end_ptr == nullptr ? INT_MAX :INT_MIN) :params.lt_start_ptr[thread_idx + row_offset]);
-        // if(thread_idx < kBlockN) if(bidb ==1 and bidh == 0) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, lt_start_flashmask_index_smem_%d: %d\n", thread_idx,bidb,bidh,n_block,thread_idx + row_offset-seqlen,thread_idx,flashmask_index_smem_[thread_idx]);
-        if(thread_idx < kBlockN) flashmask_index_smem_[thread_idx + kBlockN] = is_oob ? INT_MAX : (params.lt_end_ptr == nullptr ? (params.lt_start_ptr == nullptr? INT_MIN :INT_MAX): params.lt_end_ptr[thread_idx + row_offset]);
-        if(thread_idx < kBlockN) flashmask_index_smem_[thread_idx + 2 * kBlockN] = is_oob ? INT_MIN : (params.ut_start_ptr == nullptr ? (params.ut_end_ptr == nullptr ? INT_MAX :INT_MIN) : params.ut_start_ptr[thread_idx + row_offset]);
-        if(thread_idx < kBlockN) flashmask_index_smem_[thread_idx + 3 * kBlockN] = is_oob ? INT_MAX : (params.ut_end_ptr == nullptr ? (params.ut_start_ptr == nullptr? INT_MIN :INT_MAX) : params.ut_end_ptr[thread_idx + row_offset]);
+        const bool in_range = n_block * kBlockN + thread_idx < seqlen;
+        // Note(xhy): kBlockN in fa3 is always less than 128
+
+        if (thread_idx < kBlockN) {
+            flashmask_index_smem_[thread_idx] = in_range ? params.lt_start_ptr[thread_idx + row_offset] : INT_MAX;
+            if constexpr (Has_lt_end) {
+                flashmask_index_smem_[thread_idx + kBlockN] = in_range ? (Has_lt_end ? params.lt_end_ptr[thread_idx + row_offset] : INT_MAX) : INT_MAX;
+            } else {
+                flashmask_index_smem_[thread_idx + kBlockN] = INT_MAX;
+            }
+            if constexpr (!Is_causal) {
+                // Note(heqianyue): make sure that `Is_causal` masks are actually causal (no unmasked elements on upper triangle)
+                if constexpr (Has_ut_start) {
+                    flashmask_index_smem_[thread_idx + 2 * kBlockN] = in_range ? params.ut_start_ptr[thread_idx + row_offset] : INT_MAX;
+                }
+                // if causal, Has_ut_start won't be true, so if 'Is_causal' == true, ut_end loading and int branching can be skipped in its entirity
+                flashmask_index_smem_[thread_idx + 3 * kBlockN] = in_range ? params.ut_end_ptr[thread_idx + row_offset] : INT_MIN;
+            }
+        }
+
         // if(thread_idx < kBlockN) if(bidb ==1 and bidh == 0) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, ut_end_flashmask_index_smem_%d: %d\n", thread_idx,bidb,bidh,n_block,thread_idx + row_offset-seqlen,thread_idx,flashmask_index_smem_[thread_idx + 3 * kBlockN]);
             // if(bidb ==0 and (bidh == 0 or bidh == 2) and n_block * kBlockN + i < seqlen and params.ut_end_ptr != nullptr) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, ut_end_flashmask_index_smem_%d: %d, params.ut_end_ptr_val: %d, params.ut_end_ptr_ptr: %p\n", thread_idx,bidb,bidh,n_block,row_offset,i,flashmask_index_smem_[i + 3 * kBlockN],params.ut_end_ptr[i + row_offset],params.ut_end_ptr + i + row_offset);
         cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskProducer) /*id*/);
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskFull) /*id*/);
-        // printf("pass\n");
     }
 
-    CUTLASS_DEVICE
-    void release_n_block_info() {
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskEmpty) /*id*/);
-    }
-
-    CUTLASS_DEVICE
-    void wait_for_load_n_block_info(){
-        cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskFull) /*id*/);
-    }
-
-
-    CUTLASS_DEVICE
-    void wait_for_release_n_block_info() {
-        cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskEmpty) /*id*/);
-    }
-
-    template <typename SchedulerPrefetch, typename SharedStorage>
+    template <typename SharedStorage>
     CUTLASS_DEVICE void
     load(Params const& params,
          MainloopPipeline pipeline_q,
          MainloopPipeline_dO pipeline_do,
-        //  MainloopPipeline_flashmask pipeline_flashmask,
          PipelineState& smem_pipe_write,
          PipelineState_dO& smem_pipe_write_do,
          SharedStorage &shared_storage,
-         SchedulerPrefetch const& scheduler_prefetch,
          cute::tuple<int32_t, int32_t, int32_t> block_coord,
          int32_t const * const flashmask_mem_
          ) {
@@ -587,7 +574,6 @@ struct CollectiveMainloopBwdSm90 {
         // It's possible to have m_block_max <= m_block_min. Loading Q, K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) {
-                scheduler_prefetch();
                 return;
             }
         }
@@ -687,11 +673,6 @@ struct CollectiveMainloopBwdSm90 {
                 copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
                      tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
 
-                // printf("sdo:\n");
-                // cute::print_tensor(sdO);
-                // printf("\n");
-                // __syncthreads();
-
                 copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
                      gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
                 if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
@@ -700,34 +681,32 @@ struct CollectiveMainloopBwdSm90 {
             int loop_end = m_block_max;
             if constexpr(!Is_causal){
                 if constexpr (Has_ut_start) {
-                    loop_end = (flashmask_mem_[4] -1)/kBlockM ;
+                    loop_end = flashmask_mem_[4];
                     #pragma unroll (kHeadDim < 256 ? 2 : 1)
-                    for (; m_block <= loop_end;++m_block) {
+                    for (; m_block <= loop_end; ++m_block) {
                         process_block(m_block);
                     }
                 }
-                m_block = std::max(m_block,flashmask_mem_[7] /kBlockM); 
+                m_block = std::max(m_block, flashmask_mem_[7]); 
             } 
-            loop_end = std::min(m_block_max-1,(flashmask_mem_[0] -1)/ kBlockM);
+            loop_end = std::min(m_block_max - 1, flashmask_mem_[0]);
             // printf("flashmask_mem_0,lt_start_nblockmax,n_block: %d, %d, %d\n", flashmask_mem_[0],params.lt_start_nblockmax[n_block],n_block);
             // printf("loop_end: %d\n", loop_end);
             #pragma unroll (kHeadDim < 256 ? 2 : 1)
-            for (; m_block <= loop_end;++m_block) {
+            for (; m_block <= loop_end; ++m_block) {
                 // printf("m_block: %d\n", m_block);
                 // printf("producer0 m_block,n_block: %d, %d\n", m_block,n_block);
                 process_block(m_block);
             } 
             if constexpr (Has_lt_end) {
-                m_block = std::max(m_block,flashmask_mem_[3]/kBlockM);      
+                m_block = std::max(m_block, flashmask_mem_[3]);      
                 #pragma unroll (kHeadDim < 256 ? 2 : 1)
-                for (; m_block <= m_block_max-1;++m_block) {
+                for (; m_block <= m_block_max - 1; ++m_block) {
                     // printf("producer1 m_block,n_block: %d, %d\n", m_block,n_block);
                     process_block(m_block);
                 }    
             }
         }
-        scheduler_prefetch(); //xiehaoyang: add sync?
-//         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::Flashmask) /*id*/);
         if constexpr (Q_dO_same_stages) { smem_pipe_write_do = smem_pipe_write; }
     }
 
@@ -821,9 +800,9 @@ struct CollectiveMainloopBwdSm90 {
 		int loop_end = m_block_max;
         if constexpr(!Is_causal){
             if constexpr (Has_ut_start) {
-                loop_end = (flashmask_mem_[4] -1)/kBlockM ;
+                loop_end = flashmask_mem_[4];
                 #pragma unroll 2
-                for (; m_block <= loop_end;++m_block) {
+                for (; m_block <= loop_end; ++m_block) {
                     if constexpr (Deterministic) {
                         Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
                     }
@@ -846,6 +825,7 @@ struct CollectiveMainloopBwdSm90 {
                     }
                 }
             }
+
         	if constexpr (Deterministic) {
                 int cur_m_block = m_block;
                 m_block = std::max(m_block,flashmask_mem_[7] /kBlockM); 
@@ -861,8 +841,9 @@ struct CollectiveMainloopBwdSm90 {
             }
 		} 
         loop_end = std::min(m_block_max-1,(flashmask_mem_[0] -1 )/ kBlockM);
+
         #pragma unroll 2
-        for (; m_block <= loop_end;++m_block) {
+        for (; m_block <= loop_end; ++m_block) {
             if constexpr (Deterministic) {
                 Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
             }
@@ -898,9 +879,9 @@ struct CollectiveMainloopBwdSm90 {
             m_block = std::max(m_block,(flashmask_mem_[3]+1)/kBlockM); 
         } 
         if constexpr (Has_lt_end) {
-            m_block = std::max(m_block,(flashmask_mem_[3]+1)/kBlockM);      
+            m_block = std::max(m_block, flashmask_mem_[3]);      
             #pragma unroll 2
-            for (; m_block <= m_block_max-1;++m_block) {
+            for (; m_block < m_block_max; ++m_block) {
                 if constexpr (Deterministic) {
                     Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
                 }
@@ -935,7 +916,6 @@ struct CollectiveMainloopBwdSm90 {
 
     CUTLASS_DEVICE void
     mma_init() {
-        // We're not currently using this bc we're not using persistent scheduler
         // // Tell producer (warp 0) that smem_k and smem_v are ready
         // cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
@@ -957,13 +937,13 @@ struct CollectiveMainloopBwdSm90 {
         PipelineState_dO& smem_pipe_read_do,
         FrgTensordKV& tdKrdK,
         FrgTensordKV& tdVrdV,
-        int thread_idx,
-        int &work_idx,
+        int const thread_idx,
+        int const binary_work_idx,
         cute::tuple<int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage,
-        int32_t const * flashmask_mem_,
-        int32_t const * flashmask_index_smem_
-        ) {
+        const int32_t* const __restrict__ flashmask_mem_,
+        const int32_t* const __restrict__ flashmask_index_smem_
+    ) {
         static_assert(is_rmem<FrgTensordKV>::value, "dK and dV tensor must be rmem resident.");
 
         int n_block = get<0>(block_coord);
@@ -980,7 +960,7 @@ struct CollectiveMainloopBwdSm90 {
             if (m_block_max <= m_block_min) { return false; }
         }
 
-    //    printf("enter consumer threadidx:%d", threadIdx.x);
+        // printf("enter consumer threadidx:%d", threadIdx.x);
         // cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<uint32_t>(BwdNamedBarriers::Flashmask) /*id*/);
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
@@ -1101,8 +1081,8 @@ struct CollectiveMainloopBwdSm90 {
         clear(tdVrdV);
         // tiled_mma_dKV.accumulate_ = GMMA::ScaleOut::Zero;
 
-        cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.pipelines.barrier_KV.try_wait(work_idx % 2));
-        if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.pipelines.barrier_KV.wait(work_idx % 2); }
+        cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.pipelines.barrier_KV.try_wait(binary_work_idx));
+        if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.pipelines.barrier_KV.wait(binary_work_idx); }
 
         if constexpr (Mma_dP_is_RS) {
             using SmemCopyAtomV = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
@@ -1113,7 +1093,7 @@ struct CollectiveMainloopBwdSm90 {
             cute::copy(smem_tiled_copy_V, tdPsV_copy_view, tdPrV_copy_view);
         }
 
-        auto bwd_step = [&](int m_block, auto mask_fn, bool partially_masked, int32_t const * flashmask_index_smem_) {
+        auto bwd_step = [&](int m_block, auto mask_fn, bool partially_masked, const int32_t* const flashmask_index_smem_) {
             Tensor tSrS = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
             consumer_wait(pipeline_q, smem_pipe_read);
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/SdP_swapAB>(tiled_mma_SdP, tSrQ(_, _, _, smem_pipe_read.index()), tSrK, tSrS);
@@ -1124,7 +1104,7 @@ struct CollectiveMainloopBwdSm90 {
                 #pragma unroll
                 for (int i = 0; i < kStatsPerThread; ++i) {
                     // It's ok to read OOB, since we made sure sLSE is large enough and we won't use the OOB values
-                    tLSErLSE(i) = tLSEsLSE((thread_idx % 32) / 4 + i * 8, smem_pipe_read.index());
+                    tLSErLSE(i) = tLSEsLSE((thread_idx & 31) / 4 + i * 8, smem_pipe_read.index());
                 }
             }
             Tensor tdPrdP = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
@@ -1140,12 +1120,13 @@ struct CollectiveMainloopBwdSm90 {
             // dtanh needs to happen before masking, otherwise we get 1 - (-inf)^2 = NaN in the dtanh
             auto dtanh = [&] { if constexpr (Has_softcap) return flash::calculate_dtanh(scores); else return nullptr; }();
             mask_fn(tSrS, m_block);
-            if(partially_masked) flash::apply_flashmask_bwd<TiledMmaSdP,kBlockM,kBlockN,SdP_swapAB>(tSrS,thread_idx,flashmask_index_smem_,m_block);
+            if(partially_masked) flash::apply_flashmask_bwd<TiledMmaSdP, kBlockM, kBlockN, SdP_swapAB,
+                        Has_ut_start, Is_causal>(tSrS, thread_idx, flashmask_index_smem_, m_block);
             #pragma unroll
             for (int mi = 0; mi < size<0>(scores); ++mi) {
                 float const lse_scaled = [&] {
                     if constexpr (!ShuffleLSE) return tLSErLSE(mi);
-                    else return __shfl_sync(0xffffffff, tLSErLSE(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
+                    else return __shfl_sync(0xffffffff, tLSErLSE(mi >> 3), (mi & 7) * 4 + (thread_idx & 3));
                 }();
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(scores); ++ni) {
@@ -1161,7 +1142,7 @@ struct CollectiveMainloopBwdSm90 {
             } else {
                 #pragma unroll
                 for (int i = 0; i < kStatsPerThread; ++i) {
-                    tLSErdPsum(i) = tLSEsdPsum((thread_idx % 32) / 4 + i * 8, smem_pipe_read_do_cur.index());
+                    tLSErdPsum(i) = tLSEsdPsum((thread_idx & 31) / 4 + i * 8, smem_pipe_read_do_cur.index());
                 }
             }
 
@@ -1172,7 +1153,7 @@ struct CollectiveMainloopBwdSm90 {
             for (int mi = 0; mi < size<0>(dS); ++mi) {
                 float const dP_sum_cur = [&] {
                     if constexpr (!ShuffledPsum) return tLSErdPsum(mi);
-                    else return __shfl_sync(0xffffffff, tLSErdPsum(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
+                    else return __shfl_sync(0xffffffff, tLSErdPsum(mi >> 3), (mi & 7) * 4 + (thread_idx & 3));
                 }();
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(dS); ++ni) {
@@ -1281,7 +1262,7 @@ struct CollectiveMainloopBwdSm90 {
 
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/0, /*SwapAB=*/dQ_swapAB, /*M_slice=*/1>(tiled_mma_dQ, tdQrdS_cur, tdQrK, tdQrdQ);
                 #pragma unroll
-                for (int i = size(tdQrdQ_atomic) / 2;  i < size(tdQrdQ_atomic); ++i) { atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i)); }
+                for (int i = size(tdQrdQ_atomic) / 2; i < size(tdQrdQ_atomic); ++i) { atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i)); }
 
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/-1, /*SwapAB=*/dKV_swapAB, /*M_slice=*/1>(tiled_mma_dKV, tdKrdS_cur, tdKrQ(_, _, _, smem_pipe_read.index()), tdKrdK);
             }
@@ -1301,44 +1282,44 @@ struct CollectiveMainloopBwdSm90 {
         int loop_end = m_block_max;
         if constexpr(!Is_causal){
             if constexpr (Has_ut_start) {
-                loop_end = std::min(flashmask_mem_[5]/*ut_start_nblockmin*/ / kBlockM,m_block_max);
+                loop_end = std::min(flashmask_mem_[5]/*ut_start_nblockmin*/, m_block_max);
                 CUTLASS_PRAGMA_NO_UNROLL
                 for (; m_block < loop_end; m_block++) {
                     // if(threadIdx.x == 128) printf("consumer0 m_block,n_block: %d, %d\n", m_block,n_block);
-                    bwd_step(m_block, mask_fn, false,flashmask_index_smem_);
+                    bwd_step(m_block, mask_fn, false, flashmask_index_smem_);
                 }
-                loop_end = (flashmask_mem_[4]/*ut_start_nblockmax*/ -1)/ kBlockM ;
+                loop_end = flashmask_mem_[4]/*ut_start_nblockmax*/;
                 CUTLASS_PRAGMA_NO_UNROLL
-                for (; m_block <= loop_end;++m_block) {
+                for (; m_block <= loop_end; ++m_block) {
                     // if(threadIdx.x == 128) printf("consumer0 m_block,n_block: %d, %d\n", m_block,n_block);
-                    bwd_step(m_block,mask_fn,true,flashmask_index_smem_);
+                    bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
                 }
             }
-            m_block = std::max(m_block,flashmask_mem_[7]/*ut_end_nblockmin*/ / kBlockM); 
-            loop_end = std::min((flashmask_mem_[6]/*ut_end_nblockmax*/-1) / kBlockM, m_block_max-1);
+            m_block = std::max(m_block, flashmask_mem_[7]/*ut_end_nblockmin*/); 
+            loop_end = std::min(flashmask_mem_[6]/*ut_end_nblockmax*/, m_block_max - 1);
             CUTLASS_PRAGMA_NO_UNROLL
             for (; m_block <= loop_end; m_block++) {
                 // if(threadIdx.x == 128) printf("consumer-u-2 m_block,n_block,m_block_max,flashmask_mem_[2]: %d, %d, %d,%d\n", m_block,n_block,m_block_max,flashmask_mem_[6]);
                 bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
             }
         } 
-       loop_end = std::min(flashmask_mem_[1]/*lt_start_nblockmin*/ / kBlockM,m_block_max);
+       loop_end = std::min(flashmask_mem_[1]/*lt_start_nblockmin*/, m_block_max);
         CUTLASS_PRAGMA_NO_UNROLL
         for (; m_block < loop_end; m_block++) {
             // if(threadIdx.x == 128) printf("consumer-l-0 m_block,n_block: %d, %d\n", m_block,n_block);
             bwd_step(m_block, mask_fn, false, flashmask_index_smem_);
         }
         //partial_maskloop_end
-        loop_end = std::min(m_block_max-1,(flashmask_mem_[0]/*lt_start_nblockmax*/ -1 )/ kBlockM);
+        loop_end = std::min(m_block_max - 1, flashmask_mem_[0]/*lt_start_nblockmax*/);
         CUTLASS_PRAGMA_NO_UNROLL
         for (; m_block <= loop_end; m_block++) {
             // if(threadIdx.x == 128) printf("consumer-l-1 m_block,n_block, flashmask_mem_[0]: %d, %d, %d\n", m_block,n_block,flashmask_mem_[0]);
             bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
         }
         if constexpr (Has_lt_end) {
-            m_block = std::max(m_block,flashmask_mem_[3]/*lt_end_nblockmin*/ / kBlockM);  
+            m_block = std::max(m_block, flashmask_mem_[3]/*lt_end_nblockmin*/);  
             //partial_maskloop_end
-            loop_end = std::min((flashmask_mem_[2]/*lt_end_nblockmax*/-1) / kBlockM, m_block_max-1);
+            loop_end = std::min(flashmask_mem_[2]/*lt_end_nblockmax*/, m_block_max - 1);
             CUTLASS_PRAGMA_NO_UNROLL
             for (; m_block <= loop_end; m_block++) {
                 // if(threadIdx.x == 128) printf("consumer2 m_block,n_block,m_block_max,flashmask_mem_[2]: %d, %d, %d,%d\n", m_block,n_block,m_block_max,flashmask_mem_[2]);
@@ -1354,7 +1335,6 @@ struct CollectiveMainloopBwdSm90 {
         for (int i = 0; i < size(tdKrdK); ++i) { tdKrdK(i) *= params.softmax_scale; }
 
         if constexpr (Q_dO_same_stages) { smem_pipe_read_do = smem_pipe_read; }
-        ++work_idx;
         return true;
     }
 

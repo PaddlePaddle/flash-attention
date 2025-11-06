@@ -699,8 +699,20 @@ struct CollectiveMainloopFwdSm90 {
         int32_t bidh = get<1>(block_coord);
         int32_t bidb = get<2>(block_coord);
         // pad for fully 128B aligned load
-        int32_t m_block = get<0>(block_coord);
-        const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc;
+
+        // Note(heqianyue): compute the part that actually needs loading and computation for causal masks
+        const int nblock_seqlen = [&] {
+            if constexpr (Is_causal) {
+                const int m_block = get<0>(block_coord);
+                // Warn(heqianyue): abs_coord might be greater than unpadded nblock_seqlen (this is mathematically prove-able) 
+                // but we don't need to clip to nblock_seqlen, since loading invalid data is fine, we can choose not to use it
+                // (mblock_id + 1) * kBlockM + diff_seqlen is the block ID of the rightmost valid block in causal, so + 1 for length
+                const int valid_nblock_seqlen = ((m_block + 1) * kBlockM + seqlen_info.seqlen_k - seqlen_info.seqlen_q) / kBlockN + 1;
+                return (valid_nblock_seqlen + 3) & 0xfffffffc;
+            } else {    // original nblock_seqlen
+                return ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc;
+            }
+        } ();
 
         // change this to num_chunk * chunk_size (should be Flashmask_n_block_buffer_length)
         const int chunks_size = total_num_chunks * Flashmask_n_block_buffer_length;
@@ -818,7 +830,9 @@ struct CollectiveMainloopFwdSm90 {
                      int32_t const end_flag,
                      int32_t const n_block_min,
                      int32_t const n_block_max,
+                     int32_t const nblock_seqlen,
                      int32_t const seqlen_q,
+                     int32_t const seqlen_k,
                      int32_t* const __restrict__ flashmask_maxmin_smem,
                      int32_t* const __restrict__ mask_encode_n_block_smem_,
                      int32_t* const __restrict__ extra_flags,
@@ -870,6 +884,19 @@ struct CollectiveMainloopFwdSm90 {
       int32_t valid_n_block_num = 0;
 
       const int32_t base_offset = (total_num_chunks - 1 - reverse_chunk_idx) * Flashmask_n_block_buffer_valid_length;
+      constexpr int valid_buffer_length = Flashmask_n_block_buffer_valid_length;
+      const int nblock_start = [&]() {
+        if constexpr (Is_causal) {
+            // Warn(heqianyue): abs_coord might be greater than unpadded nblock_seqlen (this is mathematically prove-able) 
+            // in order not to load invalid data (or even OOR, which is highly not possible), we clip it to nblock_seqlen
+            const int abs_coord = std::min(((m_block + 1) * kBlockM + seqlen_k - seqlen_q) / kBlockN, nblock_seqlen - 1);
+            return std::min(abs_coord - base_offset + 1, valid_buffer_length);
+        } else {
+            // Note(heqianyue): even for non-causal masks, we can skip some of the computation, for example:
+            // since buffer is 16k, if seqlen is 8k, we can skip 50% of the computation here, legit save!
+            return std::min(valid_buffer_length, nblock_seqlen);
+        }
+      } ();
 
       // explanation for the loop condition:
       // -2, -1,  0,  1,  2
@@ -879,8 +906,8 @@ struct CollectiveMainloopFwdSm90 {
       // Note(heqianyue): ute/lte will be seqlen_q (at most). Yet if m_block_e > seqlen_q, even if ute/lte are seqlen_q (masked to the end)
       // we will still consider the block as partially masked, adding unnecessary computation for those fully-masked blocks
       const int m_block_e = __viaddmin_s32(m_block_s, kBlockM, seqlen_q);       // min(a + b, c)
-      for(int32_t idx = Flashmask_n_block_buffer_valid_length - 1 - thread_idx;         // make sure thread_idx is in range [0, ProducerThreadNum)
-          idx >= (0 - (ProducerThreadNum - Flashmask_n_block_buffer_valid_length % ProducerThreadNum)); idx -= ProducerThreadNum
+      for(int32_t idx = nblock_start - 1 - thread_idx;         // make sure thread_idx is in range [0, ProducerThreadNum)
+          idx >= (0 - (ProducerThreadNum - nblock_start % ProducerThreadNum)); idx -= ProducerThreadNum
       ) {
         int32_t n_block = base_offset + idx;
         int prefix_sum = 0;

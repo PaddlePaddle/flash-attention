@@ -350,7 +350,7 @@ public:
                             reverse_chunk_idx,                                                                                                                  \
                             num_chunk,                                                                                                                          \
                             reverse_chunk_idx == num_chunk - 1 ? CollectiveMainloop::Flashmask_n_block_finish : CollectiveMainloop::Flashmask_n_block_chunk_end,\
-                            n_block_min, n_block_max, seqlen_info.seqlen_q,                                                                                     \
+                            n_block_min, n_block_max, nblock_seqlen, seqlen_info.seqlen_q, seqlen_info.seqlen_k,                                                \
                             flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),        \
                             n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),                     \
                             extra_flags + n_block_pipe_write.index() + cppl_stage,                                                                              \

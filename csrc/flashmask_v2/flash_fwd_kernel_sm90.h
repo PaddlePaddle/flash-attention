@@ -332,6 +332,15 @@ public:
               // for padding 32 and padding 4: the num_chunk (pad_32) >= num_chunk (pad_4) is always true
               const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc; // umiswing: padding for int4 load
               const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_valid_length - 1) / CollectiveMainloop::Flashmask_n_block_buffer_valid_length;
+              const int reverse_chunk_start = [&] {
+                if constexpr (Is_causal) {
+                    // if causal, the 'valid' sequence length is smaller. We don't need that many chunks, so we will start from chunks closer to the start
+                    const int seqlen_offset = seqlen_info.seqlen_k - seqlen_info.seqlen_q;
+                    return std::max(num_chunk - 1 - (kBlockM * (m_block + 1) + seqlen_offset) / (kBlockN * CollectiveMainloop::Flashmask_n_block_buffer_valid_length), 0);
+                } else {
+                    return 0;
+                }
+              } ();
               // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
               bool valid_chunk = true;
               const int cppl_stage = scheduler.template stage<true>();      // coarse pipeline stage (offset, 0 or 2)

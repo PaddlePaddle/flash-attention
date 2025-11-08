@@ -37,7 +37,6 @@ public:
     static_assert(CollectiveMainloop::Varlen == CollectiveEpilogue::Varlen);
     static constexpr bool Has_softcap = CollectiveMainloop::Has_softcap;
     static constexpr bool Varlen = CollectiveMainloop::Varlen;
-    static constexpr bool Split = CollectiveMainloop::Split;
     static constexpr bool Is_FP8 = CollectiveMainloop::Is_FP8;
     static constexpr bool Transpose_V = CollectiveMainloop::Transpose_V;
     static constexpr bool AppendKV = CollectiveMainloop::AppendKV;
@@ -49,7 +48,6 @@ public:
     static constexpr int NumProducerThreads = CollectiveMainloop::NumProducerThreads;
     static constexpr bool SameHeadDim = CollectiveMainloop::SameHeadDim;
     static constexpr bool LargeHeadDimV = CollectiveMainloop::LargeHeadDimV;
-    static constexpr bool Is_flashmask = CollectiveMainloop::Is_flashmask;
     static constexpr bool Use_Sch_Pipeline = TileScheduler_::pipelining;
     static_assert(CollectiveMainloop::LargeHeadDimV == CollectiveEpilogue::LargeHeadDimV);
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
@@ -280,7 +278,6 @@ public:
               int const m_block = get<0>(block_coord);
               int const bidh = get<1>(block_coord);
               int const bidb = get<2>(block_coord);
-              int const split_idx = get<3>(block_coord);
               SeqlenInfo_t seqlen_info{
                   get<2>(block_coord) /*bidb*/,
                   get<0>(params.mainloop.shape_Q),
@@ -290,11 +287,11 @@ public:
                   params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
               };
               auto [n_block_min, n_block_max] = CollectiveMainloop::BlockMN_t::get_n_block_min_max(
-                  seqlen_info, m_block, bidb, split_idx, params.mainloop.num_splits,
+                  seqlen_info, m_block, bidb, 0, 1,
                   params.mainloop.window_size_left, params.mainloop.window_size_right, params.mainloop.qhead_per_khead_divmod);
 
               // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
-              if constexpr (Is_causal || Is_local || Varlen || Split) {
+              if constexpr (Is_causal || Is_local || Varlen) {
                   if (n_block_max <= n_block_min) {
                       // skipping, don't forget to fetch us the next work!
                       scheduler.prefetch_next_work(params.scheduler, work_tile_info);

@@ -71,7 +71,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // in headdim = 64 case, I suspect I've fixed it, but there is no testing facility (9.30 EB5 occupied)
     // The current logic: only headdim=128 will use Dual PPTX
     using Scheduler = std::conditional_t<
-        Arch >= 90,
+        Arch >= 90 && !short_seqlen,
         std::conditional_t<
             (Predicate_for_Headdim && (kHeadDimV != 128 || kHeadDim != 128)) || No_Scheduler_Pipeline,
             flash::PreemptivePersistentTileScheduler<_NumConsumerThreads, _NumProducerThreads>,

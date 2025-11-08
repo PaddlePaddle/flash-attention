@@ -228,7 +228,7 @@ public:
     constexpr uint32_t stage() const noexcept { return 0; }
 };
 
-template<int NumConsumerThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=96, bool Split=false>
+template<int NumConsumerThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=96>
 class PreemptivePersistentTileScheduler {
     // **PPT** scheduler: performs correct synchronization for producer (generate_n_block) and consumer (KV load and computation pipeline)
     // This scheduler has the same coordinate computation logic as StaticPersistentTileSch, the difference is that
@@ -250,16 +250,16 @@ public:
     struct Params {
         int total_blocks;
         cutlass::FastDivmod m_block_divmod, head_divmod;
-        cutlass::FastDivmod nsplits_divmod;
         int* const tile_count_semaphore;
     };
 
     static Params
     to_underlying_arguments(TileSchedulerArguments const& args) {
         assert(args.tile_count_semaphore != nullptr);
-        return {args.num_blocks * args.num_head * args.num_batch * (!Split ? 1 : args.num_splits),
-                cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head * (!Split ? 1 : args.num_splits)),
-                cutlass::FastDivmod(!Split ? 1 : args.num_splits), args.tile_count_semaphore};
+        return {args.num_blocks * args.num_head * args.num_batch,
+                cutlass::FastDivmod(args.num_blocks), 
+                cutlass::FastDivmod(args.num_head),
+                args.tile_count_semaphore};
     }
 
     static dim3
@@ -281,11 +281,7 @@ public:
         get_block_coord(Params const& params) const {
             int block, bidh, bidb;
             bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(block, tile_idx));
-            int split_idx = 0;
-            if constexpr (Split) {
-                bidh = params.nsplits_divmod.divmod(split_idx, bidh);
-            }
-            return {block, bidh, bidb, split_idx};
+            return {block, bidh, bidb, 0};
         }
 
     };
@@ -470,7 +466,7 @@ public:
 };
 
 
-template<int NumConsumerThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=96, bool Split=false>
+template<int NumConsumerThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=96>
 class DualPreemptivePersistentTileExecutionScheduler {
     // **PPT** scheduler: performs correct synchronization for producer (generate_n_block) and consumer (KV load and computation pipeline)
     // This scheduler has the same coordinate computation logic as StaticPersistentTileSch, the difference is that
@@ -493,16 +489,16 @@ public:
     struct Params {
         int total_blocks;
         cutlass::FastDivmod m_block_divmod, head_divmod;
-        cutlass::FastDivmod nsplits_divmod;
         int* const tile_count_semaphore;
     };
 
     static Params
     to_underlying_arguments(TileSchedulerArguments const& args) {
         assert(args.tile_count_semaphore != nullptr);
-        return {args.num_blocks * args.num_head * args.num_batch * (!Split ? 1 : args.num_splits),
-                cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head * (!Split ? 1 : args.num_splits)),
-                cutlass::FastDivmod(!Split ? 1 : args.num_splits), args.tile_count_semaphore};
+        return {args.num_blocks * args.num_head * args.num_batch,
+                cutlass::FastDivmod(args.num_blocks), 
+                cutlass::FastDivmod(args.num_head),
+                args.tile_count_semaphore};
     }
 
     static dim3
@@ -524,11 +520,7 @@ public:
         get_block_coord(Params const& params) const {
             int block, bidh, bidb;
             bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(block, tile_idx));
-            int split_idx = 0;
-            if constexpr (Split) {
-                bidh = params.nsplits_divmod.divmod(split_idx, bidh);
-            }
-            return {block, bidh, bidb, split_idx};
+            return {block, bidh, bidb, 0};
         }
 
     };
@@ -616,7 +608,7 @@ public:
 };
 
 template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
-        bool Split=false, bool PackGQA=false, bool WarpSpecialized=true, bool Is_flashmask=false>
+        bool Split=false, bool PackGQA=false, bool WarpSpecialized=true>
 class DynamicPersistentTileScheduler {
 
     // This scheduler targets the causal (or local) case where each tile takes different
@@ -629,7 +621,7 @@ class DynamicPersistentTileScheduler {
     // size of K & V and the L2 cache size.
 
     static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
-    static constexpr int NumThreads = WarpSpecialized ? NumMmaThreads + (Is_flashmask ? 128 : NumProducerThreads) : NumMmaThreads;
+    static constexpr int NumThreads = WarpSpecialized ? NumMmaThreads + 128 : NumMmaThreads;
 
 public:
     using SharedStorage = int;

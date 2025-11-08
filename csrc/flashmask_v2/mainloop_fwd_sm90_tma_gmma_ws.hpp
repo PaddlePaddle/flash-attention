@@ -1135,8 +1135,8 @@ struct CollectiveMainloopFwdSm90 {
         const int32_t* extra_flags_smem = extra_flags + n_block_pipe_read.index();
 
         auto load_flashmask = [&] (auto const& smem_pipe_write) {
-            pipeline_flashmask_apply.producer_acquire(smem_pipe_write);
             if(n_block_idx < Flashmask_n_block_buffer_valid_length && mask_encode_n_block_smem_[n_block_idx] >= 0) {
+                pipeline_flashmask_apply.producer_acquire(smem_pipe_write);
                 int32_t* const flashmask_base_addr = flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN;
                 const int row_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen_info.seqlen_k;
                 const int nb_mul_kBN = n_block * kBlockN;
@@ -1194,8 +1194,8 @@ struct CollectiveMainloopFwdSm90 {
                 }
                 asm volatile("cp.async.commit_group;\n" ::);
                 asm volatile("cp.async.wait_group 0;\n" ::);
+                pipeline_flashmask_apply.producer_commit(smem_pipe_write);
             }
-            pipeline_flashmask_apply.producer_commit(smem_pipe_write);
         };
 
         auto n_block_wait = [](auto& pipeline, auto& smem_pipe_read) {
@@ -1706,8 +1706,8 @@ struct CollectiveMainloopFwdSm90 {
         scoremod_premask_fn(tSrS);
         mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
 
-        consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
         if (n_block_idx < Flashmask_n_block_buffer_valid_length && mask_encode_n_block_smem_[n_block_idx] >= 0) {
+            consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
             if (params.ut_start_ptr) {
                 flashmask_apply<TiledMmaQK, PtrExistDispatchTag::FULL_PTR>(
                             tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
@@ -1723,8 +1723,8 @@ struct CollectiveMainloopFwdSm90 {
                             tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
                             params.lt_start_ptr, nullptr, nullptr, nullptr);
             }
+            pipeline_flashmask_apply.consumer_release(smem_pipe_read);
         }
-        pipeline_flashmask_apply.consumer_release(smem_pipe_read);
 
         Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
         // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
@@ -1771,8 +1771,8 @@ struct CollectiveMainloopFwdSm90 {
             scoremod_premask_fn(tSrS);
             mask_fn(tSrS, n_block);
 
-            consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
             if (n_block_idx < Flashmask_n_block_buffer_valid_length && mask_encode_n_block_smem_[n_block_idx] >= 0) {
+                consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
                 if (params.ut_start_ptr) {
                     flashmask_apply<TiledMmaQK, PtrExistDispatchTag::FULL_PTR>(
                                 tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
@@ -1786,8 +1786,8 @@ struct CollectiveMainloopFwdSm90 {
                                 tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
                                 params.lt_start_ptr, nullptr, nullptr, nullptr);
                 }
+                pipeline_flashmask_apply.consumer_release(smem_pipe_read);
             }
-            pipeline_flashmask_apply.consumer_release(smem_pipe_read);
 
             cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
             if constexpr (LargeHeadDimV) { store_scales(scores_scale, smem_pipe_read_v.index()); }

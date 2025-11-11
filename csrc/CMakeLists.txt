@@ -29,15 +29,15 @@ if(NOT SKIP_BUILD_FA)
       OUTPUT_VARIABLE output
       ERROR_VARIABLE error
   )
-  
+
   if(NOT result EQUAL 0)
       message(FATAL_ERROR "Generating FA2 Python script execution failed with exit code ${result}: ${error}")
   endif()
-  
+
   file(GLOB FA2_SOURCES_CU_SOURCES "flash_attn/src/*_sm80.cu")
-  
+
   message(STATUS "Auto generated CUDA source files: ${FA2_SOURCES_CU_SOURCES}")
-  
+
   set(FA2_REDUCE_ATTNSCORE_SOURCES_CU
       flash_attn/src/cuda_utils.cu
       flash_attn/src/calc_reduced_attn_scores_dispatch/hdim32_fp16_sm80.cu
@@ -57,7 +57,7 @@ if(NOT SKIP_BUILD_FA)
       flash_attn/src/calc_reduced_attn_scores_dispatch/hdim256_fp16_sm80.cu
       flash_attn/src/calc_reduced_attn_scores_dispatch/hdim256_bf16_sm80.cu
   )
-  
+
   # merge FA2 cu sources
   set(FA2_SOURCES_CU ${FA2_REDUCE_ATTNSCORE_SOURCES_CU} ${FA2_SOURCES_CU_SOURCES})
   
@@ -97,20 +97,20 @@ if(NOT SKIP_BUILD_FA)
     
   add_dependencies(flashattn flashattn_with_bias_mask)
   
-  
+
   if(NOT DEFINED NVCC_ARCH_BIN OR NVCC_ARCH_BIN STREQUAL "")
       message(FATAL_ERROR "NVCC_ARCH_BIN is not defined or is empty.")
   endif()
-  
+
   STRING(REPLACE "-" ";" FA_NVCC_ARCH_BIN ${NVCC_ARCH_BIN})
-  
+
   set(FA_GENCODE_OPTION "SHELL:")
   foreach(arch ${FA_NVCC_ARCH_BIN})
      if(${arch} GREATER_EQUAL 80)
        set(FA_GENCODE_OPTION "${FA_GENCODE_OPTION} -gencode arch=compute_${arch},code=sm_${arch}")
      endif()
   endforeach()
-  
+
   target_compile_options(flashattn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
     -w
     -Xcompiler="-fPIC"
@@ -140,12 +140,11 @@ if(NOT SKIP_BUILD_FA)
     --use_fast_math
     "${FA_GENCODE_OPTION}"
     >)
-  
-  INSTALL(TARGETS flashattn
-      LIBRARY DESTINATION "lib")
+
+  INSTALL(TARGETS flashattn LIBRARY DESTINATION "lib")
   
   INSTALL(FILES capi/flash_attn.h DESTINATION "include")
-  
+
   if(WITH_FLASHATTN_V3)
     execute_process(
         COMMAND "${PYTHON_EXECUTABLE}" flash_attn_v3/generate_kernels.py -o flash_attn_v3/instantiations
@@ -235,7 +234,7 @@ if(NOT SKIP_BUILD_FA)
     if(NOT DISABLE_FP8)
         list(APPEND DTYPE_FWD_SM90 "e4m3")
     endif()
-    
+
     set(DTYPE_BWD "bf16")
     if(NOT DISABLE_FP16)
         list(APPEND DTYPE_BWD "fp16")
@@ -260,29 +259,29 @@ if(NOT SKIP_BUILD_FA)
 
     set(HEAD_DIMENSIONS_FWD "all" "diff")
     set(HEAD_DIMENSIONS_FWD_SM80 ${HEAD_DIMENSIONS_BWD})
-    
+
     set(SPLIT "__EMPTY__")
     if(NOT DISABLE_SPLIT)
         list(APPEND SPLIT "_split")
     endif()
-    
+
     set(PAGEDKV "__EMPTY__")
     if(NOT DISABLE_PAGEDKV)
         list(APPEND PAGEDKV "_paged")
     endif()
-    
+
     set(SOFTCAP "__EMPTY__")
     if(NOT DISABLE_SOFTCAP)
         list(APPEND SOFTCAP "_softcap")
     endif()
-    
+
     set(SOFTCAP_ALL)
     if(DISABLE_SOFTCAP)
         set(SOFTCAP_ALL "__EMPTY__")
     else()
         set(SOFTCAP_ALL "_softcapall")
     endif()
-    
+
     set(PACKGQA "__EMPTY__")
     if(NOT DISABLE_PACKGQA)
         list(APPEND PACKGQA "_packgqa")
@@ -302,7 +301,7 @@ if(NOT SKIP_BUILD_FA)
             endforeach()
         endforeach()
     endforeach()
-    
+
     set(sources_fwd_sm90)
     foreach(hdim ${HEAD_DIMENSIONS_FWD})
         foreach(dtype ${DTYPE_FWD_SM90})
@@ -332,7 +331,7 @@ if(NOT SKIP_BUILD_FA)
             endforeach()
         endforeach()
     endforeach()
-    
+
     set(sources_bwd_sm90)
     foreach(hdim ${HEAD_DIMENSIONS_BWD})
         foreach(dtype ${DTYPE_BWD})
@@ -348,7 +347,7 @@ if(NOT SKIP_BUILD_FA)
         set(sources_bwd_sm80 "")
         set(sources_bwd_sm90 "")
     endif()
-    
+
     set(FA3_SOURCES_CU_SOURCES "flash_attn_v3/flash_api.cu")
     if(NOT DISABLE_SM8X)
         list(APPEND FA3_SOURCES_CU_SOURCES ${sources_fwd_sm80})
@@ -358,23 +357,23 @@ if(NOT SKIP_BUILD_FA)
         list(APPEND FA3_SOURCES_CU_SOURCES ${sources_bwd_sm80})
     endif()
     list(APPEND FA3_SOURCES_CU_SOURCES ${sources_bwd_sm90})
-    
+
     if(NOT DISABLE_SPLIT)
         list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/flash_fwd_combine.cu")
     endif()
-    
+
     list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/flash_prepare_scheduler.cu")
 
     message(STATUS "Auto generated CUDA source files: ${FA3_SOURCES_CU_SOURCES}")
     add_library(flashattnv3 SHARED
         ${FA3_SOURCES_CU_SOURCES}
       )
-  
+
     target_include_directories(flashattnv3 PRIVATE
         flash_attn_v3
         flash_attn_v3/cutlass/include
       )
-  
+
     target_compile_options(flashattnv3 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
       -Xcompiler="-fPIC"
       -Xcompiler="-O3"
@@ -390,9 +389,8 @@ if(NOT SKIP_BUILD_FA)
       -gencode arch=compute_90a,code=sm_90a
       --expt-relaxed-constexpr
       >)
-  
-    INSTALL(TARGETS flashattnv3
-        LIBRARY DESTINATION "lib")
+
+    INSTALL(TARGETS flashattnv3 LIBRARY DESTINATION "lib")
   
     INSTALL(FILES flash_attn_v3/flash_api.h DESTINATION "include" RENAME flashv3_api.h)
   endif()
@@ -412,7 +410,7 @@ if(NOT SKIP_BUILD_FA)
     option(DISABLE_FLASHMASK_V2_HDIM96 "Disable HDIM96 for flashmask_v2" ON)
     option(DISABLE_FLASHMASK_V2_HDIM128 "Disable HDIM128 for flashmask_v2" OFF)
     option(DISABLE_FLASHMASK_V2_HDIM192 "Disable HDIM192 for flashmask_v2" ON)
-    option(DISABLE_FLASHMASK_V2_HDIM256 "Disable HDIM256 for flashmask_v2" ON)
+    option(DISABLE_FLASHMASK_V2_HDIM256 "Disable HDIM256 for flashmask_v2" OFF)
     option(DISABLE_FLASHMASK_V2_SPLIT "Disable Split for flashmask_v2" ON)
     option(DISABLE_FLASHMASK_V2_PAGEDKV "Disable PagedKV for flashmask_v2" ON)
     option(DISABLE_FLASHMASK_V2_SOFTCAP "Disable Softcap for flashmask_v2" ON)
@@ -512,7 +510,8 @@ if(NOT SKIP_BUILD_FA)
         list(APPEND FLASHMASKV2_HEAD_DIMENSIONS_BWD 256)
     endif()
 
-    set(FLASHMASKV2_HEAD_DIMENSIONS_FWD "all" "diff")
+    # Disable diff, not support headdim != headdim_v
+    set(FLASHMASKV2_HEAD_DIMENSIONS_FWD ${FLASHMASKV2_HEAD_DIMENSIONS_BWD})
     set(FLASHMASKV2_HEAD_DIMENSIONS_FWD_SM80 ${FLASHMASKV2_HEAD_DIMENSIONS_BWD})
 
     set(FLASHMASKV2_SPLIT "__EMPTY__")
@@ -586,7 +585,7 @@ if(NOT SKIP_BUILD_FA)
             endforeach()
         endforeach()
     endforeach()
-    
+
     set(flashmaskv2_sources_bwd_sm90)
     foreach(hdim ${FLASHMASKV2_HEAD_DIMENSIONS_BWD})
         foreach(dtype ${FLASHMASKV2_DTYPE_BWD})
@@ -599,17 +598,13 @@ if(NOT SKIP_BUILD_FA)
             endforeach()
         endforeach()
     endforeach()
-    
+
     if(DISABLE_FLASHMASK_V2_BACKWARD)
         set(flashmaskv2_sources_bwd_sm80 "")
         set(flashmaskv2_sources_bwd_sm90 "")
     endif()
 
-    #TODO:change
 
-    set(flashmaskv2_sources_fwd_sm80 "")
-    set(flashmaskv2_sources_fwd_sm90 "")
-    
     set(FLASHMASKV2_SOURCES_CU_SOURCES "flashmask_v2/flash_api.cu")
     if(NOT DISABLE_FLASHMASK_V2_SM8X)
         list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES ${flashmaskv2_sources_fwd_sm80})
@@ -619,16 +614,12 @@ if(NOT SKIP_BUILD_FA)
         list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES ${flashmaskv2_sources_bwd_sm80})
     endif()
     list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES ${flashmaskv2_sources_bwd_sm90})
-    
+
     if(NOT DISABLE_FLASHMASK_V2_SPLIT)
         list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES "flashmask_v2/flash_fwd_combine.cu")
     endif()
-    
+
     list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES "flashmask_v2/flash_prepare_scheduler.cu")
-
-    list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES "flashmask_v2/instantiations/flash_fwd_hdim128_bf16_sm90.cu" 
-                                                "flashmask_v2/instantiations/flash_fwd_hdim64_bf16_sm90.cu")
-
     message(STATUS "Auto generated CUDA source files for flashmask_v2: ${FLASHMASKV2_SOURCES_CU_SOURCES}")
 
     # 3. 添加动态库
@@ -657,8 +648,7 @@ if(NOT SKIP_BUILD_FA)
       --expt-relaxed-constexpr
       >)
 
-    INSTALL(TARGETS flashmaskv2
-        LIBRARY DESTINATION "lib")
+    INSTALL(TARGETS flashmaskv2 LIBRARY DESTINATION "lib")
 
     INSTALL(FILES flashmask_v2/flash_api.h DESTINATION "include" RENAME flashmaskv2_api.h)
 

@@ -538,6 +538,10 @@ DEFINE_GETTER_SETTER(int32_t *, ut_start_nblockmin)
 DEFINE_GETTER_SETTER(int32_t *, ut_end_nblockmax)
 DEFINE_GETTER_SETTER(int32_t *, ut_end_nblockmin)
 
+DEFINE_GETTER_SETTER(int, m_block_dim)
+DEFINE_GETTER_SETTER(int, n_block_dim)
+DEFINE_GETTER_SETTER(int32_t *, block_mask_ptr)
+
 #define DEFINE_BWD_GETTER_SETTER(type, member) \
 type flashmaskv2_bwd_params_get_##member(const Flash_bwd_params* params_handle) { return params_handle->member; } \
 void flashmaskv2_bwd_params_set_##member(Flash_bwd_params* params_handle, type value) { params_handle->member = value; }

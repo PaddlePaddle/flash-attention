@@ -825,23 +825,9 @@ struct CollectiveMainloopBwdSm90 {
                     }
                 }
             }
-
-        	if constexpr (Deterministic) {
-                int cur_m_block = m_block;
-                m_block = std::max(m_block,flashmask_mem_[7] /kBlockM); 
-                // up mask
-                for (; cur_m_block < m_block; cur_m_block++) {
-                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, cur_m_block * num_batch * num_head, n_block);
-                    /* Do Nothing, just wait */
-                    Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, cur_m_block * num_batch * num_head);
-                }
-            }
-            else {
-                m_block = std::max(m_block,flashmask_mem_[7] /kBlockM); 
-            }
-		} 
-        loop_end = std::min(m_block_max-1,(flashmask_mem_[0] -1 )/ kBlockM);
-
+            m_block = std::max(m_block, flashmask_mem_[7]); 
+        } 
+        loop_end = std::min(m_block_max - 1, flashmask_mem_[0]);
         #pragma unroll 2
         for (; m_block <= loop_end; ++m_block) {
             if constexpr (Deterministic) {

@@ -182,6 +182,9 @@ struct Flash_fwd_params : public Qkv_params {
     
     int32_t * __restrict__ ut_end_nblockmax = nullptr;
     int32_t * __restrict__ ut_end_nblockmin = nullptr;
+
+    int m_block_dim,n_block_dim;
+    int32_t * __restrict__ block_mask_ptr = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

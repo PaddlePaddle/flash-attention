@@ -150,6 +150,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.lt_end_nblockmax, params.lt_end_nblockmin,
         params.ut_start_nblockmax, params.ut_start_nblockmin,
         params.ut_end_nblockmax, params.ut_end_nblockmin,
+        params.m_block_dim,params.n_block_dim,
+        params.block_mask_ptr
     };
 
     typename CollectiveEpilogue::Arguments epilogue_args {
@@ -237,7 +239,7 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                         BOOL_SWITCH(params.seqlen_k < 128 && params.seqlen_q < 128, ShortSeqlen, [&] {
                             // If the sequence length is (extremely) short, we should cut down the tile size
                             static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, 
-                                                           sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, ShortSeqlen)) : 128;
+                                                        sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, ShortSeqlen)) : 128;
                             static constexpr bool HasQv = HasQV_ && Arch == 90 && !Is_FP8 && kHeadDim == 64 && kHeadDimV == 512;
                             APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
                                 // Only use Cluster if number of tiles along seqlen_q is even and not varlen

@@ -76,10 +76,19 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int Flashmask_max_seqlen_k = 1024 * 16;    // scheduler pipelining needs to cut smem in half
     static constexpr int ProducerThreadNum = 96;
 
+    // static constexpr bool Is_blockmask = Is_blockmask_;
+    //xhy : now only support blockmask blocksize == 128, and blockdim info need to be constexpr 
+    // otherwise it will cause register spill
+    static constexpr int m_block_dim = 128;
+    static constexpr int n_block_dim = 128;
+    static constexpr int m_factor = std::max(m_block_dim / kBlockM,1);
+    static constexpr int n_factor = std::max(n_block_dim / kBlockN,1);
+
     // Flashmask_n_block_buffer_length is the multiple of 32 for 128B excessive-sector-free load/store
     static constexpr int Flashmask_n_block_buffer_length = ((Flashmask_max_seqlen_k + kBlockN - 1) / kBlockN + 31) & 0xffffffe0;
     static constexpr int Flashmask_n_block_buffer_valid_length = ((Flashmask_max_seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4;
-
+    static constexpr int Blockmask_n_block_buffer_valid_length = (Flashmask_n_block_buffer_valid_length * kBlockN + n_block_dim -1) / n_block_dim;
+    
     // Using bool in smem will usually lead to 4-way bank conflict, in order to accelerate this func
     // we encode `partially_masked` flags in `n_block_smem`, which both saved some smem, while eliminating 4-way bank conflict
     // if partially mask: the original value is stored, otherwise we store `-n_block - 1`
@@ -439,6 +448,9 @@ struct CollectiveMainloopFwdSm90 {
 
         int32_t * __restrict__ const ut_end_nblockmax = nullptr;
         int32_t * __restrict__ const ut_end_nblockmin = nullptr;
+
+        int m_block_dim,n_block_dim;
+        int32_t * __restrict__ block_mask_ptr = nullptr;
     };
 
     // Device side kernel params
@@ -518,6 +530,10 @@ struct CollectiveMainloopFwdSm90 {
 
         int * __restrict__ const ut_end_nblockmax = nullptr;
         int * __restrict__ const ut_end_nblockmin = nullptr;
+
+        // int m_block_dim,n_block_dim;
+        int32_t * __restrict__ block_mask_ptr = nullptr;
+        // int m_factor = 0, n_factor = 0;
     };
 
     static Params
@@ -602,6 +618,13 @@ struct CollectiveMainloopFwdSm90 {
             assert(page_size % kBlockN == 0);
             assert(!args.leftpad_k);
         }
+
+        //block sparse attn
+        assert(args.m_block_dim == 128);
+        assert(args.n_block_dim == 128);
+        // int m_factor = args.m_block_dim / kBlockM;
+        // int n_factor = args.n_block_dim / kBlockN;
+
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -634,7 +657,10 @@ struct CollectiveMainloopFwdSm90 {
                 args.lt_start_nblockmax, args.lt_start_nblockmin,
                 args.lt_end_nblockmax, args.lt_end_nblockmin,
                 args.ut_start_nblockmax, args.ut_start_nblockmin,
-                args.ut_end_nblockmax, args.ut_end_nblockmin};
+                args.ut_end_nblockmax, args.ut_end_nblockmin,
+                // args.m_block_dim,args.n_block_dim,
+                // m_factor,n_factor,
+                args.block_mask_ptr};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -670,10 +696,10 @@ struct CollectiveMainloopFwdSm90 {
                  int32_t reverse_chunk_idx, // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0]
                  int32_t total_num_chunks,
                  int32_t* const flashmask_maxmin_smem) {
-
         int32_t bidh = get<1>(block_coord);
         int32_t bidb = get<2>(block_coord);
         // pad for fully 128B aligned load
+        int32_t m_block = get<0>(block_coord);
         const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc;
 
         // change this to num_chunk * chunk_size (should be Flashmask_n_block_buffer_length)
@@ -684,7 +710,7 @@ struct CollectiveMainloopFwdSm90 {
 
         const int thread_idx = threadIdx.x - 32;
         const int length = Flashmask_n_block_buffer_valid_length < nblock_seqlen ? Flashmask_n_block_buffer_valid_length : nblock_seqlen;
-
+        
         // it's a pity that tag cannot have static dispatch, since load_max_min should remain the same
         // across different main loop implementation. We can implement a func with default 
         const auto tag = [&params]() {
@@ -747,6 +773,43 @@ struct CollectiveMainloopFwdSm90 {
         cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
     }
 
+    CUTLASS_DEVICE
+    void
+    load_blockmask(Params const& params,
+                 SeqlenInfo_t const& seqlen_info,
+                 cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
+                 int32_t reverse_chunk_idx, 
+                 int32_t total_num_chunks,
+                 int32_t* block_mask_smem ) {
+
+        int32_t bidh = get<1>(block_coord);
+        int32_t bidb = get<2>(block_coord);
+        int32_t m_block = get<0>(block_coord);
+        const int thread_idx = threadIdx.x - 32;
+
+        const int chunks_size = total_num_chunks * Flashmask_n_block_buffer_length;
+        const int offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * chunks_size +
+                (chunks_size - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_length);
+        
+        const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc;
+
+        const int valid_block_nblock_seqlen = (seqlen_info.seqlen_k + n_block_dim - 1) / n_block_dim ; //xhy :maybe nblock_seqlen - 4
+        const int valid_block_mblock_seqlen = (seqlen_info.seqlen_q + m_block_dim - 1) / m_block_dim;
+        int blockmask_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * valid_block_nblock_seqlen * valid_block_mblock_seqlen; // row_offset
+        blockmask_offset += m_block * valid_block_nblock_seqlen / m_factor;
+        blockmask_offset += std::max((valid_block_nblock_seqlen - (reverse_chunk_idx + 1) * Blockmask_n_block_buffer_valid_length), 0);
+        int blockmask_length = Blockmask_n_block_buffer_valid_length < valid_block_nblock_seqlen ? Blockmask_n_block_buffer_valid_length : valid_block_nblock_seqlen;
+
+        //xhy: blockmask ptr maybe not 16-aligned, since load_blockmask is called before load_max_min, sync can be shared with load_max_min
+        for(int64_t idx = thread_idx; idx < blockmask_length && (offset + idx >= 0); idx += ProducerThreadNum) {
+            asm volatile(
+            "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(block_mask_smem + idx)),
+                "l"(params.block_mask_ptr + blockmask_offset + idx),
+                "n"(4));
+        }
+}
+    
     template <PtrExistDispatchTag tag>
     CUTLASS_DEVICE bool
     generate_n_block(int32_t const m_block,
@@ -758,7 +821,9 @@ struct CollectiveMainloopFwdSm90 {
                      int32_t const seqlen_q,
                      int32_t* const __restrict__ flashmask_maxmin_smem,
                      int32_t* const __restrict__ mask_encode_n_block_smem_,
-                     int32_t* const __restrict__ extra_flags) {
+                     int32_t* const __restrict__ extra_flags,
+                     bool is_blockmask,
+                     int32_t* const __restrict__ block_mask_smem = nullptr) {
       static constexpr int kBlockM = get<0>(TileShape_MNK{});
       static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
@@ -803,6 +868,7 @@ struct CollectiveMainloopFwdSm90 {
       }
       
       int32_t valid_n_block_num = 0;
+
       const int32_t base_offset = (total_num_chunks - 1 - reverse_chunk_idx) * Flashmask_n_block_buffer_valid_length;
 
       // explanation for the loop condition:
@@ -851,6 +917,11 @@ struct CollectiveMainloopFwdSm90 {
             } else {
                 fully_masked = m_block_s >= lt_start_max;
                 partially_masked = m_block_e > lt_start_min;
+            }
+            if (is_blockmask){
+                if(!block_mask_smem[idx / n_factor]){
+                    fully_masked = true;            
+                }
             }
             
             prefix_sum = int(!fully_masked);

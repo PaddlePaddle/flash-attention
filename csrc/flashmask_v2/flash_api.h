@@ -199,6 +199,10 @@ DECLARE_GETTER_SETTER(int32_t *, ut_end_ptr)
 
 DECLARE_GETTER_SETTER(int32_t *, flashmask_maxmin_ptr)
 
+DECLARE_GETTER_SETTER(int, m_block_dim)
+DECLARE_GETTER_SETTER(int, n_block_dim)
+DECLARE_GETTER_SETTER(int32_t *, block_mask_ptr)
+
 #define DECLARE_BWD_GETTER_SETTER(type, member) \
 type flashmaskv2_bwd_params_get_##member(const Flash_bwd_params* params_handle); \
 void flashmaskv2_bwd_params_set_##member(Flash_bwd_params* params_handle, type value);

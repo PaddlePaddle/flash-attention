@@ -87,8 +87,33 @@ public:
     // static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
     // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
 
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
+    // static constexpr uint32_t NBlockRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
+    // static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
+    // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
+
+    static constexpr int kHeadDim = CollectiveMainloop::kHeadDim;
+
+    static constexpr uint32_t NBlockRegisterRequirement = [] {
+        if constexpr (kHeadDim <= 64) {
+            return 56;
+        } else {
+            return NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
+        }
+    }();
+    static constexpr uint32_t LoadRegisterRequirement = [] {
+        if constexpr (kHeadDim <= 64) {
+            return 32;
+        } else {
+            return NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
+        }
+    }();
+    static constexpr uint32_t MmaRegisterRequirement = [] {
+        if constexpr (kHeadDim <= 64) {
+            return 224;
+        } else {
+            return NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
+        }
+    }();
 
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
@@ -215,8 +240,11 @@ public:
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
         __shared__ __align__(128) int32_t flashmask_maxmin_smem[num_sch_stage * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
         __shared__ int32_t n_block_smem[num_sch_stage * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+         __shared__ __align__(128) int32_t blockmask_smem_[CollectiveMainloop::Blockmask_n_block_buffer_valid_length * CollectiveMainloop::kNBlockStages];
         // When n_block_smem is full, we need to store the flag in the following extra flag storage, instead of allocating 4 more elements
         __shared__ int32_t extra_flags[4];   // if num_sch_stage is 1, we actually only need two (kNBlockStages = 2)
+
+        bool Is_blockmask = params.mainloop.block_mask_ptr != nullptr;
 
         if constexpr (Use_Sch_Pipeline) {
             if (threadIdx.x < 2) {
@@ -269,7 +297,7 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0 && warp_idx_in_warpgroup != 0) { // n_block generator
-          cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+          cutlass::arch::warpgroup_reg_dealloc<NBlockRegisterRequirement>();
           cutlass::PipelineState<CollectiveMainloop::kNBlockStages> n_block_pipe_write = cutlass::make_producer_start_state<MainloopPipelineNBlock>();
           // Manually specify the scheduler role: producer. For StaticPersistentTileSch, passing template args won't change the behavior
           for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler); 
@@ -317,10 +345,18 @@ public:
                             n_block_min, n_block_max, seqlen_info.seqlen_q,                                                                                     \
                             flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),        \
                             n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),                     \
-                            extra_flags + n_block_pipe_write.index() + cppl_stage)
+                            extra_flags + n_block_pipe_write.index() + cppl_stage,                                                                              \
+                            Is_blockmask, \
+                            blockmask_smem_ + CollectiveMainloop::Blockmask_n_block_buffer_valid_length * (n_block_pipe_write.index() + cppl_stage))              
+                            
+
               for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
                 if (valid_chunk)
                     pipeline_n_block.producer_acquire(n_block_pipe_write);
+                if (Is_blockmask) {
+                    mainloop.load_blockmask(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, num_chunk,
+                                      blockmask_smem_ + CollectiveMainloop::Blockmask_n_block_buffer_valid_length * (n_block_pipe_write.index() + cppl_stage));
+                }
                 mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, num_chunk, flashmask_maxmin_smem +
                                       8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage));
                 if (params.mainloop.ut_start_ptr) {
@@ -546,3 +582,4 @@ public:
 };
 
 } // namespace flash
+

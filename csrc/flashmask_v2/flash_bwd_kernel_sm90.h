@@ -214,6 +214,14 @@ public:
         CollectiveEpilogue epilogue;
         __shared__ __align__(16) int32_t flashmask_smem_[8];
         __shared__ __align__(128) int32_t flashmask_index_smem_[kBlockN * 4];
+        constexpr int max_seqlen_k = 1024 * 128;
+        static constexpr bool Is_blockmask = CollectiveMainloop_::Is_blockmask;
+        int32_t* blockmask_smem_ = nullptr;
+
+        if constexpr (Is_blockmask) {
+            __shared__ __align__(128) int32_t blockmask_smem_array[max_seqlen_k / 128];
+            blockmask_smem_ = blockmask_smem_array;
+        }
 
         // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
         if constexpr (size(ClusterShape{}) > 1) {
@@ -250,7 +258,7 @@ public:
                 auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
                 auto [n_block, bidh, bidb] = block_coord_;
                 cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                mainloop.load_n_block_info(flashmask_smem_, flashmask_index_smem_, block_coord, params.mainloop);
+                mainloop.load_n_block_info(flashmask_smem_, flashmask_index_smem_, blockmask_smem_, block_coord, params.mainloop);
                 scheduler.producer_notify();
                 if (warp_idx_in_warpgroup == 0) {  // Load K, V, and do TMA on Q and dO
                     
@@ -259,14 +267,14 @@ public:
                     // cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
                     // mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
                     mainloop.load(params.mainloop, pipeline_q, pipeline_do, smem_pipe_write,
-                                smem_pipe_write_do, shared_storage, block_coord, flashmask_smem_);
+                                smem_pipe_write_do, shared_storage, block_coord, flashmask_smem_, blockmask_smem_);
                     mainloop.load_tail(pipeline_q, pipeline_do, smem_pipe_write, smem_pipe_write_do);
                 } else if (warp_idx_in_warpgroup == 1) {
                     // auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
                     // auto [n_block, bidh, bidb] = block_coord_;
                     // cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
                     // mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
-                    mainloop.store_dq(params.mainloop, shared_storage, block_coord, flashmask_smem_);
+                    mainloop.store_dq(params.mainloop, shared_storage, block_coord, flashmask_smem_, blockmask_smem_);
                 }
                 scheduler.prefetch_next_work(params.scheduler, work_tile_info);
             }
@@ -302,7 +310,7 @@ public:
                 
                 bool tile_valid = mainloop.mma(
                     params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,
-                    tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, binary_work_idx, block_coord, shared_storage,flashmask_smem_, flashmask_index_smem_);
+                    tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, binary_work_idx, block_coord, shared_storage,flashmask_smem_, flashmask_index_smem_, blockmask_smem_);
                 if (tile_valid) {
                     binary_work_idx = 1 - binary_work_idx;
                     epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
@@ -312,6 +320,7 @@ public:
                 }
                 scheduler.consumer_notify();
             }
+            // if(threadIdx.x == 128) printf("consumer blockid: %d\n", blockIdx.x );
             epilogue.store_tail();
         }
 

@@ -165,15 +165,20 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
     #endif
 }
 
-inline bool is_short_seqlen(Flash_fwd_params const& params) {
-    return params.seqlen_k < 128 && params.seqlen_q < 128;
+inline SeqlenDispatchTag get_seqlen_dispatch_tag(Flash_fwd_params const& params) {
+    if (params.seqlen_k < 128 && params.seqlen_q < 128) {
+        return SeqlenDispatchTag::TinySeq;
+    } else if (params.seqlen_k < 16384 && params.seqlen_q < 16384) {
+        return SeqlenDispatchTag::ShortSeq;
+    }
+    return SeqlenDispatchTag::LongSeq;
 }
 
 inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
     if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr) { return false; }
     // This needs to match the kernel configs
-    bool const short_seqlen = is_short_seqlen(params);
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f, short_seqlen);
+    auto const seqlen_dispatch = get_seqlen_dispatch_tag(params);
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f, seqlen_dispatch);
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
     int const kBlockN = std::get<1>(kBlockMN_kernel_args_sm90);
     // Heuristic: when seqlen_q <= kBlockM, we're not compute bound, and somehow using TMA is slower,
@@ -191,8 +196,8 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     // params.page_table must already be set
     if (params.h == params.h_k) { return false; }
     // This needs to match the kernel configs
-    bool const short_seqlen = is_short_seqlen(params);
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, short_seqlen);
+    auto const seqlen_dispatch = get_seqlen_dispatch_tag(params);
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, seqlen_dispatch);
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
     return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, kBlockM);
     #endif
@@ -206,8 +211,8 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // params.page_table must already be set
     // This needs to match the kernel configs
     bool const varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
-    bool const short_seqlen = is_short_seqlen(params);
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, short_seqlen);
+    auto const seqlen_dispatch = get_seqlen_dispatch_tag(params);
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, seqlen_dispatch);
     // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
     // has not been set here. It's OK though because we might just underestimate kBlockN a bit
     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);

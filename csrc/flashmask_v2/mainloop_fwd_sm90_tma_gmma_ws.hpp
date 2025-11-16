@@ -32,7 +32,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool PackGQA_, bool V_colmajor_>
+        bool MmaPV_is_RS, bool PackGQA_, bool V_colmajor_, bool ShortSeq_ = false>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -61,6 +61,7 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
     static constexpr bool LargeHeadDimV = kHeadDimV > 256;
+    static constexpr bool ShortSeq = ShortSeq_;     // seqlen <= 8k
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
 

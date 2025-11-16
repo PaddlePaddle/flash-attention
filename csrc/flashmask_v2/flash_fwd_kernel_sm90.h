@@ -89,23 +89,24 @@ public:
     // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
 
     static constexpr int kHeadDim = CollectiveMainloop::kHeadDim;
+    static constexpr int IsShortSeq = CollectiveMainloop::ShortSeq;
 
     static constexpr uint32_t NBlockRegisterRequirement = [] {
-        if constexpr (kHeadDim <= 64) {
+        if constexpr (kHeadDim <= 64 && IsShortSeq) {
             return 56;
         } else {
             return NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
         }
     }();
     static constexpr uint32_t LoadRegisterRequirement = [] {
-        if constexpr (kHeadDim <= 64) {
+        if constexpr (kHeadDim <= 64 && IsShortSeq) {
             return 32;
         } else {
             return NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
         }
     }();
     static constexpr uint32_t MmaRegisterRequirement = [] {
-        if constexpr (kHeadDim <= 64) {
+        if constexpr (kHeadDim <= 64 && IsShortSeq) {
             return 224;
         } else {
             return NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);

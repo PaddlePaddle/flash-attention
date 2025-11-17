@@ -37,7 +37,6 @@ public:
     static_assert(CollectiveMainloop::Varlen == CollectiveEpilogue::Varlen);
     static constexpr bool Has_softcap = CollectiveMainloop::Has_softcap;
     static constexpr bool Varlen = CollectiveMainloop::Varlen;
-    static constexpr bool Split = CollectiveMainloop::Split;
     static constexpr bool Is_FP8 = CollectiveMainloop::Is_FP8;
     static constexpr bool Transpose_V = CollectiveMainloop::Transpose_V;
     static constexpr bool AppendKV = CollectiveMainloop::AppendKV;
@@ -49,7 +48,6 @@ public:
     static constexpr int NumProducerThreads = CollectiveMainloop::NumProducerThreads;
     static constexpr bool SameHeadDim = CollectiveMainloop::SameHeadDim;
     static constexpr bool LargeHeadDimV = CollectiveMainloop::LargeHeadDimV;
-    static constexpr bool Is_flashmask = CollectiveMainloop::Is_flashmask;
     static constexpr bool Use_Sch_Pipeline = TileScheduler_::pipelining;
     static_assert(CollectiveMainloop::LargeHeadDimV == CollectiveEpilogue::LargeHeadDimV);
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
@@ -87,8 +85,33 @@ public:
     // static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
     // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
 
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
+    // static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
+    // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
+
+    static constexpr int kHeadDim = CollectiveMainloop::kHeadDim;
+    static constexpr int IsShortSeq = CollectiveMainloop::ShortSeq;
+
+    static constexpr uint32_t NBlockRegisterRequirement = [] {
+        if constexpr (kHeadDim <= 64 && IsShortSeq) {
+            return 56;
+        } else {
+            return NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
+        }
+    }();
+    static constexpr uint32_t LoadRegisterRequirement = [] {
+        if constexpr (kHeadDim <= 64 && IsShortSeq) {
+            return 32;
+        } else {
+            return NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
+        }
+    }();
+    static constexpr uint32_t MmaRegisterRequirement = [] {
+        if constexpr (kHeadDim <= 64 && IsShortSeq) {
+            return 224;
+        } else {
+            return NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
+        }
+    }();
 
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
@@ -272,7 +295,7 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0 && warp_idx_in_warpgroup != 0) { // n_block generator
-          cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+          cutlass::arch::warpgroup_reg_dealloc<NBlockRegisterRequirement>();
           cutlass::PipelineState<CollectiveMainloop::kNBlockStages> n_block_pipe_write = cutlass::make_producer_start_state<MainloopPipelineNBlock>();
           // Manually specify the scheduler role: producer. For StaticPersistentTileSch, passing template args won't change the behavior
           for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler); 
@@ -283,7 +306,6 @@ public:
               int const m_block = get<0>(block_coord);
               int const bidh = get<1>(block_coord);
               int const bidb = get<2>(block_coord);
-              int const split_idx = get<3>(block_coord);
               SeqlenInfo_t seqlen_info{
                   get<2>(block_coord) /*bidb*/,
                   get<0>(params.mainloop.shape_Q),
@@ -293,11 +315,11 @@ public:
                   params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
               };
               auto [n_block_min, n_block_max] = CollectiveMainloop::BlockMN_t::get_n_block_min_max(
-                  seqlen_info, m_block, bidb, split_idx, params.mainloop.num_splits,
+                  seqlen_info, m_block, bidb, 0, 1,
                   params.mainloop.window_size_left, params.mainloop.window_size_right, params.mainloop.qhead_per_khead_divmod);
 
               // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
-              if constexpr (Is_causal || Is_local || Varlen || Split) {
+              if constexpr (Is_causal || Is_local || Varlen) {
                   if (n_block_max <= n_block_min) {
                       // skipping, don't forget to fetch us the next work!
                       scheduler.prefetch_next_work(params.scheduler, work_tile_info);
@@ -308,6 +330,15 @@ public:
               // for padding 32 and padding 4: the num_chunk (pad_32) >= num_chunk (pad_4) is always true
               const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc; // umiswing: padding for int4 load
               const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_valid_length - 1) / CollectiveMainloop::Flashmask_n_block_buffer_valid_length;
+              const int reverse_chunk_start = [&] {
+                if constexpr (Is_causal) {
+                    // if causal, the 'valid' sequence length is smaller. We don't need that many chunks, so we will start from chunks closer to the start
+                    const int seqlen_offset = seqlen_info.seqlen_k - seqlen_info.seqlen_q;
+                    return std::max(num_chunk - 1 - (kBlockM * (m_block + 1) + seqlen_offset) / (kBlockN * CollectiveMainloop::Flashmask_n_block_buffer_valid_length), 0);
+                } else {
+                    return 0;
+                }
+              } ();
               // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
               bool valid_chunk = true;
               const int cppl_stage = scheduler.template stage<true>();      // coarse pipeline stage (offset, 0 or 2)
@@ -317,7 +348,7 @@ public:
                             reverse_chunk_idx,                                                                                                                  \
                             num_chunk,                                                                                                                          \
                             reverse_chunk_idx == num_chunk - 1 ? CollectiveMainloop::Flashmask_n_block_finish : CollectiveMainloop::Flashmask_n_block_chunk_end,\
-                            n_block_min, n_block_max, seqlen_info.seqlen_q,                                                                                     \
+                            n_block_min, n_block_max, nblock_seqlen, seqlen_info.seqlen_q, seqlen_info.seqlen_k,                                                \
                             flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),        \
                             n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),                     \
                             extra_flags + n_block_pipe_write.index() + cppl_stage,                                                                              \

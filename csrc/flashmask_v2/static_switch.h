@@ -27,6 +27,20 @@
     }                                                                                            \
   }()
 
+#define TRIPLE_SWITCH(PRED1, PRED2, TYPE, CONST_NAME, VAL1, VAL2, VAL3, ...)                     \
+  [&] {                                                                                          \
+    if (PRED1) {                                                                                 \
+      constexpr static TYPE CONST_NAME = VAL1;                                                   \
+      return __VA_ARGS__();                                                                      \
+    } else if (PRED2) {                                                                          \
+      constexpr static TYPE CONST_NAME = VAL2;                                                   \
+      return __VA_ARGS__();                                                                      \
+    } else {                                                                                     \
+      constexpr static TYPE CONST_NAME = VAL3;                                                   \
+      return __VA_ARGS__();                                                                      \
+    }                                                                                            \
+  }()
+
 #define FLASH_MASK_SWITCH(LTE_COND, UTS_COND, LTS_CONST_NAME, UTS_CONST_NAME, ...) \
   [&] {                                                                                                      \
     if (LTE_COND) {                                                                                          \

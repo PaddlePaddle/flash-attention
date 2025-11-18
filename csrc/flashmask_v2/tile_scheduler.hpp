@@ -358,7 +358,7 @@ public:
     constexpr uint32_t stage() const noexcept { return 0; }
 };
 
-template<int NumConsumerThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=128>
+template<int NumConsumerThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=128, bool Deterministic=false>
 class BwdPreemptivePersistentTileScheduler {
     static constexpr int NumThreads = NumConsumerThreads + NumProducerThreads;
 public:
@@ -453,8 +453,13 @@ public:
             flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskSmemEmpty) /*id*/);
             // TODO(heqianyue): atomicAdd here?
             if (threadIdx.x == 0) {    // hard-coded, since n_block producer threads are in [32, 128)
-                // the next job we are going to process: number of currently blocks done
-                *tile_count_smem = atomicAdd(params.tile_count_semaphore, 1);
+                if constexpr (Deterministic) {
+                    *tile_count_smem = current_work.tile_idx + gridDim.x;
+                }
+                else {
+                    // the next job we are going to process: number of currently blocks done
+                    *tile_count_smem = atomicAdd(params.tile_count_semaphore, 1);
+                }
             }
             flash::named_barrier_sync(NumProducerThreads, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskProducer) /*id*/);
         } else {

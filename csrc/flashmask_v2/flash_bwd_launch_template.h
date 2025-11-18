@@ -105,7 +105,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     >;
     using Scheduler = std::conditional_t<
         Arch >= 90,
-        flash::BwdPreemptivePersistentTileScheduler<CollectiveMainloop::NumMmaThreads, cutlass::NumThreadsPerWarpGroup>,
+        flash::BwdPreemptivePersistentTileScheduler<CollectiveMainloop::NumMmaThreads, cutlass::NumThreadsPerWarpGroup, Deterministic>,
         flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>
     >;
     using AttnKernel = std::conditional_t<
@@ -360,10 +360,10 @@ template<int Arch, typename T, int kBlockM, int kBlockN, int kHeadDim, bool Is_c
 void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
     VARLEN_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
         BOOL_SWITCH(params.h != params.h_k, GQA, [&] {
-//             BOOL_SWITCH(params.deterministic, Deterministic, [&] {
+            BOOL_SWITCH(params.deterministic, Deterministic, [&] {
             // run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen, false, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);   
-                run_flash_bwd<Arch, kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, false /*Deterministic*/, GQA, Is_flashmask_, Has_lt_end_, Has_ut_start_,Is_blockmask_, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>(params, stream);
-//             });
+                run_flash_bwd<Arch, kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, Deterministic /*Deterministic*/, GQA, Is_flashmask_, Has_lt_end_, Has_ut_start_,Is_blockmask_, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>(params, stream);
+            });
         });
     });
 }

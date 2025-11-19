@@ -273,7 +273,7 @@ struct CollectiveMainloopBwdSm90 {
     // For hdim256, we want to slice the dQ MMA (64 x 256 on 2 WGs) into two (64 x 128 on 2 WGs) so that we can
     // do atomic add on one half before doing the other half of the MMA, to reduce register pressure.
     static constexpr bool Slice_dQKV_Mma = kHeadDim == 256 && !dQacc_use_TMA && dQ_swapAB && AtomLayoutMdQ == 1 && NumMmaWarpGroups == 2;
-    static_assert(!(Deterministic && Slice_dQKV_Mma), "Deterministic mode not supported with Slice_dQKV_Mma");
+    // static_assert(!(Deterministic && Slice_dQKV_Mma), "Deterministic mode not supported with Slice_dQKV_Mma");
 
     static constexpr size_t SmemAlignmentP = cutlass::detail::alignment_for_swizzle(SmemLayoutPdS{});
     static constexpr size_t SmemAlignmentdS = cutlass::detail::alignment_for_swizzle(SmemLayoutPdS{});
@@ -836,6 +836,13 @@ struct CollectiveMainloopBwdSm90 {
         // load_n_block_info(n_block, flashmask_mem_, params);
         // printf("m_block:%d", m_block);
         // printf("m_block_max:%d\n", m_block_max);
+        if constexpr (Deterministic) {
+			for (int prefix_m_block=0; prefix_m_block < m_block; prefix_m_block++) {
+                Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, prefix_m_block * num_batch * num_head, n_block);
+                /* Do Nothing, just wait */
+                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, prefix_m_block * num_batch * num_head);
+            }
+        }
         int loop_end = m_block_max;
         if constexpr(!Is_causal){
             if constexpr (Has_ut_start) {
@@ -867,8 +874,20 @@ struct CollectiveMainloopBwdSm90 {
                     }
                 }
             }
-            m_block = std::max(m_block, flashmask_mem_[7]); 
-        } 
+            if constexpr (Deterministic) {
+                int cur_m_block = m_block;
+                m_block = std::max(m_block,flashmask_mem_[7]); 
+                // up mask
+                for (; cur_m_block < m_block; cur_m_block++) {
+                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, cur_m_block * num_batch * num_head, n_block);
+                    /* Do Nothing, just wait */
+                    Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, cur_m_block * num_batch * num_head);
+                }
+            }
+            else {
+                m_block = std::max(m_block,flashmask_mem_[7]); 
+            }
+        }
         loop_end = std::min(m_block_max - 1, flashmask_mem_[0]);
         #pragma unroll 2
         for (; m_block <= loop_end; ++m_block) {
@@ -897,7 +916,17 @@ struct CollectiveMainloopBwdSm90 {
             }
         } 
         if constexpr (Has_lt_end) {
-            m_block = std::max(m_block, flashmask_mem_[3]);      
+            if constexpr (Deterministic) {
+                int cur_m_block = m_block;
+                m_block = std::max(m_block,flashmask_mem_[3]);  
+                // down mask
+                for (; cur_m_block < m_block; cur_m_block++) {
+                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, cur_m_block * num_batch * num_head, n_block);
+                    /* Do Nothing, just wait */
+                    Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, cur_m_block * num_batch * num_head);
+                }
+            }
+            else m_block = std::max(m_block, flashmask_mem_[3]);     
             #pragma unroll 2
             for (; m_block < m_block_max; ++m_block) {
                 if constexpr (Is_blockmask){
@@ -925,13 +954,12 @@ struct CollectiveMainloopBwdSm90 {
                 }
             }
         }
-
-        if constexpr (Is_local && Deterministic) {
+        if constexpr (Deterministic) {
             int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
-            #pragma unroll 2
             for (; m_block < m_block_global_max; m_block++) {
-            // for (; m_block < m_block_global_max; m++) {
-                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
+                Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
+                /* Do Nothing, just wait */
+				Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
             }
         }
     }

@@ -1567,7 +1567,8 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
     }
 
     if (true/*Is_flashmask*/) {
-        if (tidx < kBlockN) {
+        const int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
+        if (tidx < kBlockN && (n_block != n_block_max - 1 || binfo.actual_seqlen_k % kBlockN == 0 || tidx < binfo.actual_seqlen_k % kBlockN)) {
 	        sFlashMaskLTStart(tidx) = gFlashMaskLTStart(tidx);
             if(!Is_causal) {
                 sFlashMaskUTEnd(tidx) = gFlashMaskUTEnd(tidx);

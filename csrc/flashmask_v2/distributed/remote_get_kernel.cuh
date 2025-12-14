@@ -53,29 +53,36 @@ __global__ __launch_bounds__(128, 16) void SparseKVFewHeadRemoteGetKernel(
     const int my_pe,
     const int cp_stride,
     const int total_n_pes,
-    const int S_stride,                 // H * D
-    const int seqlen_offset             // S - S / cp_size
+    const int num_batch,                // B
+    const int S_stride                  // H * D
 ) {
     // assume num_head is even, so that we can transfer two rows per warp
     // and only need to read mask once (since heads reuse the same mask, 
     // even head num won't result in two rows in a warp mapped to different seq)
     constexpr int seqlen_stride = num_warps * num_blocks;
     const int warp_id = threadIdx.x >> 5;
-    const int work_per_warp = seqlen_offset / (num_blocks * num_warps);
+    const int work_per_warp = num_batch * seqlen_offset / (num_blocks * num_warps);
+    constexpr int seqlen_offset = S - S_chunk;
 
-    for (int i = 0, seqlen_id = seqlen_offset - 1 - (blockIdx.x * num_warps + warp_id);
+    for (int i = 0, seqlen_id = seqlen_offset - 1 - (blockIdx.x * num_warps + warp_id), batch_offset = 0;
         i < work_per_warp; 
         i++, seqlen_id -= seqlen_stride        // reverse traversal
     ) {
         // TODO(heqianyue): We only support LTS + UTE and multi-head shared mask currently, this should be extended
-        const int2 lts_ute = *(reinterpret_cast<const int2*>(&column_mask[seqlen_id * 2]));
+        if (seqlen_id < 0) {
+            seqlen_id = seqlen_offset - 1 - (blockIdx.x * num_warps + warp_id);
+            batch_offset += S;
+        }
+        // TODO(heqianyue): We need a simple way to set batch
+        const int2 lts_ute = *(reinterpret_cast<const int2*>(&column_mask[batch_offset * 2 + seqlen_id * 2]));
         if (lts_ute.x > lts_ute.y) {         // mask does not cover the whole row of KV
             // actually, two calls can be merged
             int cp_chunk_id = S - 1 - seqlen_id / S_chunk;
             int remote_pe = my_pe - cp_chunk_id * cp_stride;
             remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes; 
-            const int dst_addr = seqlen_id * S_stride;
-            const int src_addr = (seqlen_id % S_chunk) * S_stride;
+            const int dst_addr = (seqlen_id + batch_offset) * S_stride;
+            // TODO(heqianyue): Check the following
+            const int src_addr = (S - S_chunk + (seqlen_id % S_chunk) + batch_offset) * S_stride;
             // TODO(heqianyue): Check whether we should use blocking version -- we do not call get multiple times before sync
             nvshmemx_getmem_nbi_warp(
                         &k_sr[dst_addr],
@@ -216,8 +223,8 @@ public:
         const int work_per_row = S * (_cp_size - 1);
         constexpr int S_chunk = 8192;
 
-#define MultiHeadKernel(S, D)                                                   \
-    SparseKVMultiHeadRemoteGetKernel<KVType, S, S_chunk, D, num_blocks,         \
+#define MultiHeadKernel(_S, _D)                                                 \
+    SparseKVMultiHeadRemoteGetKernel<KVType, _S, S_chunk, _D, num_blocks,       \
                     num_warps><<<num_blocks, num_warps * 4, 0, comm_stream>>>(  \
                         kv_buffer->k_data(),                                    \
                         kv_buffer->v_data(),                                    \
@@ -231,8 +238,8 @@ public:
                         B * work_per_row * H / 2                                \
                     )
 
-#define FewHeadKernel(S)                                                    \
-    SparseKVFewHeadRemoteGetKernel<KVType, S, S_chunk, num_blocks,          \
+#define FewHeadKernel(_S)                                                   \
+    SparseKVFewHeadRemoteGetKernel<KVType, _S, S_chunk, num_blocks,         \
                 num_warps><<<num_blocks, num_warps * 4, 0, comm_stream>>>(  \
                         kv_buffer->k_data(),                                \
                         kv_buffer->v_data(),                                \
@@ -240,8 +247,8 @@ public:
                         _my_pe,                                             \
                         _cp_stride,                                         \
                         _total_n_pes,                                       \
-                        H * D,                                              \
-                        work_per_row                                        \
+                        B,                                                  \
+                        H * D                                               \
                     )
 
 #define SeqlenCase(MACRO_FUNC, _S, ...)         \

@@ -417,6 +417,7 @@ if(NOT SKIP_BUILD_FA)
     option(DISABLE_FLASHMASK_V2_PACKGQA "Disable PackGQA for flashmask_v2" ON)
     option(DISABLE_FLASHMASK_V2_BACKWARD "Disable Backward for flashmask_v2" OFF)
     option(DISABLE_FLASHMASK_V2_SM8X "Disable SM8x for flashmask_v2" ON)
+    option(WITH_DISTRIBUTED_OVERLAP "Enable distributed communication overlap" OFF)
 
     if(DISABLE_FLASHMASK_V2_FP16)
       add_compile_definitions(FLASHMASK_V2_DISABLE_FP16)
@@ -624,6 +625,13 @@ if(NOT SKIP_BUILD_FA)
     list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES "flashmask_v2/flash_prepare_scheduler.cu")
     message(STATUS "Auto generated CUDA source files for flashmask_v2: ${FLASHMASKV2_SOURCES_CU_SOURCES}")
 
+    if(WITH_DISTRIBUTED_OVERLAP)
+        message(STATUS "Enabling NVSHMEM for distributed overlap support")
+        
+        include(${CMAKE_CURRENT_SOURCE_DIR}/flashmask_v2/distributed/cmake/nvshmem.cmake)
+        add_subdirectory(flashmask_v2/distributed)
+    endif()
+
     # 3. 添加动态库
     add_library(flashmaskv2 SHARED
         ${FLASHMASKV2_SOURCES_CU_SOURCES}
@@ -649,6 +657,11 @@ if(NOT SKIP_BUILD_FA)
       -gencode arch=compute_90a,code=sm_90a
       --expt-relaxed-constexpr
       >)
+
+    if(WITH_DISTRIBUTED_OVERLAP)
+        target_link_libraries(flashmaskv2 PRIVATE flashmaskv2_distributed)
+        add_dependencies(flashmaskv2 flashmaskv2_distributed)
+    endif()
 
     INSTALL(TARGETS flashmaskv2 LIBRARY DESTINATION "lib")
 

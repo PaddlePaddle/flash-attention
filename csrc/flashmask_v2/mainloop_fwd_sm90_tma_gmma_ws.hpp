@@ -451,6 +451,8 @@ struct CollectiveMainloopFwdSm90 {
 
         int m_block_dim,n_block_dim;
         int32_t * __restrict__ block_mask_ptr = nullptr;
+
+        const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
     };
 
     // Device side kernel params
@@ -534,6 +536,8 @@ struct CollectiveMainloopFwdSm90 {
         // int m_block_dim,n_block_dim;
         int32_t * __restrict__ block_mask_ptr = nullptr;
         // int m_factor = 0, n_factor = 0;
+
+        const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
     };
 
     static Params
@@ -660,7 +664,8 @@ struct CollectiveMainloopFwdSm90 {
                 args.ut_end_nblockmax, args.ut_end_nblockmin,
                 // args.m_block_dim,args.n_block_dim,
                 // m_factor,n_factor,
-                args.block_mask_ptr};
+                args.block_mask_ptr,
+                args.write_ptr};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1132,7 +1137,39 @@ struct CollectiveMainloopFwdSm90 {
             }
         }
 
+        int old_wptr_val = 0;
+        // the following function stalls to wait for write_ptr. Can use static dispatch to optimize
+        auto wait_for_write_ptr = [&](int const n_block) {
+            if (params.write_ptr == nullptr) return;
+            static constexpr int chunk_size = 8192;
+            const int reverse_blockN_id = seqlen_info.seqlen_k - n_block * kBlockN - chunk_size;
+            if (reverse_blockN_id >= 0) {
+                const int target = bidb * (seqlen_info.seqlen_k - chunk_size) + reverse_blockN_id - chunk_size;
+                if (old_wptr_val >= target) return; // use the cached value to avoid frequent load from GMEM
+                // TODO(heqianyue): this should be made more generalized
+                // if num_head > 4: (bidb * num_head + bidh) / 2 * ..., divide by 2: overlap_comm copy 2 heads at once 
+
+                // TODO(heqianyue): timeout mechanism should be added for debugging purposes (`trap()`)
+                asm volatile(                    // this is a simple single-thread spin-lock
+                    "{\n"
+                    "  .reg .pred p_cond;\n"
+                    "  .reg .s32 r_val;\n"
+                    "\n"
+                    "SpinLoop:\n"
+                    "  ld.global.nc.s32 r_val, [%1];\n"
+                    "  setp.ge.s32 p_cond, r_val, %2;\n"
+                    "  @!p_cond bra SpinLoop;\n"  // Spin and poll the write_ptr
+                    "  mov.s32 %0, r_val;\n"
+                    "}\n"
+                    : "=r"(old_wptr_val) 
+                    : "l"(params.write_ptr), "r"(target) 
+                    : "memory"
+                );
+            }
+        };
+
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
+            wait_for_write_ptr(n_block);                    // wait for remote load (if any)
             pipeline_k.producer_acquire(smem_pipe_write);
             if constexpr (!PagedKVNonTMA) {
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
@@ -1146,6 +1183,7 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         auto load_V = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
+            wait_for_write_ptr(n_block);                    // wait for remote load (if any)
             auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
             pipeline_v_load.producer_acquire(smem_pipe_write);
             if constexpr (!PagedKVNonTMA) {

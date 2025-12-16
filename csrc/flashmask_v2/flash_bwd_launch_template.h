@@ -119,7 +119,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     }
 
     if constexpr (Arch >= 90) {
-        prepare_preemptive_scheduler(params, stream, params.num_sm);
+        prepare_flashmask(params, stream, params.num_sm);
     }
 
     typename CollectiveMainloop::Arguments mainloop_args = [&] () {

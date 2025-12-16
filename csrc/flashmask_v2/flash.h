@@ -183,8 +183,12 @@ struct Flash_fwd_params : public Qkv_params {
     int32_t * __restrict__ ut_end_nblockmax = nullptr;
     int32_t * __restrict__ ut_end_nblockmin = nullptr;
 
-    int m_block_dim,n_block_dim;
+    int m_block_dim, n_block_dim;
     int32_t * __restrict__ block_mask_ptr = nullptr;
+
+    // FlashMask Distributed Overlap
+    int cp_size = 0;        // means no CP, not used in distributed env
+    int * __restrict__ write_ptr = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -242,5 +246,5 @@ template <int Arch, typename T, int kHeadDim, bool Has_softcap, bool Is_causal, 
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
 template <typename T, typename Tpartial, int kBlockK>
 void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl);
-void prepare_preemptive_scheduler(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx = false);
-void prepare_preemptive_scheduler(Flash_bwd_params &params, cudaStream_t stream, int num_sm);
+void prepare_flashmask(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx = false, cudaEvent_t* const comm_event = nullptr);
+void prepare_flashmask(Flash_bwd_params &params, cudaStream_t stream, int num_sm, cudaEvent_t* const comm_event = nullptr);

@@ -5,6 +5,8 @@
 #include <stdexcept>
 #include <cstring>
 
+namespace flashmask {
+
 // RAII object of send/recv buffer
 template <typename KVType>
 class SRBuffer {
@@ -96,14 +98,6 @@ public:
         return _allocated && _k_sr && _v_sr && _team != NVSHMEM_TEAM_INVALID;
     }
 
-    void clear() {
-        if (_k_sr) {
-            nvshmem_team_sync(_team);
-            nvshmem_memset(_k_sr, 0, total_bytes());
-            nvshmem_team_sync(_team);
-        }
-    }
-
     nvshmem_team_t team() const noexcept {
         return _team;
     }
@@ -115,3 +109,5 @@ public:
         std::swap(_team, other._team);
     }
 };
+
+}   // namespace flashmask

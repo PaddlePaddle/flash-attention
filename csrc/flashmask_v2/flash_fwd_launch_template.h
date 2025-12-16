@@ -22,6 +22,7 @@
 #include "mainloop_fwd_sm80.hpp"
 #include "epilogue_fwd.hpp"
 #include "flash_mask.hpp"
+#include "distributed/overlap_comm.cuh"
 
 using namespace cute;
 
@@ -98,9 +99,50 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             make_stride(params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0),
             make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
 
-    if constexpr (Is_flashmask) {
-        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream, true);
+    // TODO(heqianyue): Is using static local variable safe for nvshmem related ops?
+    static std::unique_ptr<flashmask::OverlapCommunicator<Element>> overlap_comm = nullptr;
+    static constexpr bool use_dummy_dist = true;            // manually choose to use distributed functionalities
+    if constexpr (use_dummy_dist) {                         // TODO(heqianyue): deprecate in the future
+        params.cp_size = 4;
     }
+    if (params.cp_size > 1) {
+        if (overlap_comm == nullptr) {
+            if (params.d != params.dv) {
+                throw std::runtime_error("Overlap Communicator currently does not support D != Dv. KV should have the same D.");
+            }
+            if (params.seqlen_k % kBlockN) {
+                throw std::runtime_error("AttnBlock size should perfectly divided seqlen_k. This constraint will be removed in the future.");
+            }
+            overlap_comm = std::make_unique<flashmask::OverlapCommunicator<Element>>(
+                (const Element*) params.k_ptr,
+                (const Element*) params.v_ptr,
+                params.b,
+                params.seqlen_k, 
+                params.h, 
+                params.d,
+                params.cp_size
+            );
+        } else {
+            overlap_comm->update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
+        }
+    }
+
+    if constexpr (Arch >= 90) {
+        // setting scheduler tile_count_semaphore / zeroing write_ptr / record write_ptr ready event
+        prepare_flashmask(params, stream, params.num_sm, Scheduler::pipelining, overlap_comm ? &overlap_comm->wptr_init : nullptr);
+    }
+    if (overlap_comm) {
+        overlap_comm->wait_init();        // wait until wptr is initialized
+        // TODO(heqianyue): add more mask type support
+        overlap_comm->run_overlap_kernel(params.lt_start_ptr, params.ut_end_ptr, params.seqlen_k);
+        // `run_overlap_kernel` is async. Then, re-route the KV data to the nvshmem_alloc SR buffer.
+        // After `run_overlap_kernel`, the seqlen_k is no long local length, but local_length * cp_size
+        params.k_ptr = overlap_comm->k_data();
+        params.v_ptr = overlap_comm->v_data();
+    }
+
+    static constexpr int buffer_size = (SeqlenDispatch == SeqlenDispatchTag::LongSeq ? 16 : 4) * 1024;
+    flash::flashmask::prepare_block_maxmin<kBlockN, buffer_size>(params, stream, true);
 
     typename CollectiveMainloop::Arguments mainloop_args {
         static_cast<Element const*>(params.q_ptr),
@@ -151,7 +193,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.ut_start_nblockmax, params.ut_start_nblockmin,
         params.ut_end_nblockmax, params.ut_end_nblockmin,
         params.m_block_dim,params.n_block_dim,
-        params.block_mask_ptr
+        params.block_mask_ptr,
+        params.write_ptr
     };
 
     typename CollectiveEpilogue::Arguments epilogue_args {
@@ -167,10 +210,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.h_k,
         params.cu_seqlens_q, params.seqused_q
     };
-
-    if constexpr (Arch >= 90) {
-        prepare_preemptive_scheduler(params, stream, params.num_sm, Scheduler::pipelining);
-    }
 
     int qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q * qhead_per_khead, get<0>(TileShape_MNK{}));

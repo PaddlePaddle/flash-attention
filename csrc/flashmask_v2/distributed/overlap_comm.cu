@@ -1,6 +1,7 @@
 #include <mpi.h>            // deprecate note
 #include <iostream>
 #include "overlap_comm.cuh"
+#include "nvshmem_handle.h"
 #include "remote_get_kernel.cuh"
 #include "cutlass/bfloat16.h"
 
@@ -9,14 +10,6 @@ namespace flashmask {
 void get_nvshmem_info(int& my_pe, int& n_pes) {
     my_pe = nvshmem_my_pe();
     n_pes = nvshmem_n_pes();
-}
-
-std::vector<uint8_t> get_unique_id() {  // copied from DeepEP
-    nvshmemx_uniqueid_t unique_id;
-    nvshmemx_get_uniqueid(&unique_id);
-    std::vector<uint8_t> result(sizeof(nvshmemx_uniqueid_t));
-    std::memcpy(result.data(), &unique_id, sizeof(nvshmemx_uniqueid_t));
-    return result;
 }
 
 void init_with_unique_id(
@@ -31,6 +24,7 @@ void init_with_unique_id(
     nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr);
     nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
     // TODO(heqianyue): Do we need to bar here?
+    nvshmem_barrier_all();
 }
 
 void init_distributed_environment(
@@ -40,13 +34,19 @@ void init_distributed_environment(
     int& n_pes
 ) {
     printf("[FlashMask Overlap] Initializing NVSHMEM... Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
-    init_with_unique_id(get_unique_id(), rank, nranks);
+    std::vector<uint8_t> unique_id_val;
+    if (rank == 0) {
+        unique_id_val = UniqueIdFileSync::generate_and_write_unique_id(rank);
+    } else {
+        unique_id_val = UniqueIdFileSync::wait_and_read_unique_id(rank);
+    }
+    init_with_unique_id(std::move(unique_id_val), rank, nranks);
     get_nvshmem_info(my_pe, n_pes);
     printf("[FlashMask Overlap] NVSHMEM initialized. Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
 }
 
 void finalize_distributed_environment() {
-    // skip if MPI is finalized before this function
+    UniqueIdFileSync::clean_up_file();
     nvshmem_finalize();
     printf("[FlashMask Overlap] NVSHMEM env finalized.\n");
 }

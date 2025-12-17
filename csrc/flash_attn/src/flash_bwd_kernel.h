@@ -1567,7 +1567,7 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
     }
 
     if (true/*Is_flashmask*/) {
-        if (tidx < kBlockN) {
+        if (tidx < kBlockN && tidx + n_block * kBlockN < binfo.actual_seqlen_k) {
 	        sFlashMaskLTStart(tidx) = gFlashMaskLTStart(tidx);
             if(!Is_causal) {
                 sFlashMaskUTEnd(tidx) = gFlashMaskUTEnd(tidx);

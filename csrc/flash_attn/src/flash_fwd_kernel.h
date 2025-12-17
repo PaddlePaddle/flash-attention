@@ -1350,7 +1350,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_flashmask(const Params &p
                 (((m_block + 1) * kBlockM > gFlashMaskLTStartMin[n_block] && (!flashmask_ut_has_start || m_block * kBlockM < gFlashMaskLTEndMax[n_block])) || 
                     (m_block * kBlockM < gFlashMaskUTEndMax[n_block] && (!flashmask_ut_has_start || (m_block + 1) * kBlockM > gFlashMaskUTStartMin[n_block]))))) {
 
-              if (tidx < kBlockN) {
+              if (tidx < kBlockN && tidx + n_block * kBlockN < binfo.actual_seqlen_k) {
                 sFlashMaskLTStart(tidx) = gFlashMaskLTStart(tidx);
                 sFlashMaskUTEnd(tidx) = gFlashMaskUTEnd(tidx);
                 if(flashmask_ut_has_start) {
@@ -1417,7 +1417,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_flashmask(const Params &p
             if (true/*Is_flashmask*/ && (!enable_mask_bypass ||
                 (m_block + 1) * kBlockM > gFlashMaskLTStartMin[n_block] && (!flashmask_lt_has_end || m_block * kBlockM < gFlashMaskLTEndMax[n_block]))) {
 
-                if (tidx < kBlockN) {
+                if (tidx < kBlockN && tidx + n_block * kBlockN < binfo.actual_seqlen_k) {
                   sFlashMaskLTStart(tidx) = gFlashMaskLTStart(tidx);
                   if(flashmask_lt_has_end) {
                     sFlashMaskLTEnd(tidx) = gFlashMaskLTEnd(tidx);
@@ -1596,7 +1596,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_flashmask(const Params &p
               (((m_block + 1) * kBlockM > gFlashMaskLTStartMin[n_block] && (!flashmask_ut_has_start || m_block * kBlockM < gFlashMaskLTEndMax[n_block])) || 
                   (m_block * kBlockM < gFlashMaskUTEndMax[n_block] && (!flashmask_ut_has_start || (m_block + 1) * kBlockM > gFlashMaskUTStartMin[n_block]))))) {
 
-            if (tidx < kBlockN) {
+            if (tidx < kBlockN && tidx + n_block * kBlockN < binfo.actual_seqlen_k) {
               sFlashMaskLTStart(tidx) = gFlashMaskLTStart(tidx);
               sFlashMaskUTEnd(tidx) = gFlashMaskUTEnd(tidx);
               if(flashmask_ut_has_start) {
@@ -1648,7 +1648,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_flashmask(const Params &p
         } else if (Is_causal && true/*Is_flashmask*/ && (!enable_mask_bypass ||
             (m_block + 1) * kBlockM > gFlashMaskLTStartMin[n_block] && (!flashmask_lt_has_end || m_block * kBlockM < gFlashMaskLTEndMax[n_block]))) {
 
-            if (tidx < kBlockN) {
+            if (tidx < kBlockN && tidx + n_block * kBlockN < binfo.actual_seqlen_k) {
               sFlashMaskLTStart(tidx) = gFlashMaskLTStart(tidx);
               if(flashmask_lt_has_end) {
                 sFlashMaskLTEnd(tidx) = gFlashMaskLTEnd(tidx);

@@ -543,46 +543,57 @@ struct CollectiveMainloopFwdSm90 {
     static Params
     to_underlying_arguments(Arguments const& args) {
         Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q), args.shape_Q, args.stride_Q);
+        printf("tma_load_Q preparing...\n");
         TMA_Q tma_load_Q = make_tma_copy_A_sm90(
             GmemTiledCopyQ{},
             mQ,
             SmemLayoutQ{},
             TileShape_MNK{},
             ClusterShape{}); // no mcast for Q
+        printf("tma_load_Q prepared.\n");
         Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), args.shape_K, args.stride_K);
+        printf("tma_load_K preparing...\n");
         TMA_K tma_load_K = make_tma_copy_B_sm90(
             GmemTiledCopyKV{},
             mK,
             take<0, 2>(SmemLayoutK{}),
             TileShape_MNK{},
             ClusterShape{}); // mcast along M mode for this N load, if any
+        printf("tma_load_K prepared.\n");
         Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V),
                                 make_shape(args.headdim_v, get<0>(args.shape_K), get<2>(args.shape_K), get<3>(args.shape_K)),
                                 select<1, 0, 2, 3>(args.stride_V));
+        printf("tma_load_V preparing...\n");
         TMA_V tma_load_V = make_tma_copy(
             GmemTiledCopyKV{},
             mV,
             take<0, 2>(SmemLayoutVt{}),
             select<1, 2>(TileShape_MNK_PV{}),
             size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
+        printf("tma_load_V prepared.\n");
         Tensor mKnew = make_tensor(make_gmem_ptr(args.ptr_K_new), args.shape_K_new, args.stride_K_new);
+        printf("tma_load_K_new preparing...\n");
         TMA_K tma_load_K_new = make_tma_copy_B_sm90(
             GmemTiledCopyKV{},
             cute::conditional_return<AppendKV>(mKnew, mK),
             take<0, 2>(SmemLayoutK{}),
             TileShape_MNK{},
             ClusterShape{}); // mcast along M mode for this N load, if any
+        printf("tma_load_K_new prepared.\n");
         Tensor mVnew = make_tensor(make_gmem_ptr(args.ptr_V_new),
                                    make_shape(args.headdim_v, get<0>(args.shape_K_new), get<2>(args.shape_K_new), get<3>(args.shape_K_new)),
                                    select<1, 0, 2, 3>(args.stride_V_new));
+        printf("tma_load_V_new preparing...\n");
         TMA_V tma_load_V_new = make_tma_copy(
             GmemTiledCopyKV{},
             cute::conditional_return<AppendKV>(mVnew, mV),
             take<0, 2>(SmemLayoutVt{}),
             select<1, 2>(TileShape_MNK_PV{}),
             size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
+        printf("tma_load_V_new prepared.\n");
         auto shape_Qv = make_shape(get<0>(args.shape_Q), args.headdim_v, get<2>(args.shape_Q), get<3>(args.shape_Q));
         Tensor mQv = make_tensor(make_gmem_ptr(args.ptr_Qv), shape_Qv, args.stride_Qv);
+        printf("tma_load_Qv preparing...\n");
         TMA_Qv tma_load_Qv = [&] {
             if constexpr (HasQv) {
                 return make_tma_copy_A_sm90(
@@ -595,6 +606,7 @@ struct CollectiveMainloopFwdSm90 {
                 return nullptr;
             }
         }();
+        printf("tma_load_Qv prepared.\n");
         // If PackGQA, reshape Q to be ((qhead_per_khead, seqlen_q), head_size, nhead_k, batch_size)
         int const qhead_per_khead = !PackGQA ? 1 : cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K));
         auto const shape_Q_packed = cute::conditional_return<!PackGQA>(

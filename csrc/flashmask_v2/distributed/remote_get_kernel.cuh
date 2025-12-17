@@ -1,6 +1,5 @@
 #pragma once
 #include <cuda_runtime.h>
-#include "non_abi/device/common/nvshmemi_common_device.cuh"
 #include "sr_buffer.cuh"
 #include "fast_divmod.cuh"
 
@@ -20,7 +19,7 @@ inline void CheckCudaErrorAux(const char *file, unsigned line,
 #if defined(NVSHMEM_DEBUG)
 #define CUDA_DEBUG_CHECK(value) CheckCudaErrorAux(__FILE__, __LINE__, #value, value)
 #else
-#define CUDA_DEBUG_CHECK(value) do {} while(0)
+#define CUDA_DEBUG_CHECK(value) (value)
 #endif
 
 /**

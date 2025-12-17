@@ -153,6 +153,7 @@ void prepare_flashmask(Flash_fwd_params &params, cudaStream_t stream, int num_sm
         params.write_ptr,
         num_sm);
     if (comm_event) cudaEventRecord(*comm_event, stream);       // notify the overlap communicator: wptr is initialized
+    printf("params.write_ptr: %lx\n", size_t(params.write_ptr));
 }
 
 void prepare_flashmask(Flash_bwd_params &params, cudaStream_t stream, int num_sm, cudaEvent_t* const comm_event) {

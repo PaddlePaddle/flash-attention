@@ -105,12 +105,10 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     
     // This variable is simply a int32_t, so can be passed by value
     nvshmem_team_t cp_team = simple_collective_topology_setter(_my_pe, _cp_stride, _total_n_pes);
-    auto kv_buffer = std::make_unique<SRBuffer<KVType>>(_total_numel, cp_team);
+    kv_buffer = std::make_unique<SRBuffer<KVType>>(_total_numel, cp_team);
 
     // copy to the last position of the SR buffer
     DEBUG_PRINT("SR buffer valid: %d, B, S, H, D: %d, %d, %d, %d, cp_size: %d\n", int(kv_buffer->is_valid()), B, S_local, H, D, cp_size);
-    DEBUG_PRINT("K copying: dst: %x, src: %x, _cp_chunk_size: %lu, _total_numel: %lu\n", size_t(kv_buffer->k_data()), size_t(k_data), _cp_chunk_size, _total_numel);
-    DEBUG_PRINT("V copying: dst: %x, src: %x, _cp_chunk_size: %lu, _total_numel: %lu\n", size_t(kv_buffer->v_data()), size_t(v_data), _cp_chunk_size, _total_numel);
     update_kv_buffer(k_data, v_data);
     CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * num_blocks, comm_stream));
     DEBUG_PRINT("[FlashMask Overlap] constructor rank: %d, nranks: %d\n", rank, nranks);
@@ -205,7 +203,10 @@ void OverlapCommunicator<KVType>::run_overlap_kernel(
 
     // Note(heqianyue): input `S` for the following macros are full length, be careful
     if (H <= 4) {
+        printf("Run this kernel: few head dispatch, S = %d\n", S);
+        CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
         SeqlenDispatch(FewHeadKernel, S);
+        CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
     } else {
         if (D == 128) {
             SeqlenDispatch(MultiHeadKernel, S, 128);
@@ -216,7 +217,7 @@ void OverlapCommunicator<KVType>::run_overlap_kernel(
         } else {
             throw std::invalid_argument("Supported HeadDim is [64, 80, 128]");
         }
-    }   
+    }
 #undef SeqlenDispatch
 #undef SeqlenCase
 #undef FewHeadKernel

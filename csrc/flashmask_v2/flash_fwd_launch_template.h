@@ -88,17 +88,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         flash::enable_sm80_to_sm89<flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
 
-    bool const is_varlen_q = params.cu_seqlens_q;
-    bool const is_varlen_k = params.cu_seqlens_k;
-    bool const is_varlen_k_new = params.cu_seqlens_knew;
-    int seqlen_q = !is_varlen_q ? params.seqlen_q : params.total_q;
-    int batch_q = !is_varlen_q ? params.b : 1;
-    int batch_k = !is_varlen_k ? (params.kv_batch_idx ? params.b_k : params.b) : 1;
-    typename CollectiveMainloop::StrideV v_strides =
-        cute::conditional_return<!V_colmajor>(
-            make_stride(params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0),
-            make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
-
     // TODO(heqianyue): Is using static local variable safe for nvshmem related ops?
     static std::unique_ptr<flashmask::OverlapCommunicator<Element>> overlap_comm = nullptr;
     static constexpr bool use_dummy_dist = true;            // manually choose to use distributed functionalities
@@ -106,6 +95,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.cp_size = 4;
     }
     if (params.cp_size > 1 && params.nranks > 1) {
+        if constexpr (Varlen) {
+            throw std::runtime_error("Overlap Communicator currently does not support Varlen.");
+        }
         if (overlap_comm == nullptr) {
             if (params.d != params.dv) {
                 throw std::runtime_error("Overlap Communicator currently does not support D != Dv. KV should have the same D.");
@@ -118,7 +110,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 (const Element*) params.v_ptr,
                 params.b,
                 params.seqlen_k, 
-                params.h, 
+                params.h_k, 
                 params.d,
                 params.rank,
                 params.nranks,
@@ -137,11 +129,24 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         overlap_comm->wait_init();        // wait until wptr is initialized
         // TODO(heqianyue): add more mask type support
         overlap_comm->run_overlap_kernel(params.lt_start_ptr, params.ut_end_ptr, params.seqlen_k);
+        params.k_batch_stride *= params.cp_size;
+        params.v_batch_stride *= params.cp_size;
         // `run_overlap_kernel` is async. Then, re-route the KV data to the nvshmem_alloc SR buffer.
-        // After `run_overlap_kernel`, the seqlen_k is no long local length, but local_length * cp_size
+        // After `run_overlap_kernel`, the seqlen_k & k_batch_stride & v_batch_stride is no longer local, but local_length * cp_size
         params.k_ptr = overlap_comm->k_data();
         params.v_ptr = overlap_comm->v_data();
     }
+
+    bool const is_varlen_q = params.cu_seqlens_q;
+    bool const is_varlen_k = params.cu_seqlens_k;
+    bool const is_varlen_k_new = params.cu_seqlens_knew;
+    int seqlen_q = !is_varlen_q ? params.seqlen_q : params.total_q;
+    int batch_q = !is_varlen_q ? params.b : 1;
+    int batch_k = !is_varlen_k ? (params.kv_batch_idx ? params.b_k : params.b) : 1;
+    typename CollectiveMainloop::StrideV v_strides =
+        cute::conditional_return<!V_colmajor>(
+            make_stride(params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0),
+            make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
 
     static constexpr int buffer_size = (SeqlenDispatch == SeqlenDispatchTag::LongSeq ? 16 : 4) * 1024;
     flash::flashmask::prepare_block_maxmin<kBlockN, buffer_size>(params, stream, true);
@@ -213,6 +218,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.cu_seqlens_q, params.seqused_q
     };
 
+    printf("stride Q: %d, %d, %d, %d\n", get<0>(mainloop_args.stride_Q), get<1>(mainloop_args.stride_Q), get<2>(mainloop_args.stride_Q), get<3>(mainloop_args.stride_Q));
+    printf("stride K: %d, %d, %d, %d\n", get<0>(mainloop_args.stride_K), get<1>(mainloop_args.stride_K), get<2>(mainloop_args.stride_K), get<3>(mainloop_args.stride_K));
+    printf("stride V: %d, %d, %d, %d\n", get<0>(mainloop_args.stride_V), get<1>(mainloop_args.stride_V), get<2>(mainloop_args.stride_V), get<3>(mainloop_args.stride_V));
+    printf("stride K new: %d, %d, %d, %d\n", get<0>(mainloop_args.stride_K_new), get<1>(mainloop_args.stride_K_new), get<2>(mainloop_args.stride_K_new), get<3>(mainloop_args.stride_K_new));
+    printf("stride V new: %d, %d, %d, %d\n", get<0>(mainloop_args.stride_V_new), get<1>(mainloop_args.stride_V_new), get<2>(mainloop_args.stride_V_new), get<3>(mainloop_args.stride_V_new));
+    printf("stride Qv: %d, %d, %d, %d\n", get<0>(mainloop_args.stride_Qv), get<1>(mainloop_args.stride_Qv), get<2>(mainloop_args.stride_Qv), get<3>(mainloop_args.stride_Qv));
+
     int qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q * qhead_per_khead, get<0>(TileShape_MNK{}));
     num_blocks_m = cutlass::round_up(num_blocks_m, size<0>(ClusterShape{}));
@@ -236,6 +248,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
         mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
     });
+    CHECK_CUDA(cudaGetLastError());
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();
@@ -258,6 +271,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
+        printf("Before flashmask_kernel_launch. %d / %d\n", params.rank, params.nranks);
         flash::flashmask_kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
                                            Arch >= 90 && Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);
     }

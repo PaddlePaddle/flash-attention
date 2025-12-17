@@ -5,6 +5,26 @@
 #include "remote_get_kernel.cuh"
 #include "cutlass/bfloat16.h"
 
+#define DEBUG_LOGGING 1
+#if DEBUG_LOGGING > 0
+    #define DEBUG_PRINT(fmt, ...) printf("[Debug] " fmt, ##__VA_ARGS__)
+    #if DEBUG_LOGGING > 1
+        #define WARN_PRINT(fmt, ...) printf("[Warn] " fmt, ##__VA_ARGS__)
+        #if DEBUG_LOGGING > 2
+            #define ERROR_PRINT(fmt, ...) printf("[Error] " fmt, ##__VA_ARGS__)
+        #else 
+            #define ERROR_PRINT(fmt, ...) ((void)0)
+        #endif // ERROR
+    #else
+        #define ERROR_PRINT(fmt, ...) ((void)0)
+        #define WARN_PRINT(fmt, ...) ((void)0)
+    #endif // WARN
+#else
+    #define ERROR_PRINT(fmt, ...) ((void)0)
+    #define WARN_PRINT(fmt, ...) ((void)0)
+    #define DEBUG_PRINT(fmt, ...) ((void)0)
+#endif // DEBUG_LOGGING
+
 namespace flashmask {
 
 void get_nvshmem_info(int& my_pe, int& n_pes) {
@@ -33,7 +53,7 @@ void init_distributed_environment(
     int& my_pe, 
     int& n_pes
 ) {
-    printf("[FlashMask Overlap] Initializing NVSHMEM... Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
+    DEBUG_PRINT("[FlashMask Overlap] Initializing NVSHMEM... Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
     std::vector<uint8_t> unique_id_val;
     if (rank == 0) {
         unique_id_val = UniqueIdFileSync::generate_and_write_unique_id(rank);
@@ -42,13 +62,13 @@ void init_distributed_environment(
     }
     init_with_unique_id(std::move(unique_id_val), rank, nranks);
     get_nvshmem_info(my_pe, n_pes);
-    printf("[FlashMask Overlap] NVSHMEM initialized. Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
+    DEBUG_PRINT("[FlashMask Overlap] NVSHMEM initialized. Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
+    UniqueIdFileSync::clean_up_file();
 }
 
 void finalize_distributed_environment() {
-    UniqueIdFileSync::clean_up_file();
     nvshmem_finalize();
-    printf("[FlashMask Overlap] NVSHMEM env finalized.\n");
+    DEBUG_PRINT("[FlashMask Overlap] NVSHMEM env finalized.\n");
 }
 
 template <typename KVType>
@@ -88,9 +108,12 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     auto kv_buffer = std::make_unique<SRBuffer<KVType>>(_total_numel, cp_team);
 
     // copy to the last position of the SR buffer
+    DEBUG_PRINT("SR buffer valid: %d, B, S, H, D: %d, %d, %d, %d, cp_size: %d\n", int(kv_buffer->is_valid()), B, S_local, H, D, cp_size);
+    DEBUG_PRINT("K copying: dst: %x, src: %x, _cp_chunk_size: %lu, _total_numel: %lu\n", size_t(kv_buffer->k_data()), size_t(k_data), _cp_chunk_size, _total_numel);
+    DEBUG_PRINT("V copying: dst: %x, src: %x, _cp_chunk_size: %lu, _total_numel: %lu\n", size_t(kv_buffer->v_data()), size_t(v_data), _cp_chunk_size, _total_numel);
     update_kv_buffer(k_data, v_data);
     CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * num_blocks, comm_stream));
-    printf("[FlashMask Overlap] constructor rank: %d, nranks: %d\n", rank, nranks);
+    DEBUG_PRINT("[FlashMask Overlap] constructor rank: %d, nranks: %d\n", rank, nranks);
 }
 
 template <typename KVType>
@@ -109,6 +132,7 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     const KVType* const new_k_data,
     const KVType* const new_v_data
 ) {
+    DEBUG_PRINT("Inside the `update_kv_buffer` function.\n");
     CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->k_data() + (_total_numel - _cp_chunk_size), new_k_data, 
                         _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
     CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->v_data() + (_total_numel - _cp_chunk_size), new_v_data,

@@ -1,4 +1,4 @@
-#include <mpi.h>
+#include <mpi.h>            // deprecate note
 #include <iostream>
 #include "overlap_comm.cuh"
 #include "remote_get_kernel.cuh"
@@ -11,41 +11,44 @@ void get_nvshmem_info(int& my_pe, int& n_pes) {
     n_pes = nvshmem_n_pes();
 }
 
-void init_distributed_environment(int& my_pe, int& n_pes) {
-    int mpi_initialized = 0;
-    MPI_Initialized(&mpi_initialized);
+std::vector<uint8_t> get_unique_id() {  // copied from DeepEP
+    nvshmemx_uniqueid_t unique_id;
+    nvshmemx_get_uniqueid(&unique_id);
+    std::vector<uint8_t> result(sizeof(nvshmemx_uniqueid_t));
+    std::memcpy(result.data(), &unique_id, sizeof(nvshmemx_uniqueid_t));
+    return result;
+}
 
-    // try initializing if we did not initialize
-    if (!mpi_initialized) {
-        MPI_Init(NULL, NULL);
-    }
+void init_with_unique_id(
+    std::vector<uint8_t>&& root_unique_id_val,
+    int rank,
+    int num_ranks
+) {       // adopted from DeepEP
+    nvshmemx_uniqueid_t root_unique_id;
+    nvshmemx_init_attr_t attr;
+    std::memcpy(
+        &root_unique_id, root_unique_id_val.data(), sizeof(nvshmemx_uniqueid_t));
+    nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr);
+    nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
+    // TODO(heqianyue): Do we need to bar here?
+}
 
-    int rank, nranks;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-    cudaSetDevice(rank % nranks);
-
-    MPI_Comm mpi_comm = MPI_COMM_WORLD;
-    nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
-    attr.mpi_comm = &mpi_comm;
-    nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
+void init_distributed_environment(
+    int rank,
+    int nranks,
+    int& my_pe, 
+    int& n_pes
+) {
+    printf("[FlashMask Overlap] Initializing NVSHMEM... Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
+    init_with_unique_id(get_unique_id(), rank, nranks);
     get_nvshmem_info(my_pe, n_pes);
-    printf("FlashMask notify: MPI and NVSHMEM envs are initialized. Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
+    printf("[FlashMask Overlap] NVSHMEM initialized. Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
 }
 
 void finalize_distributed_environment() {
     // skip if MPI is finalized before this function
-    int mpi_finalized;
-    MPI_Finalized(&mpi_finalized);
-    if (mpi_finalized == 0) {
-        try {
-            nvshmem_finalize();
-        } catch (const std::exception& e) {
-            std::cerr << "[Error] nvshmem_finalize failed: " << e.what() << std::endl;
-        }
-        MPI_Finalize();
-        printf("FlashMask notify: MPI and NVSHMEM envs are finalized.\n");
-    }
+    nvshmem_finalize();
+    printf("[FlashMask Overlap] NVSHMEM env finalized.\n");
 }
 
 template <typename KVType>
@@ -56,6 +59,8 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     int s_kv,
     int h_kv,
     int d_kv,
+    int rank,
+    int nranks,
     int cp_size
     // Maybe we should manage the following by ourselves? Do not pass as parameters
 ): write_ptr(nullptr),
@@ -67,7 +72,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
    _cp_size(cp_size)
 {
     if constexpr (SHOULD_MANAGE_NVSHMEM) {
-        init_distributed_environment(_my_pe, _total_n_pes);
+        init_distributed_environment(rank, nranks, _my_pe, _total_n_pes);
     } else {
         get_nvshmem_info(_my_pe, _total_n_pes);     // get info if nvshmem is already avaliable
     }
@@ -85,6 +90,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     // copy to the last position of the SR buffer
     update_kv_buffer(k_data, v_data);
     CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * num_blocks, comm_stream));
+    printf("[FlashMask Overlap] constructor rank: %d, nranks: %d\n", rank, nranks);
 }
 
 template <typename KVType>

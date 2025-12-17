@@ -105,7 +105,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     if constexpr (use_dummy_dist) {                         // TODO(heqianyue): deprecate in the future
         params.cp_size = 4;
     }
-    if (params.cp_size > 1) {
+    if (params.cp_size > 1 && params.nranks > 1) {
         if (overlap_comm == nullptr) {
             if (params.d != params.dv) {
                 throw std::runtime_error("Overlap Communicator currently does not support D != Dv. KV should have the same D.");
@@ -120,6 +120,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 params.seqlen_k, 
                 params.h, 
                 params.d,
+                params.rank,
+                params.nranks,
                 params.cp_size
             );
         } else {

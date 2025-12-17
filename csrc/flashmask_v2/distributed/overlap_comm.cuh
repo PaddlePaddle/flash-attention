@@ -28,6 +28,8 @@ public:
         int s_kv,
         int h_kv,
         int d_kv,
+        int rank,
+        int nranks,
         int cp_size
     );
 

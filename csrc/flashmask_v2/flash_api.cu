@@ -543,6 +543,8 @@ DEFINE_GETTER_SETTER(int32_t *, ut_end_nblockmin)
 DEFINE_GETTER_SETTER(int, m_block_dim)
 DEFINE_GETTER_SETTER(int, n_block_dim)
 DEFINE_GETTER_SETTER(int32_t *, block_mask_ptr)
+DEFINE_GETTER_SETTER(int, rank)
+DEFINE_GETTER_SETTER(int, nranks)
 DEFINE_GETTER_SETTER(int, cp_size)
 DEFINE_GETTER_SETTER(int32_t *, write_ptr)
 

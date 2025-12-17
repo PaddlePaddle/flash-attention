@@ -187,6 +187,8 @@ struct Flash_fwd_params : public Qkv_params {
     int32_t * __restrict__ block_mask_ptr = nullptr;
 
     // FlashMask Distributed Overlap
+    int rank = 0;
+    int nranks = 1;
     int cp_size = 0;        // means no CP, not used in distributed env
     int * __restrict__ write_ptr = nullptr;
 };

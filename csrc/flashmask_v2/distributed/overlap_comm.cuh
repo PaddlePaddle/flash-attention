@@ -44,12 +44,9 @@ public:
     void run_overlap_kernel(
         const int* const lt_start_ptr,
         const int* const ut_end_ptr,
+        int* const write_ptr,
         int& S
     );
-
-    void set_wptr(int* const wptr) {
-        this->write_ptr = wptr;
-    }
 
     void wait_init() {
         cudaStreamWaitEvent(comm_stream, wptr_init);
@@ -63,7 +60,6 @@ public:
         const KVType* const new_v_data
     );
 
-    int* write_ptr;
     cudaEvent_t wptr_init;
 private:
     std::unique_ptr<SRBuffer<KVType>> kv_buffer;

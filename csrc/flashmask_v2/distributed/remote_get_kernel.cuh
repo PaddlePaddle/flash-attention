@@ -77,23 +77,24 @@ __global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
             batch_offset += S;
         }
         // TODO(heqianyue): We only support LTS + UTE and multi-head shared mask currently, this should be extended
+        // the mask indices are rolled, so we can use the following simple load
         const int lts = lt_start_ptr[batch_offset + seqlen_id];
         const int ute = ut_end_ptr[batch_offset + seqlen_id];
         if (lts > ute) {         // mask does not cover the whole row of KV
-            // actually, two calls can be merged
             int cp_chunk_id = (S - 1 - seqlen_id) / S_chunk;
             int remote_pe = my_pe - cp_chunk_id * cp_stride;
             remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes; 
-            const int dst_addr = (seqlen_id + batch_offset) * S_stride;
             // batch_offset * S_stride (batch-address) + (S-S_chunk) * S_stride (stored in the last chunk) + (seqlen_id % S_chunk) * S_stride (within chunk address)
             const int src_addr = (S - S_chunk + (seqlen_id % S_chunk) + batch_offset) * S_stride;
-            // TODO(heqianyue): Check whether we should use blocking version -- we do not call get multiple times before sync
-            nvshmemx_getmem_nbi_warp(
+            const int dst_addr = (seqlen_id + batch_offset) * S_stride;
+            // actually, two calls can be merged
+            // TODO(heqianyue): Double check whether we should use NBI API or not
+            nvshmemx_getmem_warp(
                         &k_sr[dst_addr],
                         &k_sr[src_addr],
                         S_stride * sizeof(T), remote_pe
             );
-            nvshmemx_getmem_nbi_warp(
+            nvshmemx_getmem_warp(
                         &v_sr[dst_addr],
                         &v_sr[src_addr],
                         S_stride * sizeof(T), remote_pe
@@ -103,19 +104,20 @@ __global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
         // TODO(heqianyue): I really hope to change this API again in the future. For within node transfer, there seems to be no need to
         // use nbi API and call this `quite`, since the memory transfer is done via CUDA IPC using CUDA-core (dst[..]=src[..]). Also,
         // two `get` ops can be merged into one by 
-        nvshmem_quiet();
         __syncthreads();
         // the following code ensures ordered write_ptr update without the need to sync_grid
         // using cooperative_group::this_grid().sync() is definitely correct, but can be costly
         // I don't want blocks to wait for each other
         if (threadIdx.x < 32) {
+            // TODO(heqianyue): make this better by not using __syncthreads
             // make sure the work_idx update is visible to other blocks (in terms of cache state). Otherwise, use a __threadfence
             if (threadIdx.x == 0) atomicExch(&block_work_idx[blockIdx.x], work_id);
             int work_idx = threadIdx.x == blockIdx.x ? work_id : block_work_idx[threadIdx.x];
             work_idx = __reduce_min_sync(0xffffffff, work_idx);
             // reduce the slowest block (for example, 8 blocks, 1, 2, 1, 1, 2, 1, 1, 0) --->
             // there are two blocks still not finishing work_id = 0, wptr can not move
-            atomicMax(wptr, work_idx * num_warps * num_blocks);     // 256 * work_idx
+            if (threadIdx.x == 0)
+                atomicMax(wptr, work_idx * num_warps * num_blocks);     // 256 * work_idx
         }
     }
 }
@@ -188,7 +190,8 @@ __global__ __launch_bounds__(256, 8) void SparseKVMultiHeadRemoteGetKernel(
             work_idx = __reduce_min_sync(0xFFFFFFFF, work_idx);
             // reduce the slowest block (for example, 8 blocks, -1, 0, 0, 1, 2, 0, -1, 0) --->
             // there are two blocks still not finishing work_id = 0, wptr can not move
-            atomicExch(wptr, work_idx * num_warps * num_blocks);
+            if (threadIdx.x == 0)
+                atomicMax(wptr, work_idx * num_warps * num_blocks);     // 256 * work_idx
         }
     }
 }

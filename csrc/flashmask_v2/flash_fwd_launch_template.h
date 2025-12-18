@@ -128,7 +128,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     if (overlap_comm) {
         overlap_comm->wait_init();        // wait until wptr is initialized
         // TODO(heqianyue): add more mask type support
-        overlap_comm->run_overlap_kernel(params.lt_start_ptr, params.ut_end_ptr, params.seqlen_k);
+        overlap_comm->run_overlap_kernel(params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k);
         params.k_batch_stride *= params.cp_size;
         params.v_batch_stride *= params.cp_size;
         // `run_overlap_kernel` is async. Then, re-route the KV data to the nvshmem_alloc SR buffer.
@@ -218,13 +218,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.cu_seqlens_q, params.seqused_q
     };
 
-    printf("stride Q: %d, %d, %d, %d\n", get<0>(mainloop_args.stride_Q), get<1>(mainloop_args.stride_Q), get<2>(mainloop_args.stride_Q), get<3>(mainloop_args.stride_Q));
-    printf("stride K: %d, %d, %d, %d\n", get<0>(mainloop_args.stride_K), get<1>(mainloop_args.stride_K), get<2>(mainloop_args.stride_K), get<3>(mainloop_args.stride_K));
-    printf("stride V: %d, %d, %d, %d\n", get<0>(mainloop_args.stride_V), get<1>(mainloop_args.stride_V), get<2>(mainloop_args.stride_V), get<3>(mainloop_args.stride_V));
-    printf("stride K new: %d, %d, %d, %d\n", get<0>(mainloop_args.stride_K_new), get<1>(mainloop_args.stride_K_new), get<2>(mainloop_args.stride_K_new), get<3>(mainloop_args.stride_K_new));
-    printf("stride V new: %d, %d, %d, %d\n", get<0>(mainloop_args.stride_V_new), get<1>(mainloop_args.stride_V_new), get<2>(mainloop_args.stride_V_new), get<3>(mainloop_args.stride_V_new));
-    printf("stride Qv: %d, %d, %d, %d\n", get<0>(mainloop_args.stride_Qv), get<1>(mainloop_args.stride_Qv), get<2>(mainloop_args.stride_Qv), get<3>(mainloop_args.stride_Qv));
-
     int qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q * qhead_per_khead, get<0>(TileShape_MNK{}));
     num_blocks_m = cutlass::round_up(num_blocks_m, size<0>(ClusterShape{}));
@@ -271,7 +264,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
-        printf("Before flashmask_kernel_launch. %d / %d\n", params.rank, params.nranks);
         flash::flashmask_kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
                                            Arch >= 90 && Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);
     }

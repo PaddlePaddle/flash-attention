@@ -67,6 +67,7 @@ void init_distributed_environment(
 }
 
 void finalize_distributed_environment() {
+    DEBUG_PRINT("[FlashMask Overlap] Finalizing...\n");
     nvshmem_finalize();
     DEBUG_PRINT("[FlashMask Overlap] NVSHMEM env finalized.\n");
 }
@@ -83,8 +84,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     int nranks,
     int cp_size
     // Maybe we should manage the following by ourselves? Do not pass as parameters
-): write_ptr(nullptr),
-   kv_buffer(nullptr),
+): kv_buffer(nullptr),
    B(b_kv),
    S_local(s_kv),
    H(h_kv),
@@ -108,18 +108,21 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     kv_buffer = std::make_unique<SRBuffer<KVType>>(_total_numel, cp_team);
 
     // copy to the last position of the SR buffer
-    DEBUG_PRINT("SR buffer valid: %d, B, S, H, D: %d, %d, %d, %d, cp_size: %d\n", int(kv_buffer->is_valid()), B, S_local, H, D, cp_size);
+    WARN_PRINT("SR buffer valid: %d, B, S, H, D: %d, %d, %d, %d, cp_size: %d, stride: %d\n", int(kv_buffer->is_valid()), B, S_local, H, D, cp_size, _cp_stride);
     update_kv_buffer(k_data, v_data);
     CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * num_blocks, comm_stream));
-    DEBUG_PRINT("[FlashMask Overlap] constructor rank: %d, nranks: %d\n", rank, nranks);
+    WARN_PRINT("[FlashMask Overlap] constructor rank: %d, nranks: %d\n", rank, nranks);
 }
 
 template <typename KVType>
 OverlapCommunicator<KVType>::~OverlapCommunicator() {
-    CUDA_DEBUG_CHECK(cudaStreamSynchronize(comm_stream));
+    nvshmem_barrier_all();
+    CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
     CUDA_DEBUG_CHECK(cudaFreeAsync(block_work_ids, comm_stream));
-    cudaEventDestroy(wptr_init);
-    cudaStreamDestroy(comm_stream);
+    CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
+    CUDA_DEBUG_CHECK(cudaEventDestroy(wptr_init));
+    CUDA_DEBUG_CHECK(cudaStreamDestroy(comm_stream));
+    kv_buffer->release();           // do not depend on auto-release
     if constexpr (SHOULD_MANAGE_NVSHMEM) {
         finalize_distributed_environment();
     }
@@ -130,11 +133,13 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     const KVType* const new_k_data,
     const KVType* const new_v_data
 ) {
-    DEBUG_PRINT("Inside the `update_kv_buffer` function.\n");
+    // This is the only part I am not sure of (whether there will be extra overhead)
     CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->k_data() + (_total_numel - _cp_chunk_size), new_k_data, 
                         _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
     CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->v_data() + (_total_numel - _cp_chunk_size), new_v_data,
                         _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
+    // make sure data is ready for all PEs
+    kv_buffer->team_bar();
 }
 
 /**
@@ -145,6 +150,7 @@ template <typename KVType>
 void OverlapCommunicator<KVType>::run_overlap_kernel(
     const int* const lt_start_ptr,
     const int* const ut_end_ptr,
+    int* const write_ptr,
     int& S
 ) {
     constexpr int S_chunk = 8192;
@@ -195,18 +201,15 @@ void OverlapCommunicator<KVType>::run_overlap_kernel(
 
 #define SeqlenDispatch(MACRO_FUNC, _S, ...)             \
     switch (_S) {                                       \
-        SeqlenCase(MACRO_FUNC, 131072, ##__VA_ARGS__)   \
         SeqlenCase(MACRO_FUNC, 32768, ##__VA_ARGS__)    \
+        SeqlenCase(MACRO_FUNC, 131072, ##__VA_ARGS__)   \
     default:                                            \
         throw std::invalid_argument("Full seqlen must be 32K or 128K"); \
     }
 
     // Note(heqianyue): input `S` for the following macros are full length, be careful
     if (H <= 4) {
-        printf("Run this kernel: few head dispatch, S = %d\n", S);
-        CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
         SeqlenDispatch(FewHeadKernel, S);
-        CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
     } else {
         if (D == 128) {
             SeqlenDispatch(MultiHeadKernel, S, 128);

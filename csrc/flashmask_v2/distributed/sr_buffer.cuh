@@ -41,6 +41,10 @@ public:
         _allocated = true;
         
         // TODO(heqianyue): is this optional? Will this barrier introduce significant runtime overhead?
+        team_bar();
+    }
+
+    void team_bar() const {
         nvshmem_team_sync(_team);
     }
 
@@ -75,15 +79,18 @@ public:
         return *this;
     }
 
-    ~SRBuffer() noexcept {
+    void release() {
         if (_allocated && _k_sr) {
-            nvshmem_team_sync(_team);
             nvshmem_free(_k_sr);
             _k_sr = nullptr;
             _v_sr = nullptr;
             _allocated = false;
             _team = NVSHMEM_TEAM_INVALID;
         }
+    }
+
+    ~SRBuffer() noexcept {
+        release();
     }
 
     inline KVType* k_data() const noexcept {

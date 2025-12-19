@@ -124,7 +124,6 @@ if(NOT SKIP_BUILD_FA)
     --expt-extended-lambda
     --use_fast_math
     "${FA_GENCODE_OPTION}"
-    -lineinfo
     >)
   
   target_compile_options(flashattn_with_bias_mask PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
@@ -140,7 +139,6 @@ if(NOT SKIP_BUILD_FA)
     --expt-extended-lambda
     --use_fast_math
     "${FA_GENCODE_OPTION}"
-    -lineinfo
     >)
 
   INSTALL(TARGETS flashattn LIBRARY DESTINATION "lib")

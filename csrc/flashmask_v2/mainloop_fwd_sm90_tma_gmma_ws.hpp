@@ -1144,31 +1144,14 @@ struct CollectiveMainloopFwdSm90 {
             static constexpr int chunk_size = 8192;
             const int reverse_blockN_id = seqlen_info.seqlen_k - n_block * kBlockN - chunk_size;
             if (reverse_blockN_id >= 0) {
-                const int target = bidb * (seqlen_info.seqlen_k - chunk_size) + reverse_blockN_id - chunk_size;
+                const int target = bidb * (seqlen_info.seqlen_k - chunk_size) + reverse_blockN_id;
                 if (old_wptr_val >= target) return; // use the cached value to avoid frequent load from GMEM
                 // TODO(heqianyue): this should be made more generalized
                 // if num_head > 4: (bidb * num_head + bidh) / 2 * ..., divide by 2: overlap_comm copy 2 heads at once 
 
                 // TODO(heqianyue): timeout mechanism should be added for debugging purposes (`trap()`)
-
-                // asm volatile(                    // this is a simple single-thread spin-lock
-                //     "{\n"
-                //     "  .reg .pred p_cond;\n"
-                //     "  .reg .s32 r_val;\n"
-                //     "\n"
-                //     "SpinLoop:\n"
-                //     "  ld.global.nc.s32 r_val, [%1];\n"
-                //     "  setp.ge.s32 p_cond, r_val, %2;\n"
-                //     "  @!p_cond bra SpinLoop;\n"  // Spin and poll the write_ptr
-                //     "  mov.s32 %0, r_val;\n"
-                //     "}\n"
-                //     : "=r"(old_wptr_val) 
-                //     : "l"(params.write_ptr), "r"(target) 
-                //     : "memory"
-                // );
-
                 do {
-                    old_wptr_val = __ldg(params.write_ptr);
+                    asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(old_wptr_val) : "l"(params.write_ptr));
                     if (old_wptr_val >= target) return;
                 } while (true);
             }

@@ -114,10 +114,14 @@ __global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
             if (threadIdx.x == 0) atomicExch(&block_work_idx[blockIdx.x], work_id);
             int work_idx = threadIdx.x == blockIdx.x ? work_id : block_work_idx[threadIdx.x];
             work_idx = __reduce_min_sync(0xffffffff, work_idx);
+            // if the status of all 32 blocks are 'work_idx = work_per_warp', this will mean we
+            // finished transfering, just set the write ptr INT_MAX so that mainloop.load will
+            // never need to check it again
+            work_idx = work_idx == work_per_warp ? INT_MAX : (work_idx * num_warps * num_blocks);
             // reduce the slowest block (for example, 8 blocks, 1, 2, 1, 1, 2, 1, 1, 0) --->
             // there are two blocks still not finishing work_id = 0, wptr can not move
             if (threadIdx.x == 0)
-                atomicMax(wptr, work_idx * num_warps * num_blocks);     // 256 * work_idx
+                atomicMax(wptr, work_idx);     // 256 * work_idx, or INT_MAX
         }
     }
 }

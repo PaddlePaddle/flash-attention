@@ -1158,7 +1158,6 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
-            wait_for_write_ptr(n_block);                    // wait for remote load (if any)
             pipeline_k.producer_acquire(smem_pipe_write);
             if constexpr (!PagedKVNonTMA) {
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
@@ -1172,7 +1171,6 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         auto load_V = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
-            wait_for_write_ptr(n_block);                    // wait for remote load (if any)
             auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
             pipeline_v_load.producer_acquire(smem_pipe_write);
             if constexpr (!PagedKVNonTMA) {
@@ -1313,6 +1311,7 @@ struct CollectiveMainloopFwdSm90 {
             } else {
                 paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
             }
+            wait_for_write_ptr(n_block);
             if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
             load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
         }
@@ -1380,6 +1379,7 @@ struct CollectiveMainloopFwdSm90 {
                 } else {
                     paged_kv_manager.load_page_table_TMA(n_block);
                 }
+                wait_for_write_ptr(n_block);
                 if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
                 load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
                 if constexpr (!Transpose_V) {
@@ -1411,7 +1411,8 @@ struct CollectiveMainloopFwdSm90 {
         pipeline_n_block.consumer_release(n_block_pipe_read);
         ++n_block_pipe_read;
 
-        if constexpr (!Transpose_V && IntraWGOverlap) {
+        if constexpr (!Transpose_V) {
+            wait_for_write_ptr(n_block);
             if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
         if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }

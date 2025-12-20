@@ -27,6 +27,8 @@
 
 namespace flashmask {
 
+static constexpr bool USE_DENSE_COPY = true;
+
 void get_nvshmem_info(int& my_pe, int& n_pes) {
     my_pe = nvshmem_my_pe();
     n_pes = nvshmem_n_pes();
@@ -139,27 +141,9 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->v_data() + (_total_numel - _cp_chunk_size), new_v_data,
                         _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
     // make sure data is ready for all PEs
+    // TODO(heqianyue): optimize this next!
     kv_buffer->team_bar();
 }
-
-/**
- * run the overlap kernel asynchronously
- * @param S the seqlen of local K (for example, 32K full length, CP=4, local S=8K)
-*/
-template <typename KVType>
-void OverlapCommunicator<KVType>::run_overlap_kernel(
-    const int* const lt_start_ptr,
-    const int* const ut_end_ptr,
-    int* const write_ptr,
-    int& S
-) {
-    constexpr int S_chunk = 8192;
-    if (S_chunk != S_local) {
-        throw std::runtime_error("Local KV seqlen should be equal to S-chunk size (8192).");
-    }
-    S = S_local * _cp_size;
-    // set 0 every time we start the comm kernel --- meanning that we don't have any available attn-blocks
-    cudaMemsetAsync(block_work_ids, 0, sizeof(int) * num_blocks, comm_stream);
 
 #define MultiHeadKernel(_S, _D)                                                 \
     SparseKVMultiHeadRemoteGetKernel<KVType, _S, S_chunk, _D, num_blocks,       \
@@ -176,6 +160,20 @@ void OverlapCommunicator<KVType>::run_overlap_kernel(
                         _total_n_pes,                                           \
                         H,                                                      \
                         B * (_S - S_chunk) * H / 2                              \
+                    )
+
+#define DenseFewHeadKernel(_S)                                              \
+    DenseKVFewHeadRemoteGetKernel<KVType, _S, S_chunk, num_blocks,          \
+                num_warps><<<num_blocks, num_warps * 32, 0, comm_stream>>>( \
+                        kv_buffer->k_data(),                                \
+                        kv_buffer->v_data(),                                \
+                        write_ptr,                                          \
+                        block_work_ids,                                     \
+                        _my_pe,                                             \
+                        _cp_stride,                                         \
+                        _total_n_pes,                                       \
+                        B,                                                  \
+                        H * D                                               \
                     )
 
 #define FewHeadKernel(_S)                                                   \
@@ -207,9 +205,32 @@ void OverlapCommunicator<KVType>::run_overlap_kernel(
         throw std::invalid_argument("Full seqlen must be 32K or 128K"); \
     }
 
+/**
+ * run the overlap kernel asynchronously
+ * @param S the seqlen of local K (for example, 32K full length, CP=4, local S=8K)
+*/
+template <typename KVType>
+void OverlapCommunicator<KVType>::run_overlap_kernel(
+    const int* const lt_start_ptr,
+    const int* const ut_end_ptr,
+    int* const write_ptr,
+    int& S
+) {
+    constexpr int S_chunk = 8192;
+    if (S_chunk != S_local) {
+        throw std::runtime_error("Local KV seqlen should be equal to S-chunk size (8192).");
+    }
+    S = S_local * _cp_size;
+    // set 0 every time we start the comm kernel --- meanning that we don't have any available attn-blocks
+    cudaMemsetAsync(block_work_ids, 0, sizeof(int) * num_blocks, comm_stream);
+
     // Note(heqianyue): input `S` for the following macros are full length, be careful
     if (H <= 4) {
-        SeqlenDispatch(FewHeadKernel, S);
+        if constexpr (USE_DENSE_COPY) {     // Too fucking ugly, can we improve this?
+            SeqlenDispatch(DenseFewHeadKernel, S);
+        } else {
+            SeqlenDispatch(FewHeadKernel, S);
+        }
     } else {
         if (D == 128) {
             SeqlenDispatch(MultiHeadKernel, S, 128);
@@ -221,11 +242,11 @@ void OverlapCommunicator<KVType>::run_overlap_kernel(
             throw std::invalid_argument("Supported HeadDim is [64, 80, 128]");
         }
     }
+}
 #undef SeqlenDispatch
 #undef SeqlenCase
 #undef FewHeadKernel
 #undef MultiHeadKernel
-}
 
 // returns the team and stride between teams
 template <typename KVType>

@@ -5,7 +5,7 @@
 
 namespace flashmask {
 
-#define NVSHMEM_DEBUG
+// #define NVSHMEM_DEBUG
 
 inline void CheckCudaErrorAux(const char *file, unsigned line,
                                        const char *statement, cudaError_t err) {
@@ -66,7 +66,7 @@ __global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
     constexpr int seqlen_stride = num_warps * num_blocks;
     constexpr int seqlen_offset = S - S_chunk;
     const int warp_id = threadIdx.x >> 5;
-    const int work_per_warp = num_batch * seqlen_offset / (num_blocks * num_warps);
+    const int work_per_warp = num_batch * seqlen_offset / seqlen_stride;
 
     for (int work_id = 1, seqlen_id = seqlen_offset - 1 - (blockIdx.x * num_warps + warp_id), batch_offset = 0;
         work_id <= work_per_warp; 
@@ -122,6 +122,67 @@ __global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
             // there are two blocks still not finishing work_id = 0, wptr can not move
             if (threadIdx.x == 0)
                 atomicMax(wptr, work_idx);     // 256 * work_idx, or INT_MAX
+        }
+    }
+}
+
+
+template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8>
+__global__ __launch_bounds__(256, 8) void DenseKVFewHeadRemoteGetKernel(
+    T* const __restrict__ k_sr,
+    T* const __restrict__ v_sr,
+    int* const __restrict__ wptr,
+    int* const __restrict__ block_work_idx,
+    const int my_pe,
+    const int cp_stride,
+    const int total_n_pes,
+    const int num_batch,                // B
+    const int S_stride                  // H * D
+) {
+    // assume num_head is even, so that we can transfer two rows per warp
+    // and only need to read mask once (since heads reuse the same mask, 
+    // even head num won't result in two rows in a warp mapped to different seq)
+    constexpr int line_per_block = 4;       // one block transfers 4 lines of D * H at a time, so one grid: 128 * H * D
+    constexpr int seqlen_stride = line_per_block * num_blocks;
+    constexpr int seqlen_offset = S - S_chunk;
+    const int work_per_warp = num_batch * seqlen_offset / seqlen_stride;
+
+    for (int work_id = 1, seqlen_id = seqlen_offset - 1 - blockIdx.x * line_per_block, batch_offset = 0;
+        work_id <= work_per_warp; 
+        work_id++, seqlen_id -= seqlen_stride        // reverse traversal
+    ) {
+        if (seqlen_id < 0) {
+            seqlen_id = seqlen_offset - 1 - blockIdx.x * line_per_block;
+            batch_offset += S;
+        }
+        // TODO(heqianyue): We only support LTS + UTE and multi-head shared mask currently, this should be extended
+        // the mask indices are rolled, so we can use the following simple load
+        int cp_chunk_id = (S - 1 - seqlen_id) / S_chunk;
+        int remote_pe = my_pe - cp_chunk_id * cp_stride;
+        remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes; 
+        // batch_offset * S_stride (batch-address) + (S-S_chunk) * S_stride (stored in the last chunk) + (seqlen_id % S_chunk) * S_stride (within chunk address)
+        const int src_addr = (S - S_chunk + (seqlen_id % S_chunk) + batch_offset) * S_stride;
+        const int dst_addr = (seqlen_id + batch_offset) * S_stride;
+        // actually, two calls can be merged
+        // TODO(heqianyue): Double check whether we should use NBI API or not
+        nvshmemx_getmem_block(
+                    &k_sr[dst_addr],
+                    &k_sr[src_addr],
+                    line_per_block * sizeof(T) * S_stride, remote_pe
+        );
+        nvshmemx_getmem_block(
+                    &v_sr[dst_addr],
+                    &v_sr[src_addr],
+                    line_per_block * sizeof(T) * S_stride, remote_pe
+        );
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            if (threadIdx.x == 0) atomicExch(&block_work_idx[blockIdx.x], work_id);
+            int work_idx = threadIdx.x == blockIdx.x ? work_id : block_work_idx[threadIdx.x];
+            work_idx = __reduce_min_sync(0xffffffff, work_idx);
+            work_idx = work_idx == work_per_warp ? INT_MAX : (work_idx * seqlen_stride);
+            if (threadIdx.x == 0)
+                atomicMax(wptr, work_idx);     // 128 * work_idx, or INT_MAX
         }
     }
 }

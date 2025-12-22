@@ -1,4 +1,3 @@
-#include <mpi.h>            // deprecate note
 #include <iostream>
 #include "overlap_comm.cuh"
 #include "nvshmem_handle.h"

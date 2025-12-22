@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.9)
 
 find_package(CUDAToolkit REQUIRED)
-find_package(MPI REQUIRED)
 
 # Make sure add_subdirectory is called later than include(distributed/cmake/nvshmem), so that nvshmem external proj is visible
 if(NOT TARGET nvshmem)
@@ -22,11 +21,12 @@ target_compile_options(flashmaskv2_distributed PRIVATE $<$<COMPILE_LANGUAGE:CUDA
     -std=c++17
     --use_fast_math
     -arch=sm_90
+    -lineinfo
+    -DNDEBUG
     --expt-relaxed-constexpr
     >)
 
 target_include_directories(flashmaskv2_distributed PRIVATE
-    ${MPI_C_INCLUDE_DIRS}
     ${NVSHMEM_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../cutlass/include          # include cutlass
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -35,9 +35,8 @@ target_include_directories(flashmaskv2_distributed PRIVATE
 target_link_libraries(flashmaskv2_distributed PRIVATE 
     CUDA::cudart 
     CUDA::cuda_driver 
-    MPI::MPI_CXX
     nvshmem
-    ${NVSHMEM_BOOTSTRAP_MPI_LIB}        # using MPI_Init, mpi bootstrap
+    ${NVSHMEM_BOOTSTRAP_UID_LIB}        # using MPI_Init, mpi bootstrap
 )
 add_dependencies(flashmaskv2_distributed extern_nvshmem)
 

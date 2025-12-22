@@ -47,7 +47,7 @@ inline void CheckCudaErrorAux(const char *file, unsigned line,
  * Note that: using this kernel, we can either fetch the entire row on different heads (H * D)
  * or single head, depending on the `S_stride` and `work_per_warp`
 */
-template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8>
+template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8, bool use_semaphore=false>
 __global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
@@ -59,7 +59,8 @@ __global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
     const int cp_stride,
     const int total_n_pes,
     const int num_batch,                // B
-    const int S_stride                  // H * D
+    const int S_stride,                 // H * D
+    const int* const __restrict__ semaphores = nullptr
 ) {
     // assume num_head is even, so that we can transfer two rows per warp
     // and only need to read mask once (since heads reuse the same mask, 
@@ -68,6 +69,14 @@ __global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
     constexpr int seqlen_offset = S - S_chunk;
     const int warp_id = threadIdx.x >> 5;
     const int work_per_warp = num_batch * seqlen_offset / seqlen_stride;
+    __shared__ int cached_semaphores[16];
+
+    if constexpr (use_semaphore) {
+        if (threadIdx.x * 4 < total_n_pes) {
+            *(reinterpret_cast<int4*>(cached_semaphores) + 4 * threadIdx.x) = make_int4(0, 0, 0, 0);
+        }
+        __syncthreads();
+    }
 
     for (int work_id = 1, seqlen_id = seqlen_offset - 1 - (blockIdx.x * num_warps + warp_id), batch_offset = 0;
         work_id <= work_per_warp; 
@@ -85,6 +94,13 @@ __global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
             int cp_chunk_id = (S - 1 - seqlen_id) / S_chunk;
             int remote_pe = my_pe - cp_chunk_id * cp_stride;
             remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes; 
+            if constexpr (use_semaphore) {
+                if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
+                    nvshmem_int_wait_until(&semaphores[remote_pe], 1, NVSHMEM_CMP_EQ);
+                    cached_semaphores[remote_pe] = 1;
+                    // no need to sync, since `two_buffers_getmem_<scope>` will sync 
+                }
+            }
             // batch_offset * S_stride (batch-address) + (S-S_chunk) * S_stride (stored in the last chunk) + (seqlen_id % S_chunk) * S_stride (within chunk address)
             const int src_addr = (S - S_chunk + (seqlen_id % S_chunk) + batch_offset) * S_stride;
             const int dst_addr = (seqlen_id + batch_offset) * S_stride;
@@ -123,7 +139,7 @@ __global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
 }
 
 
-template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8>
+template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8, bool use_semaphore=false>
 __global__ __launch_bounds__(256, 8) void DenseKVFewHeadRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
@@ -133,7 +149,8 @@ __global__ __launch_bounds__(256, 8) void DenseKVFewHeadRemoteGetKernel(
     const int cp_stride,
     const int total_n_pes,
     const int num_batch,                // B
-    const int S_stride                  // H * D
+    const int S_stride,                 // H * D
+    const int* const __restrict__ semaphores = nullptr
 ) {
     // assume num_head is even, so that we can transfer two rows per warp
     // and only need to read mask once (since heads reuse the same mask, 
@@ -142,6 +159,14 @@ __global__ __launch_bounds__(256, 8) void DenseKVFewHeadRemoteGetKernel(
     constexpr int seqlen_stride = row_per_block * num_blocks;
     constexpr int seqlen_offset = S - S_chunk;
     const int work_per_block = num_batch * seqlen_offset / seqlen_stride;
+    __shared__ int cached_semaphores[16];
+
+    if constexpr (use_semaphore) {
+        if (threadIdx.x * 4 < total_n_pes) {
+            *(reinterpret_cast<int4*>(cached_semaphores) + 4 * threadIdx.x) = make_int4(0, 0, 0, 0);
+        }
+        __syncthreads();
+    }
 
     for (int work_id = 1, seqlen_id = seqlen_offset - (blockIdx.x + 1) * row_per_block, batch_offset = 0;
         work_id <= work_per_block; 
@@ -155,6 +180,13 @@ __global__ __launch_bounds__(256, 8) void DenseKVFewHeadRemoteGetKernel(
         int remote_pe = my_pe - cp_chunk_id * cp_stride;
         remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes; 
         // batch_offset * S_stride (batch-address) + (S-S_chunk) * S_stride (stored in the last chunk) + (seqlen_id % S_chunk) * S_stride (within chunk address)
+        if constexpr (use_semaphore) {
+            if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
+                nvshmem_int_wait_until(&semaphores[remote_pe], 1, NVSHMEM_CMP_EQ);
+                cached_semaphores[remote_pe] = 1;
+                // no need to sync, since `two_buffers_getmem_<scope>` will sync 
+            }
+        }
         const int src_addr = (S - S_chunk + (seqlen_id % S_chunk) + batch_offset) * S_stride;
         const int dst_addr = (seqlen_id + batch_offset) * S_stride;
         shmem::two_buffers_getmem_block(
@@ -177,6 +209,8 @@ __global__ __launch_bounds__(256, 8) void DenseKVFewHeadRemoteGetKernel(
 }
 
 /**
+ * TODO(heqianyue): this kernel needs re-work.
+ * 
  * This kernel does not copy an entire chunk of (B, S, H, D)
  * instead, it progresses firstly along `S`, then `H`, then `D`
  * with each warp responsible of copying two rows of D, for example:

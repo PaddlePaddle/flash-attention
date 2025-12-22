@@ -26,7 +26,13 @@
 
 namespace flashmask {
 
-static constexpr bool USE_DENSE_COPY = true;
+static constexpr bool USE_DENSE_COPY = true;        // no sparse mask KV skipping
+
+// if true: we will use 3 streams in total:
+// aux_stream: 1. reset semaphore and signal comm_stream. 2. copy the local KV to SR buffer and notify comm_stream
+// comm_stream: 1. wait for aux_stream to set local KV copied semaphore, then async get KV using 4 SMs. 2. manage wptr.
+// stream (computation, from paddle): wait for comm_stream to set wptr, and do attn computation
+static constexpr bool USE_SEMAPHORES = true;        // no team_bar but fine-grained signaling
 
 void get_nvshmem_info(int& my_pe, int& n_pes) {
     my_pe = nvshmem_my_pe();
@@ -101,6 +107,10 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
 
     cudaStreamCreateWithFlags(&comm_stream, cudaStreamNonBlocking);
     cudaEventCreateWithFlags(&wptr_init, cudaEventDisableTiming);
+    if constexpr (USE_SEMAPHORES) {                 // TODO(heqianyue): tiny up
+        cudaStreamCreateWithFlags(&aux_stream, cudaStreamNonBlocking);
+        cudaEventCreateWithFlags(&semaphore_init, cudaEventDisableTiming);
+    }
     _cp_chunk_size = b_kv * s_kv * h_kv * d_kv;
     _total_numel = _cp_chunk_size * cp_size;             // won't overflow, but should be careful
     
@@ -123,9 +133,21 @@ OverlapCommunicator<KVType>::~OverlapCommunicator() {
     CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
     CUDA_DEBUG_CHECK(cudaEventDestroy(wptr_init));
     CUDA_DEBUG_CHECK(cudaStreamDestroy(comm_stream));
+    if constexpr (USE_SEMAPHORES) {                 // TODO(heqianyue): tiny up
+        CUDA_DEBUG_CHECK(cudaEventDestroy(semaphore_init));
+        CUDA_DEBUG_CHECK(cudaStreamDestroy(aux_stream));
+    }
     kv_buffer->release();           // do not depend on auto-release
     if constexpr (SHOULD_MANAGE_NVSHMEM) {
         finalize_distributed_environment();
+    }
+}
+
+template <typename KVType>
+void OverlapCommunicator<KVType>::wait_init() {
+    cudaStreamWaitEvent(comm_stream, wptr_init);
+    if constexpr (USE_SEMAPHORES) {
+        cudaStreamWaitEvent(comm_stream, semaphore_init);
     }
 }
 
@@ -134,14 +156,32 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     const KVType* const new_k_data,
     const KVType* const new_v_data
 ) {
-    // This is the only part I am not sure of (whether there will be extra overhead)
-    CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->k_data() + (_total_numel - _cp_chunk_size), new_k_data, 
-                        _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
-    CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->v_data() + (_total_numel - _cp_chunk_size), new_v_data,
-                        _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
-    // make sure data is ready for all PEs
-    // TODO(heqianyue): optimize this next!
-    kv_buffer->team_bar();
+    if constexpr (USE_SEMAPHORES) {
+        // prepare_sender copys the self data to SR buffer (aux_stream) and broadcast
+        // an int signal with aux_stream. Therefore, it will have less overhead for calling
+        // `run_overlap_kernel` (no need to wait for all PEs finishing preparing sender data)
+        // and the launch call won't be serialized after cudaMemcpyAsync (since we are using a different stream)
+        kv_buffer->reset_semaphores(_my_pe, _total_n_pes, aux_stream);
+        kv_buffer->team_bar();      // I am ... inevitable ...
+        // comm_stream (overlap_comm_kernel) and aux_stream (transfer to local buffer)
+        // both depend on event `semaphore_init` (set 0 for semaphore), notify comm_stream
+        cudaEventRecord(semaphore_init, aux_stream);
+        kv_buffer->prepare_sender(
+            new_k_data,
+            new_v_data,
+            _total_numel - _cp_chunk_size,
+            _cp_chunk_size,
+            _my_pe,
+            aux_stream
+        );
+    } else {
+        CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->k_data() + (_total_numel - _cp_chunk_size), new_k_data, 
+                            _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
+        CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->v_data() + (_total_numel - _cp_chunk_size), new_v_data,
+                            _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
+        // make sure data is ready for all PEs, so bar the team
+        kv_buffer->team_bar();
+    }
 }
 
 #define MultiHeadKernel(_S, _D)                                                 \
@@ -161,34 +201,36 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                         B * (_S - S_chunk) * H / 2                              \
                     )
 
-#define DenseFewHeadKernel(_S)                                              \
-    DenseKVFewHeadRemoteGetKernel<KVType, _S, S_chunk, num_blocks,          \
-                num_warps><<<num_blocks, num_warps * 32, 0, comm_stream>>>( \
-                        kv_buffer->k_data(),                                \
-                        kv_buffer->v_data(),                                \
-                        write_ptr,                                          \
-                        block_work_ids,                                     \
-                        _my_pe,                                             \
-                        _cp_stride,                                         \
-                        _total_n_pes,                                       \
-                        B,                                                  \
-                        H * D                                               \
+#define DenseFewHeadKernel(_S)                                                      \
+    DenseKVFewHeadRemoteGetKernel<KVType, _S, S_chunk, num_blocks,                  \
+        num_warps, USE_SEMAPHORES><<<num_blocks, num_warps * 32, 0, comm_stream>>>( \
+                        kv_buffer->k_data(),                                        \
+                        kv_buffer->v_data(),                                        \
+                        write_ptr,                                                  \
+                        block_work_ids,                                             \
+                        _my_pe,                                                     \
+                        _cp_stride,                                                 \
+                        _total_n_pes,                                               \
+                        B,                                                          \
+                        H * D,                                                      \
+                        kv_buffer->semaphores()                                     \
                     )
 
-#define FewHeadKernel(_S)                                                   \
-    SparseKVFewHeadRemoteGetKernel<KVType, _S, S_chunk, num_blocks,         \
-                num_warps><<<num_blocks, num_warps * 32, 0, comm_stream>>>( \
-                        kv_buffer->k_data(),                                \
-                        kv_buffer->v_data(),                                \
-                        write_ptr,                                          \
-                        block_work_ids,                                     \
-                        lt_start_ptr,                                       \
-                        ut_end_ptr,                                         \
-                        _my_pe,                                             \
-                        _cp_stride,                                         \
-                        _total_n_pes,                                       \
-                        B,                                                  \
-                        H * D                                               \
+#define FewHeadKernel(_S)                                                           \
+    SparseKVFewHeadRemoteGetKernel<KVType, _S, S_chunk, num_blocks,                 \
+        num_warps, USE_SEMAPHORES><<<num_blocks, num_warps * 32, 0, comm_stream>>>( \
+                        kv_buffer->k_data(),                                        \
+                        kv_buffer->v_data(),                                        \
+                        write_ptr,                                                  \
+                        block_work_ids,                                             \
+                        lt_start_ptr,                                               \
+                        ut_end_ptr,                                                 \
+                        _my_pe,                                                     \
+                        _cp_stride,                                                 \
+                        _total_n_pes,                                               \
+                        B,                                                          \
+                        H * D,                                                      \
+                        kv_buffer->semaphores()                                     \
                     )
 
 #define SeqlenCase(MACRO_FUNC, _S, ...)          \

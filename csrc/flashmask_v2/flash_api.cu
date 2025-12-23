@@ -4,6 +4,8 @@
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
 #include <cutlass/numeric_types.h>
+#include <string>
+#include <stdexcept>
 
 #include "flash.h"
 #include "static_switch.h"

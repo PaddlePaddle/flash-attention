@@ -29,3 +29,6 @@ csrc/flash_attn_v3/*_sm90.cu
 csrc/flash_attn_v3/instantiations/
 csrc/flashmask_v2/*_sm90.cu
 csrc/flashmask_v2/instantiations/
+
+# Logs
+*.log

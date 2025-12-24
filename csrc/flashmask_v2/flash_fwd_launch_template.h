@@ -94,6 +94,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     if constexpr (use_dummy_dist) {                         // TODO(heqianyue): deprecate in the future
         params.cp_size = params.nranks;
     }
+    bool need_overlap_comm = false;
     if (params.cp_size > 1) {
         if constexpr (Varlen) {
             throw std::runtime_error("Overlap Communicator currently does not support Varlen.");
@@ -117,15 +118,18 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 params.cp_size
             );
         } else {
+            // do not update the SR buffer if other ranks did not finish using it
+            overlap_comm->wait_sr_buffer_empty();
             overlap_comm->update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
         }
+        need_overlap_comm = true;
     }
 
     if constexpr (Arch >= 90) {
         // setting scheduler tile_count_semaphore / zeroing write_ptr / record write_ptr ready event
-        prepare_flashmask(params, stream, params.num_sm, Scheduler::pipelining, overlap_comm ? &overlap_comm->wptr_init : nullptr);
+        prepare_flashmask(params, stream, params.num_sm, Scheduler::pipelining, need_overlap_comm ? &overlap_comm->wptr_init : nullptr);
     }
-    if (overlap_comm) {
+    if (need_overlap_comm) {
         overlap_comm->wait_init();        // wait until wptr is initialized
         // TODO(heqianyue): add more mask type support
         overlap_comm->run_overlap_kernel(params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k);

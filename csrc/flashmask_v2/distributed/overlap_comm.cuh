@@ -58,7 +58,12 @@ public:
         const KVType* const new_v_data
     );
 
-    cudaEvent_t wptr_init, semaphore_init;
+    // in `USE_SEMAPHORES` mode, call this function before calling `updayte_kv_buffer`
+    // to make sure other PEs have finished reading the local KV data in our SR buffer
+    // also, barriers the remote_get `comm_kernel`
+    void wait_sr_buffer_empty();
+
+    cudaEvent_t wptr_init;
 private:
     std::unique_ptr<SRBuffer<KVType>> kv_buffer;
     cudaStream_t comm_stream;

@@ -7,15 +7,6 @@
 
 namespace flashmask {
 
-__global__ void ResetSemaphoreKernel(
-    int* const __restrict__ semaphores, 
-    int my_pe, int semaphore_size
-) {
-    if (threadIdx.x < semaphore_size) {
-        semaphores[threadIdx.x] = threadIdx.x == my_pe ? 1 : 0;
-    }
-}
-
 // RAII object of send/recv buffer
 template <typename KVType>
 class SRBuffer {
@@ -48,14 +39,16 @@ public:
             throw std::bad_alloc();
         }
         _v_sr = _k_sr + numel;
-        _semaphores = static_cast<int*>(_v_sr + numel);
+        _semaphores = reinterpret_cast<int*>(_v_sr + numel);
         _allocated = true;
-        // TODO(heqianyue): is this optional? Will this barrier introduce significant runtime overhead?
-        team_bar();
     }
 
     void team_bar() const {
         nvshmem_team_sync(_team);
+    }
+
+    void team_bar_on_stream(cudaStream_t stream) const {
+        nvshmemx_team_sync_on_stream(_team, stream);
     }
 
     SRBuffer(SRBuffer&& other) noexcept
@@ -90,35 +83,6 @@ public:
             other._team = NVSHMEM_TEAM_INVALID;
         }
         return *this;
-    }
-
-    // always reset the semaphore before prepare_sender and remote get kernel
-    void reset_semaphores(int my_pe, int n_pes, cudaStream_t stream) {
-        ResetSemaphoreKernel<<<1, 32, stream>>>(_semaphores, my_pe, n_pes);
-    }
-
-    // copy data from the local non-nvshmem allocated buffer
-    // and signal with broadcast
-    void prepare_sender(
-        const KVType* const k_local,
-        const KVType* const v_local,
-        size_t sr_buffer_offset,
-        size_t numel,
-        int my_pe,
-        cudaStream_t stream
-    ) {
-        // clear the local semaphore
-        cudaMemcpyAsync(_k_sr + sr_buffer_offset, k_local, 
-                        numel * sizeof(KVType), cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpyAsync(_v_sr + sr_buffer_offset, v_local,
-                        numel * sizeof(KVType), cudaMemcpyDeviceToDevice, stream);
-        // broadcast signal on aux_stream, tell comm_stream remote_get kernel KV data is ready
-        nvshmemx_int_broadcast_on_stream(_team,
-                            &_semaphores[my_pe],            // dst (remote)
-                            &_semaphores[my_pe],            // src (local)
-                            1,                              // n_elems
-                            my_pe,                          // root
-                            stream);
     }
 
     void release() {

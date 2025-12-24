@@ -3,6 +3,8 @@
 #include "sr_buffer.cuh"
 #include "fast_divmod.cuh"
 #include "nvshmem_copy_utils.cuh"
+#include "semaphore_ops.cuh"
+#include "debug_logger.cuh"
 
 namespace flashmask {
 
@@ -69,11 +71,15 @@ __global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
     constexpr int seqlen_offset = S - S_chunk;
     const int warp_id = threadIdx.x >> 5;
     const int work_per_warp = num_batch * seqlen_offset / seqlen_stride;
+
+    // When `use_semaphore` is true, there is no choice but to cache the GMEM semaphore onto SMEM
+    // for faster loading. There is no way to cache in the register file, since we are using
+    // dynamic indexing, local array will inevitablely lead to local memory (GMEM) reads
     __shared__ int cached_semaphores[16];
 
     if constexpr (use_semaphore) {
         if (threadIdx.x * 4 < total_n_pes) {
-            *(reinterpret_cast<int4*>(cached_semaphores) + 4 * threadIdx.x) = make_int4(0, 0, 0, 0);
+            *(reinterpret_cast<int4*>(cached_semaphores) + threadIdx.x) = make_int4(0, 0, 0, 0);
         }
         __syncthreads();
     }
@@ -96,7 +102,7 @@ __global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
             remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes; 
             if constexpr (use_semaphore) {
                 if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
-                    nvshmem_int_wait_until(&semaphores[remote_pe], 1, NVSHMEM_CMP_EQ);
+                    sema::wait_full(semaphores, remote_pe);
                     cached_semaphores[remote_pe] = 1;
                     // no need to sync, since `two_buffers_getmem_<scope>` will sync 
                 }
@@ -163,7 +169,7 @@ __global__ __launch_bounds__(256, 8) void DenseKVFewHeadRemoteGetKernel(
 
     if constexpr (use_semaphore) {
         if (threadIdx.x * 4 < total_n_pes) {
-            *(reinterpret_cast<int4*>(cached_semaphores) + 4 * threadIdx.x) = make_int4(0, 0, 0, 0);
+            *(reinterpret_cast<int4*>(cached_semaphores) + threadIdx.x) = make_int4(0, 0, 0, 0);
         }
         __syncthreads();
     }
@@ -182,7 +188,7 @@ __global__ __launch_bounds__(256, 8) void DenseKVFewHeadRemoteGetKernel(
         // batch_offset * S_stride (batch-address) + (S-S_chunk) * S_stride (stored in the last chunk) + (seqlen_id % S_chunk) * S_stride (within chunk address)
         if constexpr (use_semaphore) {
             if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
-                nvshmem_int_wait_until(&semaphores[remote_pe], 1, NVSHMEM_CMP_EQ);
+                sema::wait_full(semaphores, remote_pe);
                 cached_semaphores[remote_pe] = 1;
                 // no need to sync, since `two_buffers_getmem_<scope>` will sync 
             }

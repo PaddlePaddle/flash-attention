@@ -50,7 +50,7 @@ inline void CheckCudaErrorAux(const char *file, unsigned line,
  * or single head, depending on the `S_stride` and `work_per_warp`
 */
 template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8, bool use_semaphore=false>
-__global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
+__global__ void __launch_bounds__(256, 8) SparseKVFewHeadRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,
@@ -146,7 +146,7 @@ __global__ __launch_bounds__(256, 8) void SparseKVFewHeadRemoteGetKernel(
 
 
 template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8, bool use_semaphore=false>
-__global__ __launch_bounds__(256, 8) void DenseKVFewHeadRemoteGetKernel(
+__global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,

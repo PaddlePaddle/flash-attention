@@ -48,7 +48,7 @@ public:
         int& S
     );
 
-    void wait_init();
+    void wait_wptr_init();
 
     void* k_data() const { return kv_buffer->k_data(); }
     void* v_data() const { return kv_buffer->v_data(); }
@@ -67,7 +67,6 @@ public:
 private:
     std::unique_ptr<SRBuffer<KVType>> kv_buffer;
     cudaStream_t comm_stream;
-    cudaStream_t aux_stream;        // auxilary stream
     const int B;
     const int S_local;
     const int H;

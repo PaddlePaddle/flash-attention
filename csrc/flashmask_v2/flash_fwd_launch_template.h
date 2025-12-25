@@ -130,7 +130,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         prepare_flashmask(params, stream, params.num_sm, Scheduler::pipelining, need_overlap_comm ? &overlap_comm->wptr_init : nullptr);
     }
     if (need_overlap_comm) {
-        overlap_comm->wait_init();        // wait until wptr is initialized
+        overlap_comm->wait_wptr_init();        // wait until wptr is initialized
         // TODO(heqianyue): add more mask type support
         overlap_comm->run_overlap_kernel(params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k);
         params.k_batch_stride *= params.cp_size;

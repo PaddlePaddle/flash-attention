@@ -6,13 +6,8 @@
 
 namespace flashmask {
 
-static constexpr bool USE_DENSE_COPY = false;      // no sparse mask KV skipping
-
-// if true: we will use 3 streams in total:
-// aux_stream: 1. reset semaphore and signal comm_stream. 2. copy the local KV to SR buffer and notify comm_stream
-// comm_stream: 1. wait for aux_stream to set local KV copied semaphore, then async get KV using 4 SMs. 2. manage wptr.
-// stream (computation, from paddle): wait for comm_stream to set wptr, and do attn computation
-static constexpr bool USE_SEMAPHORES = true;        // no team_bar but fine-grained signaling
+static constexpr bool USE_DENSE_COPY = true;      // no sparse mask KV skipping
+static constexpr bool USE_SEMAPHORES = true;      // no team_bar but fine-grained signaling
 
 void get_nvshmem_info(int& my_pe, int& n_pes) {
     my_pe = nvshmem_my_pe();
@@ -85,7 +80,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     }
     _cp_stride = _total_n_pes / cp_size;
 
-    // TODO(heqianyue): cudaStreamCreateWithPriority --- need to make sure aux > comm > comp
+    // TODO(heqianyue): cudaStreamCreateWithPriority
     cudaStreamCreateWithFlags(&comm_stream, cudaStreamNonBlocking);
     cudaEventCreateWithFlags(&wptr_init, cudaEventDisableTiming);
     _cp_chunk_size = b_kv * s_kv * h_kv * d_kv;
@@ -95,8 +90,6 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     nvshmem_team_t cp_team = simple_collective_topology_setter(_my_pe, _cp_stride, _total_n_pes);
     kv_buffer = std::make_unique<SRBuffer<KVType>>(_total_numel, cp_team, USE_SEMAPHORES ? _total_n_pes : 0);
     if constexpr (USE_SEMAPHORES) {
-        cudaStreamCreateWithFlags(&aux_stream, cudaStreamNonBlocking);
-        // No async here, we want the initialization to be blocking, so that it is visible to aux & comm_stream
         cudaMemset(kv_buffer->semaphores(), 0, sizeof(int) * _total_n_pes);
     }
     CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * num_blocks, comm_stream));
@@ -115,9 +108,6 @@ OverlapCommunicator<KVType>::~OverlapCommunicator() {
     CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
     CUDA_DEBUG_CHECK(cudaEventDestroy(wptr_init));
     CUDA_DEBUG_CHECK(cudaStreamDestroy(comm_stream));
-    if constexpr (USE_SEMAPHORES) {                 // TODO(heqianyue): tiny up
-        CUDA_DEBUG_CHECK(cudaStreamDestroy(aux_stream));
-    }
     kv_buffer->release();           // do not depend on auto-release
     if constexpr (SHOULD_MANAGE_NVSHMEM) {
         finalize_distributed_environment();
@@ -125,7 +115,7 @@ OverlapCommunicator<KVType>::~OverlapCommunicator() {
 }
 
 template <typename KVType>
-void OverlapCommunicator<KVType>::wait_init() {
+void OverlapCommunicator<KVType>::wait_wptr_init() {
     cudaStreamWaitEvent(comm_stream, wptr_init);
 }
 
@@ -141,9 +131,9 @@ void OverlapCommunicator<KVType>::wait_sr_buffer_empty() {
         sema::wait_self_empty(
             kv_buffer->semaphores(),
             _my_pe,
-            aux_stream
+            comm_stream
         );
-        WARN_PRINT_SYNC(aux_stream, "After wait_self_empty\n");
+        WARN_PRINT_SYNC(comm_stream, "After wait_self_empty\n");
     }
 }
 
@@ -157,22 +147,24 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     // yet, `team_bar` (nvshmem_sync_team) is the culprit
     WARN_PRINT("Before cudaMemcpyAsync...\n");
     CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->k_data() + (_total_numel - _cp_chunk_size), new_k_data, 
-                            _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, USE_SEMAPHORES ? aux_stream : comm_stream));
+                            _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
     CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->v_data() + (_total_numel - _cp_chunk_size), new_v_data,
-                            _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, USE_SEMAPHORES ? aux_stream : comm_stream));
+                            _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
     if constexpr (USE_SEMAPHORES) {
         // notify all other PEs that the local data is ready (1. set self to be `total_pes - 1`. 2. broadcast to other PEs)
         sema::notify_full(
             kv_buffer->semaphores(),
             _my_pe, _total_n_pes, 
-            kv_buffer->team(), aux_stream
+            kv_buffer->team(), comm_stream
         );
     } else {
         // bar, so that comm_stream will finish transfering data before starting to get data from remote
         // this can be slow if the pace difference of PEs is large  
-        kv_buffer->team_bar();
+        kv_buffer->team_bar_on_stream(comm_stream);
     }
-    WARN_PRINT_SYNC(USE_SEMAPHORES ? aux_stream : comm_stream, "After cudaMemcpyAsync and notify full\n");
+    // sync, otherwise it might hang unexceptedly
+    CUDA_DEBUG_CHECK(cudaStreamSynchronize(comm_stream));
+    WARN_PRINT(comm_stream, "After cudaMemcpyAsync and notify full\n");
 }
 
 #define MultiHeadKernel(_S, _D)                                                 \
@@ -279,14 +271,13 @@ void OverlapCommunicator<KVType>::run_overlap_kernel(
     if constexpr (USE_SEMAPHORES) {
         // after this kernel, other PEs will know we have finished using their data.
         // also, the local value will be reset to 0 before we notify other PEs.
-        // **comm_stream** itself does the reset, so we don't need to use event to
-        // make sure aux_stream has reset the local semaphores for other PEs to 0 (not-ready)
+        // **comm_stream** itself does the reset (to not-ready state)
         WARN_PRINT("Before notify_all_empty kernel\n");
         sema::notify_all_empty(
             kv_buffer->semaphores(),
             _my_pe,
             _total_n_pes,
-            comm_stream             // do not use aux_stream here!
+            comm_stream
         );
         WARN_PRINT_SYNC(comm_stream, "After notify_all_empty kernel\n");
     }

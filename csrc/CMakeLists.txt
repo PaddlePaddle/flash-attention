@@ -630,6 +630,7 @@ if(NOT SKIP_BUILD_FA)
         
         include(${CMAKE_CURRENT_SOURCE_DIR}/flashmask_v2/distributed/cmake/nvshmem.cmake)
         add_subdirectory(flashmask_v2/distributed)
+        add_compile_definitions(NVSHMEM_DISTRIBUTED_OVERLAP)
     endif()
 
     # 3. 添加动态库

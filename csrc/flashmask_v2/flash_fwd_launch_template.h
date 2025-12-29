@@ -22,7 +22,10 @@
 #include "mainloop_fwd_sm80.hpp"
 #include "epilogue_fwd.hpp"
 #include "flash_mask.hpp"
+
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
 #include "distributed/overlap_comm.cuh"
+#endif
 
 using namespace cute;
 
@@ -88,58 +91,64 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         flash::enable_sm80_to_sm89<flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
 
-    // TODO(heqianyue): Is using static local variable safe for nvshmem related ops?
-    static std::unique_ptr<flashmask::OverlapCommunicator<Element>> overlap_comm = nullptr;
-    static constexpr bool use_dummy_dist = true;            // manually choose to use distributed functionalities
-    if constexpr (use_dummy_dist) {                         // TODO(heqianyue): deprecate in the future
-        params.cp_size = params.nranks;
-    }
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+    params.cp_size = params.nranks;
     bool need_overlap_comm = false;
     if (params.cp_size > 1) {
         if constexpr (Varlen) {
             throw std::runtime_error("Overlap Communicator currently does not support Varlen.");
         }
-        if (overlap_comm == nullptr) {
+        if (flashmask::comm::is_singleton_null()) {
             if (params.d != params.dv) {
                 throw std::runtime_error("Overlap Communicator currently does not support D != Dv. KV should have the same D.");
             }
             if (params.seqlen_k % kBlockN) {
                 throw std::runtime_error("AttnBlock size should perfectly divided seqlen_k. This constraint will be removed in the future.");
             }
-            overlap_comm = std::make_unique<flashmask::OverlapCommunicator<Element>>(
+            flashmask::comm::init_singleton_instance(
                 (const Element*) params.k_ptr,
                 (const Element*) params.v_ptr,
                 params.b,
-                params.seqlen_k, 
-                params.h_k, 
+                params.seqlen_k,
+                params.h_k,
                 params.d,
                 params.rank,
                 params.nranks,
-                params.cp_size
+                params.cp_size,
+                params.unique_id_ptr
             );
         } else {
             // do not update the SR buffer if other ranks did not finish using it
-            overlap_comm->wait_sr_buffer_empty();
-            overlap_comm->update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
+            auto& comm_singleton = flashmask::comm::singleton();
+            comm_singleton.wait_sr_buffer_empty();
+            comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
         }
         need_overlap_comm = true;
     }
 
     if constexpr (Arch >= 90) {
         // setting scheduler tile_count_semaphore / zeroing write_ptr / record write_ptr ready event
-        prepare_flashmask(params, stream, params.num_sm, Scheduler::pipelining, need_overlap_comm ? &overlap_comm->wptr_init : nullptr);
+        prepare_flashmask(params, stream, params.num_sm, Scheduler::pipelining, 
+            need_overlap_comm ? &flashmask::comm::singleton().wptr_init : nullptr);
     }
+
     if (need_overlap_comm) {
-        overlap_comm->wait_wptr_init();        // wait until wptr is initialized
+        auto& comm_singleton = flashmask::comm::singleton();
+        comm_singleton.wait_wptr_init();        // wait until wptr is initialized
         // TODO(heqianyue): add more mask type support
-        overlap_comm->run_overlap_kernel(params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k);
+        comm_singleton.run_overlap_kernel(params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k);
         params.k_batch_stride *= params.cp_size;
         params.v_batch_stride *= params.cp_size;
         // `run_overlap_kernel` is async. Then, re-route the KV data to the nvshmem_alloc SR buffer.
         // After `run_overlap_kernel`, the seqlen_k & k_batch_stride & v_batch_stride is no longer local, but local_length * cp_size
-        params.k_ptr = overlap_comm->k_data();
-        params.v_ptr = overlap_comm->v_data();
+        params.k_ptr = comm_singleton.k_data();
+        params.v_ptr = comm_singleton.v_data();
     }
+#else
+    if constexpr (Arch >= 90) {
+        prepare_flashmask(params, stream, params.num_sm, Scheduler::pipelining);
+    }
+#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 
     bool const is_varlen_q = params.cu_seqlens_q;
     bool const is_varlen_k = params.cu_seqlens_k;

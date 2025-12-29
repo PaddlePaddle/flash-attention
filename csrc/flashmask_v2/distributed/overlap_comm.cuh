@@ -1,6 +1,7 @@
 #pragma once
 #include <memory>
 #include "sr_buffer.cuh"
+#include "cutlass/bfloat16.h"
 
 namespace flashmask {
 
@@ -30,7 +31,8 @@ public:
         int d_kv,
         int rank,
         int nranks,
-        int cp_size
+        int cp_size,
+        const uint8_t* unique_id_ptr = nullptr
     );
 
     ~OverlapCommunicator();
@@ -82,11 +84,36 @@ private:
 
     static constexpr int num_warps = 8;
     static constexpr int num_blocks = 32;   // 32 reg, 256 thread, one SM of H800 can hold 8 blocks, we use 4 SM
-    // whether should we manually manage nvshmem related environment setups
-    static constexpr bool SHOULD_MANAGE_NVSHMEM = true;
 
     // returns the team and stride between teams
     static nvshmem_team_t simple_collective_topology_setter(int my_global_pe, int stride, int n_pes);
 };
+
+namespace comm {
+
+// OverlapCommunicator instance is managed via this singleton, therefore
+// the instance is accessible to both fwd and bwd passes
+
+// init and get instance (mutable ref), used in fwd
+void init_singleton_instance(
+    const cutlass::bfloat16_t* const k_data,
+    const cutlass::bfloat16_t* const v_data,
+    int b_kv,
+    int s_kv,
+    int h_kv,
+    int d_kv,
+    int rank,
+    int nranks,
+    int cp_size,
+    const uint8_t* unique_id_ptr
+);
+
+// get instance (mutable ref), make sure the instance is initialized, used in both fwd and bwd
+OverlapCommunicator<cutlass::bfloat16_t>& singleton();
+
+// check whether the singleton unique_ptr is nullptr
+bool is_singleton_null();
+
+}   // namespace comm
 
 }   // namespace flashmask

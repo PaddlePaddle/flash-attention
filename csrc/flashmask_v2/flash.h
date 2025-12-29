@@ -191,6 +191,10 @@ struct Flash_fwd_params : public Qkv_params {
     int nranks = 1;
     int cp_size = 0;        // means no CP, not used in distributed env
     int * __restrict__ write_ptr = nullptr;
+    // NVSHMEM should be initialized with unique ID, generated
+    // with PHI exported python API, broadcast in the CP group
+    // so that all ranks in the same group can use the ID from rank 0
+    uint8_t * __restrict__ unique_id_ptr = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -250,3 +254,4 @@ template <typename T, typename Tpartial, int kBlockK>
 void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl);
 void prepare_flashmask(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx = false, cudaEvent_t* const comm_event = nullptr);
 void prepare_flashmask(Flash_bwd_params &params, cudaStream_t stream, int num_sm, cudaEvent_t* const comm_event = nullptr);
+std::vector<uint8_t> get_nvshmem_unique_id();

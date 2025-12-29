@@ -2,10 +2,12 @@
 #include "overlap_comm.cuh"
 #include "nvshmem_handle.h"
 #include "remote_get_kernel.cuh"
-#include "cutlass/bfloat16.h"
 
 namespace flashmask {
 
+// whether should we manually manage nvshmem related environment setups
+// deprecation warning: will be removed in the future
+static constexpr bool SHOULD_MANAGE_NVSHMEM = true;
 static constexpr bool USE_DENSE_COPY = true;      // no sparse mask KV skipping
 static constexpr bool USE_SEMAPHORES = true;      // no team_bar but fine-grained signaling
 
@@ -33,14 +35,21 @@ void init_distributed_environment(
     int rank,
     int nranks,
     int& my_pe, 
-    int& n_pes
+    int& n_pes,
+    const uint8_t* unique_id_ptr
 ) {
     DEBUG_PRINT("[FlashMask Overlap] Initializing NVSHMEM... Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
     std::vector<uint8_t> unique_id_val;
-    if (rank == 0) {
-        unique_id_val = UniqueIdFileSync::generate_and_write_unique_id(rank);
+    if (unique_id_ptr == nullptr) {         
+        // TODO(heqianyue): deprecate in the future, we do not allow local shared file
+        if (rank == 0) {
+            unique_id_val = UniqueIdFileSync::generate_and_write_unique_id(rank);
+        } else {
+            unique_id_val = UniqueIdFileSync::wait_and_read_unique_id(rank);
+        }
     } else {
-        unique_id_val = UniqueIdFileSync::wait_and_read_unique_id(rank);
+        unique_id_val.resize(sizeof(nvshmemx_uniqueid_t));
+        std::memcpy(unique_id_val.data(), unique_id_ptr, sizeof(nvshmemx_uniqueid_t));
     }
     init_with_unique_id(std::move(unique_id_val), rank, nranks);
     get_nvshmem_info(my_pe, n_pes);
@@ -64,7 +73,8 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     int d_kv,
     int rank,
     int nranks,
-    int cp_size
+    int cp_size,
+    const uint8_t* unique_id_ptr
     // Maybe we should manage the following by ourselves? Do not pass as parameters
 ): kv_buffer(nullptr),
    B(b_kv),
@@ -74,7 +84,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
    _cp_size(cp_size)
 {
     if constexpr (SHOULD_MANAGE_NVSHMEM) {
-        init_distributed_environment(rank, nranks, _my_pe, _total_n_pes);
+        init_distributed_environment(rank, nranks, _my_pe, _total_n_pes, unique_id_ptr);
     } else {
         get_nvshmem_info(_my_pe, _total_n_pes);     // get info if nvshmem is already avaliable
     }
@@ -316,7 +326,40 @@ nvshmem_team_t OverlapCommunicator<KVType>::simple_collective_topology_setter(in
     }
 }
 
-// explicit instantiation
+// explicit instantiation and singleton management
+
 template class OverlapCommunicator<cutlass::bfloat16_t>;
+static std::unique_ptr<flashmask::OverlapCommunicator<cutlass::bfloat16_t>> overlap_comm = nullptr;
+
+namespace comm {
+
+void init_singleton_instance(
+    const cutlass::bfloat16_t* const k_data,
+    const cutlass::bfloat16_t* const v_data,
+    int b_kv,
+    int s_kv,
+    int h_kv,
+    int d_kv,
+    int rank,
+    int nranks,
+    int cp_size,
+    const uint8_t* unique_id_ptr
+) {
+    if (!overlap_comm) {
+        overlap_comm = std::make_unique<OverlapCommunicator<cutlass::bfloat16_t>>(
+            k_data, v_data, b_kv, s_kv, h_kv, d_kv, rank, nranks, cp_size, unique_id_ptr
+        );
+    }
+}
+
+OverlapCommunicator<cutlass::bfloat16_t>& singleton() {
+    return *overlap_comm;
+}
+
+bool is_singleton_null() {
+    return overlap_comm == nullptr;
+}
+
+}   // namespace comm
 
 }   // namespace flashmask

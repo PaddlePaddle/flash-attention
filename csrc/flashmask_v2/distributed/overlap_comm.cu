@@ -112,14 +112,13 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
 
 template <typename KVType>
 OverlapCommunicator<KVType>::~OverlapCommunicator() {
-    nvshmem_barrier_all();
     CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
     CUDA_DEBUG_CHECK(cudaFreeAsync(block_work_ids, comm_stream));
     CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
     CUDA_DEBUG_CHECK(cudaEventDestroy(wptr_init));
     CUDA_DEBUG_CHECK(cudaStreamDestroy(comm_stream));
     kv_buffer->release();           // do not depend on auto-release
-    if constexpr (SHOULD_MANAGE_NVSHMEM) {
+    if constexpr (SHOULD_MANAGE_NVSHMEM && MANUAL_CLEANUP) {
         finalize_distributed_environment();
     }
 }

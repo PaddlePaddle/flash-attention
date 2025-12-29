@@ -7,6 +7,14 @@
 
 namespace flashmask {
 
+// Note(heqianyue): This is a strange impasse, calling nvshmem_free / nvshmem_finalize
+// for statically-managed instance might be deadly, there can be mutex-failure / failed
+// cuda resources handle, etc.. skipping free-ing and finalizing can get rid of this error
+// at the risk of being seemingly unsafe. I've tested it though, there is no leaking
+// or potential bugs found. I suppose the OS and nv-driver is doing the resource management for us.
+// To avoid blowing-up the process during exitting, we can choose to leave the cleanup to the driver and OS.
+static constexpr bool MANUAL_CLEANUP = false;
+
 // RAII object of send/recv buffer
 template <typename KVType>
 class SRBuffer {
@@ -87,7 +95,9 @@ public:
 
     void release() {
         if (_allocated && _k_sr) {
-            nvshmem_free(_k_sr);
+            if constexpr (MANUAL_CLEANUP) {
+                nvshmem_free(_k_sr);
+            }
             _k_sr = nullptr;
             _v_sr = nullptr;
             _semaphores = nullptr;

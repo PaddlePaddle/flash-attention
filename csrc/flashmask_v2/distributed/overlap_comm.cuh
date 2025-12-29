@@ -47,7 +47,8 @@ public:
         const int* const lt_start_ptr,
         const int* const ut_end_ptr,
         int* const write_ptr,
-        int& S
+        int& S,
+        const bool fwd = true
     );
 
     void wait_wptr_init();
@@ -57,13 +58,18 @@ public:
 
     void update_kv_buffer(
         const KVType* const new_k_data,
-        const KVType* const new_v_data
+        const KVType* const new_v_data,
+        const bool fwd = true
     );
 
     // in `USE_SEMAPHORES` mode, call this function before calling `updayte_kv_buffer`
     // to make sure other PEs have finished reading the local KV data in our SR buffer
     // also, barriers the remote_get `comm_kernel`
     void wait_sr_buffer_empty();
+
+    int cp_size() const {
+        return _cp_size;
+    }
 
     cudaEvent_t wptr_init;
 private:

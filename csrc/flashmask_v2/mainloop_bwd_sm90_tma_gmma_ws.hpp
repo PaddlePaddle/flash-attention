@@ -356,6 +356,7 @@ struct CollectiveMainloopBwdSm90 {
 
         int m_block_dim,n_block_dim;
         int32_t * __restrict__ block_mask_ptr = nullptr;
+        const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
     };
 
     // Device side kernel params
@@ -411,6 +412,7 @@ struct CollectiveMainloopBwdSm90 {
         int m_block_dim,n_block_dim;
         int m_factor, n_factor;
         int32_t * __restrict__ block_mask_ptr = nullptr;
+        const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
     };
 
     static Params
@@ -479,7 +481,8 @@ struct CollectiveMainloopBwdSm90 {
                 args.ut_end_nblockmax, args.ut_end_nblockmin,
                 args.m_block_dim,args.n_block_dim,
                 m_factor,n_factor,
-                args.block_mask_ptr};
+                args.block_mask_ptr,
+                args.write_ptr};
     }
 
      enum class FmBlockInfo {
@@ -695,6 +698,24 @@ struct CollectiveMainloopBwdSm90 {
 
         if (lane_predicate) {
             shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
+
+            // Used in distributed overlap
+            if (params.write_ptr && bidh == 0) {
+                // for example: 8K local, CP4, hd128 ---> 32K --> 256 blocks, Hopper has 132-144 SMs
+                // so by the time bidh increment from 0 to 1, 1-KV-head KV blocks are loaded
+                // so for bidh >= 1, we don't need to wait for KV write ptr anymore
+                static constexpr int chunk_size = 8192;
+                const int nblock_id = n_block * kBlockN;
+                if (nblock_id >= chunk_size) {
+                    const int target = bidb * (seqlen_info.seqlen_k - chunk_size) + nblock_id;
+                    do {
+                        int current_wptr = 0;
+                        asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(current_wptr) : "l"(params.write_ptr));
+                        if (current_wptr >= target) break;
+                    } while (true);
+                }
+            }
+
             copy(params.tma_load_K.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tKgK, tKsK);
             copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tVgV, tVsV);
 

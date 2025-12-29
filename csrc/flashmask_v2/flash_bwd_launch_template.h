@@ -22,6 +22,10 @@
 #include "flash_bwd_kernel_sm80.h"
 #include "utils.h"
 
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+#include "distributed/overlap_comm.cuh"
+#endif
+
 using namespace cute;
 
 template <int Arch, int kHeadDim, int kBlockM, int kBlockN, typename Element,
@@ -114,13 +118,41 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         flash::enable_sm80_to_sm89<flash::FlashAttnBwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
 
-    if constexpr (Is_flashmask) {
-        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream);
+
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+    // in bwd, we don't need to set rank, cp_size for params, since overlap_comm instance already knew these in fwd
+    bool use_overlap = !flashmask::comm::is_singleton_null();
+    if (use_overlap) {
+        auto& comm_singleton = flashmask::comm::singleton();
+        comm_singleton.wait_sr_buffer_empty();
+        comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr, false /*fwd*/);     // copy new KV data
+    } else if (params.nranks > 1) {
+        throw std::runtime_error("Overlap singleton instance is null but we try using overlap mechanism. This should be buggy.");
     }
 
     if constexpr (Arch >= 90) {
+        prepare_flashmask(params, stream, params.num_sm,
+           use_overlap ? &flashmask::comm::singleton().wptr_init : nullptr);
+    }
+
+    if (use_overlap) {
+        auto& comm_singleton = flashmask::comm::singleton();
+        comm_singleton.wait_wptr_init();        // wait until wptr is initialized
+        comm_singleton.run_overlap_kernel(params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k, false /*fwd*/);
+        params.k_batch_stride *= comm_singleton.cp_size();
+        params.v_batch_stride *= comm_singleton.cp_size();
+        // `run_overlap_kernel` is async. Then, re-route the KV data to the nvshmem_alloc SR buffer.
+        params.k_ptr = comm_singleton.k_data();
+        params.v_ptr = comm_singleton.v_data();
+        // dK, dV should be resized, too. Yet it is done in Paddle-PHI end.
+    }
+#else
+    if constexpr (Arch >= 90) {
         prepare_flashmask(params, stream, params.num_sm);
     }
+#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
+
+    flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream);
 
     typename CollectiveMainloop::Arguments mainloop_args = [&] () {
         if constexpr(Arch >= 90)
@@ -159,7 +191,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
                 params.ut_start_nblockmax, params.ut_start_nblockmin,
                 params.ut_end_nblockmax, params.ut_end_nblockmin,
                 params.m_block_dim, params.n_block_dim,
-                params.block_mask_ptr
+                params.block_mask_ptr,
+                params.write_ptr
             };
         else
             return typename CollectiveMainloop::Arguments {

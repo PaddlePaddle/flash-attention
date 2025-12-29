@@ -1,7 +1,7 @@
 #include <iostream>
 #include "overlap_comm.cuh"
 #include "nvshmem_handle.h"
-#include "remote_get_kernel.cuh"
+#include "remote_get_kernel_specialized.cuh"
 
 namespace flashmask {
 
@@ -150,15 +150,18 @@ void OverlapCommunicator<KVType>::wait_sr_buffer_empty() {
 template <typename KVType>
 void OverlapCommunicator<KVType>::update_kv_buffer(
     const KVType* const new_k_data,
-    const KVType* const new_v_data
+    const KVType* const new_v_data,
+    const bool fwd
 ) {
     // remember to pair `update_kv_buffer` with `wait_sr_buffer_empty` (except from the constructor call)
     // this `cudaMemcpyAsync` itself won't introduce too much overhead
     // yet, `team_bar` (nvshmem_sync_team) is the culprit
     WARN_PRINT("Before cudaMemcpyAsync...\n");
-    CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->k_data() + (_total_numel - _cp_chunk_size), new_k_data, 
+    // bwd copies the data to the start chunk of the SR, while fwd copies to the last chunk
+    const int local_offset = fwd ? _total_numel - _cp_chunk_size : 0;
+    CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->k_data() + local_offset, new_k_data, 
                             _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
-    CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->v_data() + (_total_numel - _cp_chunk_size), new_v_data,
+    CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->v_data() + local_offset, new_v_data,
                             _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
     if constexpr (USE_SEMAPHORES) {
         // notify all other PEs that the local data is ready (1. set self to be `total_pes - 1`. 2. broadcast to other PEs)
@@ -177,25 +180,8 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     WARN_PRINT(comm_stream, "After cudaMemcpyAsync and notify full\n");
 }
 
-#define MultiHeadKernel(_S, _D)                                                 \
-    SparseKVMultiHeadRemoteGetKernel<KVType, _S, S_chunk, _D, num_blocks,       \
-                    num_warps><<<num_blocks, num_warps * 32, 0, comm_stream>>>( \
-                        kv_buffer->k_data(),                                    \
-                        kv_buffer->v_data(),                                    \
-                        write_ptr,                                              \
-                        block_work_ids,                                         \
-                        lt_start_ptr,                                           \
-                        ut_end_ptr,                                             \
-                        flashmask::FastDivmod(H),                               \
-                        _my_pe,                                                 \
-                        _cp_stride,                                             \
-                        _total_n_pes,                                           \
-                        H,                                                      \
-                        B * (_S - S_chunk) * H / 2                              \
-                    )
-
-#define DenseFewHeadKernel(_S)                                                      \
-    DenseKVFewHeadRemoteGetKernel<KVType, _S, S_chunk, num_blocks,                  \
+#define DenseFewHeadKernel(_S, KernelTraits)                                        \
+    DenseKVFewHeadRemoteGet##KernelTraits##Kernel<KVType, _S, S_chunk, num_blocks,  \
         num_warps, USE_SEMAPHORES><<<num_blocks, num_warps * 32, 0, comm_stream>>>( \
                         kv_buffer->k_data(),                                        \
                         kv_buffer->v_data(),                                        \
@@ -209,8 +195,8 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                         kv_buffer->semaphores()                                     \
                     )
 
-#define FewHeadKernel(_S)                                                           \
-    SparseKVFewHeadRemoteGetKernel<KVType, _S, S_chunk, num_blocks,                 \
+#define FewHeadKernel(_S, KernelTraits)                                             \
+    SparseKVFewHeadRemoteGet##KernelTraits##Kernel<KVType, _S, S_chunk, num_blocks, \
         num_warps, USE_SEMAPHORES><<<num_blocks, num_warps * 32, 0, comm_stream>>>( \
                         kv_buffer->k_data(),                                        \
                         kv_buffer->v_data(),                                        \
@@ -226,18 +212,22 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                         kv_buffer->semaphores()                                     \
                     )
 
-#define SeqlenCase(MACRO_FUNC, _S, ...)          \
-    case _S: {                                   \
-        MACRO_FUNC(_S, ##__VA_ARGS__); break;    \
+#define SeqlenCase(MACRO_FUNC, _S, KernelTraits, ...)       \
+    case _S: {                                              \
+        MACRO_FUNC(_S, KernelTraits, ##__VA_ARGS__); break; \
     }
 
-#define SeqlenDispatch(MACRO_FUNC, _S, ...)             \
-    switch (_S) {                                       \
-        SeqlenCase(MACRO_FUNC, 32768, ##__VA_ARGS__)    \
-        SeqlenCase(MACRO_FUNC, 131072, ##__VA_ARGS__)   \
-    default:                                            \
+#define SeqlenDispatch(MACRO_FUNC, _S, ...)                 \
+    switch (_S) {                                           \
+        SeqlenCase(MACRO_FUNC, 32768, ##__VA_ARGS__)        \
+        SeqlenCase(MACRO_FUNC, 131072, ##__VA_ARGS__)       \
+    default:                                                \
         throw std::invalid_argument("Full seqlen must be 32K or 128K"); \
     }
+
+// can be adjust to use non-specialized version
+#define FwdKernelTrait Specialized
+#define BwdKernelTrait SpecializedBwd
 
 /**
  * run the overlap kernel asynchronously
@@ -248,7 +238,8 @@ void OverlapCommunicator<KVType>::run_overlap_kernel(
     const int* const lt_start_ptr,
     const int* const ut_end_ptr,
     int* const write_ptr,
-    int& S
+    int& S,
+    const bool fwd
 ) {
     constexpr int S_chunk = 8192;
     if (S_chunk != S_local) {
@@ -260,23 +251,24 @@ void OverlapCommunicator<KVType>::run_overlap_kernel(
 
     WARN_PRINT_SYNC(comm_stream, "Before remote get kernel\n");
     // Note(heqianyue): input `S` for the following macros are full length, be careful
-    if (H <= 4) {
-        if constexpr (USE_DENSE_COPY) {     // Too fucking ugly, can we improve this?
-            SeqlenDispatch(DenseFewHeadKernel, S);
+    
+    // TODO(heqianyue): in the previous versions (before commit 7fe9e3f), we support multi-head case (head > 4)
+    // but since we don't need it **yet**, the support is removed. So, in the current state,
+    // make sure the head of KV is no more than 4. Multi-head kernels are removed temporarily.
+    if constexpr (USE_DENSE_COPY) {
+        if (fwd) {
+            SeqlenDispatch(DenseFewHeadKernel, S, FwdKernelTrait);
         } else {
-            SeqlenDispatch(FewHeadKernel, S);
+            SeqlenDispatch(DenseFewHeadKernel, S, BwdKernelTrait);
         }
     } else {
-        if (D == 128) {
-            SeqlenDispatch(MultiHeadKernel, S, 128);
-        } else if (D == 80) {
-            SeqlenDispatch(MultiHeadKernel, S, 80);
-        } else if (D == 64) {
-            SeqlenDispatch(MultiHeadKernel, S, 64);
+        if (fwd) {
+            SeqlenDispatch(FewHeadKernel, S, FwdKernelTrait);
         } else {
-            throw std::invalid_argument("Supported HeadDim is [64, 80, 128]");
+            SeqlenDispatch(FewHeadKernel, S, BwdKernelTrait);
         }
     }
+
     WARN_PRINT_SYNC(comm_stream, "After remote_get kernel\n");
     if constexpr (USE_SEMAPHORES) {
         // after this kernel, other PEs will know we have finished using their data.

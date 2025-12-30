@@ -1,0 +1,121 @@
+import os
+import subprocess
+import shutil
+import re
+
+
+def get_version_from_txt():
+    version_file = os.path.join(os.path.dirname(__file__), "version.txt")
+    with open(version_file, "r") as f:
+        version = f.read().strip()
+    return version
+
+
+def custom_version_scheme(version):
+    base_version = get_version_from_txt()
+    date_str = (
+        subprocess.check_output(
+            ["git", "log", "-1", "--format=%cd", "--date=format:%Y%m%d"]
+        )
+        .decode()
+        .strip()
+    )
+    return f"{base_version}.dev{date_str}"
+
+
+def no_local_scheme(version):
+    return ""
+
+
+def change_pwd():
+    """change_pwd"""
+    path = os.path.dirname(__file__)
+    if path:
+        os.chdir(path)
+
+def get_cuda_version():
+    nvcc_path = shutil.which("nvcc")
+    if nvcc_path is None:
+        raise FileNotFoundError(
+            "nvcc command not found. Please make sure CUDA toolkit is installed and nvcc is in PATH."
+        )
+
+    result = subprocess.run(
+        ["nvcc", "--version"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    version_output = result.stdout
+
+    match = re.search(r"release (\d+)\.(\d+)", version_output)
+    if not match:
+        raise ValueError(
+            f"Cannot parse CUDA version from nvcc output:\n{version_output}"
+        )
+    cuda_major = int(match.group(1))
+    cuda_minor = int(match.group(2))
+    return cuda_major, cuda_minor
+
+
+def setup_ops_extension():
+    from paddle.utils.cpp_extension import CUDAExtension, setup
+
+    # 定义 NVCC 编译参数
+    nvcc_args = [
+        "-O3",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+        "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+        "-maxrregcount=32",
+        "-lineinfo",
+        "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+        "-gencode=arch=compute_80,code=sm_80",
+        "-gencode=arch=compute_90a,code=sm_90a",
+        "-gencode=arch=compute_100,code=sm_100",
+        "-DNDEBUG",
+    ]
+    cuda_major, cuda_minor = get_cuda_version()
+    if cuda_major < 12:
+        raise ValueError(
+            f"CUDA version must be >= 12. Detected version: {cuda_major}.{cuda_minor}"
+        )
+    if cuda_major == 12 and cuda_minor < 8:
+        nvcc_args = [arg for arg in nvcc_args if "compute_100" not in arg]
+
+    ext_module = CUDAExtension(
+        sources=[
+            # cpp files
+            # cuda files
+            "./cp_balance_utils.cu",
+        ],
+        include_dirs=[
+            os.path.join(os.getcwd(), "./"),
+        ],
+        extra_compile_args={
+            "cxx": [
+                "-O3",
+                "-w",
+                "-Wno-abi",
+                "-fPIC",
+                "-std=c++17",
+            ],
+            "nvcc": nvcc_args,
+        },
+    )
+
+    change_pwd()
+    setup(
+        name="flashmask_cpbalance_cudaops",
+        ext_modules=[ext_module],
+        version="0.0.1",
+        setup_requires=["setuptools_scm"],
+    )
+
+
+setup_ops_extension()

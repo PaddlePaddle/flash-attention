@@ -121,7 +121,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 
 #ifdef NVSHMEM_DISTRIBUTED_OVERLAP
     // in bwd, we don't need to set rank, cp_size for params, since overlap_comm instance already knew these in fwd
-    bool use_overlap = !flashmask::comm::is_singleton_null();
+    // also, when nranks == 1, overlap mode is not used
+    bool use_overlap = params.nranks > 1 && (!flashmask::comm::is_singleton_null());
     if (use_overlap) {
         auto& comm_singleton = flashmask::comm::singleton();
         comm_singleton.wait_sr_buffer_empty();

@@ -1,3 +1,4 @@
+#include <fstream>
 #include <iostream>
 #include "overlap_comm.cuh"
 #include "nvshmem_handle.h"
@@ -10,6 +11,38 @@ namespace flashmask {
 static constexpr bool SHOULD_MANAGE_NVSHMEM = true;
 static constexpr bool USE_DENSE_COPY = true;      // no sparse mask KV skipping
 static constexpr bool USE_SEMAPHORES = true;      // no team_bar but fine-grained signaling
+
+template <typename Ty>
+void dump_sr_buffer(const Ty* const src, int num_elem, int rank, std::string buffer_name) {
+    // used only when debugging, dump the SR buffer to a .bin binary and can be read by numpy
+    if (src == nullptr || num_elem <= 0) return;
+    CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
+
+    size_t size_in_bytes = num_elem * sizeof(Ty);
+    
+    // 1. Allocate CPU staging memory
+    std::vector<char> host_buffer(size_in_bytes);
+
+    // 2. Copy data from GPU (Global Memory) to CPU
+    cudaError_t err = cudaMemcpy(host_buffer.data(), src, size_in_bytes, cudaMemcpyDeviceToHost);
+    
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA Memcpy failed: " << cudaGetErrorString(err) << std::endl;
+        return;
+    }
+
+    // 3. Construct filename and write to binary file
+    std::string filename = buffer_name + std::to_string(rank) + ".bin";
+    std::ofstream outfile(filename, std::ios::out | std::ios::binary);
+    
+    if (outfile.is_open()) {
+        outfile.write(host_buffer.data(), size_in_bytes);
+        outfile.close();
+        std::cout << "Successfully dumped " << num_elem << " elements to " << filename << std::endl;
+    } else {
+        std::cerr << "Failed to open file: " << filename << std::endl;
+    }
+}
 
 void get_nvshmem_info(int& my_pe, int& n_pes) {
     my_pe = nvshmem_my_pe();
@@ -157,7 +190,7 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     // yet, `team_bar` (nvshmem_sync_team) is the culprit
     WARN_PRINT("Before cudaMemcpyAsync...\n");
     // bwd copies the data to the start chunk of the SR, while fwd copies to the last chunk
-    const int local_offset = fwd ? _total_numel - _cp_chunk_size : 0;
+    const int local_offset = fwd ? (_total_numel - _cp_chunk_size) : 0;
     CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->k_data() + local_offset, new_k_data, 
                             _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
     CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->v_data() + local_offset, new_v_data,

@@ -140,6 +140,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         auto& comm_singleton = flashmask::comm::singleton();
         comm_singleton.wait_wptr_init();        // wait until wptr is initialized
         comm_singleton.run_overlap_kernel(params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k, false /*fwd*/);
+        seqlen_k *= comm_singleton.cp_size();
         params.k_batch_stride *= comm_singleton.cp_size();
         params.v_batch_stride *= comm_singleton.cp_size();
         // `run_overlap_kernel` is async. Then, re-route the KV data to the nvshmem_alloc SR buffer.

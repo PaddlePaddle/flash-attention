@@ -705,8 +705,8 @@ struct CollectiveMainloopBwdSm90 {
                 // so by the time bidh increment from 0 to 1, 1-KV-head KV blocks are loaded
                 // so for bidh >= 1, we don't need to wait for KV write ptr anymore
                 static constexpr int chunk_size = 8192;
-                const int nblock_id = n_block * kBlockN;
-                if (nblock_id >= chunk_size) {
+                const int nblock_id = (n_block + 1) * kBlockN;      // right bound of this block
+                if (nblock_id > chunk_size) {
                     const int target = bidb * (seqlen_info.seqlen_k - chunk_size) + nblock_id;
                     do {
                         int current_wptr = 0;

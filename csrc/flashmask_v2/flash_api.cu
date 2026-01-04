@@ -361,10 +361,10 @@ void flashmaskv2_run_mha_fwd(Flash_fwd_params* params_handle, cudaStream_t strea
     run_mha_fwd(*params_handle, stream);
 }
 
-bool flashmaskv2_get_nvshmem_unique_id(uint8_t * unique_id_ptr, cudaStream_t stream) {
+bool flashmaskv2_get_nvshmem_unique_id(uint8_t * unique_id_ptr) {
     std::vector<uint8_t> result = get_nvshmem_unique_id();
     if (!result.empty()) {
-        cudaMemcpyAsync(unique_id_ptr, result.data(), result.size(), cudaMemcpyHostToDevice, stream);
+        std::memcpy(unique_id_ptr, result.data(), result.size());
         return true;
     }
     return false;

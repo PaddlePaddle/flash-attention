@@ -58,9 +58,12 @@ void init_with_unique_id(
     nvshmemx_init_attr_t attr;
     std::memcpy(
         &root_unique_id, root_unique_id_val.data(), sizeof(nvshmemx_uniqueid_t));
+    DEBUG_PRINT("Start to set unique ID args...\n");
     nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr);
+    DEBUG_PRINT("Start to set init attr...\n");
     nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
     // TODO(heqianyue): Do we need to bar here?
+    DEBUG_PRINT("%d / %d bars before completing the init.\n", rank, num_ranks);
     nvshmem_barrier_all();
 }
 
@@ -81,6 +84,7 @@ void init_distributed_environment(
             unique_id_val = UniqueIdFileSync::wait_and_read_unique_id(rank);
         }
     } else {
+        DEBUG_PRINT("Extracting unique ID...");
         unique_id_val.resize(sizeof(nvshmemx_uniqueid_t));
         std::memcpy(unique_id_val.data(), unique_id_ptr, sizeof(nvshmemx_uniqueid_t));
     }

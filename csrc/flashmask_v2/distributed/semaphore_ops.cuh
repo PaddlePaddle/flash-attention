@@ -15,8 +15,10 @@ __global__ void NotifySemaphoreEmptyKernel(
     if (threadIdx.x != my_pe) {
         // the other PE will not notify us before we reset
         semaphores[threadIdx.x] = 0;
-        // clear bit representing the current PE on the all other target PE
-        nvshmem_int32_atomic_and(semaphores + threadIdx.x, ~(1 << my_pe), threadIdx.x);
+        // for example: PE0 (self), tells PE1 --> semaphores[1] -= 1
+        // PE2 --> semaphores[2] -= 1. So if PE1/2 checks [1]/[2] locally
+        // if is 0 --> PE1/2 will know that their data is finished reading by all other PEs
+        nvshmem_int_atomic_add(semaphores + threadIdx.x, -1, threadIdx.x);
     }
 }
 
@@ -129,8 +131,7 @@ void notify_full(
     cudaStream_t stream
 ) {
     // step 1: set the self pos to be `total_pes - 1`
-    int bit_val = (1 << total_pes) - (1 << my_pe) - 1;
-    SetSemaphoreValueKernel<<<1, 1, 0, stream>>>(semaphores + my_pe, bit_val);
+    SetSemaphoreValueKernel<<<1, 1, 0, stream>>>(semaphores + my_pe, total_pes - 1);
     // step 2: broadcast this to other PE, to notify other PEs that data is ready (full) 
     nvshmemx_int_broadcast_on_stream(team,
         &semaphores[my_pe],            // dst (remote)
@@ -155,7 +156,7 @@ __device__ __forceinline__ void wait_full(
     const int* const __restrict__ semaphores,
     const int target_pe
 ) {
-    nvshmem_int_wait_until(const_cast<int*>(semaphores) + target_pe, NVSHMEM_CMP_NE, 0);   // wait until not 0
+    nvshmem_int_wait_until(const_cast<int*>(semaphores) + target_pe, NVSHMEM_CMP_GT, 0);   // wait until > 0
 }
 
 }   // namespace sema

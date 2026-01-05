@@ -61,7 +61,7 @@ __global__ void __launch_bounds__(256, 8) SparseKVFewHeadRemoteGetKernel(
     const int total_n_pes,
     const int num_batch,                // B
     const int S_stride,                 // H * D
-    const int* const __restrict__ semaphores = nullptr
+    const int64_t* const __restrict__ semaphores = nullptr
 ) {
     // assume num_head is even, so that we can transfer two rows per warp
     // and only need to read mask once (since heads reuse the same mask, 
@@ -155,7 +155,7 @@ __global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetKernel(
     const int total_n_pes,
     const int num_batch,                // B
     const int S_stride,                 // H * D
-    const int* const __restrict__ semaphores = nullptr
+    const int64_t* const __restrict__ semaphores = nullptr
 ) {
     // assume num_head is even, so that we can transfer two rows per warp
     // and only need to read mask once (since heads reuse the same mask, 
@@ -229,7 +229,7 @@ __global__ void __launch_bounds__(256, 8) SparseKVFewHeadRemoteGetBwdKernel(
     const int total_n_pes,
     const int num_batch,                // B
     const int S_stride,                 // H * D
-    const int* const __restrict__ semaphores = nullptr
+    const int64_t* const __restrict__ semaphores = nullptr
 ) {
     constexpr int seqlen_stride = num_warps * num_blocks;
     const int warp_id = threadIdx.x >> 5;
@@ -298,7 +298,7 @@ __global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetBwdKernel(
     const int total_n_pes,
     const int num_batch,                // B
     const int S_stride,                 // H * D
-    const int* const __restrict__ semaphores = nullptr
+    const int64_t* const __restrict__ semaphores = nullptr
 ) {
     constexpr int row_per_block = num_warps * 2;     // 16-line per-block (* 2), if (* 1) 8-line per-block
     constexpr int seqlen_stride = row_per_block * num_blocks;

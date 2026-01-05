@@ -137,7 +137,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     nvshmem_team_t cp_team = simple_collective_topology_setter(_my_pe, _cp_stride, _total_n_pes);
     kv_buffer = std::make_unique<SRBuffer<KVType>>(_total_numel, cp_team, USE_SEMAPHORES ? _total_n_pes : 0);
     if constexpr (USE_SEMAPHORES) {
-        cudaMemset(kv_buffer->semaphores(), 0, sizeof(int) * _total_n_pes);
+        cudaMemset(kv_buffer->semaphores(), 0, sizeof(int64_t) * _total_n_pes);
     }
     CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * num_blocks, comm_stream));
     kv_buffer->team_bar();

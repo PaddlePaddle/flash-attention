@@ -14,6 +14,7 @@ namespace flashmask {
 // or potential bugs found. I suppose the OS and nv-driver is doing the resource management for us.
 // To avoid blowing-up the process during exitting, we can choose to leave the cleanup to the driver and OS.
 static constexpr bool MANUAL_CLEANUP = false;
+using SemaphoreType = int64_t;
 
 // RAII object of send/recv buffer
 template <typename KVType>
@@ -21,7 +22,7 @@ class SRBuffer {
 private:
     KVType* _k_sr;
     KVType* _v_sr;
-    int* _semaphores;
+    SemaphoreType* _semaphores;
     bool _allocated;
     nvshmem_team_t _team;
 
@@ -39,7 +40,7 @@ public:
             throw std::invalid_argument("SRBuffer: numel should be a multiple of 32");
         }
 
-        size_t total_elements = 2 * numel + semaphore_size * sizeof(int) / sizeof(KVType);
+        size_t total_elements = 2 * numel + semaphore_size * sizeof(SemaphoreType) / sizeof(KVType);
         size_t total_bytes = total_elements * sizeof(KVType);
         
         _k_sr = static_cast<KVType*>(nvshmem_malloc(total_bytes));
@@ -47,7 +48,7 @@ public:
             throw std::bad_alloc();
         }
         _v_sr = _k_sr + numel;
-        _semaphores = reinterpret_cast<int*>(_v_sr + numel);
+        _semaphores = reinterpret_cast<SemaphoreType*>(_v_sr + numel);
         _allocated = true;
     }
 
@@ -118,7 +119,7 @@ public:
         return _v_sr;
     }
 
-    inline int* semaphores() const noexcept {
+    inline SemaphoreType* semaphores() const noexcept {
         return _semaphores;
     }
 

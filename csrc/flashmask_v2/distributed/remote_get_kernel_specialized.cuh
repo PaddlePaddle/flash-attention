@@ -21,7 +21,7 @@ __global__ void __launch_bounds__(256, 8) SparseKVFewHeadRemoteGetSpecializedKer
     const int total_n_pes,
     const int UNUSED _num_batch,                // B
     const int UNUSED _S_stride,                 // H * D
-    const int* const __restrict__ semaphores = nullptr
+    const int64_t* const __restrict__ semaphores = nullptr
 ) {
     constexpr int seqlen_stride = num_warps * num_blocks;
     constexpr int seqlen_offset = S - S_chunk;
@@ -86,7 +86,7 @@ __global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetSpecializedKern
     const int total_n_pes,
     const int UNUSED _num_batch,                // B
     const int UNUSED _S_stride,                 // H * D
-    const int* const __restrict__ semaphores = nullptr
+    const int64_t* const __restrict__ semaphores = nullptr
 ) {
     constexpr int row_per_block = num_warps * 2;     // 16-line per-block (* 2), if (* 1) 8-line per-block
     constexpr int seqlen_stride = row_per_block * num_blocks;
@@ -153,7 +153,7 @@ __global__ void __launch_bounds__(256, 8) SparseKVFewHeadRemoteGetSpecializedBwd
     const int total_n_pes,
     const int UNUSED _num_batch,                // B
     const int UNUSED _S_stride,                 // H * D
-    const int* const __restrict__ semaphores = nullptr
+    const int64_t* const __restrict__ semaphores = nullptr
 ) {
     constexpr int seqlen_stride = num_warps * num_blocks;
     constexpr int S_stride = 128;           // single KV head, hd128
@@ -219,7 +219,7 @@ __global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetSpecializedBwdK
     const int total_n_pes,
     const int UNUSED _num_batch,                // B
     const int UNUSED _S_stride,                 // H * D
-    const int* const __restrict__ semaphores = nullptr
+    const int64_t* const __restrict__ semaphores = nullptr
 ) {
     constexpr int row_per_block = num_warps * 2;     // 16-line per-block (* 2), if (* 1) 8-line per-block
     constexpr int seqlen_stride = row_per_block * num_blocks;

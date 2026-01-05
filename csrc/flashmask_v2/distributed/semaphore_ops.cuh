@@ -6,9 +6,14 @@
 namespace flashmask {
 namespace sema {
 
+// Note(heqianyue): single node AMO can use int (4B) as semaphore types, but when in multi-node
+// env, IBRC does not allow 4B AMO. Check NVSHMEM 3.2.5 src/modules/transport/ibrc/ibrc.cpp:1265
+// So we need to use int64_t semaphores. If we know for sure that our CP distributed overlap
+// utilizes only 1 node, change the dtype of SR buffer, remote_get kernels and current file.
+
 // num thread: total_pes
 __global__ void NotifySemaphoreEmptyKernel(
-    int* const __restrict__ semaphores,
+    int64_t* const __restrict__ semaphores,
     const int my_pe,
     const int total_pes
 ) {
@@ -18,47 +23,43 @@ __global__ void NotifySemaphoreEmptyKernel(
         // for example: PE0 (self), tells PE1 --> semaphores[1] -= 1
         // PE2 --> semaphores[2] -= 1. So if PE1/2 checks [1]/[2] locally
         // if is 0 --> PE1/2 will know that their data is finished reading by all other PEs
-        nvshmem_int_atomic_add(semaphores + threadIdx.x, -1, threadIdx.x);
+        nvshmem_long_atomic_add(semaphores + threadIdx.x, -1, threadIdx.x);
     }
 }
 
 // num thread: 1
 __global__ void SetSemaphoreValueKernel(
-    int* const __restrict__ semaphore,
+    int64_t* const __restrict__ semaphore,
     const int value
 ) {
-    *semaphore = value;
+    *semaphore = int64_t(value);
 }
 
 // A debug kernel for `wait_self_empty`. Spins until the max-cycles or predicate is true.
 // If max-cycles is reached, skip this kernel and report status with print
 __global__ void DebugWaitOnStreamLocalKernel(
-    int* const __restrict__ semaphore,
-    const int target_val
+    int64_t* const __restrict__ semaphore,
+    const int64_t target_val // Changed to int64_t to match semaphore
 ) {
-    static constexpr int64_t max_allowed_wait_cycles = 10000000;    // 10M cycles
-    int64_t start_cycles = clock64(), current_cycles = 0;
-    do {
-        int current_val = 0;
-        asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(current_val) : "l"(semaphore));
-        if (current_val == target_val) return;
-        current_cycles = clock64();
-    } while (current_cycles - start_cycles <= max_allowed_wait_cycles);
+    static constexpr int64_t max_allowed_wait_cycles = 10000000; 
+    int64_t start_cycles = clock64();
+    int64_t current_val = 0;
 
-    int current_val = 0;
-    asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(current_val) : "l"(semaphore));
-    printf("[WaitOnStreamKernel TimeOut] Wait for %d, but still got: %d. Possible reason is data dependency bugs.\n", target_val, current_val);
-}
+    while (true) {
+        // Use "l" for 64-bit destination and "l" for 64-bit address pointer
+        // Added .acquire to ensure data visibility after the flag is set
+        asm volatile("ld.acquire.sys.global.s64 %0, [%1];" 
+                     : "=l"(current_val) : "l"(semaphore) : "memory");
 
-__global__ void WaitOnStreamLocalKernel(
-    int* const __restrict__ semaphore,
-    const int target_val
-) {
-    do {
-        int current_val = 0;
-        asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(current_val) : "l"(semaphore));
         if (current_val == target_val) return;
-    } while (true);
+
+        if (clock64() - start_cycles > max_allowed_wait_cycles) break;
+        
+        // Optional: __nanosleep() or yield to prevent blinding the SM
+    }
+
+    printf("[WaitOnStreamKernel TimeOut] Wait for %ld, but still got: %ld\n", 
+            target_val, current_val);
 }
 
 /**
@@ -68,7 +69,7 @@ __global__ void WaitOnStreamLocalKernel(
  * @param stream waiting stream. This API is therefore async on stream (if non-blocking)
 */
 void wait_self_empty(
-    int* const __restrict__ semaphores,
+    int64_t* const __restrict__ semaphores,
     int my_pe,
     cudaStream_t stream
 ) {
@@ -79,7 +80,7 @@ void wait_self_empty(
             0
         );
     } else {
-        nvshmemx_int_wait_until_on_stream(
+        nvshmemx_int64_wait_until_on_stream(
             semaphores + my_pe,
             NVSHMEM_CMP_EQ,
             0,
@@ -104,7 +105,7 @@ void wait_self_empty(
  * @param stream waiting stream. This API is therefore async on stream (if non-blocking)
 */
 void notify_all_empty(
-    int* const __restrict__ semaphore,
+    int64_t* const __restrict__ semaphore,
     int my_pe,
     int total_pes,
     cudaStream_t stream
@@ -124,7 +125,7 @@ void notify_all_empty(
  * @param stream waiting stream. This API is therefore async on stream (if non-blocking)
 */
 void notify_full(
-    int* const __restrict__ semaphores,
+    int64_t* const __restrict__ semaphores,
     int my_pe,
     int total_pes,
     nvshmem_team_t team,
@@ -133,7 +134,7 @@ void notify_full(
     // step 1: set the self pos to be `total_pes - 1`
     SetSemaphoreValueKernel<<<1, 1, 0, stream>>>(semaphores + my_pe, total_pes - 1);
     // step 2: broadcast this to other PE, to notify other PEs that data is ready (full) 
-    nvshmemx_int_broadcast_on_stream(team,
+    nvshmemx_int64_broadcast_on_stream(team,
         &semaphores[my_pe],            // dst (remote)
         &semaphores[my_pe],            // src (local)
         1,                             // n_elems
@@ -153,10 +154,10 @@ void notify_full(
  * @param target_pe the rank to get data from, 
 */
 __device__ __forceinline__ void wait_full(
-    const int* const __restrict__ semaphores,
+    const int64_t* const __restrict__ semaphores,
     const int target_pe
 ) {
-    nvshmem_int_wait_until(const_cast<int*>(semaphores) + target_pe, NVSHMEM_CMP_GT, 0);   // wait until > 0
+    nvshmem_int64_wait_until(const_cast<int64_t*>(semaphores) + target_pe, NVSHMEM_CMP_GT, 0);   // wait until > 0
 }
 
 }   // namespace sema

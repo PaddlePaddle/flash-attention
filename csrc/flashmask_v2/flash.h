@@ -252,6 +252,6 @@ template <int Arch, typename T, int kHeadDim, bool Has_softcap, bool Is_causal, 
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
 template <typename T, typename Tpartial, int kBlockK>
 void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl);
-void prepare_flashmask(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx = false, cudaEvent_t* const comm_event = nullptr);
-void prepare_flashmask(Flash_bwd_params &params, cudaStream_t stream, int num_sm, cudaEvent_t* const comm_event = nullptr);
+void prepare_flashmask(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx = false, cudaEvent_t* const comm_event = nullptr, int* const block_cnt_semaphore = nullptr);
+void prepare_flashmask(Flash_bwd_params &params, cudaStream_t stream, int num_sm, cudaEvent_t* const comm_event = nullptr, int* const block_cnt_semaphore = nullptr);
 std::vector<uint8_t> get_nvshmem_unique_id();

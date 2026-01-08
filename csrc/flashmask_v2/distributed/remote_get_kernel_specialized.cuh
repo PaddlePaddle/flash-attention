@@ -88,7 +88,7 @@ __global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetSpecializedKern
     const int UNUSED _S_stride,                 // H * D
     const int64_t* const __restrict__ semaphores = nullptr
 ) {
-    constexpr int row_per_block = num_warps * 2;     // 16-line per-block (* 2), if (* 1) 8-line per-block
+    constexpr int row_per_block = num_warps * 32;     // 16-line per-block (* 2), if (* 1) 8-line per-block
     constexpr int seqlen_stride = row_per_block * num_blocks;
     constexpr int seqlen_offset = S - S_chunk;
     constexpr int S_stride = 128;           // single KV head, hd128
@@ -221,7 +221,7 @@ __global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetSpecializedBwdK
     const int UNUSED _S_stride,                 // H * D
     const int64_t* const __restrict__ semaphores = nullptr
 ) {
-    constexpr int row_per_block = num_warps * 2;     // 16-line per-block (* 2), if (* 1) 8-line per-block
+    constexpr int row_per_block = num_warps * 32;     // 16-line per-block (* 2), if (* 1) 8-line per-block
     constexpr int seqlen_stride = row_per_block * num_blocks;
     constexpr int S_stride = 128;           // single KV head, hd128
     const int work_per_block = (S - S_chunk) / seqlen_stride;
@@ -263,6 +263,179 @@ __global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetSpecializedBwdK
             if (threadIdx.x == 0)
                 atomicMax(wptr, work_idx);     // 128 * work_idx, or INT_MAX
         }
+    }
+}
+
+
+// =========================== bigger patch transfer kernel ====================================
+/**
+ * The latest experiment shows that for multi-node overlap, communication is the culprit for degraded performance
+ * Splitting the KV tensor into smaller chunks performs worse than using larger chunks.
+ * Currently, 256 or 512 rows per CTA (32 CTAs in total, so each wave transfers 8192 rows, which is one CP chunk)
+ * yields the best performance, but the copy is in terms of dense chunks. After dual chunk reordering and mask processing,
+ * the 256/512-row block sparsity is actually not low: avg 50% of the chunks are masked, which need no transfering.
+ * I suppose this can save us a lot of time in the multi-node context, and is potentially beneficial for single-node
+ * 
+ * The follow kernels implements specialized sparse large chunk transfer kernels. These kernels:
+ * - Check with the given mask: whether a KV block (256/512 rows) is masked (so that we can skip transfering)
+ * - Transfer KV data sparsely. The sparisty granularity is 256/512-row block (either to copy entire block, or discard it)
+ * - Dynamically schedule the CTAs. Since there will be skipped blocks (50%), we want the workload for
+ *  different CTAs to be more balanced. 
+*/
+
+template <int S_chunk, int num_warps = 8, int row_per_warp = 32, bool bwd=false>
+__global__ void __launch_bounds__(256, 8) BlockSparsityCheckKernel(
+    const int* const __restrict__ lt_start_ptr,
+    const int* const __restrict__ ut_end_ptr,
+    int* const __restrict__ copy_chunk_mask
+) {
+    // each thread load 1 int4 from lt_start_ptr and 1 int4 from ut_end_ptr
+    static_assert(num_warps == 8);
+    static_assert(row_per_warp == 32 || row_per_warp == 64);
+    __shared__ int warps_masked[num_warps];
+    // bwd valid mask starts from mask[S_chunk], while fwd starts from mask[0] due to different roll strategy
+    constexpr int mask_offset = bwd ? S_chunk : 0;
+    const int load_index = blockIdx.x * num_warps * 32 + threadIdx.x;
+    const int4 lts = *(reinterpret_cast<const int4*>(lt_start_ptr + mask_offset) + load_index);
+    const int4 ute = *(reinterpret_cast<const int4*>(ut_end_ptr + mask_offset) + load_index);
+    // all of the LTS <= UTE, then the 4 rows are fully masked
+    int is_masked = (lts.x <= ute.x) && (lts.y <= ute.y) && (lts.z <= ute.z) && (lts.w <= ute.w);
+    // warp reduce to check whether all the 128 rows (32 * 4 = 128 rows) are masked 
+    int current_warp_masked = __all_sync(0xffffffff, is_masked);
+    if ((threadIdx.x % 32) == 0) {      // first lane
+        warps_masked[threadIdx.x / 32] = current_warp_masked;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        // two warps will produce the masking result of one 256/512-row block
+        if constexpr (row_per_warp == 64) {
+            int2 result;
+            int4 src = *(reinterpret_cast<const int4*>(warps_masked));
+            result.x = src.x & src.y & src.z & src.w;
+            src = *(reinterpret_cast<const int4*>(warps_masked) + 1);
+            result.y = src.x & src.y & src.z & src.w;
+            *(reinterpret_cast<int2*>(copy_chunk_mask) + blockIdx.x) = result;
+        }
+        if constexpr (row_per_warp == 32) {
+            int4 result;
+            int4 src = *(reinterpret_cast<const int4*>(warps_masked));
+            result.x = src.x & src.y;
+            result.y = src.z & src.w;
+            src = *(reinterpret_cast<const int4*>(warps_masked) + 1);
+            result.z = src.x & src.y;
+            result.w = src.z & src.w;
+            *(reinterpret_cast<int4*>(copy_chunk_mask) + blockIdx.x) = result;
+        }
+    }
+}
+
+__device__ __forceinline__ int load_volatile(const int* const __restrict__ ptr) {
+    int val = 0;
+    asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(val) : "l"(ptr));
+    return val;
+}
+
+/**
+ * 'Sparse' means that we will check whether the 256/512-row chunk can be skipped or not.
+ * @param copy_chunk_mask Pre-computed chunk mask. If all 256/512 rows in a chunk are masked, mask[chunk_id] = 1
+ *  copy_chunk_mask is generated by `BlockSparsityCheckKernel`, 1D buffer (size: (S - S_chunk) / 256 or 512)
+ * @param  block_cnt_semaphore Used in dynamic scheduling. Since each CTA is responsible for remote-getting
+ *  one entire chunk (256/512 rows), if the chunk is masked then the computation power will be wasted. To avoid
+ *  load-imbalance for this communication kernel (which is crucial to overlap performance), a chunk-cnt semaphore
+ *  is used so every CTA use atomic op to get a chunk ID to process.
+*/
+template <typename T, int S, int S_chunk, int num_warps=8, int row_per_warp=32, bool use_semaphore=false, bool bwd=false>
+__global__ void __launch_bounds__(256, 8) SparseLargeKVChunkRemoteGetSpecializedKernel(
+    T* const __restrict__ k_sr,
+    T* const __restrict__ v_sr,
+    int* const __restrict__ wptr,
+    int* const __restrict__ block_work_idx,
+    int* const __restrict__ block_cnt_semaphore,      // for dynamic scheduling
+    const int* const __restrict__ copy_chunk_mask,
+    const int my_pe,
+    const int total_n_pes,
+    const int64_t* const __restrict__ semaphores = nullptr
+) {
+    constexpr int row_per_block = num_warps * row_per_warp;     // 256 or 512 row per block (32 or 64 per warp)
+    constexpr int seqlen_offset = bwd ? 0 : (S - S_chunk);
+    constexpr int total_blocks = (S - S_chunk) / row_per_block;     // 8192 chunk: 32 blocks --> 96 blocks
+    constexpr int S_stride = 128;           // single KV head, hd128, H * D
+    __shared__ int cached_semaphores[16];
+    __shared__ int next_work_id;
+    // note that block_cnt_semaphore starts from 1. dyn-scheduling from the beginning.
+
+    // this lambda ensures correct visibility to the change of block_work_idx and 
+    // the last CTA will correctly set the wptr to be INT_MAX to notify completion 
+    auto update_wptr_and_work_id_sync = [&](int wid) {
+        if (threadIdx.x < 32) {
+            if (threadIdx.x == blockIdx.x) {
+                int next_wid = atomicAdd(block_cnt_semaphore, 1);       // fetch and check the next work ID
+                // if there is no more work to do: set the wid for the current block to be INT_MAX
+                wid = next_wid <= total_blocks ? wid : INT_MAX;
+                next_work_id = next_wid;
+                atomicExch(&block_work_idx[blockIdx.x], wid);
+            }
+            // make sure atomicExch happen before load from block_work_idx[threadIdx.x],
+            // so that if one block finished atomicExch first, other blocks will know
+            __syncwarp();
+            wid = threadIdx.x != blockIdx.x ? block_work_idx[threadIdx.x] : wid;
+            wid = __reduce_min_sync(0xffffffff, wid);
+            if (threadIdx.x == blockIdx.x) {
+                atomicMax(wptr, wid == INT_MAX ? INT_MAX : (wid * row_per_block));     // 256 or 512 * wid, or INT_MAX
+            }
+        }
+        __syncthreads();
+        return next_work_id;
+    };
+
+    if constexpr (use_semaphore) {
+        if (threadIdx.x * 4 < total_n_pes) {
+            *(reinterpret_cast<int4*>(cached_semaphores) + threadIdx.x) = make_int4(0, 0, 0, 0);
+        }
+    }
+
+    for (int work_id = update_wptr_and_work_id_sync(0); work_id <= total_blocks;) {
+        int mask_index = bwd ? (work_id - 1) : (total_blocks - work_id);
+        if (copy_chunk_mask[mask_index]) {
+            // does not need copying since the current KV block is masked. skip directly
+            // __syncthreads() here is necessary: in case some of the warp haven't updated
+            // the work_id and warp 0 overwrites next_work_id first, which will be bad.
+            __syncthreads();
+            work_id = update_wptr_and_work_id_sync(work_id);
+            continue;
+        }
+        // calculate seqlen offset via work_id
+        int seqlen_id = 0, remote_pe = 0;
+        if constexpr (bwd) {        // bwd is forward traversal
+            seqlen_id = S_chunk + (work_id - 1) * row_per_block;
+            remote_pe = my_pe + seqlen_id / S_chunk;
+            remote_pe = remote_pe < total_n_pes ? remote_pe : remote_pe - total_n_pes; 
+        } else {                    // fwd is reversed traversal
+            seqlen_id = seqlen_offset - work_id * row_per_block;
+            int cp_chunk_id = (S - 1 - seqlen_id) / S_chunk;
+            remote_pe = my_pe - cp_chunk_id;
+            remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes; 
+        }
+        if constexpr (use_semaphore) {
+            if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
+                sema::wait_full(semaphores, remote_pe);
+                cached_semaphores[remote_pe] = 1;
+                // no need to sync, since `two_buffers_getmem_<scope>` will sync 
+            }
+        }
+        const int src_addr = (seqlen_offset + (seqlen_id % S_chunk)) * S_stride;
+        const int dst_addr = seqlen_id * S_stride;
+        shmem::two_buffers_getmem_block(
+            k_sr + dst_addr,
+            v_sr + dst_addr,
+            k_sr + src_addr,
+            v_sr + src_addr,
+            row_per_block * S_stride * sizeof(T), remote_pe
+        );
+        // buffer getmem_block will call syncthreads(), so next_work_id will not be updated
+        // therefore, next_work_id's update is visible to all threads and won't be overwritten
+        // before some threads reading it. Safe!
+        work_id = update_wptr_and_work_id_sync(work_id);
     }
 }
 

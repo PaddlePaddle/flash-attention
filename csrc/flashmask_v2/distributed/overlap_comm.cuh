@@ -62,10 +62,21 @@ public:
         const bool fwd = true
     );
 
+    void compute_chunk_mask(
+        const int* const lt_start_ptr,
+        const int* const ut_end_ptr,
+        cudaStream_t stream,
+        const bool fwd = true
+    );
+
     // in `USE_SEMAPHORES` mode, call this function before calling `updayte_kv_buffer`
     // to make sure other PEs have finished reading the local KV data in our SR buffer
     // also, barriers the remote_get `comm_kernel`
     void wait_sr_buffer_empty();
+
+    int* get_block_cnt_semaphore() const {
+        return block_cnt_semaphore;
+    }
 
     int cp_size() const {
         return _cp_size;
@@ -87,6 +98,8 @@ private:
     size_t _total_numel;
 
     int* block_work_ids;
+    int* block_cnt_semaphore;
+    int* copy_chunk_mask;
 
     static constexpr int num_warps = 8;
     static constexpr int num_blocks = 32;   // 32 reg, 256 thread, one SM of H800 can hold 8 blocks, we use 4 SM
@@ -101,7 +114,7 @@ namespace comm {
 // the instance is accessible to both fwd and bwd passes
 
 // init and get instance (mutable ref), used in fwd
-void init_singleton_instance(
+OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     const cutlass::bfloat16_t* const k_data,
     const cutlass::bfloat16_t* const v_data,
     int b_kv,

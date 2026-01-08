@@ -126,6 +126,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     if (use_overlap) {
         auto& comm_singleton = flashmask::comm::singleton();
         comm_singleton.wait_sr_buffer_empty();
+        comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.ut_end_ptr, stream, false /* fwd */);
         comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr, false /*fwd*/);     // copy new KV data
     } else if (params.nranks > 1) {
         throw std::runtime_error("Overlap singleton instance is null but we try using overlap mechanism. This should be buggy.");
@@ -133,7 +134,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 
     if constexpr (Arch >= 90) {
         prepare_flashmask(params, stream, params.num_sm,
-           use_overlap ? &flashmask::comm::singleton().wptr_init : nullptr);
+            use_overlap ? &flashmask::comm::singleton().wptr_init : nullptr,
+            use_overlap ? flashmask::comm::singleton().get_block_cnt_semaphore() : nullptr);
     }
 
     if (use_overlap) {

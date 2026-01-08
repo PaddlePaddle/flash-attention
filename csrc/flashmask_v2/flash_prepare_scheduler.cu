@@ -115,11 +115,15 @@ __global__ void prepare_varlen_num_blocks_kernel(
 __global__ void prepare_flashmask_kernel(
         int* const tile_count_semaphore,
         int* const write_ptr,
+        int* const block_cnt_semaphore,
         int sm_count) {
     // There's only 1 block in the grid, so might as well start launching the main attn kernel
     cutlass::arch::launch_dependent_grids();
-    if (threadIdx.x == 0 && tile_count_semaphore) { *tile_count_semaphore = sm_count; }
-    if (threadIdx.x == 0 && write_ptr) { *write_ptr = 0; }
+    if (threadIdx.x == 0) {
+        if (tile_count_semaphore) { *tile_count_semaphore = sm_count; }
+        if (write_ptr) { *write_ptr = 0; }
+        if (block_cnt_semaphore) { *block_cnt_semaphore = 1; }
+    }
 }
 
 } // flash
@@ -140,7 +144,7 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
 }
 
 // TODO(heqianyue): maybe template-fy the following two functions to reduce code
-void prepare_flashmask(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx, cudaEvent_t* const comm_event) {
+void prepare_flashmask(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx, cudaEvent_t* const comm_event, int* const block_cnt_semaphore) {
     if (params.tile_count_semaphore == nullptr) {           // fallback, deprecate in the future
         CHECK_CUDA(cudaGetSymbolAddress((void**)&params.tile_count_semaphore, semaphore_storage_fwd));
     }
@@ -151,11 +155,12 @@ void prepare_flashmask(Flash_fwd_params &params, cudaStream_t stream, int num_sm
     flash::prepare_flashmask_kernel<<<1 /*grid*/, 32 /*block*/, 0, stream>>>(
         params.tile_count_semaphore,
         params.write_ptr,
+        block_cnt_semaphore,
         num_sm);
     if (comm_event) cudaEventRecord(*comm_event, stream);       // notify the overlap communicator: wptr is initialized
 }
 
-void prepare_flashmask(Flash_bwd_params &params, cudaStream_t stream, int num_sm, cudaEvent_t* const comm_event) {
+void prepare_flashmask(Flash_bwd_params &params, cudaStream_t stream, int num_sm, cudaEvent_t* const comm_event, int* const block_cnt_semaphore) {
     if (params.tile_count_semaphore == nullptr) {           // fallback, deprecate in the future
         CHECK_CUDA(cudaGetSymbolAddress((void**)&params.tile_count_semaphore, semaphore_storage_bwd));
     }
@@ -165,6 +170,7 @@ void prepare_flashmask(Flash_bwd_params &params, cudaStream_t stream, int num_sm
     flash::prepare_flashmask_kernel<<<1 /*grid*/, 32 /*block*/, 0, stream>>>(
         params.tile_count_semaphore,
         params.write_ptr,
+        block_cnt_semaphore,
         num_sm);
     if (comm_event) cudaEventRecord(*comm_event, stream);       // notify the overlap communicator: wptr is initialized
 }

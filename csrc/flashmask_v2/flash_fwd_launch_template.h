@@ -105,7 +105,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             if (params.seqlen_k % kBlockN) {
                 throw std::runtime_error("AttnBlock size should perfectly divided seqlen_k. This constraint will be removed in the future.");
             }
-            flashmask::comm::init_singleton_instance(
+            auto& comm_singleton = flashmask::comm::init_singleton_instance(
                 (const Element*) params.k_ptr,
                 (const Element*) params.v_ptr,
                 params.b,
@@ -117,10 +117,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 params.cp_size,
                 params.unique_id_ptr
             );
+            // initial step does not need to wait for SR buffer's emptyness.
+            comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
+            comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
         } else {
             // do not update the SR buffer if other ranks did not finish using it
             auto& comm_singleton = flashmask::comm::singleton();
             comm_singleton.wait_sr_buffer_empty();
+            comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
             comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
         }
         need_overlap_comm = true;
@@ -129,7 +133,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     if constexpr (Arch >= 90) {
         // setting scheduler tile_count_semaphore / zeroing write_ptr / record write_ptr ready event
         prepare_flashmask(params, stream, params.num_sm, Scheduler::pipelining, 
-            need_overlap_comm ? &flashmask::comm::singleton().wptr_init : nullptr);
+            need_overlap_comm ? &flashmask::comm::singleton().wptr_init : nullptr,
+            need_overlap_comm ? flashmask::comm::singleton().get_block_cnt_semaphore() : nullptr);
     }
 
     if (need_overlap_comm) {

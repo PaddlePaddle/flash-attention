@@ -20,19 +20,12 @@ __global__ void NotifySemaphoreEmptyKernel(
     if (threadIdx.x != my_pe) {
         // the other PE will not notify us before we reset
         semaphores[threadIdx.x] = 0;
-        // for example: PE0 (self), tells PE1 --> semaphores[1] -= 1
-        // PE2 --> semaphores[2] -= 1. So if PE1/2 checks [1]/[2] locally
-        // if is 0 --> PE1/2 will know that their data is finished reading by all other PEs
-        nvshmem_long_atomic_add(semaphores + threadIdx.x, -1, threadIdx.x);
+        // Note(heqianyue): bitwise op is generally safer than add, if we are using only 1 node
+        // we can opt for the following atomic_and approach
+        // clear bit representing the current PE on the all other target PE
+        // nvshmem_int64_atomic_and(semaphores + threadIdx.x, ~(1 << my_pe), threadIdx.x);
+        nvshmem_long_atomic_add(semaphores + threadIdx.x, -(1 << my_pe), threadIdx.x);
     }
-}
-
-// num thread: 1
-__global__ void SetSemaphoreValueKernel(
-    int64_t* const __restrict__ semaphore,
-    const int value
-) {
-    *semaphore = int64_t(value);
 }
 
 // A debug kernel for `wait_self_empty`. Spins until the max-cycles or predicate is true.
@@ -60,6 +53,14 @@ __global__ void DebugWaitOnStreamLocalKernel(
 
     printf("[WaitOnStreamKernel TimeOut] Wait for %ld, but still got: %ld\n", 
             target_val, current_val);
+}
+
+// num thread: 1
+__global__ void SetSemaphoreValueKernel(
+    int64_t* const __restrict__ semaphore,
+    const int value
+) {
+    *semaphore = int64_t(value);
 }
 
 /**
@@ -132,7 +133,8 @@ void notify_full(
     cudaStream_t stream
 ) {
     // step 1: set the self pos to be `total_pes - 1`
-    SetSemaphoreValueKernel<<<1, 1, 0, stream>>>(semaphores + my_pe, total_pes - 1);
+    int bit_val = (1 << total_pes) - (1 << my_pe) - 1;
+    SetSemaphoreValueKernel<<<1, 1, 0, stream>>>(semaphores + my_pe, bit_val);
     // step 2: broadcast this to other PE, to notify other PEs that data is ready (full) 
     nvshmemx_int64_broadcast_on_stream(team,
         &semaphores[my_pe],            // dst (remote)
@@ -157,7 +159,7 @@ __device__ __forceinline__ void wait_full(
     const int64_t* const __restrict__ semaphores,
     const int target_pe
 ) {
-    nvshmem_int64_wait_until(const_cast<int64_t*>(semaphores) + target_pe, NVSHMEM_CMP_GT, 0);   // wait until > 0
+    nvshmem_int64_wait_until(const_cast<int64_t*>(semaphores) + target_pe, NVSHMEM_CMP_GT, 0);   // wait until not 0
 }
 
 }   // namespace sema

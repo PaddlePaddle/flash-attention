@@ -9,8 +9,12 @@ namespace flashmask {
 // whether should we manually manage nvshmem related environment setups
 // deprecation warning: will be removed in the future
 static constexpr bool SHOULD_MANAGE_NVSHMEM = true;
-static constexpr bool USE_DENSE_COPY = true;      // no sparse mask KV skipping
-static constexpr bool USE_SEMAPHORES = true;      // no team_bar but fine-grained signaling
+static constexpr bool USE_DENSE_COPY = true;            // no sparse mask KV skipping
+static constexpr bool USE_SEMAPHORES = false;           // no team_bar but fine-grained signaling
+// If true, we will scale up the transfering chunk for one CTA (16 rows per chunk ---> 256-512 rows per chunk)
+// and calculate per-chunk sparsity to skip some comm (avg 50% of the chunks are not needed)
+static constexpr bool USE_SPARSE_LARGE_CHUNK = true;
+static constexpr int RDMA_ROW_PER_WARP = 32;
 
 template <typename Ty>
 void dump_sr_buffer(const Ty* const src, int num_elem, int rank, std::string buffer_name) {
@@ -118,7 +122,10 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
    S_local(s_kv),
    H(h_kv),
    D(d_kv),
-   _cp_size(cp_size)
+   _cp_size(cp_size),
+   block_work_ids(nullptr),
+   block_cnt_semaphore(nullptr),
+   copy_chunk_mask(nullptr)
 {
     if constexpr (SHOULD_MANAGE_NVSHMEM) {
         init_distributed_environment(rank, nranks, _my_pe, _total_n_pes, unique_id_ptr);
@@ -139,11 +146,17 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     if constexpr (USE_SEMAPHORES) {
         cudaMemset(kv_buffer->semaphores(), 0, sizeof(int64_t) * _total_n_pes);
     }
-    CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * num_blocks, comm_stream));
+    if constexpr (USE_SPARSE_LARGE_CHUNK) {
+        const int num_chunks = s_kv * cp_size / (RDMA_ROW_PER_WARP * num_warps);
+        CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (num_blocks + num_chunks + 1), comm_stream));
+        copy_chunk_mask = block_work_ids + num_blocks;
+        block_cnt_semaphore = copy_chunk_mask + num_chunks;
+    } else {
+        CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * num_blocks, comm_stream));
+    }
     kv_buffer->team_bar();
     // copy to the last position of the SR buffer
     WARN_PRINT("SR buffer valid: %d, B, S, H, D: %d, %d, %d, %d, cp_size: %d, stride: %d\n", int(kv_buffer->is_valid()), B, S_local, H, D, cp_size, _cp_stride);
-    update_kv_buffer(k_data, v_data);
     WARN_PRINT("[FlashMask Overlap] constructor rank: %d, nranks: %d\n", rank, nranks);
 }
 
@@ -213,7 +226,7 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     }
     // sync, otherwise it might hang unexceptedly
     CUDA_DEBUG_CHECK(cudaStreamSynchronize(comm_stream));
-    WARN_PRINT(comm_stream, "After cudaMemcpyAsync and notify full\n");
+    WARN_PRINT("After cudaMemcpyAsync and notify full\n");
 }
 
 #define DenseFewHeadKernel(_S, KernelTraits)                                        \
@@ -228,6 +241,22 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                         _total_n_pes,                                               \
                         B,                                                          \
                         H * D,                                                      \
+                        kv_buffer->semaphores()                                     \
+                    )
+
+
+#define SparseLargeChunkKernel(_S, KernelTraits, bwd)                               \
+    SparseLargeKVChunkRemoteGet##KernelTraits##Kernel<KVType, _S, S_chunk,          \
+        num_warps, RDMA_ROW_PER_WARP, USE_SEMAPHORES, bwd>                          \
+        <<<num_blocks, num_warps * 32, 0, comm_stream>>>(                           \
+                        kv_buffer->k_data(),                                        \
+                        kv_buffer->v_data(),                                        \
+                        write_ptr,                                                  \
+                        block_work_ids,                                             \
+                        block_cnt_semaphore,                                        \
+                        copy_chunk_mask,                                            \
+                        _my_pe,                                                     \
+                        _total_n_pes,                                               \
                         kv_buffer->semaphores()                                     \
                     )
 
@@ -262,8 +291,30 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     }
 
 // can be adjust to use non-specialized version
+#define KernelTrait Specialized
 #define FwdKernelTrait Specialized
 #define BwdKernelTrait SpecializedBwd
+
+template <typename KVType>
+void OverlapCommunicator<KVType>::compute_chunk_mask(
+    const int* const lt_start_ptr,
+    const int* const ut_end_ptr,
+    cudaStream_t stream,
+    const bool fwd
+) {
+    if constexpr (USE_SPARSE_LARGE_CHUNK) {
+        constexpr int S_chunk = 8192;
+        const int grid_size = (S_local * _cp_size - S_chunk) / (num_warps * 32 * 4);      // each CTA reduce 1024 ints to 4 or 2 ints
+        // TODO(heqianyue): check the runtime overhead. We might actually fuse this kernel into the comm kernel
+        if (fwd) {
+            BlockSparsityCheckKernel<S_chunk, num_warps, RDMA_ROW_PER_WARP, false /* bwd */>
+                <<< grid_size, num_warps * 32, 0, stream >>>(lt_start_ptr, ut_end_ptr, copy_chunk_mask);
+        } else {
+            BlockSparsityCheckKernel<S_chunk, num_warps, RDMA_ROW_PER_WARP, true /* bwd */>
+                <<< grid_size, num_warps * 32, 0, stream >>>(lt_start_ptr, ut_end_ptr, copy_chunk_mask);
+        }
+    }
+}
 
 /**
  * run the overlap kernel asynchronously
@@ -285,23 +336,31 @@ void OverlapCommunicator<KVType>::run_overlap_kernel(
     // set 0 every time we start the comm kernel --- meanning that we don't have any available attn-blocks
     cudaMemsetAsync(block_work_ids, 0, sizeof(int) * num_blocks, comm_stream);
 
-    WARN_PRINT_SYNC(comm_stream, "Before remote get kernel\n");
+    WARN_PRINT_SYNC(comm_stream, "Before remote get kernel: %d\n", _my_pe);
     // Note(heqianyue): input `S` for the following macros are full length, be careful
     
     // TODO(heqianyue): in the previous versions (before commit 7fe9e3f), we support multi-head case (head > 4)
     // but since we don't need it **yet**, the support is removed. So, in the current state,
     // make sure the head of KV is no more than 4. Multi-head kernels are removed temporarily.
-    if constexpr (USE_DENSE_COPY) {
+    if constexpr (USE_SPARSE_LARGE_CHUNK) {
         if (fwd) {
-            SeqlenDispatch(DenseFewHeadKernel, S, FwdKernelTrait);
+            SeqlenDispatch(SparseLargeChunkKernel, S, KernelTrait, false);
         } else {
-            SeqlenDispatch(DenseFewHeadKernel, S, BwdKernelTrait);
+            SeqlenDispatch(SparseLargeChunkKernel, S, KernelTrait, true);
         }
     } else {
-        if (fwd) {
-            SeqlenDispatch(FewHeadKernel, S, FwdKernelTrait);
+        if constexpr (USE_DENSE_COPY) {
+            if (fwd) {
+                SeqlenDispatch(DenseFewHeadKernel, S, FwdKernelTrait);
+            } else {
+                SeqlenDispatch(DenseFewHeadKernel, S, BwdKernelTrait);
+            }
         } else {
-            SeqlenDispatch(FewHeadKernel, S, BwdKernelTrait);
+            if (fwd) {
+                SeqlenDispatch(FewHeadKernel, S, FwdKernelTrait);
+            } else {
+                SeqlenDispatch(FewHeadKernel, S, BwdKernelTrait);
+            }
         }
     }
 
@@ -361,7 +420,7 @@ static std::unique_ptr<flashmask::OverlapCommunicator<cutlass::bfloat16_t>> over
 
 namespace comm {
 
-void init_singleton_instance(
+OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     const cutlass::bfloat16_t* const k_data,
     const cutlass::bfloat16_t* const v_data,
     int b_kv,
@@ -378,6 +437,7 @@ void init_singleton_instance(
             k_data, v_data, b_kv, s_kv, h_kv, d_kv, rank, nranks, cp_size, unique_id_ptr
         );
     }
+    return *overlap_comm;
 }
 
 OverlapCommunicator<cutlass::bfloat16_t>& singleton() {

@@ -308,7 +308,7 @@ def _flash_attn_fwd(
         else _compute_capability
     )
 
-    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+    assert compute_capability in [10], "Unsupported compute capability. Supported: 10.x"
 
     sparse_tensors = None
     if block_sparse_tensors is not None:
@@ -629,7 +629,7 @@ def _flash_attn_bwd(
     deterministic: bool = False,
 ) -> Tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor]:
     compute_capability = paddle.device.cuda.get_device_capability()[0]
-    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+    assert compute_capability in [10], "Unsupported compute capability. Supported: 10.x"
 
     cute_flashmask_info = None
     num_flashmask_tensors = 0

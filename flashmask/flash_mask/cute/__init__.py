@@ -18,12 +18,9 @@ __version__ = "4.0.0"
 
 import cutlass.cute as cute
 
-# Note(wusiming): it would be better to provide a public interface rather than exposing internal function
 from .interface import (
     flash_attention,
     flashmask_attention,
-    _flash_attn_fwd,
-    _flash_attn_bwd,
 )
 
 from flash_mask.cute.cute_dsl_utils import cute_compile_patched
@@ -35,6 +32,4 @@ cute.compile = cute_compile_patched
 __all__ = [
     "flash_attention",
     "flashmask_attention",
-    "_flash_attn_fwd",
-    "_flash_attn_bwd",
 ]

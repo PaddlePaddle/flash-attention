@@ -1668,7 +1668,7 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
             lse,
             flashmask_info,
             causal=ctx.causal,
-            #deterministic=True
+            deterministic=paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"],
         )
         return dq, dk, dv
 
@@ -1719,9 +1719,6 @@ def flashmask_attention(
         )
         assert block_mask is None, (
             "flashmask v4 does not support block mask"
-        )
-        assert not paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"], (
-            "flashmask v4 does not support deterministic"
         )
         assert paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"] == 4, (
             f"FLAGS_flash_attn_version:{paddle.base.framework.get_flags(['FLAGS_flash_attn_version'])['FLAGS_flash_attn_version']}, but running flashmask v4"
@@ -1851,9 +1848,6 @@ def flash_attention(
         )
         assert name is None, (
             "flash attention 4 does not support setting name"
-        )
-        assert not paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"], (
-            "flash attention 4 does not support deterministic"
         )
 
         # Note(wusiming): i dont think it is necessary to add a pylayer for flash_attention, just reuse flashmask

@@ -1872,7 +1872,7 @@ def flash_attention(
                 "Please ensure seqlen_q equals seqlen_k or disable causal."
             )
         try:
-            out, lse = paddle.nn.functional.flash_attention(
+            out, lse = paddle.nn.functional.flash_attention.flash_attention(
                 query=query,
                 key=key,
                 value=value,

@@ -257,6 +257,8 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                         copy_chunk_mask,                                            \
                         _my_pe,                                                     \
                         _total_n_pes,                                               \
+                        B,                                                          \
+                        H * D,                                                      \
                         kv_buffer->semaphores()                                     \
                     )
 
@@ -291,9 +293,11 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     }
 
 // can be adjust to use non-specialized version
-#define KernelTrait Specialized
+#define KernelTrait
+#define BlockChunkKernelTrait Specialized
 #define FwdKernelTrait Specialized
 #define BwdKernelTrait SpecializedBwd
+#define EXPAND_MACRO(MACRO, ...) MACRO(__VA_ARGS__)
 
 template <typename KVType>
 void OverlapCommunicator<KVType>::compute_chunk_mask(
@@ -304,14 +308,17 @@ void OverlapCommunicator<KVType>::compute_chunk_mask(
 ) {
     if constexpr (USE_SPARSE_LARGE_CHUNK) {
         constexpr int S_chunk = 8192;
-        const int grid_size = (S_local * _cp_size - S_chunk) / (num_warps * 32 * 4);      // each CTA reduce 1024 ints to 4 or 2 ints
-        // TODO(heqianyue): check the runtime overhead. We might actually fuse this kernel into the comm kernel
+        const dim3 grid = dim3((S_local * _cp_size - S_chunk) / (num_warps * 32 * 4), B, 1);      // each CTA reduce 1024 ints to 4 or 2 ints
+        // TODO(heqianyue): 2 is for special mask (only has LTS and UTE)
+        const int head_stride = S_local * _cp_size * 2;
+#define CallBlockSparsityKernel(is_bwd, Trait)                                                   \
+    BlockSparsityCheck##Trait##Kernel<S_chunk, num_warps, RDMA_ROW_PER_WARP, is_bwd /* bwd */>   \
+                <<< grid, num_warps * 32, 0, stream >>>(lt_start_ptr, ut_end_ptr, copy_chunk_mask, H, head_stride)
+
         if (fwd) {
-            BlockSparsityCheckKernel<S_chunk, num_warps, RDMA_ROW_PER_WARP, false /* bwd */>
-                <<< grid_size, num_warps * 32, 0, stream >>>(lt_start_ptr, ut_end_ptr, copy_chunk_mask);
+            EXPAND_MACRO(CallBlockSparsityKernel, false, BlockChunkKernelTrait);
         } else {
-            BlockSparsityCheckKernel<S_chunk, num_warps, RDMA_ROW_PER_WARP, true /* bwd */>
-                <<< grid_size, num_warps * 32, 0, stream >>>(lt_start_ptr, ut_end_ptr, copy_chunk_mask);
+            EXPAND_MACRO(CallBlockSparsityKernel, true, BlockChunkKernelTrait);
         }
     }
 }

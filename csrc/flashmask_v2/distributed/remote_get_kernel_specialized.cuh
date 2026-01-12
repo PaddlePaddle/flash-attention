@@ -283,18 +283,22 @@ __global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetSpecializedBwdK
  *  different CTAs to be more balanced. 
 */
 
+// Specialized kernel used only when (Mask Head = 1, meaning that multiple KV heads share the same mask)
 template <int S_chunk, int num_warps = 8, int row_per_warp = 32, bool bwd=false>
-__global__ void __launch_bounds__(256, 8) BlockSparsityCheckKernel(
+__global__ void __launch_bounds__(256, 8) BlockSparsityCheckSpecializedKernel(
     const int* const __restrict__ lt_start_ptr,
     const int* const __restrict__ ut_end_ptr,
-    int* const __restrict__ copy_chunk_mask
+    int* const __restrict__ copy_chunk_mask,
+    const int UNUSED num_head,
+    const int head_stride
 ) {
     // each thread load 1 int4 from lt_start_ptr and 1 int4 from ut_end_ptr
     static_assert(num_warps == 8);
     static_assert(row_per_warp == 32 || row_per_warp == 64);
     __shared__ int warps_masked[num_warps];
     // bwd valid mask starts from mask[S_chunk], while fwd starts from mask[0] due to different roll strategy
-    constexpr int mask_offset = bwd ? S_chunk : 0;
+    const int batch_offset = blockIdx.y * head_stride;
+    const int mask_offset = (bwd ? S_chunk : 0) + batch_offset;
     const int load_index = blockIdx.x * num_warps * 32 + threadIdx.x;
     const int4 lts = *(reinterpret_cast<const int4*>(lt_start_ptr + mask_offset) + load_index);
     const int4 ute = *(reinterpret_cast<const int4*>(ut_end_ptr + mask_offset) + load_index);
@@ -307,6 +311,8 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckKernel(
     }
     __syncthreads();
     if (threadIdx.x == 0) {
+        // grid is: (num-chunks (# 1024-row chunks), num_batch, 1)
+        const int block_offset = blockIdx.y * gridDim.x + blockIdx.x;
         // two warps will produce the masking result of one 256/512-row block
         if constexpr (row_per_warp == 64) {
             int2 result;
@@ -314,7 +320,7 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckKernel(
             result.x = src.x & src.y & src.z & src.w;
             src = *(reinterpret_cast<const int4*>(warps_masked) + 1);
             result.y = src.x & src.y & src.z & src.w;
-            *(reinterpret_cast<int2*>(copy_chunk_mask) + blockIdx.x) = result;
+            *(reinterpret_cast<int2*>(copy_chunk_mask) + block_offset) = result;
         }
         if constexpr (row_per_warp == 32) {
             int4 result;
@@ -324,15 +330,9 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckKernel(
             src = *(reinterpret_cast<const int4*>(warps_masked) + 1);
             result.z = src.x & src.y;
             result.w = src.z & src.w;
-            *(reinterpret_cast<int4*>(copy_chunk_mask) + blockIdx.x) = result;
+            *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = result;
         }
     }
-}
-
-__device__ __forceinline__ int load_volatile(const int* const __restrict__ ptr) {
-    int val = 0;
-    asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(val) : "l"(ptr));
-    return val;
 }
 
 /**
@@ -354,6 +354,8 @@ __global__ void __launch_bounds__(256, 8) SparseLargeKVChunkRemoteGetSpecialized
     const int* const __restrict__ copy_chunk_mask,
     const int my_pe,
     const int total_n_pes,
+    const int UNUSED num_batch,                // B
+    const int UNUSED _S_stride,                // H * D
     const int64_t* const __restrict__ semaphores = nullptr
 ) {
     constexpr int row_per_block = num_warps * row_per_warp;     // 256 or 512 row per block (32 or 64 per warp)

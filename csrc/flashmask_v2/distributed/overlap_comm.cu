@@ -137,8 +137,8 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     // TODO(heqianyue): cudaStreamCreateWithPriority
     cudaStreamCreateWithFlags(&comm_stream, cudaStreamNonBlocking);
     cudaEventCreateWithFlags(&wptr_init, cudaEventDisableTiming);
-    _cp_chunk_size = b_kv * s_kv * h_kv * d_kv;
-    _total_numel = _cp_chunk_size * cp_size;             // won't overflow, but should be careful
+    _cp_chunk_size = s_kv * h_kv * d_kv;
+    _total_numel = _cp_chunk_size * b_kv * cp_size;             // won't overflow, but should be careful
 
     // This variable is simply a int32_t, so can be passed by value
     nvshmem_team_t cp_team = simple_collective_topology_setter(_my_pe, _cp_stride, _total_n_pes);
@@ -147,7 +147,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         cudaMemset(kv_buffer->semaphores(), 0, sizeof(int64_t) * _total_n_pes);
     }
     if constexpr (USE_SPARSE_LARGE_CHUNK) {
-        const int num_chunks = s_kv * cp_size / (RDMA_ROW_PER_WARP * num_warps);
+        const int num_chunks = b_kv * s_kv * cp_size / (RDMA_ROW_PER_WARP * num_warps);
         CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (num_blocks + num_chunks + 1), comm_stream));
         copy_chunk_mask = block_work_ids + num_blocks;
         block_cnt_semaphore = copy_chunk_mask + num_chunks;
@@ -207,11 +207,20 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     // yet, `team_bar` (nvshmem_sync_team) is the culprit
     WARN_PRINT("Before cudaMemcpyAsync...\n");
     // bwd copies the data to the start chunk of the SR, while fwd copies to the last chunk
-    const int local_offset = fwd ? (_total_numel - _cp_chunk_size) : 0;
-    CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->k_data() + local_offset, new_k_data, 
-                            _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
-    CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->v_data() + local_offset, new_v_data,
-                            _cp_chunk_size * sizeof(KVType), cudaMemcpyDeviceToDevice, comm_stream));
+    const int local_offset = fwd ? (_cp_chunk_size * (_cp_size - 1)) : 0;
+    const int batch_stride = _cp_chunk_size * _cp_size;
+    for (int bid = 0; bid < B; bid++) {
+        CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->k_data() + local_offset + bid * batch_stride,
+                                new_k_data + bid * _cp_chunk_size, 
+                                _cp_chunk_size * sizeof(KVType), 
+                                cudaMemcpyDeviceToDevice, 
+                                comm_stream));
+        CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->v_data() + local_offset + bid * batch_stride,
+                                new_v_data + bid * _cp_chunk_size, 
+                                _cp_chunk_size * sizeof(KVType),
+                                cudaMemcpyDeviceToDevice, 
+                                comm_stream));
+    }
     if constexpr (USE_SEMAPHORES) {
         // notify all other PEs that the local data is ready (1. set self to be `total_pes - 1`. 2. broadcast to other PEs)
         sema::notify_full(
@@ -310,7 +319,7 @@ void OverlapCommunicator<KVType>::compute_chunk_mask(
         constexpr int S_chunk = 8192;
         const dim3 grid = dim3((S_local * _cp_size - S_chunk) / (num_warps * 32 * 4), B, 1);      // each CTA reduce 1024 ints to 4 or 2 ints
         // TODO(heqianyue): 2 is for special mask (only has LTS and UTE)
-        const int head_stride = S_local * _cp_size * 2;
+        const int head_stride = S_local * _cp_size;
 #define CallBlockSparsityKernel(is_bwd, Trait)                                                   \
     BlockSparsityCheck##Trait##Kernel<S_chunk, num_warps, RDMA_ROW_PER_WARP, is_bwd /* bwd */>   \
                 <<< grid, num_warps * 32, 0, stream >>>(lt_start_ptr, ut_end_ptr, copy_chunk_mask, H, head_stride)

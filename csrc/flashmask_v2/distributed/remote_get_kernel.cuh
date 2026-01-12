@@ -493,7 +493,10 @@ __global__ void __launch_bounds__(256, 8) SparseLargeKVChunkRemoteGetKernel(
     }
 
     for (int work_id = update_wptr_and_work_id_sync(0); work_id <= total_chunks;) {
-        int mask_index = bwd ? (work_id - 1) : (total_chunks - work_id);
+        const int work_id_m1 = work_id - 1;
+        const int batch_id = work_id_m1 / chunk_per_batch;
+        const int seq_work_id = (work_id_m1 % chunk_per_batch) + 1;     // this is in range [1, chunk_per_batch]
+        int mask_index = bwd ? (work_id - 1) : (chunk_per_batch * (batch_id + 1) - seq_work_id);
         if (copy_chunk_mask[mask_index]) {
             // does not need copying since the current KV block is masked. skip directly
             // __syncthreads() here is necessary: in case some of the warp haven't updated
@@ -504,8 +507,6 @@ __global__ void __launch_bounds__(256, 8) SparseLargeKVChunkRemoteGetKernel(
         }
         // calculate seqlen offset via work_id
         int seqlen_id = 0, remote_pe = 0;
-        const int batch_offset = (work_id / chunk_per_batch) * batch_stride;
-        const int seq_work_id = work_id % chunk_per_batch;
         if constexpr (bwd) {        // bwd is forward traversal
             seqlen_id = S_chunk + (seq_work_id - 1) * row_per_block;
             remote_pe = my_pe + seqlen_id / S_chunk;
@@ -524,8 +525,8 @@ __global__ void __launch_bounds__(256, 8) SparseLargeKVChunkRemoteGetKernel(
             }
         }
         // copy upto 4 heads (S_stride = H * D), and row_per_block rows (seqlen axis) per CTA
-        const int src_addr = batch_offset + (seqlen_offset + (seqlen_id % S_chunk)) * S_stride;
-        const int dst_addr = batch_offset + seqlen_id * S_stride;
+        const int src_addr = batch_id * batch_stride + (seqlen_offset + (seqlen_id % S_chunk)) * S_stride;
+        const int dst_addr = batch_id * batch_stride + seqlen_id * S_stride;
         shmem::two_buffers_getmem_block(
             k_sr + dst_addr,
             v_sr + dst_addr,

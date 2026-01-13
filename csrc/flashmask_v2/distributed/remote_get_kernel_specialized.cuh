@@ -284,6 +284,8 @@ __global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetSpecializedBwdK
 */
 
 // Specialized kernel used only when (Mask Head = 1, meaning that multiple KV heads share the same mask)
+// When num_warp is 4. this kernel only has 128 threads per CTA and each CTA reduces 512 mask pos to an int4
+// Can be used when KV head > 1 to reduce comm workload per CTA (so that computation won't stall that long)
 template <int S_chunk, int num_warps = 8, int row_per_warp = 32, bool bwd=false>
 __global__ void __launch_bounds__(256, 8) BlockSparsityCheckSpecializedKernel(
     const int* const __restrict__ lt_start_ptr,
@@ -293,8 +295,10 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckSpecializedKernel(
     const int head_stride
 ) {
     // each thread load 1 int4 from lt_start_ptr and 1 int4 from ut_end_ptr
-    static_assert(num_warps == 8);
-    static_assert(row_per_warp == 32 || row_per_warp == 64);
+    static_assert(num_warps == 8 || num_warps == 4);
+    static_assert(row_per_warp == 32 || row_per_warp == 64 || row_per_warp == 16);
+    // num_warp = 4 and row_per_warp = 16 can't be different
+    static_assert(row_per_warp != 16 || (row_per_warp == 16 && num_warps == 4));
     __shared__ int warps_masked[num_warps];
     // bwd valid mask starts from mask[S_chunk], while fwd starts from mask[0] due to different roll strategy
     const int batch_offset = blockIdx.y * head_stride;
@@ -331,6 +335,9 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckSpecializedKernel(
             result.z = src.x & src.y;
             result.w = src.z & src.w;
             *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = result;
+        }
+        if constexpr (row_per_warp == 16) {
+            *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = *(reinterpret_cast<const int4*>(warps_masked));
         }
     }
 }

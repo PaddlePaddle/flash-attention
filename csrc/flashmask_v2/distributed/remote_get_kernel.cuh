@@ -358,8 +358,10 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckKernel(
     const int head_stride
 ) {
     // each thread load 1 int4 from lt_start_ptr and 1 int4 from ut_end_ptr
-    static_assert(num_warps == 8);
-    static_assert(row_per_warp == 32 || row_per_warp == 64);
+    static_assert(num_warps == 8 || num_warps == 4);
+    static_assert(row_per_warp == 32 || row_per_warp == 64 || row_per_warp == 16);
+    // num_warp = 4 and row_per_warp = 16 can't be different
+    static_assert(row_per_warp != 16 || (row_per_warp == 16 && num_warps == 4));
     __shared__ int warps_masked[num_warps];
     __shared__ int temp_result[128 / row_per_warp];
     // bwd valid mask starts from mask[S_chunk], while fwd starts from mask[0] due to different roll strategy
@@ -417,6 +419,20 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckKernel(
                     *(reinterpret_cast<int4*>(temp_result)) = old_result;
                 }
             }
+            if constexpr (row_per_warp == 16) {
+                int4 result = *(reinterpret_cast<const int4*>(warps_masked));
+                if (head_id == 0) {
+                    *(reinterpret_cast<int4*>(temp_result)) = result;
+                } else {
+                    int4 old_result = *(reinterpret_cast<int4*>(temp_result));
+                    // reduce over heads (the chunk can be skipped only when all-heads can be skipped)
+                    old_result.x &= result.x;
+                    old_result.y &= result.y;
+                    old_result.z &= result.z;
+                    old_result.w &= result.w;
+                    *(reinterpret_cast<int4*>(temp_result)) = old_result;
+                }
+            }
         }
     }
     if (threadIdx.x == 0) {
@@ -424,7 +440,7 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckKernel(
         if constexpr (row_per_warp == 64) {
             *(reinterpret_cast<int2*>(copy_chunk_mask) + block_offset) = *(reinterpret_cast<int2*>(temp_result));
         }
-        if constexpr (row_per_warp == 32) {
+        if constexpr (row_per_warp == 32 || row_per_warp == 16) {
             *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = *(reinterpret_cast<int4*>(temp_result));
         }
     }
@@ -455,7 +471,7 @@ __global__ void __launch_bounds__(256, 8) SparseLargeKVChunkRemoteGetKernel(
 ) {
     constexpr int row_per_block = num_warps * row_per_warp;     // 256 or 512 row per block (32 or 64 per warp)
     constexpr int seqlen_offset = bwd ? 0 : (S - S_chunk);
-    const int chunk_per_batch = (S - S_chunk) / row_per_block;
+    constexpr int chunk_per_batch = (S - S_chunk) / row_per_block;
     const int total_chunks = num_batch * chunk_per_batch;     // 8192 chunk: 32 blocks --> 96 blocks
     const int batch_stride = S * S_stride;
     __shared__ int cached_semaphores[16];

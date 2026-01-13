@@ -317,12 +317,13 @@ void OverlapCommunicator<KVType>::compute_chunk_mask(
 ) {
     if constexpr (USE_SPARSE_LARGE_CHUNK) {
         constexpr int S_chunk = 8192;
-        const dim3 grid = dim3((S_local * _cp_size - S_chunk) / (num_warps * 32 * 4), B, 1);      // each CTA reduce 1024 ints to 4 or 2 ints
+        constexpr int num_reduce_warp = RDMA_ROW_PER_WARP == 16 ? 4 : num_warps;
+        const dim3 grid = dim3((S_local * _cp_size - S_chunk) / (num_reduce_warp * 32 * 4), B, 1);      // each CTA reduce 1024 ints to 4 or 2 ints
         // TODO(heqianyue): 2 is for special mask (only has LTS and UTE)
         const int head_stride = S_local * _cp_size;
-#define CallBlockSparsityKernel(is_bwd, Trait)                                                   \
-    BlockSparsityCheck##Trait##Kernel<S_chunk, num_warps, RDMA_ROW_PER_WARP, is_bwd /* bwd */>   \
-                <<< grid, num_warps * 32, 0, stream >>>(lt_start_ptr, ut_end_ptr, copy_chunk_mask, H, head_stride)
+#define CallBlockSparsityKernel(is_bwd, Trait)                                                          \
+    BlockSparsityCheck##Trait##Kernel<S_chunk, num_reduce_warp, RDMA_ROW_PER_WARP, is_bwd /* bwd */>    \
+                <<< grid, num_reduce_warp * 32, 0, stream >>>(lt_start_ptr, ut_end_ptr, copy_chunk_mask, H, head_stride)
 
         if (fwd) {
             EXPAND_MACRO(CallBlockSparsityKernel, false, BlockChunkKernelTrait);

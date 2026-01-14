@@ -390,7 +390,7 @@ void launch_reduce_workload_kernel(
     cudaStream_t stream) {
     
     dim3 block_dim(1024, 1);
-    dim3 grid_dim(num_row_blocks, (batch_times_heads + 3) / 4);
+    dim3 grid_dim(num_row_blocks, batch_times_heads);
 
     int ptr_dispatch_tag = SINGLE_PTR;
     if (lt_end_max || ut_end_max) {

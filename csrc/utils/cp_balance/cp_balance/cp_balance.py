@@ -42,7 +42,7 @@ def get_q_workload(
         n_block_size (int): FlashAttention kernel 中 key 侧的块大小 (Bc)。
 
     Returns:
-        paddle.Tensor: 形状为 [B, H, Tchunks, 2] 的张量，
+        paddle.Tensor: 形状为 [1, H, Tchunks, 2] 的张量，
                        其中 Tchunks 是 chunk 的数量。
                        每个 chunk 的信息为 [workload, original_index]，
                        表示该 chunk 的估算工作量和其原始索引。
@@ -96,10 +96,10 @@ def get_q_workload(
 
     # 5. 将每个块的工作负载聚合到 chunk 级别
     workload_grouped = workload_per_block.reshape([B, H, Tchunks, blocks_per_chunk, 1])
-    workload_per_chunk = paddle.sum(workload_grouped, axis=3).squeeze(axis=-1)
+    workload_per_chunk = paddle.sum(workload_grouped, axis=3).sum(axis=0).reshape([1, H, Tchunks])
 
     # 6. 准备最终输出，包含工作负载和原始索引
-    final_res = paddle.zeros([B, H, Tchunks, 2], dtype='int32', device=start_row_indices.place)
+    final_res = paddle.zeros([1, H, Tchunks, 2], dtype='int32', device=start_row_indices.place)
     final_res[:, :, :, 0] = workload_per_chunk
     final_res[:, :, :, 1] = paddle.arange(0, Tchunks, dtype="int32")
     

@@ -260,7 +260,8 @@ def test_cp_famask(
     
     # print(workload)
     total_workload = paddle.sum(workload,axis = 1)
-    buckets, bucket_weights,cuts = assign_tasks_heap(workload.reshape(-1,2), cp_size)
+    buckets, bucket_weights,cuts = assign_tasks_heap(workload.reshape(-1,2).cpu().numpy(), cp_size)
+    buckets0 = buckets.copy()
     hcg = fleet.get_hybrid_communicate_group()
         
     ref_o = flashmask_attention(query, key, value, startend_row_indices, causal=causal)
@@ -287,6 +288,7 @@ def test_cp_famask(
         local_xs.append(x[:,idx * balance_q_chunksize:(idx+1) * balance_q_chunksize,:])
     
     local_q = paddle.concat(local_qs, axis=1).detach().contiguous()
+    local_ref_q = local_q.detach()
     local_k = paddle.concat(local_ks, axis=1).detach().contiguous()
     local_v = paddle.concat(local_vs, axis=1).detach().contiguous()
     local_o_grad = paddle.concat(local_ograds, axis=1)
@@ -297,6 +299,7 @@ def test_cp_famask(
     local_ref_x = paddle.concat(local_xs, axis=1).detach().contiguous()
     
     local_startend_row_indices, buckets = balance_flashmask_input( startend_row_indices, cp_size, rank,balance_chunk_size= balance_q_chunksize)
+    assert buckets0 == buckets
     local_q = scatter_balance(query, group = cp_group, axis=1,mode = "balanced_swap", buckets = buckets).detach().contiguous()
     local_x = scatter_balance(x, group = cp_group, axis=1,mode = "balanced_swap", buckets = buckets)
     gather_x = all_gather_balance(local_x, group = cp_group, axis=1,mode = "balanced_swap", buckets = buckets)
@@ -330,6 +333,7 @@ def test_cp_famask(
         # np.savetxt('buckets.txt', x_np.reshape(-1, x_np.shape[-1]), fmt='%d')
     # strict_check(local_o[:,:,0,0].flatten(), local_o1[:,:,0,0].flatten())
     # strict_check(local_o1[:,:,0,0].flatten(), local_ref_o[:,:,0,0].flatten())
+    strict_check(local_q.flatten(), local_ref_q.flatten())
     strict_check(local_o.flatten(), local_ref_o.flatten())
     strict_check(local_k.grad.flatten(), local_ref_grad_k.flatten())
     strict_check(local_v.grad.flatten(), local_ref_grad_v.flatten())
@@ -824,8 +828,9 @@ def main(examples: List[str] = ["all"], dtype='bf16'):
         # print(doc_seq_lens_list)
         results = []
         for idx in range(0,50):
-            B = 1
+            B = 2
             startend_row_indices = paddle.load(f'/root/paddlejob/workspace/env_run/xiehaoyang/flashmask/flashmask-cp/cp_balance/dump_32k_startend_row_indices/startend_row_indices_{idx}.pdparams')
+            startend_row_indices = startend_row_indices.repeat(B, 1, 1, 1)
             print(startend_row_indices)
             S = 32768
             print(f"{B}_{S}_{H}_{D}_{idx}_{dtype}")

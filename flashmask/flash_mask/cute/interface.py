@@ -485,7 +485,9 @@ def _flash_attn_fwd(
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
         # flashmask
-        len(startend_row_indices.shape) if startend_row_indices is not None else None,
+        startend_row_indices.shape[0] if startend_row_indices is not None else None,
+        startend_row_indices.shape[1] if startend_row_indices is not None else None,
+        startend_row_indices.shape[3] if startend_row_indices is not None else None,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:

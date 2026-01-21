@@ -115,7 +115,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 params.rank,
                 params.nranks,
                 params.cp_size,
-                params.unique_id_ptr
+                params.unique_id_ptr,
+                params.h_flashmask
             );
             // initial step does not need to wait for SR buffer's emptyness.
             comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.ut_end_ptr, stream, true /* fwd */);

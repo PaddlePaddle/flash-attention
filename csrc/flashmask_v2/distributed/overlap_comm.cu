@@ -14,7 +14,13 @@ static constexpr bool USE_SEMAPHORES = false;           // no team_bar but fine-
 // If true, we will scale up the transfering chunk for one CTA (16 rows per chunk ---> 256-512 rows per chunk)
 // and calculate per-chunk sparsity to skip some comm (avg 50% of the chunks are not needed)
 static constexpr bool USE_SPARSE_LARGE_CHUNK = true;
-static constexpr int RDMA_ROW_PER_WARP = 32;
+
+// allowed value: [16, 32, 64] (larger number is generally better for KV with larger num_head and higher CP)
+static constexpr int RDMA_ROW_PER_WARP = 64;
+
+// allowed value: 16 or 8 (16 warps are generally better for KV with larger num_head and higher CP)
+static constexpr int num_warps = 16;    // making the grid larger is generally better
+static constexpr int num_blocks = 32;   // 32 reg, 256 thread, one SM of H800 can hold 8 blocks, we use 4 SM
 
 template <typename Ty>
 void dump_sr_buffer(const Ty* const src, int num_elem, int rank, std::string buffer_name) {
@@ -115,12 +121,14 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     int rank,
     int nranks,
     int cp_size,
-    const uint8_t* unique_id_ptr
+    const uint8_t* unique_id_ptr,
+    int mask_head
     // Maybe we should manage the following by ourselves? Do not pass as parameters
 ): kv_buffer(nullptr),
    B(b_kv),
    S_local(s_kv),
    H(h_kv),
+   H_mask(mask_head),
    D(d_kv),
    _cp_size(cp_size),
    block_work_ids(nullptr),
@@ -323,7 +331,7 @@ void OverlapCommunicator<KVType>::compute_chunk_mask(
         const int head_stride = S_local * _cp_size;
 #define CallBlockSparsityKernel(is_bwd, Trait)                                                          \
     BlockSparsityCheck##Trait##Kernel<S_chunk, num_reduce_warp, RDMA_ROW_PER_WARP, is_bwd /* bwd */>    \
-                <<< grid, num_reduce_warp * 32, 0, stream >>>(lt_start_ptr, ut_end_ptr, copy_chunk_mask, H, head_stride)
+                <<< grid, num_reduce_warp * 32, 0, stream >>>(lt_start_ptr, ut_end_ptr, copy_chunk_mask, H_mask, head_stride)
 
         if (fwd) {
             EXPAND_MACRO(CallBlockSparsityKernel, false, BlockChunkKernelTrait);
@@ -447,11 +455,12 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     int rank,
     int nranks,
     int cp_size,
-    const uint8_t* unique_id_ptr
+    const uint8_t* unique_id_ptr,
+    int mask_head
 ) {
     if (!overlap_comm) {
         overlap_comm = std::make_unique<OverlapCommunicator<cutlass::bfloat16_t>>(
-            k_data, v_data, b_kv, s_kv, h_kv, d_kv, rank, nranks, cp_size, unique_id_ptr
+            k_data, v_data, b_kv, s_kv, h_kv, d_kv, rank, nranks, cp_size, unique_id_ptr, mask_head
         );
     }
     return *overlap_comm;

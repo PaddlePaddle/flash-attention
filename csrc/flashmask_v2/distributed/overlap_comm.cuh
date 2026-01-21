@@ -32,7 +32,8 @@ public:
         int rank,
         int nranks,
         int cp_size,
-        const uint8_t* unique_id_ptr = nullptr
+        const uint8_t* unique_id_ptr = nullptr,
+        int mask_head = 0
     );
 
     ~OverlapCommunicator();
@@ -89,6 +90,7 @@ private:
     const int B;
     const int S_local;
     const int H;
+    const int H_mask;       // mask head
     const int D;
     const int _cp_size;
     int _my_pe;
@@ -100,9 +102,6 @@ private:
     int* block_work_ids;
     int* block_cnt_semaphore;
     int* copy_chunk_mask;
-
-    static constexpr int num_warps = 8;
-    static constexpr int num_blocks = 32;   // 32 reg, 256 thread, one SM of H800 can hold 8 blocks, we use 4 SM
 
     // returns the team and stride between teams
     static nvshmem_team_t simple_collective_topology_setter(int my_global_pe, int stride, int n_pes);
@@ -124,7 +123,8 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     int rank,
     int nranks,
     int cp_size,
-    const uint8_t* unique_id_ptr
+    const uint8_t* unique_id_ptr,
+    int mask_head = 1
 );
 
 // get instance (mutable ref), make sure the instance is initialized, used in both fwd and bwd

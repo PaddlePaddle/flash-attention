@@ -9,7 +9,7 @@ namespace flashmask {
 #define UNUSED __attribute__((unused))
 
 template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8, bool use_semaphore=false>
-__global__ void __launch_bounds__(256, 8) SparseKVFewHeadRemoteGetSpecializedKernel(
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseKVFewHeadRemoteGetSpecializedKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,
@@ -76,7 +76,7 @@ __global__ void __launch_bounds__(256, 8) SparseKVFewHeadRemoteGetSpecializedKer
 }
 
 template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8, bool use_semaphore=false>
-__global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetSpecializedKernel(
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) DenseKVFewHeadRemoteGetSpecializedKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,
@@ -141,7 +141,7 @@ __global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetSpecializedKern
 // the fwd kernels get data in reverse, while the backward does not
 
 template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8, bool use_semaphore=false>
-__global__ void __launch_bounds__(256, 8) SparseKVFewHeadRemoteGetSpecializedBwdKernel(
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseKVFewHeadRemoteGetSpecializedBwdKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,
@@ -209,7 +209,7 @@ __global__ void __launch_bounds__(256, 8) SparseKVFewHeadRemoteGetSpecializedBwd
 
 
 template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8, bool use_semaphore=false>
-__global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetSpecializedBwdKernel(
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) DenseKVFewHeadRemoteGetSpecializedBwdKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,
@@ -287,7 +287,7 @@ __global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetSpecializedBwdK
 // When num_warp is 4. this kernel only has 128 threads per CTA and each CTA reduces 512 mask pos to an int4
 // Can be used when KV head > 1 to reduce comm workload per CTA (so that computation won't stall that long)
 template <int S_chunk, int num_warps = 8, int row_per_warp = 32, bool bwd=false>
-__global__ void __launch_bounds__(256, 8) BlockSparsityCheckSpecializedKernel(
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityCheckSpecializedKernel(
     const int* const __restrict__ lt_start_ptr,
     const int* const __restrict__ ut_end_ptr,
     int* const __restrict__ copy_chunk_mask,
@@ -295,10 +295,11 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckSpecializedKernel(
     const int head_stride
 ) {
     // each thread load 1 int4 from lt_start_ptr and 1 int4 from ut_end_ptr
-    static_assert(num_warps == 8 || num_warps == 4);
+    static_assert(num_warps == 16 || num_warps == 8 || num_warps == 4);
     static_assert(row_per_warp == 32 || row_per_warp == 64 || row_per_warp == 16);
     // num_warp = 4 and row_per_warp = 16 can't be different
     static_assert(row_per_warp != 16 || (row_per_warp == 16 && num_warps == 4));
+    static constexpr int rows_per_cta = row_per_warp * num_warps;
     __shared__ int warps_masked[num_warps];
     // bwd valid mask starts from mask[S_chunk], while fwd starts from mask[0] due to different roll strategy
     const int batch_offset = blockIdx.y * head_stride;
@@ -318,26 +319,43 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckSpecializedKernel(
         // grid is: (num-chunks (# 1024-row chunks), num_batch, 1)
         const int block_offset = blockIdx.y * gridDim.x + blockIdx.x;
         // two warps will produce the masking result of one 256/512-row block
-        if constexpr (row_per_warp == 64) {
+        const int4* smem_int4 = reinterpret_cast<const int4*>(warps_masked);
+        if constexpr (rows_per_cta == 1024) {       // reduce 8 int
+            // happens only when num_warps == 16 and rows_per_warp = 64
+            // we reduce to 16ints, each int represents 128 rows. So
+            // we need to further reduce two int4 into a single int value
             int2 result;
-            int4 src = *(reinterpret_cast<const int4*>(warps_masked));
+            int4 src = *smem_int4;
             result.x = src.x & src.y & src.z & src.w;
-            src = *(reinterpret_cast<const int4*>(warps_masked) + 1);
+            src = *(smem_int4 + 1);
+            result.x &= src.x & src.y & src.z & src.w;
+            // reduce the second 2-int4s
+            src = *(smem_int4 + 2);
+            result.y = src.x & src.y & src.z & src.w;
+            src = *(smem_int4 + 3);
+            result.y &= src.x & src.y & src.z & src.w;
+            *(reinterpret_cast<int2*>(copy_chunk_mask) + block_offset) = result;
+        }
+        if constexpr (rows_per_cta == 512) {        // reduce 4 int
+            int2 result;
+            int4 src = *smem_int4;
+            result.x = src.x & src.y & src.z & src.w;
+            src = *(smem_int4 + 1);
             result.y = src.x & src.y & src.z & src.w;
             *(reinterpret_cast<int2*>(copy_chunk_mask) + block_offset) = result;
         }
-        if constexpr (row_per_warp == 32) {
+        if constexpr (rows_per_cta == 256) {        // reduce 2 int
             int4 result;
-            int4 src = *(reinterpret_cast<const int4*>(warps_masked));
+            int4 src = *(smem_int4);
             result.x = src.x & src.y;
             result.y = src.z & src.w;
-            src = *(reinterpret_cast<const int4*>(warps_masked) + 1);
+            src = *(smem_int4 + 1);
             result.z = src.x & src.y;
             result.w = src.z & src.w;
             *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = result;
         }
-        if constexpr (row_per_warp == 16) {
-            *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = *(reinterpret_cast<const int4*>(warps_masked));
+        if constexpr (rows_per_cta == 64) {        // no reduction
+            *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = *smem_int4;
         }
     }
 }
@@ -352,7 +370,7 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckSpecializedKernel(
  *  is used so every CTA use atomic op to get a chunk ID to process.
 */
 template <typename T, int S, int S_chunk, int num_warps=8, int row_per_warp=32, bool use_semaphore=false, bool bwd=false>
-__global__ void __launch_bounds__(256, 8) SparseLargeKVChunkRemoteGetSpecializedKernel(
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkRemoteGetSpecializedKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,

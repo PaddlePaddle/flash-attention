@@ -344,7 +344,7 @@ class ContextParallelScatterOp(PyLayer):
     """
 
     @staticmethod
-    def forward(ctx, input_tensor, axis=0):
+    def forward(ctx, input_tensor, axis=0, mode="dual_chunk", buckets=None):
         """
         Forward pass: scatter input tensor across context parallel ranks.
 
@@ -352,6 +352,8 @@ class ContextParallelScatterOp(PyLayer):
             ctx: Context object for saving information for backward pass
             input_tensor (paddle.Tensor): Input tensor to scatter
             axis (int): Axis along which to scatter
+            mode (int): Load balancing method, supports 'dual_chunk' (default) and 'balanced_swap'
+            buckets (list): Load balancing index buckets used only in 'balanced_swap' mode. None by default.
 
         Returns:
             paddle.Tensor: Scattered tensor chunk
@@ -366,8 +368,10 @@ class ContextParallelScatterOp(PyLayer):
 
         group = hcg.get_context_parallel_group()
         ctx.group = group
+        ctx.mode = mode
+        ctx.buckets = buckets
 
-        return scatter_balance(input_tensor, axis=axis, group=group)
+        return scatter_balance(input_tensor, axis=axis, group=group, mode=mode, buckets=buckets)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -381,7 +385,7 @@ class ContextParallelScatterOp(PyLayer):
         Returns:
             tuple: Gradients for input arguments
         """
-        grad_input = all_gather_balance(grad_output, axis=ctx.axis, group=ctx.group)
+        grad_input = all_gather_balance(grad_output, axis=ctx.axis, group=ctx.group, mode=ctx.mode, buckets=ctx.buckets)
         return grad_input
 
 
@@ -394,7 +398,7 @@ class ContextParallelGatherOp(PyLayer):
     """
 
     @staticmethod
-    def forward(ctx, input_tensor, axis=0):
+    def forward(ctx, input_tensor, axis=0, mode="dual_chunk", buckets=None):
         """
         Forward pass: all-gather input tensor across context parallel ranks.
 
@@ -402,6 +406,8 @@ class ContextParallelGatherOp(PyLayer):
             ctx: Context object for saving information for backward pass
             input_tensor (paddle.Tensor): Input tensor to gather
             axis (int): Axis along which to gather
+            mode (int): Load balancing method, supports 'dual_chunk' (default) and 'balanced_swap'
+            buckets (list): Load balancing index buckets used only in 'balanced_swap' mode. None by default.
 
         Returns:
             paddle.Tensor: Gathered full tensor
@@ -416,8 +422,10 @@ class ContextParallelGatherOp(PyLayer):
 
         group = hcg.get_context_parallel_group()
         ctx.group = group
+        ctx.mode = mode
+        ctx.buckets = buckets
 
-        return all_gather_balance(input_tensor, axis=axis, group=group)
+        return all_gather_balance(input_tensor, axis=axis, group=group, mode=mode, buckets=buckets)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -431,7 +439,7 @@ class ContextParallelGatherOp(PyLayer):
         Returns:
             tuple: Gradients for input arguments
         """
-        grad_input = scatter_balance(grad_output, axis=ctx.axis, group=ctx.group)
+        grad_input = scatter_balance(grad_output, axis=ctx.axis, group=ctx.group, mode=ctx.mode, buckets=ctx.buckets)
         return grad_input
 
 

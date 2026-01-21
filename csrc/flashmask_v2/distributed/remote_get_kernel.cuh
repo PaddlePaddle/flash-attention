@@ -49,7 +49,7 @@ inline void CheckCudaErrorAux(const char *file, unsigned line,
  * or single head, depending on the `S_stride` and `work_per_warp`
 */
 template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8, bool use_semaphore=false>
-__global__ void __launch_bounds__(256, 8) SparseKVFewHeadRemoteGetKernel(
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseKVFewHeadRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,
@@ -145,7 +145,7 @@ __global__ void __launch_bounds__(256, 8) SparseKVFewHeadRemoteGetKernel(
 
 
 template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8, bool use_semaphore=false>
-__global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetKernel(
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) DenseKVFewHeadRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,
@@ -217,7 +217,7 @@ __global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetKernel(
 // the fwd kernels get data in reverse, while the backward does not
 
 template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8, bool use_semaphore=false>
-__global__ void __launch_bounds__(256, 8) SparseKVFewHeadRemoteGetBwdKernel(
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseKVFewHeadRemoteGetBwdKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,
@@ -288,7 +288,7 @@ __global__ void __launch_bounds__(256, 8) SparseKVFewHeadRemoteGetBwdKernel(
 
 
 template <typename T, int S, int S_chunk, int num_blocks=32, int num_warps=8, bool use_semaphore=false>
-__global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetBwdKernel(
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) DenseKVFewHeadRemoteGetBwdKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,
@@ -350,18 +350,19 @@ __global__ void __launch_bounds__(256, 8) DenseKVFewHeadRemoteGetBwdKernel(
 }
 
 template <int S_chunk, int num_warps = 8, int row_per_warp = 32, bool bwd=false>
-__global__ void __launch_bounds__(256, 8) BlockSparsityCheckKernel(
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityCheckKernel(
     const int* const __restrict__ lt_start_ptr,
     const int* const __restrict__ ut_end_ptr,
     int* const __restrict__ copy_chunk_mask,
-    const int num_head,
+    const int num_head,                         // note that this is not KV head, but mask head
     const int head_stride
 ) {
     // each thread load 1 int4 from lt_start_ptr and 1 int4 from ut_end_ptr
-    static_assert(num_warps == 8 || num_warps == 4);
+    static_assert(num_warps == 16 || num_warps == 8 || num_warps == 4);
     static_assert(row_per_warp == 32 || row_per_warp == 64 || row_per_warp == 16);
     // num_warp = 4 and row_per_warp = 16 can't be different
     static_assert(row_per_warp != 16 || (row_per_warp == 16 && num_warps == 4));
+    static constexpr int rows_per_cta = row_per_warp * num_warps;
     __shared__ int warps_masked[num_warps];
     __shared__ int temp_result[128 / row_per_warp];
     // bwd valid mask starts from mask[S_chunk], while fwd starts from mask[0] due to different roll strategy
@@ -383,28 +384,39 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckKernel(
         // all of the LTS <= UTE, then the 4 rows are fully masked
         if (threadIdx.x == 0) {
             // two warps will produce the masking result of one 256/512-row block
-            if constexpr (row_per_warp == 64) {
+            const int4* smem_int4 = reinterpret_cast<const int4*>(warps_masked);
+            if constexpr (rows_per_cta >= 512) {
                 int2 result;
-                int4 src = *(reinterpret_cast<const int4*>(warps_masked));
+                int4 src = *smem_int4;
                 result.x = src.x & src.y & src.z & src.w;
-                src = *(reinterpret_cast<const int4*>(warps_masked) + 1);
-                result.y = src.x & src.y & src.z & src.w;
-                if (head_id == 0) {
-                    *(reinterpret_cast<int2*>(temp_result)) = result;
+                src = *(smem_int4 + 1);
+                if constexpr (rows_per_cta == 1024) {
+                    result.x &= src.x & src.y & src.z & src.w;
+                    // reduce the second 2-int4s
+                    src = *(smem_int4 + 2);
+                    result.y = src.x & src.y & src.z & src.w;
+                    src = *(smem_int4 + 3);
+                    result.y &= src.x & src.y & src.z & src.w;
                 } else {
-                    int2 old_result = *(reinterpret_cast<int2*>(temp_result));
+                    result.y = src.x & src.y & src.z & src.w;
+                }
+                int2* const reduction_addr = reinterpret_cast<int2*>(temp_result);
+                if (head_id == 0) {
+                    *reduction_addr = result;
+                } else {
+                    int2 old_result = *reduction_addr;
                     // reduce over heads (the chunk can be skipped only when all-heads can be skipped)
                     old_result.x &= result.x;
                     old_result.y &= result.y;
-                    *(reinterpret_cast<int2*>(temp_result)) = old_result;
+                    *reduction_addr = old_result;
                 }
             }
-            if constexpr (row_per_warp == 32) {
+            if constexpr (rows_per_cta == 256) {        // reduce 2 int
                 int4 result;
-                int4 src = *(reinterpret_cast<const int4*>(warps_masked));
+                int4 src = *smem_int4;
                 result.x = src.x & src.y;
                 result.y = src.z & src.w;
-                src = *(reinterpret_cast<const int4*>(warps_masked) + 1);
+                src = *(smem_int4 + 1);
                 result.z = src.x & src.y;
                 result.w = src.z & src.w;
                 if (head_id == 0) {
@@ -419,8 +431,8 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckKernel(
                     *(reinterpret_cast<int4*>(temp_result)) = old_result;
                 }
             }
-            if constexpr (row_per_warp == 16) {
-                int4 result = *(reinterpret_cast<const int4*>(warps_masked));
+            if constexpr (rows_per_cta == 64) {         // no reduction
+                int4 result = *smem_int4;
                 if (head_id == 0) {
                     *(reinterpret_cast<int4*>(temp_result)) = result;
                 } else {
@@ -437,10 +449,9 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckKernel(
     }
     if (threadIdx.x == 0) {
         int block_offset = blockIdx.y * gridDim.x + blockIdx.x;     // grid is: (num-chunks (int4), num_batch, 1)
-        if constexpr (row_per_warp == 64) {
+        if constexpr (rows_per_cta >= 512) {
             *(reinterpret_cast<int2*>(copy_chunk_mask) + block_offset) = *(reinterpret_cast<int2*>(temp_result));
-        }
-        if constexpr (row_per_warp == 32 || row_per_warp == 16) {
+        } else {
             *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = *(reinterpret_cast<int4*>(temp_result));
         }
     }
@@ -456,7 +467,7 @@ __global__ void __launch_bounds__(256, 8) BlockSparsityCheckKernel(
  *  is used so every CTA use atomic op to get a chunk ID to process.
 */
 template <typename T, int S, int S_chunk, int num_warps=8, int row_per_warp=32, bool use_semaphore=false, bool bwd=false>
-__global__ void __launch_bounds__(256, 8) SparseLargeKVChunkRemoteGetKernel(
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,
@@ -507,6 +518,11 @@ __global__ void __launch_bounds__(256, 8) SparseLargeKVChunkRemoteGetKernel(
             *(reinterpret_cast<int4*>(cached_semaphores) + threadIdx.x) = make_int4(0, 0, 0, 0);
         }
     }
+
+    // // Uncomment this line to check what happens when communication is not stalling the computation
+    // if (threadIdx.x == 0) {
+    //     atomicMax(wptr, INT_MAX);
+    // }
 
     for (int work_id = update_wptr_and_work_id_sync(0); work_id <= total_chunks;) {
         const int work_id_m1 = work_id - 1;

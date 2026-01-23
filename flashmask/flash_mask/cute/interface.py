@@ -487,7 +487,6 @@ def _flash_attn_fwd(
         # flashmask
         startend_row_indices.shape[0] if startend_row_indices is not None else None,
         startend_row_indices.shape[1] if startend_row_indices is not None else None,
-        startend_row_indices.shape[2] if startend_row_indices is not None else None,
         startend_row_indices.shape[3] if startend_row_indices is not None else None,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:

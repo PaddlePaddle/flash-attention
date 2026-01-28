@@ -42,7 +42,7 @@ In this equation:
       <td>Context Parallel</td>
       <td>✅</td>
       <td>✅</td>
-      <td>❌</td>
+      <td>✅</td>
     </tr>
     <tr>
       <td>Block Mask</td>

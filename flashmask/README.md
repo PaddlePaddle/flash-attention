@@ -1,6 +1,6 @@
 # FlashMask
 
-This repository provides the official implementation of FlashMask, FlashMask V3 and FlashMask V4 from the following papers.
+This repository provides the official implementation of FlashMask, FlashMask V3 and FlashMask V4 from the following paper.
 
 FlashMask: Efficient and Rich Mask Extension of FlashAttention.
 + Paper: https://arxiv.org/abs/2410.01359
@@ -131,7 +131,7 @@ In this equation:
 ## Performance
 FlashMask V3 is optimized for Hopper GPUs (e.g. H800).
 
-### Flash Mask
+### FlashMask V3
 
 FlashMask V3 shows substantial speedups across different head dimensions. The following benchmarks represent the performance improvement range across various sequence lengths.
 
@@ -145,7 +145,7 @@ Head Dimension 256
 + vs. FlashMask: 11.1% ~ 106.2% Increase
 + vs. FlexAttention: 66.9% ~ 212.2% Increase
 
-### Block Mask
+### BlockMask
 
 FlashMask V3 demonstrates a substantial performance advantage over Block Attention, as shown in the benchmark. Across various sequence lengths (8K, 32K, 128K) and configurations, it achieves a 75.7% to 197.3%​ speedup in forward computation and 48.0% to 94.4% speedup in backward computation.
 
@@ -166,36 +166,41 @@ TODO
 
 ## Installation
 ### Paddle
-#### 1. FlashMask & FlashMask V3
-Install Latest Stable Release or Nightly Release
+#### FlashMask & FlashMask V3
+Installation
+FlashMask and FlashMask V3 are included in the standard PaddlePaddle distribution. No additional plugins are required.
 
-For detailed information about installation, please view [Quick Install](https://www.paddlepaddle.org.cn/install/quick?docurl=/documentation/docs/zh/develop/install/pip/linux-pip.html).
+Install Latest Stable Release or Nightly Release. For detailed information about installation, please view [Quick Install](https://www.paddlepaddle.org.cn/install/quick?docurl=/documentation/docs/zh/develop/install/pip/linux-pip.html).
 
-#### 2. FlashMask V4
+
+#### FlashMask V4
 ```
+git clone https://github.com/PaddlePaddle/flash-attention.git
 cd flash-attention/flashmask
 python3 setup.py install
 ```
 
 ### PyTorch
-FlashMask V3
+#### FlashMask V3
 ```
-flash-attention/csrc/flashmask_v2
+git clone https://github.com/PaddlePaddle/flash-attention.git
+cd flash-attention/csrc/flashmask_v2
 python setup.py install
 ```
 
-FlashMask V4
+#### FlashMask V4
 ```
 TODO
 ```
 
 
 ## How to us FlashMask
-
+### Installation & Import
 ```python
 from flash_mask.cute.interface import flashmask_attention
 ```
 
+### API Reference
 ```python
 def flashmask_attention(
     query: Tensor,
@@ -289,12 +294,130 @@ def flashmask_attention(
     """
 ```
 
-For a example
+### Implementation Example
+Here is a Python example demonstrating how to use the flashmask_attention interface with a block mask implementation.
 
 ```python
-//// TODO
+import pytest
+import paddle
+from paddle.nn.functional.flash_attention import flashmask_attention
+from functools import partial
+
+def generate_sliding_window_mask(batch_size, seqlen_q, seqlen_k, h, window_size=None):
+    if window_size == None:
+        window_size = 1024
+        if seqlen_k != 8192:
+            window_size = int(window_size * (seqlen_k / 8192))
+            print(f"{seqlen_k=}, auto setting window_size to {window_size}")
+
+    startend_row_indices = paddle.arange(
+        window_size, seqlen_k + window_size, dtype="int32"
+    ).reshape((1, 1, seqlen_k, 1))
+    startend_row_indices = paddle.clip(
+        startend_row_indices, max=seqlen_q
+    ).repeat_interleave(batch_size, 0)
+
+    causal=True
+    return startend_row_indices, causal
 
 
+#blockmask utils
+def random_blockmask(shape, dtype='int32',is_causal=False, ref_q = None):
+    mask = paddle.randint(0, 2, shape, dtype=paddle.int32)
+    B, S, Q, K = shape
+    return mask
+
+# batch_size, seqlen_q, seqlen_k, nheads, nheads_kv
+shape_cases = (
+    [
+        (28, 128, 128, 16, 4),
+    ]
+)
+
+# Generate all combinations for second param
+def generate_shapes():
+    for batch_size, seqlen_q, seqlen_k, nheads, nheads_kv in shape_cases:
+        nheads_startend_row_indices_values = [1]
+        for nheads_startend_row_indices in nheads_startend_row_indices_values:
+            yield (
+                batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices
+            )
+
+@pytest.mark.parametrize("dtype", [paddle.bfloat16])
+@pytest.mark.parametrize("fa_version", [3])
+@pytest.mark.parametrize("d, dv", [(128, 128)])
+@pytest.mark.parametrize(
+    "batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, nheads_startend_row_indices",
+    list(generate_shapes())
+)
+@pytest.mark.parametrize(
+    "gen_startend_row_indices",
+    [
+        partial(generate_sliding_window_mask), # sliding window
+    ],
+)
+def test_flashmask(
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d, dv, nheads_startend_row_indices, fa_version, dtype, gen_startend_row_indices, softcap=0.0
+):
+    paddle.seed(2024)
+    assert nheads % nheads_kv == 0
+    q_ref = paddle.randn(shape=[batch_size, seqlen_q, nheads, d], dtype=dtype)
+    # print(q_ref)
+    k_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, d], dtype=dtype)
+    v_ref = paddle.randn(shape=[batch_size, seqlen_k, nheads_kv, dv], dtype=dtype)
+
+    q_ref.stop_gradient = False
+    k_ref.stop_gradient = False
+    v_ref.stop_gradient = False
+
+    q_bf16, k_bf16, v_bf16 = [x.detach().clone() for x in (q_ref, k_ref, v_ref)]
+
+    q_bf16.stop_gradient = False
+    k_bf16.stop_gradient = False
+    v_bf16.stop_gradient = False
+
+    q, k, v = [x.detach().clone() for x in (q_ref, k_ref, v_ref)]
+    # print(q_ref)
+    q.stop_gradient = False
+    k.stop_gradient = False
+    v.stop_gradient = False
+
+    startend_row_indices, causal = gen_startend_row_indices(batch_size, seqlen_q, seqlen_k, nheads_startend_row_indices)
+
+    if startend_row_indices is None and causal and d == 80:
+      pytest.skip(f"Skipping because running headdim 80 with flash_attn in causal mask")
+
+    print(k_ref.shape)
+    blockmask = random_blockmask(
+        shape=[
+            startend_row_indices.shape[0],
+            startend_row_indices.shape[1],
+            (seqlen_q + 127)// 128,
+            (seqlen_k + 127)// 128
+        ],
+        dtype=paddle.int32,
+        is_causal=causal,
+        ref_q = q_ref
+    )
+
+    if fa_version == 2:
+        paddle.set_flags({'FLAGS_flash_attn_version': 2})
+    elif fa_version == 3:
+        paddle.set_flags({'FLAGS_flash_attn_version': 3})
+    else:
+        raise ValueError(
+            f"Invalid flash attention version: {fa_version}"
+        )
+
+    out, lse = flashmask_attention(
+        q,
+        k,
+        v,
+        startend_row_indices=startend_row_indices,
+        causal=causal,
+        return_softmax_lse=True,
+        block_mask=blockmask
+    )
 ```
 
 

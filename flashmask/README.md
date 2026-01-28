@@ -168,8 +168,8 @@ TODO
 ### Paddle
 #### 1. FlashMask & FlashMask V3
 Install Latest Stable Release or Nightly Release
-For detailed information about installation, please view Quick Install.
-https://www.paddlepaddle.org.cn/install/quick?docurl=/documentation/docs/zh/develop/install/pip/linux-pip.html
+
+For detailed information about installation, please view [Quick Install](https://www.paddlepaddle.org.cn/install/quick?docurl=/documentation/docs/zh/develop/install/pip/linux-pip.html).
 
 #### 2. FlashMask V4
 ```
@@ -177,8 +177,17 @@ cd flash-attention/flashmask
 python3 setup.py install
 ```
 
-### Torch
-TODO(baoqiwen)
+### PyTorch
+FlashMask V3
+```
+flash-attention/csrc/flashmask_v2
+python setup.py install
+```
+
+FlashMask V4
+```
+TODO
+```
 
 
 ## How to us FlashMask

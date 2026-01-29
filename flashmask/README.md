@@ -4,7 +4,7 @@ This repository provides the official implementation of FlashMask, FlashMask V3 
 
 **FlashMask: Efficient and Rich Mask Extension of FlashAttention**
 + Paper: https://arxiv.org/abs/2410.01359
-+ Blog: https://zhuanlan.zhihu.com/p/4539730179
++ Blog: https://aistudio.baidu.com/projectdetail/8459413
 
 The core equation utilized in FlashMask is as follows:
 
@@ -39,7 +39,7 @@ This approach efficiently represents a wide range of mask types and facilitates 
   </thead>
   <tbody>
     <tr>
-      <td rowspan="8" align="center" style="vertical-align: middle;"><strong>Training</strong></td>
+      <td rowspan="6" align="center" style="vertical-align: middle;"><strong>Training</strong></td>
       <td>Custom Mask</td>
       <td>✅</td>
       <td>✅</td>

@@ -250,7 +250,7 @@ python setup.py install
 ```
 
 # Example
-## How to us FlashMask
+## How to use FlashMask
 ### Installation & Import
 ```python
 from flash_mask.cute.interface import flashmask_attention
@@ -459,7 +459,7 @@ def test_flashmask():
 ```
 
 
-## How to us MARCO
+## How to use MARCO
 ### FlashMask V3 overlapped layer
 The following code presents a usable PyLayer object that calls overlapped all-gather automatically under the hood. The users themselves do not need to configure communication overlapping.
 
@@ -749,7 +749,6 @@ Since load-balancing module works on sharding Q, K, V and rearrange mask tensors
 import paddle
 from paddle.distributed import fleet
 from cp_balance.cp_balance import balance_flashmask_input
-from cp_balance.context_parallel_utils import scatter_balance, all_gather_balance
 
 fleet.init(is_collective=True, strategy={
     "your_strategy": "this is a dummy one"

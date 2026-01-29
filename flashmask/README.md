@@ -24,13 +24,13 @@ We propose FlashMask, an extension of FlashAttention that introduces a column-wi
 
 This approach efficiently represents a wide range of mask types and facilitates the development of optimized kernel implementations. By adopting this novel representation, FlashMask achieves linear memory complexity O(N), suitable for modeling long-context sequences. Moreover, this representation enables kernel optimizations that eliminate unnecessary computations by leveraging sparsity in the attention mask, without sacrificing computational accuracy, resulting in higher computational efficiency. 
 
-Types of Masks Supported by FLASHMASK:
+Types of Masks Supported by FlashMask:
 <img width="960" height="862" alt="image" src="https://github.com/user-attachments/assets/e05702b7-3318-4591-8dd4-f694521240c4" />
 
-ColumnWise Sparse Representation in FLASHMASK:
+ColumnWise Sparse Representation in FlashMask:
 <img width="960" height="1192" alt="image" src="https://github.com/user-attachments/assets/9d701a43-de7d-4ba4-ab2e-876a76b5a869" />
 
-Efficient Implementation of FLASHMASK:
+Efficient Implementation of FlashMask:
 <img width="960" height="1278" alt="image" src="https://github.com/user-attachments/assets/b31b7ec2-0260-45f8-ba81-7546cc437399" />
 
 
@@ -178,7 +178,7 @@ Head Dimension 128, Bwd
 
 
 ## MARCO
-** MARCO: Mask-Aware Responsive Communication Overlap**
+**MARCO: Mask-Aware Responsive Communication Overlap**
 Context Parallelism (CP) requires the attention kernel to shard the Query (Q), Key (K), and Value (V) tensors along the sequence length axis. However, this approach typically introduces two primary bottlenecks:
 + **Workload Imbalance**: Standard sharding is often "mask-unaware," meaning QKV chunks assigned to different ranks result in varying computational loads. Consequently, the rank with the heaviest workload becomes a bottleneck, slowing down the entire operation.
 + **Communication Overhead**: Computing full attention requires fetching K/V (forward) and dK/dV (backward) from other ranks. Naive implementations—such as NCCL-based all-gather and reduce-scatter or ring-based mechanisms—fail to leverage attention sparsity and often introduce significant runtime overhead.
@@ -214,14 +214,14 @@ Install Latest Stable Release or Nightly Release. For detailed information about
 
 
 ### FlashMask V4
-```
+```bash
 git clone https://github.com/PaddlePaddle/flash-attention.git
 cd flash-attention/flashmask
 python3 setup.py install
 ```
 
 ### MARCO
-```
+```bash
 git clone https://github.com/PaddlePaddle/flash-attention.git
 cd flash-attention/csrc/utils/cp_balance/csrc/
 python3 setup.py install
@@ -229,7 +229,7 @@ python3 setup.py install
 
 ## PyTorch
 ### FlashMask V3
-```
+```bash
 git clone https://github.com/PaddlePaddle/flash-attention.git
 cd flash-attention/csrc/flashmask_v2
 python setup.py install
@@ -237,7 +237,7 @@ python setup.py install
 
 ### FlashMask V4
 To use the FlashMask V4 features, you need to pull the specific implementation from the PaddlePaddle repository's [Pull Request #103](https://github.com/PaddlePaddle/flash-attention/pull/103). Follow the steps below:
-```
+```bash
 git clone https://github.com/PaddlePaddle/flash-attention.git
 cd flash-attention/flashmask
 # Fetch and checkout the specific PR (Pull Request 103)
@@ -812,7 +812,7 @@ PaddlePaddle/flash-attention is provided under the Apache-2.0 license.
 
 # Citation
 If you use FlashMask in your research or project, we appreciate that you use the following citations:
-```
+```bibtex
 @article{wang2024flashmask,
 title={Flashmask: Efficient and rich mask extension of flashattention},
 author={Wang, Guoxia and Zeng, Jinle and Xiao, Xiyuan and Wu, Siming and Yang, Jiabin and Zheng, Lujing and Chen, Zeyu and Bian, Jiang and Yu, Dianhai and Wang, Haifeng},

@@ -35,7 +35,7 @@ In this equation:
 
 
 
-## FlashMask Feature Comparison
+## Key Features
 
 <table>
   <thead>
@@ -49,7 +49,7 @@ In this equation:
   </thead>
   <tbody>
     <tr>
-      <td rowspan="6" align="center" style="vertical-align: middle;"><strong>Training</strong></td>
+      <td rowspan="7" align="center" style="vertical-align: middle;"><strong>Training</strong></td>
       <td>Custom Mask</td>
       <td>✅</td>
       <td>✅</td>
@@ -84,6 +84,12 @@ In this equation:
       <td>✅</td>
       <td>✅(Support Head Dim <= 128 Only)</td>
       <td>✅</td>
+    </tr>
+    <tr>
+      <td>FP8</td>
+      <td>❌</td>
+      <td>❌</td>
+      <td>❌</td>
     </tr>
     <tr>
       <td rowspan="5" align="center" style="vertical-align: middle;"><strong>Inference</strong></td>

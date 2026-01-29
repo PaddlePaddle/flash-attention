@@ -215,7 +215,7 @@ public:
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
         __shared__ __align__(128) int32_t flashmask_maxmin_smem[num_sch_stage * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
         __shared__ int32_t n_block_smem[num_sch_stage * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
-         __shared__ __align__(128) int32_t blockmask_smem_[CollectiveMainloop::Blockmask_n_block_buffer_valid_length * CollectiveMainloop::kNBlockStages];
+         __shared__ __align__(128) int32_t blockmask_smem_[num_sch_stage * CollectiveMainloop::Blockmask_n_block_buffer_valid_length * CollectiveMainloop::kNBlockStages];
         // When n_block_smem is full, we need to store the flag in the following extra flag storage, instead of allocating 4 more elements
         __shared__ int32_t extra_flags[4];   // if num_sch_stage is 1, we actually only need two (kNBlockStages = 2)
 

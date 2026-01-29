@@ -209,8 +209,12 @@ Specifically, we present the runtime data for FlashMaskV3 MARCO and latest Magi-
 ### FlashMask & FlashMask V3
 Installation
 FlashMask and FlashMask V3 are included in the standard PaddlePaddle distribution. No additional plugins are required.
+For detailed information about installation, please view [Quick Install](https://www.paddlepaddle.org.cn/install/quick?docurl=/documentation/docs/zh/develop/install/pip/linux-pip.html). 
 
-Install Latest Stable Release or Nightly Release. For detailed information about installation, please view [Quick Install](https://www.paddlepaddle.org.cn/install/quick?docurl=/documentation/docs/zh/develop/install/pip/linux-pip.html).
+For example:
+```bash
+python -m pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+```
 
 
 ### FlashMask V4

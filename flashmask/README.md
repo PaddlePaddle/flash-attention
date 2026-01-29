@@ -742,7 +742,7 @@ class OverlappedFlashMask(PyLayer):
         return query_grad, key_grad, value_grad
 ```
 
-### FlashMask V3 overlapped layer
+### FlashMask V3 using load balancing
 Since load-balancing module works on sharding Q, K, V and rearrange mask tensors, the module can be used independently with overlap attention layer. Therefore, users are free to choose whether some of the functionalities should be switched off. The following code presents an example for using load balancing:
 
 ```python

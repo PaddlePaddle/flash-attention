@@ -186,6 +186,7 @@ Head Dimension 128, Bwd
 
 ## MARCO
 **MARCO: Mask-Aware Responsive Communication Overlap**
+
 Context Parallelism (CP) requires the attention kernel to shard the Query (Q), Key (K), and Value (V) tensors along the sequence length axis. However, this approach typically introduces two primary bottlenecks:
 + **Workload Imbalance**: Standard sharding is often "mask-unaware," meaning QKV chunks assigned to different ranks result in varying computational loads. Consequently, the rank with the heaviest workload becomes a bottleneck, slowing down the entire operation.
 + **Communication Overhead**: Computing full attention requires fetching K/V (forward) and dK/dV (backward) from other ranks. Naive implementations—such as NCCL-based all-gather and reduce-scatter or ring-based mechanisms—fail to leverage attention sparsity and often introduce significant runtime overhead.

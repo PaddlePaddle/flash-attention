@@ -1,10 +1,25 @@
 # FlashMask
+<div align="center"><strong>FlashMask: Efficient and Rich Mask Extension of FlashAttention</strong></div>
+
+
+<img width="2100" height="868" alt="image" src="https://github.com/user-attachments/assets/f2a9cef4-9ad1-49a5-a791-711550ae5957" />
+<p style="margin-bottom: 2em;">
+Overview of FlashMask. (a) Types of Masks Supported by FlashMask, (b) ColumnWise Sparse Representation in FlashMask, (c) Efficient Implementation of FlashMask.
+</p>
+
+
 
 This repository provides the official implementation of FlashMask, FlashMask V3 and FlashMask V4.
 
-**FlashMask: Efficient and Rich Mask Extension of FlashAttention**
 + Paper: https://arxiv.org/abs/2410.01359
 + Blog: https://aistudio.baidu.com/projectdetail/8459413
+
+
+## About
+We propose FlashMask, an extension of FlashAttention that introduces a column-wise sparse representation of attention masks. 
+
+This approach efficiently represents a wide range of mask types and facilitates the development of optimized kernel implementations. By adopting this novel representation, FlashMask achieves linear memory complexity O(N), suitable for modeling long-context sequences. Moreover, this representation enables kernel optimizations that eliminate unnecessary computations by leveraging sparsity in the attention mask, without sacrificing computational accuracy, resulting in higher computational efficiency. 
+
 
 The core equation utilized in FlashMask is as follows:
 
@@ -18,20 +33,6 @@ In this equation:
 + $d$ denotes the size of the last dimension of these tensors.
 + $M$ represents the column-wise sparse mask introduced by FlashMask.
 
-
-## Overview
-We propose FlashMask, an extension of FlashAttention that introduces a column-wise sparse representation of attention masks. 
-
-This approach efficiently represents a wide range of mask types and facilitates the development of optimized kernel implementations. By adopting this novel representation, FlashMask achieves linear memory complexity O(N), suitable for modeling long-context sequences. Moreover, this representation enables kernel optimizations that eliminate unnecessary computations by leveraging sparsity in the attention mask, without sacrificing computational accuracy, resulting in higher computational efficiency. 
-
-Types of Masks Supported by FlashMask:
-<img width="960" height="862" alt="image" src="https://github.com/user-attachments/assets/e05702b7-3318-4591-8dd4-f694521240c4" />
-
-ColumnWise Sparse Representation in FlashMask:
-<img width="960" height="1192" alt="image" src="https://github.com/user-attachments/assets/9d701a43-de7d-4ba4-ab2e-876a76b5a869" />
-
-Efficient Implementation of FlashMask:
-<img width="960" height="1278" alt="image" src="https://github.com/user-attachments/assets/b31b7ec2-0260-45f8-ba81-7546cc437399" />
 
 
 ## FlashMask Feature Comparison
@@ -192,16 +193,201 @@ By integrating these features, MARCO achieves balanced workloads and effectively
 The following benchmarks across three mask types supported by FlashMaskV3 demonstrate MARCO's performance gains. Our results show that MARCO performs on par with—and in many cases, significantly outperforms—Magi-Attention.
 Note: In the figures below, FlashMaskV3 performance is normalized to 1.0; values for other methods represent their speed ratio relative to this baseline.
 
-<img width="1513" height="706" alt="image" src="https://github.com/user-attachments/assets/0ef6e015-b242-4285-b5fe-1cf7cca4c208" />
+<img width="800" height="400" alt="image" src="https://github.com/user-attachments/assets/0ef6e015-b242-4285-b5fe-1cf7cca4c208" />
 
-<img width="1513" height="706" alt="image" src="https://github.com/user-attachments/assets/cd04b1da-5b5e-492e-918a-dcdd61d4c748" />
+<img width="800" height="400" alt="image" src="https://github.com/user-attachments/assets/cd04b1da-5b5e-492e-918a-dcdd61d4c748" />
 
-<img width="1513" height="706" alt="image" src="https://github.com/user-attachments/assets/c1bb5f9d-e592-4a05-92b0-2a1078b2a5ca" />
+<img width="800" height="400" alt="image" src="https://github.com/user-attachments/assets/c1bb5f9d-e592-4a05-92b0-2a1078b2a5ca" />
 
 Specifically, we present the runtime data for FlashMaskV3 MARCO and latest Magi-Attention (upto 2025.1.21):
 
-// TODO, 看一下数据要不要改。
-<img width="1204" height="640" alt="image" src="https://github.com/user-attachments/assets/f2c7b33a-34a0-4b87-862f-e4ac69bb67c1" />
+<table>
+  <thead>
+    <tr>
+      <th>Seqlen</th>
+      <th>Shape</th>
+      <th>Operation</th>
+      <th>magi-fwd (ms)</th>
+      <th>magi-bwd (ms)</th>
+      <th>magi-total (ms)</th>
+      <th>FlashMask-fwd (ms)</th>
+      <th>FlashMask-bwd (ms)</th>
+      <th>FlashMask-total (ms)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td rowspan="9" align="center" style="vertical-align: middle;"><strong>32K</strong></td>
+      <td rowspan="3">b=2, hq=8<br>hkv=1, d=128</td>
+      <td>Causal Document Mask</td>
+      <td>3.34</td>
+      <td>5.22</td>
+      <td>8.56</td>
+      <td>0.64</td>
+      <td>2.09</td>
+      <td>2.73</td>
+    </tr>
+    <tr>
+      <td>Document Mask</td>
+      <td>3.54</td>
+      <td>5.33</td>
+      <td>8.88</td>
+      <td>0.93</td>
+      <td>2.46</td>
+      <td>3.38</td>
+    </tr>
+    <tr>
+      <td>Prefix LM Document Mask</td>
+      <td>3.39</td>
+      <td>5.16</td>
+      <td>8.55</td>
+      <td>0.65</td>
+      <td>2.09</td>
+      <td>2.74</td>
+    </tr>
+    <tr>
+      <td rowspan="3">b=2, hq=32<br>hkv=4, d=128</td>
+      <td>Causal Document Mask</td>
+      <td>3.88</td>
+      <td>7.62</td>
+      <td>11.50</td>
+      <td>1.25</td>
+      <td>6.89</td>
+      <td>8.13</td>
+    </tr>
+    <tr>
+      <td>Document Mask</td>
+      <td>4.88</td>
+      <td>11.95</td>
+      <td>16.83</td>
+      <td>1.98</td>
+      <td>8.13</td>
+      <td>10.11</td>
+    </tr>
+    <tr>
+      <td>Prefix LM Document Mask</td>
+      <td>3.98</td>
+      <td>8.05</td>
+      <td>12.03</td>
+      <td>1.27</td>
+      <td>6.91</td>
+      <td>8.18</td>
+    </tr>
+    <tr>
+      <td rowspan="3">b=2, hq=64<br>hkv=8, d=128</td>
+      <td>Causal Document Mask</td>
+      <td>5.07</td>
+      <td>13.71</td>
+      <td>18.78</td>
+      <td>2.00</td>
+      <td>13.15</td>
+      <td>15.16</td>
+    </tr>
+    <tr>
+      <td>Document Mask</td>
+      <td>7.37</td>
+      <td>22.30</td>
+      <td>29.67</td>
+      <td>3.34</td>
+      <td>15.59</td>
+      <td>18.93</td>
+    </tr>
+    <tr>
+      <td>Prefix LM Document Mask</td>
+      <td>5.27</td>
+      <td>14.03</td>
+      <td>19.30</td>
+      <td>2.05</td>
+      <td>13.20</td>
+      <td>15.25</td>
+    </tr>
+    <tr>
+      <td rowspan="9" align="center" style="vertical-align: middle;"><strong>128K</strong></td>
+      <td rowspan="3">b=1, hq=8<br>hkv=1, d=128</td>
+      <td>Causal Document Mask</td>
+      <td>3.53</td>
+      <td>5.65</td>
+      <td>9.17</td>
+      <td>1.02</td>
+      <td>3.59</td>
+      <td>4.61</td>
+    </tr>
+    <tr>
+      <td>Document Mask</td>
+      <td>3.71</td>
+      <td>6.77</td>
+      <td>10.48</td>
+      <td>1.66</td>
+      <td>4.32</td>
+      <td>5.98</td>
+    </tr>
+    <tr>
+      <td>Prefix LM Document Mask</td>
+      <td>3.55</td>
+      <td>5.68</td>
+      <td>9.23</td>
+      <td>1.11</td>
+      <td>3.61</td>
+      <td>4.72</td>
+    </tr>
+    <tr>
+      <td rowspan="3">b=1, hq=32<br>hkv=4, d=128</td>
+      <td>Causal Document Mask</td>
+      <td>4.42</td>
+      <td>10.41</td>
+      <td>14.83</td>
+      <td>1.89</td>
+      <td>12.11</td>
+      <td>14.00</td>
+    </tr>
+    <tr>
+      <td>Document Mask</td>
+      <td>5.50</td>
+      <td>15.44</td>
+      <td>20.94</td>
+      <td>3.37</td>
+      <td>14.72</td>
+      <td>18.10</td>
+    </tr>
+    <tr>
+      <td>Prefix LM Document Mask</td>
+      <td>4.44</td>
+      <td>10.53</td>
+      <td>14.97</td>
+      <td>2.05</td>
+      <td>12.26</td>
+      <td>14.31</td>
+    </tr>
+    <tr>
+      <td rowspan="3">b=1, hq=64<br>hkv=8, d=128</td>
+      <td>Causal Document Mask</td>
+      <td>6.18</td>
+      <td>19.10</td>
+      <td>25.27</td>
+      <td>3.10</td>
+      <td>23.23</td>
+      <td>26.33</td>
+    </tr>
+    <tr>
+      <td>Document Mask</td>
+      <td>8.81</td>
+      <td>29.39</td>
+      <td>38.20</td>
+      <td>5.66</td>
+      <td>28.43</td>
+      <td>34.09</td>
+    </tr>
+    <tr>
+      <td>Prefix LM Document Mask</td>
+      <td>6.35</td>
+      <td>19.70</td>
+      <td>26.05</td>
+      <td>3.31</td>
+      <td>23.55</td>
+      <td>26.86</td>
+    </tr>
+  </tbody>
+</table>
 
 
 # Installation
@@ -817,10 +1003,10 @@ PaddlePaddle/flash-attention is provided under the Apache-2.0 license.
 If you use FlashMask in your research or project, we appreciate that you use the following citations:
 ```bibtex
 @article{wang2024flashmask,
-title={Flashmask: Efficient and rich mask extension of flashattention},
-author={Wang, Guoxia and Zeng, Jinle and Xiao, Xiyuan and Wu, Siming and Yang, Jiabin and Zheng, Lujing and Chen, Zeyu and Bian, Jiang and Yu, Dianhai and Wang, Haifeng},
-journal={arXiv preprint arXiv:2410.01359},
-year={2024}
+  title={Flashmask: Efficient and rich mask extension of flashattention},
+  author={Wang, Guoxia and Zeng, Jinle and Xiao, Xiyuan and Wu, Siming and Yang, Jiabin and Zheng, Lujing and Chen, Zeyu and Bian, Jiang and Yu, Dianhai and Wang, Haifeng},
+  journal={arXiv preprint arXiv:2410.01359},
+  year={2024}
 }
 ```
 

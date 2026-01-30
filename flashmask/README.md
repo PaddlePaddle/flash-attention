@@ -6,7 +6,7 @@
 
 
 [![arXiv](https://img.shields.io/badge/arXiv-2410.01359-b31b1b.svg)](https://arxiv.org/abs/2410.01359)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/PaddlePaddle/flash-attention/blob/main/LICENSE)
 [![Paddle](https://img.shields.io/badge/Paddle-3.3.0+-orange.svg)](https://www.paddlepaddle.org.cn/)
 
 <p align="center">
@@ -23,7 +23,6 @@
 - [Performance](#-performance)
 - [Installation](#-installation)
 - [Quick Start](#-quick-start)
-- [Advanced Usage](#-advanced-usage)
 - [Citation](#-citation)
 
 ---
@@ -1024,9 +1023,6 @@ k = scatter_balance(full_k, group = cp_group, axis=1, buckets = buckets
 v = scatter_balance(full_v, group = cp_group, axis=1, buckets = buckets).contiguous()
 ```
 
-
-## 📄 Copyright and License
-PaddlePaddle/flash-attention is provided under the Apache-2.0 license.
 
 ## 📝 Citation
 If you use FlashMask in your research or project, we appreciate that you use the following citations:

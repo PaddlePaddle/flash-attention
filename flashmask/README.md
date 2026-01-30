@@ -29,9 +29,9 @@
 
 
 ## 🎯 Overview
-We propose FlashMask, an extension of FlashAttention that introduces a column-wise sparse representation of attention masks. 
+We propose FlashMask, an extension of FlashAttention that introduces a **column-wise sparse representation** of attention masks. 
 
-This approach efficiently represents a wide range of mask types and facilitates the development of optimized kernel implementations. By adopting this novel representation, FlashMask achieves linear memory complexity O(N), suitable for modeling long-context sequences. Moreover, this representation enables kernel optimizations that eliminate unnecessary computations by leveraging sparsity in the attention mask, without sacrificing computational accuracy, resulting in higher computational efficiency. 
+This approach efficiently represents a wide range of mask types and facilitates the development of optimized kernel implementations. By adopting this novel representation, FlashMask achieves **linear memory complexity O(N)**, suitable for modeling long-context sequences. Moreover, this representation enables kernel optimizations that eliminate unnecessary computations by leveraging sparsity in the attention mask, without sacrificing computational accuracy, resulting in higher computational efficiency. 
 
 ### Core Equation
 
@@ -47,7 +47,7 @@ In this equation:
 + $d$ denotes the size of the last dimension of these tensors.
 + $M$ represents the column-wise sparse mask introduced by FlashMask.
 
-
+---
 
 ## ✨ Key Features
 
@@ -230,6 +230,7 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
 
 <details>
 <summary><b>📊 Detailed Runtime Comparison (ms)</b></summary>
+
 <table>
   <thead>
     <tr>

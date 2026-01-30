@@ -565,7 +565,7 @@ def flashmask_attention(
     """
 ```
 
-### Implementation Example
+#### Implementation Example
 Here is a Python example demonstrating how to use the flashmask_attention interface with a block mask implementation.
 
 ```python

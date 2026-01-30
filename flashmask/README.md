@@ -220,7 +220,7 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
 1. **Dynamic Load Balancing** — On-the-fly workload estimation for even distribution
 2. **Communication Overlapping** — Hides KV all-gather latency via computation overlap
 
-### MARCO vs Magi-Attention (32K & 128K Sequences)
+#### MARCO vs Magi-Attention (32K & 128K Sequences)
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/0ef6e015-b242-4285-b5fe-1cf7cca4c208" width="32%" alt="MARCO Bench 1"/>

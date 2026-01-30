@@ -1,25 +1,40 @@
-# FlashMask
-<div align="center"><strong>FlashMask: Efficient and Rich Mask Extension of FlashAttention</strong></div>
+<div align="center">
+
+# ⚡ FlashMask
+
+**Efficient and Rich Mask Extension of FlashAttention**
 
 
-<img width="2100" height="868" alt="image" src="https://github.com/user-attachments/assets/f2a9cef4-9ad1-49a5-a791-711550ae5957" />
-<p style="margin-bottom: 2em;">
-Overview of FlashMask. (a) Types of Masks Supported by FlashMask, (b) ColumnWise Sparse Representation in FlashMask, (c) Efficient Implementation of FlashMask.
+[![arXiv](https://img.shields.io/badge/arXiv-2410.01359-b31b1b.svg)](https://arxiv.org/abs/2410.01359)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Paddle](https://img.shields.io/badge/Paddle-3.3.0+-orange.svg)](https://www.paddlepaddle.org.cn/)
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/f2a9cef4-9ad1-49a5-a791-711550ae5957" width="85%" alt="FlashMask Overview"/>
 </p>
+<p><i>Figure 1: (a) Supported Mask Types, (b) ColumnWise Sparse Representation, (c) Efficient Implementation</i></p>
+
+</div>
+
+## 📋 Table of Contents
+
+- [Overview](#-overview)
+- [Key Features](#-key-features)
+- [Performance](#-performance)
+- [Installation](#-installation)
+- [Quick Start](#-quick-start)
+- [Advanced Usage](#-advanced-usage)
+- [Citation](#-citation)
+
+---
 
 
-
-This repository provides the official implementation of FlashMask, FlashMask V3 and FlashMask V4.
-
-+ Paper: https://arxiv.org/abs/2410.01359
-+ Blog: https://aistudio.baidu.com/projectdetail/8459413
-
-
-## About
+## 🎯 Overview
 We propose FlashMask, an extension of FlashAttention that introduces a column-wise sparse representation of attention masks. 
 
 This approach efficiently represents a wide range of mask types and facilitates the development of optimized kernel implementations. By adopting this novel representation, FlashMask achieves linear memory complexity O(N), suitable for modeling long-context sequences. Moreover, this representation enables kernel optimizations that eliminate unnecessary computations by leveraging sparsity in the attention mask, without sacrificing computational accuracy, resulting in higher computational efficiency. 
 
+### Core Equation
 
 The core equation utilized in FlashMask is as follows:
 
@@ -35,179 +50,187 @@ In this equation:
 
 
 
-## Key Features
+## ✨ Key Features
 
-<table>
-  <thead>
-    <tr>
-      <th>Training/Inference</th>
-      <th>Feature</th>
-      <th>FlashMask</th>
-      <th>FlashMask V3</th>
-      <th>FlashMask V4</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td rowspan="7" align="center" style="vertical-align: middle;"><strong>Training</strong></td>
-      <td>Custom Mask</td>
-      <td>✅</td>
-      <td>✅</td>
-      <td>✅</td>
-    </tr>
-    <tr>
-      <td>Context Parallel</td>
-      <td>✅</td>
-      <td>✅</td>
-      <td>✅</td>
-    </tr>
-    <tr>
-      <td>Block Mask</td>
-      <td>❌</td>
-      <td>✅</td>
-      <td>❌</td>
-    </tr>
-    <tr>
-      <td>Support Head Dim</td>
-      <td>up to 256</td>
-      <td>up to 256</td>
-      <td>64, 128</td>
-    </tr>
-    <tr>
-      <td>Supported DataType</td>
-      <td>FP16, BF16</td>
-      <td>BF16</td>
-      <td>BF16</td>
-    </tr>
-    <tr>
-      <td>Deterministic</td>
-      <td>✅</td>
-      <td>✅(Support Head Dim <= 128 Only)</td>
-      <td>✅</td>
-    </tr>
-    <tr>
-      <td>FP8</td>
-      <td>❌</td>
-      <td>❌</td>
-      <td>❌</td>
-    </tr>
-    <tr>
-      <td rowspan="5" align="center" style="vertical-align: middle;"><strong>Inference</strong></td>
-      <td>Custom Mask</td>
-      <td>✅</td>
-      <td>✅</td>
-      <td>✅</td>
-    </tr>
-    <tr>
-      <td>PagedAttn</td>
-      <td>❌</td>
-      <td>❌</td>
-      <td>❌</td>
-    </tr>
-    <tr>
-      <td>Split KV</td>
-      <td>❌</td>
-      <td>❌</td>
-      <td>❌</td>
-    </tr>
-    <tr>
-      <td>PackGQA</td>
-      <td>❌</td>
-      <td>❌</td>
-      <td>❌</td>
-    </tr>
-    <tr>
-      <td>FP8</td>
-      <td>❌</td>
-      <td>❌</td>
-      <td>❌</td>
-    </tr>
-    <tr>
-      <td rowspan="2" align="center" style="vertical-align: middle;"><strong>Supported Framework</strong></td>
-      <td>Paddle</td>
-      <td>✅</td>
-      <td>✅</td>
-      <td>✅</td>
-    </tr>
-    <tr>
-      <td>PyTorch</td>
-      <td>❌</td>
-      <td>✅</td>
-      <td>✅</td>
-    </tr>
-  </tbody>
+<details open>
+<summary><b>🔢 Version Comparison Matrix</b></summary>
+
+<table align="center">
+<thead>
+<tr>
+<th>Category</th>
+<th>Feature</th>
+<th align="center">FlashMask</th>
+<th align="center">FlashMask V3</th>
+<th align="center">FlashMask V4</th>
+</tr>
+</thead>
+<tbody>
+
+<tr>
+<td rowspan="7" align="center"><b>Training</b></td>
+<td>Custom Mask</td>
+<td align="center">✅</td>
+<td align="center">✅</td>
+<td align="center">✅</td>
+</tr>
+<tr>
+<td>Context Parallel</td>
+<td align="center">✅</td>
+<td align="center">✅</td>
+<td align="center">✅</td>
+</tr>
+<tr>
+<td>Block Mask</td>
+<td align="center">❌</td>
+<td align="center">✅</td>
+<td align="center">❌</td>
+</tr>
+<tr>
+<td>Support Head Dim</td>
+<td align="center">up to 256</td>
+<td align="center">up to 256</td>
+<td align="center">64, 128</td>
+</tr>
+<tr>
+<td>Data Type</td>
+<td align="center">FP16, BF16</td>
+<td align="center">BF16</td>
+<td align="center">BF16</td>
+</tr>
+<tr>
+<td>Deterministic</td>
+<td align="center">✅</td>
+<td align="center">✅*</td>
+<td align="center">✅</td>
+</tr>
+<tr>
+<td>FP8</td>
+<td align="center">❌</td>
+<td align="center">❌</td>
+<td align="center">❌</td>
+</tr>
+
+<tr style="border-top: 2px solid #ddd;">
+<td rowspan="5" align="center"><b>Inference</b></td>
+<td>Custom Mask</td>
+<td align="center">✅</td>
+<td align="center">✅</td>
+<td align="center">✅</td>
+</tr>
+<tr>
+<td>PagedAttn</td>
+<td align="center">❌</td>
+<td align="center">❌</td>
+<td align="center">❌</td>
+</tr>
+<tr>
+<td>Split KV</td>
+<td align="center">❌</td>
+<td align="center">❌</td>
+<td align="center">❌</td>
+</tr>
+<tr>
+<td>PackGQA</td>
+<td align="center">❌</td>
+<td align="center">❌</td>
+<td align="center">❌</td>
+</tr>
+<tr>
+<td>FP8</td>
+<td align="center">❌</td>
+<td align="center">❌</td>
+<td align="center">❌</td>
+</tr>
+
+<tr style="border-top: 2px solid #ddd;">
+<td rowspan="2" align="center"><b>Framework</b></td>
+<td>Paddle</td>
+<td align="center">✅</td>
+<td align="center">✅</td>
+<td align="center">✅</td>
+</tr>
+<tr>
+<td>PyTorch</td>
+<td align="center">❌</td>
+<td align="center">✅</td>
+<td align="center">✅</td>
+</tr>
+
+</tbody>
 </table>
 
+<small>*V3 deterministic only for head dim ≤128</small>
 
-# Performance
-## FlashMask
-We evaluate FlashMask's performance in fine-tuning and alignment training of LLMs such as SFT, LoRA, DPO, and RM. FlashMask achieves significant throughput improvements, with end-to-end speedups ranging from 1.65x to 3.22x compared to existing FlashAttention dense method. 
-
-End-to-end training throughput across four downstream tasks (SFT, LoRA, DPO, and RM) for three Llama2 model scales under varying sequence lengths.
-
-<img width="960" height="720" alt="image" src="https://github.com/user-attachments/assets/6ca490b4-b57b-4e6a-a913-57517754a47e" />
-
-Additionally, our kernel-level comparisons demonstrate that FlashMask surpasses the latest counterpart, FlexAttention, by 12.1% to 60.7% in terms of kernel TFLOPs/s, achieving 37.8% to 62.3% of the theoretical maximum FLOPs/s on the A100 GPU. The code is open-sourced on PaddlePaddle and integrated into PaddleNLP, supporting models with over 100 billion parameters for contexts up to 128K tokens.
-
-Comparison of kernel forward and backward speeds on an A100-SXM 80GB GPU. FlexAttention is evaluated using PyTorch 2.6.0.dev20240920+cu124:
-
-<img width="960" height="320" alt="image" src="https://github.com/user-attachments/assets/2239af39-1787-4338-bfa3-cfc623e88151" />
+</details>
 
 
-## FlashMask V3
-FlashMask V3 is optimized for Hopper GPUs.
+---
 
-FlashMask V3 shows substantial speedups across different head dimensions. The following benchmarks represent the performance improvement range across various sequence lengths.
+## 🚀 Performance
 
-<img width="5400" height="3600" alt="2761a8aaec6e13c7f7c5882d2962dad5" src="https://github.com/user-attachments/assets/cc8c0913-d3a8-4d0d-b6c3-83a299886225" />
+### FlashMask
+#### End-to-End Training Speedup
+FlashMask achieves **1.65× to 3.22×** end-to-end speedup compared to dense FlashAttention methods across SFT, LoRA, DPO, and RM tasks.
 
-Head Dimension 128
-+ vs. FlashMask: 40.2% ~ 141.1% Increase
-+ vs. FlexAttention: 7.3% ~ 67.5% Increase
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/6ca490b4-b57b-4e6a-a913-57517754a47e" width="80%" alt="Training Throughput"/>
+</p>
 
-Head Dimension 256
-+ vs. FlashMask: 11.1% ~ 106.2% Increase
-+ vs. FlexAttention: 66.9% ~ 212.2% Increase
 
-## Block Mask
+#### Kernel-Level Benchmarks (A100-SXM 80GB)
+FlashMask surpasses **FlexAttention (PyTorch 2.6.0)** by **12.1% to 60.7%** in kernel TFLOPs/s, achieving **37.8% to 62.3%** of theoretical peak FLOPs/s.
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/2239af39-1787-4338-bfa3-cfc623e88151" width="80%" alt="Kernel Speed Comparison"/>
+</p>
+
+
+### FlashMask V3 (Hopper Optimized)
+
+| Head Dim | vs FlashMask | vs FlexAttention |
+|:--------:|:------------:|:----------------:|
+| 128 | +40.2% ~ +141.1% | +7.3% ~ +67.5% |
+| 256 | +11.1% ~ +106.2% | +66.9% ~ +212.2% |
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/cc8c0913-d3a8-4d0d-b6c3-83a299886225" width="85%" alt="V3 Performance"/>
+</p>
+
+
+### Block Mask
 
 FlashMask V3 demonstrates a substantial performance advantage over [Block Attention](https://github.com/mit-han-lab/Block-Sparse-Attention), as shown in the benchmark. Across various sequence lengths (8K, 32K, 128K) and configurations, it achieves a 75.7% to 197.3%​ speedup in forward computation and 48.0% to 94.4% speedup in backward computation.
 
-<img width="5400" height="1800" alt="image" src="https://github.com/user-attachments/assets/bc79b760-9fbe-49d6-a79c-25047904b977" />
+| Direction | Speedup Range |
+|-----------|---------------|
+| Forward | **+75.7% ~ +197.3%** |
+| Backward | **+48.0% ~ +94.4%** |
 
-<img width="5400" height="1800" alt="image" src="https://github.com/user-attachments/assets/613421ad-cdb5-4ad4-b90b-776d6de9f8fc" />
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/bc79b760-9fbe-49d6-a79c-25047904b977" width="48%" alt="Block Mask Fwd"/>
+  <img src="https://github.com/user-attachments/assets/613421ad-cdb5-4ad4-b90b-776d6de9f8fc" width="48%" alt="Block Mask Bwd"/>
+</p>
 
-Head Dimension 128, Fwd
-+ vs. BlockAttention: 75.7% ~ 197.3% Increase
-
-Head Dimension 128, Bwd
-+ vs. BlockAttention: 48.0% ~ 94.4% Increase
+---
 
 
-## MARCO
-**MARCO: Mask-Aware Responsive Communication Overlap**
+### MARCO
+**MARCO: Mask-Aware Responsive Communication Overlap** eliminates CP bottlenecks through:
 
-Context Parallelism (CP) requires the attention kernel to shard the Query (Q), Key (K), and Value (V) tensors along the sequence length axis. However, this approach typically introduces two primary bottlenecks:
-+ **Workload Imbalance**: Standard sharding is often "mask-unaware," meaning QKV chunks assigned to different ranks result in varying computational loads. Consequently, the rank with the heaviest workload becomes a bottleneck, slowing down the entire operation.
-+ **Communication Overhead**: Computing full attention requires fetching K/V (forward) and dK/dV (backward) from other ranks. Naive implementations—such as NCCL-based all-gather and reduce-scatter or ring-based mechanisms—fail to leverage attention sparsity and often introduce significant runtime overhead.
+1. **Dynamic Load Balancing** — On-the-fly workload estimation for even distribution
+2. **Communication Overlapping** — Hides KV all-gather latency via computation overlap
 
-To address these challenges, we introduce MARCO (Mask-Aware Responsive Communication Overlap) for FlashMaskV3 CP acceleration. MARCO consists of two core components:
-1. Dynamic Load Balancing: Utilizes on-the-fly workload estimation to ensure even distribution across ranks.
-2. Advanced Communication Overlapping: Overlaps CP KV all-gather (and dK/dV reduce-scatter, currently WIP) with computation to hide latency.
+### MARCO vs Magi-Attention (32K & 128K Sequences)
 
-By integrating these features, MARCO achieves balanced workloads and effectively masks communication overhead.
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/0ef6e015-b242-4285-b5fe-1cf7cca4c208" width="32%" alt="MARCO Bench 1"/>
+  <img src="https://github.com/user-attachments/assets/cd04b1da-5b5e-492e-918a-dcdd61d4c748" width="32%" alt="MARCO Bench 2"/>
+  <img src="https://github.com/user-attachments/assets/c1bb5f9d-e592-4a05-92b0-2a1078b2a5ca" width="32%" alt="MARCO Bench 3"/>
+</p>
 
-The following benchmarks across three mask types supported by FlashMaskV3 demonstrate MARCO's performance gains. Our results show that MARCO performs on par with—and in many cases, significantly outperforms—Magi-Attention.
-Note: In the figures below, FlashMaskV3 performance is normalized to 1.0; values for other methods represent their speed ratio relative to this baseline.
-
-<img width="800" height="400" alt="image" src="https://github.com/user-attachments/assets/0ef6e015-b242-4285-b5fe-1cf7cca4c208" />
-
-<img width="800" height="400" alt="image" src="https://github.com/user-attachments/assets/cd04b1da-5b5e-492e-918a-dcdd61d4c748" />
-
-<img width="800" height="400" alt="image" src="https://github.com/user-attachments/assets/c1bb5f9d-e592-4a05-92b0-2a1078b2a5ca" />
-
-Specifically, we present the runtime data for FlashMaskV3 MARCO and latest Magi-Attention (upto 2025.1.21):
-
+<details>
+<summary><b>📊 Detailed Runtime Comparison (ms)</b></summary>
 <table>
   <thead>
     <tr>
@@ -395,44 +418,43 @@ Specifically, we present the runtime data for FlashMaskV3 MARCO and latest Magi-
     </tr>
   </tbody>
 </table>
+</details>
 
+---
 
-# Installation
-## Paddle
-### FlashMask & FlashMask V3
-Installation
+## 📦 Installation
+### 🥇 Paddle (Recommended)
+#### FlashMask & FlashMask V3
 FlashMask and FlashMask V3 are included in the standard PaddlePaddle distribution. No additional plugins are required.
 For detailed information about installation, please view [Quick Install](https://www.paddlepaddle.org.cn/install/quick?docurl=/documentation/docs/zh/develop/install/pip/linux-pip.html). 
-
-For example:
 ```bash
 python -m pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
 ```
 
 
-### FlashMask V4
+#### FlashMask V4
 ```bash
 git clone https://github.com/PaddlePaddle/flash-attention.git
 cd flash-attention/flashmask
 python3 setup.py install
 ```
 
-### MARCO
+#### MARCO
 ```bash
 git clone https://github.com/PaddlePaddle/flash-attention.git
 cd flash-attention/csrc/utils/cp_balance/csrc/
 python3 setup.py install
 ```
 
-## PyTorch
-### FlashMask V3
+### PyTorch
+#### FlashMask V3
 ```bash
 git clone https://github.com/PaddlePaddle/flash-attention.git
 cd flash-attention/csrc/flashmask_v2
 python setup.py install
 ```
 
-### FlashMask V4
+#### FlashMask V4
 To use the FlashMask V4 features, you need to pull the specific implementation from the PaddlePaddle repository's [Pull Request #103](https://github.com/PaddlePaddle/flash-attention/pull/103). Follow the steps below:
 ```bash
 git clone https://github.com/PaddlePaddle/flash-attention.git
@@ -442,14 +464,14 @@ gh pr checkout 103
 python setup.py install
 ```
 
-# Example
-## How to use FlashMask
-### Installation & Import
+## 🚀 Quick Start
+### How to use FlashMask
+#### Installation & Import
 ```python
 from flash_mask.cute.interface import flashmask_attention
 ```
 
-### API Reference
+#### API Reference
 ```python
 def flashmask_attention(
     query: Tensor,
@@ -652,8 +674,8 @@ def test_flashmask():
 ```
 
 
-## How to use MARCO
-### FlashMask V3 overlapped layer
+### How to use MARCO
+#### FlashMask V3 overlapped layer
 The following code presents a usable PyLayer object that calls overlapped all-gather automatically under the hood. The users themselves do not need to configure communication overlapping.
 
 ```python
@@ -935,7 +957,7 @@ class OverlappedFlashMask(PyLayer):
         return query_grad, key_grad, value_grad
 ```
 
-### FlashMask V3 using load balancing
+#### FlashMask V3 using load balancing
 Since load-balancing module works on sharding Q, K, V and rearrange mask tensors, the module can be used independently with overlap attention layer. Therefore, users are free to choose whether some of the functionalities should be switched off. The following code presents an example for using load balancing:
 
 ```python
@@ -1003,11 +1025,12 @@ v = scatter_balance(full_v, group = cp_group, axis=1, buckets = buckets
 ```
 
 
-# Copyright and License
+## 📄 Copyright and License
 PaddlePaddle/flash-attention is provided under the Apache-2.0 license.
 
-# Citation
+## 📝 Citation
 If you use FlashMask in your research or project, we appreciate that you use the following citations:
+
 ```bibtex
 @article{wang2024flashmask,
   title={Flashmask: Efficient and rich mask extension of flashattention},

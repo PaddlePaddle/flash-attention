@@ -49,7 +49,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseKVFewHea
             remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes; 
             if constexpr (use_semaphore) {
                 if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
-                    sema::wait_full(semaphores, remote_pe);
+                    sema::ag::wait_full(semaphores, remote_pe);
                     cached_semaphores[remote_pe] = 1;
                 }
             }
@@ -111,7 +111,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) DenseKVFewHead
         remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes; 
         if constexpr (use_semaphore) {
             if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
-                sema::wait_full(semaphores, remote_pe);
+                sema::ag::wait_full(semaphores, remote_pe);
                 cached_semaphores[remote_pe] = 1;
                 // no need to sync, since `two_buffers_getmem_<scope>` will sync 
             }
@@ -181,7 +181,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseKVFewHea
             remote_pe = remote_pe < total_n_pes ? remote_pe : remote_pe - total_n_pes; 
             if constexpr (use_semaphore) {
                 if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
-                    sema::wait_full(semaphores, remote_pe);
+                    sema::ag::wait_full(semaphores, remote_pe);
                     cached_semaphores[remote_pe] = 1;
                 }
             }
@@ -242,7 +242,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) DenseKVFewHead
         remote_pe = remote_pe < total_n_pes ? remote_pe : remote_pe - total_n_pes; 
         if constexpr (use_semaphore) {
             if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
-                sema::wait_full(semaphores, remote_pe);
+                sema::ag::wait_full(semaphores, remote_pe);
                 cached_semaphores[remote_pe] = 1;
             }
         }
@@ -286,7 +286,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) DenseKVFewHead
 // Specialized kernel used only when (Mask Head = 1, meaning that multiple KV heads share the same mask)
 // When num_warp is 4. this kernel only has 128 threads per CTA and each CTA reduces 512 mask pos to an int4
 // Can be used when KV head > 1 to reduce comm workload per CTA (so that computation won't stall that long)
-template <int S_chunk, int num_warps = 8, int row_per_warp = 32, bool bwd=false>
+template <int S_chunk, int num_warps = 8, int row_per_warp = 32, bool skip_local=false>
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityCheckSpecializedKernel(
     const int* const __restrict__ lt_start_ptr,
     const int* const __restrict__ ut_end_ptr,
@@ -303,7 +303,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityC
     __shared__ int warps_masked[num_warps];
     // bwd valid mask starts from mask[S_chunk], while fwd starts from mask[0] due to different roll strategy
     const int batch_offset = blockIdx.y * head_stride;
-    const int mask_offset = (bwd ? S_chunk : 0) + batch_offset;
+    const int mask_offset = (skip_local ? S_chunk : 0) + batch_offset;
     const int load_index = blockIdx.x * num_warps * 32 + threadIdx.x;
     const int4 lts = *(reinterpret_cast<const int4*>(lt_start_ptr + mask_offset) + load_index);
     const int4 ute = *(reinterpret_cast<const int4*>(ut_end_ptr + mask_offset) + load_index);
@@ -445,7 +445,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         }
         if constexpr (use_semaphore) {
             if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
-                sema::wait_full(semaphores, remote_pe);
+                sema::ag::wait_full(semaphores, remote_pe);
                 cached_semaphores[remote_pe] = 1;
                 // no need to sync, since `two_buffers_getmem_<scope>` will sync 
             }

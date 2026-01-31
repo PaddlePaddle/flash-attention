@@ -142,11 +142,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         auto& comm_singleton = flashmask::comm::singleton();
         comm_singleton.wait_wptr_init();        // wait until wptr is initialized
         // TODO(heqianyue): add more mask type support
-        comm_singleton.run_overlap_kernel(params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k);
+        comm_singleton.run_overlap_ag_kernel(params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k);
         params.k_batch_stride *= params.cp_size;
         params.v_batch_stride *= params.cp_size;
-        // `run_overlap_kernel` is async. Then, re-route the KV data to the nvshmem_alloc SR buffer.
-        // After `run_overlap_kernel`, the seqlen_k & k_batch_stride & v_batch_stride is no longer local, but local_length * cp_size
+        // `run_overlap_ag_kernel` is async. Then, re-route the KV data to the nvshmem_alloc SR buffer.
+        // After `run_overlap_ag_kernel`, the seqlen_k & k_batch_stride & v_batch_stride is no longer local, but local_length * cp_size
         params.k_ptr = comm_singleton.k_data();
         params.v_ptr = comm_singleton.v_data();
     }

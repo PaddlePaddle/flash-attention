@@ -5,6 +5,7 @@
 
 namespace flashmask {
 namespace sema {
+namespace ag {
 
 // Note(heqianyue): single node AMO can use int (4B) as semaphore types, but when in multi-node
 // env, IBRC does not allow 4B AMO. Check NVSHMEM 3.2.5 src/modules/transport/ibrc/ibrc.cpp:1265
@@ -162,5 +163,7 @@ __device__ __forceinline__ void wait_full(
     nvshmem_int64_wait_until(const_cast<int64_t*>(semaphores) + target_pe, NVSHMEM_CMP_GT, 0);   // wait until not 0
 }
 
+
+}   // namespace ag
 }   // namespace sema
 }   // namespace flashmask

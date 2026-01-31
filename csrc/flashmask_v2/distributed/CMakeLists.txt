@@ -9,6 +9,7 @@ endif()
 
 set(DISTRIBUTED_SOURCES
     overlap_comm.cu
+    sep_sr_buffer.cu
 )
 
 add_library(flashmaskv2_distributed STATIC

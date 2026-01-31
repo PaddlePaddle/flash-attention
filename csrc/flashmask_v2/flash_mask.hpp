@@ -243,5 +243,55 @@ namespace flashmask {
       params.ut_start_nblockmin = nullptr;
     }
   }
+
+/**
+ * This class updates the lt/ut_start/end_ptr
+ * as well as the lt/ut_start/end_nblock min/max ptr, so that if we do
+ * splitting (for example, FMV3 bwd RS-overlap, split 128K bwd to 4 * 32K),
+ * then we can use this updater to offset the mask pointer (move long seqlen-axis)
+ * 
+ * The updater is state-less, so MAKE SURE this updater is called correctly
+ * in accordance with the splitted bwd loop
+*/
+template <int kBlockN>
+class MaskPtrUpdater {
+public:
+  MaskPtrUpdater(
+    Flash_bwd_params &params, 
+    int chunk_size, 
+    int chunks_per_seg
+  ): _params(params), 
+     seqlen_offset(chunk_size * chunks_per_seg),
+     nblock_seqlen(((seqlen_offset + kBlockN - 1) / kBlockN + 3) & 0xfffffffc) {}
+
+  void inplace_update() {
+    // TODO(heqianyue): assert kBlockN to be the power of 2
+    if (_params.lt_start_ptr != nullptr) {
+      _params.lt_start_ptr += seqlen_offset;
+      _params.lt_start_nblockmax += nblock_seqlen;
+      _params.lt_start_nblockmin += nblock_seqlen;
+    }
+    if (_params.lt_end_ptr != nullptr) {
+      _params.lt_end_ptr += seqlen_offset;
+      _params.lt_end_nblockmax += nblock_seqlen;
+      _params.lt_end_nblockmin += nblock_seqlen;
+    }
+    if (_params.ut_start_ptr != nullptr) {
+      _params.ut_start_ptr += seqlen_offset;
+      _params.ut_start_nblockmax += nblock_seqlen;
+      _params.ut_start_nblockmin += nblock_seqlen;
+    }
+    if (_params.ut_end_ptr != nullptr) {
+      _params.ut_end_ptr += seqlen_offset;
+      _params.ut_end_nblockmax += nblock_seqlen;
+      _params.ut_end_nblockmin += nblock_seqlen;
+    }
+  }
+
+private:
+  Flash_bwd_params& _params;
+  const int seqlen_offset;    // seqlen offset per segment
+  const int nblock_seqlen;    // block-column mask offset per segment
+};
 } // namespace flashmask
 } // namespace flash

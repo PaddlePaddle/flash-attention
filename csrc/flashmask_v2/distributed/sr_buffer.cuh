@@ -1,3 +1,6 @@
+/**
+ * S-R buffer for a2a-based gather
+*/
 #pragma once
 
 #include <nvshmem.h>

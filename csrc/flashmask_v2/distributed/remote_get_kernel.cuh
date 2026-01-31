@@ -2,7 +2,7 @@
 #include <cuda_runtime.h>
 #include "sr_buffer.cuh"
 #include "nvshmem_copy_utils.cuh"
-#include "semaphore_ops.cuh"
+#include "ag_semaphore_ops.cuh"
 #include "debug_logger.cuh"
 
 namespace flashmask {
@@ -101,7 +101,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseKVFewHea
             remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes; 
             if constexpr (use_semaphore) {
                 if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
-                    sema::wait_full(semaphores, remote_pe);
+                    sema::ag::wait_full(semaphores, remote_pe);
                     cached_semaphores[remote_pe] = 1;
                     // no need to sync, since `two_buffers_getmem_<scope>` will sync 
                 }
@@ -187,7 +187,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) DenseKVFewHead
         // batch_offset * S_stride (batch-address) + (S-S_chunk) * S_stride (stored in the last chunk) + (seqlen_id % S_chunk) * S_stride (within chunk address)
         if constexpr (use_semaphore) {
             if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
-                sema::wait_full(semaphores, remote_pe);
+                sema::ag::wait_full(semaphores, remote_pe);
                 cached_semaphores[remote_pe] = 1;
                 // no need to sync, since `two_buffers_getmem_<scope>` will sync 
             }
@@ -260,7 +260,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseKVFewHea
             remote_pe = remote_pe < total_n_pes ? remote_pe : remote_pe - total_n_pes; 
             if constexpr (use_semaphore) {
                 if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
-                    sema::wait_full(semaphores, remote_pe);
+                    sema::ag::wait_full(semaphores, remote_pe);
                     cached_semaphores[remote_pe] = 1;
                 }
             }
@@ -325,7 +325,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) DenseKVFewHead
         remote_pe = remote_pe < total_n_pes ? remote_pe : remote_pe - total_n_pes; 
         if constexpr (use_semaphore) {
             if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
-                sema::wait_full(semaphores, remote_pe);
+                sema::ag::wait_full(semaphores, remote_pe);
                 cached_semaphores[remote_pe] = 1;
             }
         }
@@ -551,7 +551,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         }
         if constexpr (use_semaphore) {
             if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
-                sema::wait_full(semaphores, remote_pe);
+                sema::ag::wait_full(semaphores, remote_pe);
                 cached_semaphores[remote_pe] = 1;
                 // no need to sync, since `two_buffers_getmem_<scope>` will sync 
             }
@@ -567,6 +567,109 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             row_per_block * S_stride * sizeof(T), remote_pe
         );
         // buffer getmem_block will call syncthreads(), so next_work_id will not be updated
+        // therefore, next_work_id's update is visible to all threads and won't be overwritten
+        // before some threads reading it. Safe!
+        work_id = update_wptr_and_work_id_sync(work_id);
+    }
+}
+
+// remote get kernel (multi-stage remote_get overlapped gather), can only be called in the BWD when RS-overlap is ON.
+// Current BWD write_ptr wait logic: absolute offset (not relative offset), meaning that the bwd won't skip
+// the first chunk itself and make no assumption on the validity of the data. All it does now is to check whether
+// the local read ptr is exceeded by the write ptr and load KV can procede if true. Therefore, we can choose to
+// start the AG-overlap kernel (non-splitted version) just once at the beginning of the BWD kernel. We only need to
+// inform the bwd kernel one more thing: what is the current segment ID? For now, use the splitted version.
+template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunks=4>
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkSplittedRemoteGetKernel(
+    T* const __restrict__ k_sr,
+    T* const __restrict__ v_sr,
+    int* const __restrict__ wptr,
+    int* const __restrict__ block_work_idx,
+    int* const __restrict__ block_cnt_semaphore,      // for dynamic scheduling
+    const int* const __restrict__ copy_chunk_mask,
+    const int start_rank,               // first call is my_pe + 1
+    const int segment_idx,
+    const int total_n_pes,
+    const int num_batch,                // B
+    const int S_stride,                 // H * D
+    const int num_segments = 4
+) {
+    constexpr bool has_local = (num_chunks & 1) > 0;
+    constexpr int row_per_block = num_warps * row_per_warp;
+    // round the num_chunks to include the local chunk
+    constexpr int rounded_num_chunks = has_local ? (num_chunks + 1) : num_chunks;
+    constexpr int S = S_chunk * rounded_num_chunks;         // seqlen of this segment
+    constexpr int work_per_seg = S / row_per_block;
+    // for each segment, get the number of work we can skip (due to being local). Note that
+    // for each batch, if work_to_skip is not 0, there will be some skippable works
+    constexpr int work_to_skip = has_local ? (S_chunk / row_per_block) : 0;
+    // though the actual skippable work is `num_batch * (work_per_seg - work_to_skip)`
+    // for batch_idx > 0, those skippable local works cannot be skipped **directly**.
+    const int total_works = num_batch * work_per_seg;
+    // this batch_stride is the segment batch stride, not full (num_segs * segment_size) batch stride
+    const int batch_stride = S * S_stride;
+    
+    __shared__ int next_work_id;
+
+    // block_cnt_semaphore starts from 1, and we can offset it
+    auto update_wptr_and_work_id_sync = [&](int wid) {
+        if (threadIdx.x < 32) {
+            if (threadIdx.x == blockIdx.x) {
+                int next_wid = atomicAdd(block_cnt_semaphore, 1) + work_to_skip;       // fetch and check the next work ID
+                // if there is no more work to do: set the wid for the current block to be INT_MAX
+                wid = next_wid <= total_works ? wid : INT_MAX;
+                next_work_id = next_wid;
+                atomicExch(&block_work_idx[blockIdx.x], wid);
+            }
+            // make sure atomicExch happen before load from block_work_idx[threadIdx.x],
+            // so that if one block finished atomicExch first, other blocks will know
+            __syncwarp();
+            wid = threadIdx.x != blockIdx.x ? block_work_idx[threadIdx.x] : wid;
+            wid = __reduce_min_sync(0xffffffff, wid);
+            if (threadIdx.x == blockIdx.x) {
+                atomicMax(wptr, wid == INT_MAX ? INT_MAX : (wid * row_per_block));     // 256 or 512 * wid, or INT_MAX
+            }
+        }
+        __syncthreads();
+        return next_work_id;
+    };
+
+    // // Uncomment this line to check what happens when communication is not stalling the computation
+    // if (threadIdx.x == 0) {
+    //     atomicMax(wptr, INT_MAX);
+    // }
+
+    // Note(heqianyue): the simple way to skip the first chunk: offset the initial work_cnt
+    // and the atomicAdd result (semaphore fetch result)
+    for (int work_id = update_wptr_and_work_id_sync(work_to_skip); work_id <= total_works;) {
+        const int work_id_m1 = work_id - 1;
+        const int batch_id = work_id_m1 / work_per_seg;
+        const int seq_work_id = work_id_m1 % work_per_seg;
+        // within_segment_offset + segment_offset + batch_offset
+        int mask_index = seq_work_id + work_per_seg * (segment_idx + batch_id * num_segments);
+        // if there is local_chunk and B > 1, we might have some of the 
+        // work to be skipped (due to being local) directly.
+        if (seq_work_id < work_to_skip || copy_chunk_mask[mask_index]) {
+            __syncthreads();
+            work_id = update_wptr_and_work_id_sync(work_id);
+            continue;
+        }
+        // calculate seqlen offset via work_id
+        int seqlen_id = seq_work_id * row_per_block;
+        int remote_pe = start_rank + seqlen_id / S_chunk;
+        remote_pe = remote_pe < total_n_pes ? remote_pe : remote_pe - total_n_pes;
+
+        // copy upto 4 heads (S_stride = H * D), and row_per_block rows (seqlen axis) per CTA
+        const int src_addr = batch_id * batch_stride + (seqlen_id % S_chunk) * S_stride;
+        const int dst_addr = batch_id * batch_stride + seqlen_id * S_stride;
+        shmem::two_buffers_getmem_block(
+            k_sr + dst_addr,
+            v_sr + dst_addr,
+            k_sr + src_addr,
+            v_sr + src_addr,
+            row_per_block * S_stride * sizeof(T), remote_pe
+        );
+        // buffer getmem_block will call syncthreads(), so next_work_id will not be updated.
         // therefore, next_work_id's update is visible to all threads and won't be overwritten
         // before some threads reading it. Safe!
         work_id = update_wptr_and_work_id_sync(work_id);

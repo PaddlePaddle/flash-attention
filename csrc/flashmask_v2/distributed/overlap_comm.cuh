@@ -1,6 +1,7 @@
 #pragma once
 #include <memory>
 #include "sr_buffer.cuh"
+#include "sep_sr_buffer.cuh"
 #include "cutlass/bfloat16.h"
 
 namespace flashmask {
@@ -10,12 +11,9 @@ namespace flashmask {
  * 
  * An RAII object managing CP-groups / comm stream / buffer lifetimes automatically
  * 
- * Call the constructor of this communicator, and call `run_overlap_kernel` before
+ * Call the constructor of this communicator, and call `run_overlap_ag_kernel` before
  * the main attention kernel, make sure the lifetime of the instance outlast the main kernel
  * Then you should be able to get async remote get, costing only 4 SMs.
- * 
- * TODO(heqianyue): Can we create this class only once? So that the resource management can be amortized
- * currently, we choose to use `static` local variable due to its simplicity, but this could be risky and resource-consuming
  * 
  * TODO(heqianyue): Code-style --- make this class move-only explicitly. Currently this class is only implicitly move-only.
 */
@@ -33,7 +31,8 @@ public:
         int nranks,
         int cp_size,
         const uint8_t* unique_id_ptr = nullptr,
-        int mask_head = 0
+        int mask_head = 0,
+        bool overlap_rs = false
     );
 
     ~OverlapCommunicator();
@@ -44,7 +43,7 @@ public:
      *      After the execution of this function, S will be set to `S * cp_size`
      * TODO(heqianyue): extend to more mask types!
     */
-    void run_overlap_kernel(
+    void run_overlap_ag_kernel(
         const int* const lt_start_ptr,
         const int* const ut_end_ptr,
         int* const write_ptr,
@@ -52,10 +51,32 @@ public:
         const bool fwd = true
     );
 
+    // only used when use_rs_overlap and in the bwd
+    void run_overlap_splitted_ag_kernel(
+        const int* const lt_start_ptr,
+        const int* const ut_end_ptr,
+        int* const write_ptr,
+        int& S,
+        int segment_idx
+    );
+
+    void run_overlap_rs_kernel(
+        KVType* const dk_accum,
+        KVType* const dv_accum,
+        int segment_idx,
+        cudaStream_t comp_stream    // compute_stream (stream of Tensor and bwd kernel)
+    );
+
     void wait_wptr_init();
 
     void* k_data() const { return kv_buffer->k_data(); }
     void* v_data() const { return kv_buffer->v_data(); }
+
+    // we need to reroute the bwd dx_accum output buffer to dk_send and dv_send
+    // so that the output of post-proc kernel can be directly sent
+    // DO NOT call the following methods, if overlap_rs = false
+    void* dk_send() const { return dkv_buffer->k_send(); }
+    void* dv_send() const { return dkv_buffer->v_send(); }
 
     void update_kv_buffer(
         const KVType* const new_k_data,
@@ -83,10 +104,30 @@ public:
         return _cp_size;
     }
 
-    cudaEvent_t wptr_init;
+    // this function is only called in the bwd
+    int seqlen_scale() const;
+    int num_segments() const;
+    // for RS overlap, returns number of chunks per segment
+    int chunk_per_seg() const;
+    void reset_dkv_semaphores(cudaStream_t stream);
+    void notify_dkv_reduce_done(cudaStream_t stream);
+
+    // wptr_init: comp_stream notifies comm_stream, write_ptr is usable
+    // bwd_done (only when RS-overlap): comp_stream notifies aux_streams, bwd post-proc done
+    // reduce_done (only when RS-overlap): aux_stream notifies comp_stream, dK, dV are reduced
+    cudaEvent_t wptr_init, bwd_done, reduce_done;
 private:
     std::unique_ptr<SRBuffer<KVType>> kv_buffer;
+    /**
+     * If overlap_rs is set, dkv_buffer will be populated.
+     * and since the fwd AG buffer is always bigger than bwd AG
+     * (due to the fact that bwd AG is splitted), fwd kv_buffer
+     * can be reused (carefully).
+    */
+    std::unique_ptr<SepSRBuffer<KVType>> dkv_buffer;
     cudaStream_t comm_stream;
+    cudaStream_t aux_p_stream;      // RS-overlap: producer (put) stream
+    cudaStream_t aux_c_stream;      // RS-overlap: consumer (reduce) stream
     const int B;
     const int S_local;
     const int H;

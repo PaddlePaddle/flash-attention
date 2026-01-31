@@ -118,20 +118,47 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         flash::enable_sm80_to_sm89<flash::FlashAttnBwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
 
-
+    bool use_overlap = false, overlap_rs = false;
+    int segment_idx = 0, segment_cnt = 1;
 #ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+    use_overlap = params.nranks > 1 && (!flashmask::comm::is_singleton_null());
+    std::unique_ptr<flash::flashmask::MaskPtrUpdater<kBlockN>> updater = nullptr;
+
     // in bwd, we don't need to set rank, cp_size for params, since overlap_comm instance already knew these in fwd
     // also, when nranks == 1, overlap mode is not used
-    bool use_overlap = params.nranks > 1 && (!flashmask::comm::is_singleton_null());
     if (use_overlap) {
         auto& comm_singleton = flashmask::comm::singleton();
+        segment_cnt = comm_singleton.num_segments();
+        overlap_rs = segment_cnt > 1;
+
+        // Chunk mask does not affect sync behavior, and it does not need to be computed in a splitted way.
+        // Also, only one chunk (the local chunk) needs to be moved to the SR buffer. For RS-overlap, only the first
+        // segment needs to call 'update_kv_buffer' since the following segments do not have local chunks. The
+        // chunk_mask and update_kv_buffer can actually be called only once. AG and RS overlap are called 4 (num_segs) times.
         comm_singleton.wait_sr_buffer_empty();
+        comm_singleton.reset_dkv_semaphores(stream);        // RS-overlap: reset dK, dV semaphores to all 0
         comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.ut_end_ptr, stream, false /* fwd */);
         comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr, false /*fwd*/);     // copy new KV data
+
+        // seqlen_scale: when use_rs is true, this is chunks_per_seg (4 if CP16), otherwise this is cp_size
+        params.seqlen_k *= comm_singleton.seqlen_scale();
+        seqlen_k *= comm_singleton.seqlen_scale();
+        params.k_batch_stride *= comm_singleton.seqlen_scale();
+        params.v_batch_stride *= comm_singleton.seqlen_scale();
+        
+        // Re-route the KV data to the nvshmem_alloc SR buffer.
+        params.k_ptr = comm_singleton.k_data();
+        params.v_ptr = comm_singleton.v_data();
+        // prepare mask_ptr updater and set params.num_segments to enable correct mask access in bwd kernel
+        if (overlap_rs) {
+            static constexpr int cp_chunk_size = 8192;
+            updater = std::make_unique<flash::flashmask::MaskPtrUpdater<kBlockN>>(params, cp_chunk_size, comm_singleton.chunk_per_seg());
+        }
     } else if (params.nranks > 1) {
         throw std::runtime_error("Overlap singleton instance is null but we try using overlap mechanism. This should be buggy.");
     }
 
+SEGMENT_LOOP_START:
     if constexpr (Arch >= 90) {
         prepare_flashmask(params, stream, params.num_sm,
             use_overlap ? &flashmask::comm::singleton().wptr_init : nullptr,
@@ -140,15 +167,17 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 
     if (use_overlap) {
         auto& comm_singleton = flashmask::comm::singleton();
+        // Note(heqianyue): for RS-overlap, before the last computation kernel, communication kernel won't start
         comm_singleton.wait_wptr_init();        // wait until wptr is initialized
-        comm_singleton.run_overlap_kernel(params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k, false /*fwd*/);
-        seqlen_k *= comm_singleton.cp_size();
-        params.k_batch_stride *= comm_singleton.cp_size();
-        params.v_batch_stride *= comm_singleton.cp_size();
-        // `run_overlap_kernel` is async. Then, re-route the KV data to the nvshmem_alloc SR buffer.
-        params.k_ptr = comm_singleton.k_data();
-        params.v_ptr = comm_singleton.v_data();
-        // dK, dV should be resized, too. Yet it is done in Paddle-PHI end.
+        if (overlap_rs) {  // RS-overlap splits the AG and attn kernel
+            comm_singleton.run_overlap_splitted_ag_kernel(
+                params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k, segment_idx
+            );
+        } else {
+            comm_singleton.run_overlap_ag_kernel(
+                params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k, false /*fwd*/
+            );
+        }
     }
 #else
     if constexpr (Arch >= 90) {
@@ -156,7 +185,9 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     }
 #endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 
-    flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream);
+    if (segment_idx == 0) {
+        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream);
+    }
 
     typename CollectiveMainloop::Arguments mainloop_args = [&] () {
         if constexpr(Arch >= 90)
@@ -187,16 +218,17 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
                 params.cu_seqlens_q, params.cu_seqlens_k,
                 params.seqused_q, params.seqused_k,
                 params.h_flashmask, params.h_h_flashmask_ratio,
+                // RS-overlap: the following mask ptrs will be updated by the updater
                 params.lt_start_ptr, params.lt_end_ptr,
                 params.ut_start_ptr, params.ut_end_ptr,
-                params.flashmask_maxmin_ptr,
                 params.lt_start_nblockmax, params.lt_start_nblockmin,
                 params.lt_end_nblockmax, params.lt_end_nblockmin,
                 params.ut_start_nblockmax, params.ut_start_nblockmin,
                 params.ut_end_nblockmax, params.ut_end_nblockmin,
                 params.m_block_dim, params.n_block_dim,
                 params.block_mask_ptr,
-                params.write_ptr
+                params.write_ptr,
+                segment_cnt
             };
         else
             return typename CollectiveMainloop::Arguments {
@@ -322,26 +354,30 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         typename AttnKernel::CollectiveMainloop::TiledMmadQ,
         AttnKernel::CollectiveMainloop::dQ_swapAB
         >;
-    typename PostprocessKernel::Arguments postprocess_args {
-        static_cast<ElementAccum const*>(params.dq_accum_ptr),
-        {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
-        {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
-        static_cast<Element*>(params.dq_ptr),
-        {seqlen_q, params.d, params.h, batch_q},  // shape_dQ
-        {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
-        params.scale_softmax,
-        params.cu_seqlens_q,
-        params.seqused_q
-    };
-    typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
-    int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
-    dim3 grid_m_postprocess(num_m_block_postprocess, params.h, params.b);
-    int smem_size_postprocess = PostprocessKernel::SharedStorageSize;
-    if (smem_size_postprocess >= 48 * 1024) {
-        CHECK_CUDA(cudaFuncSetAttribute(flash::cutlass_flashmask_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
+
+    if (segment_idx == segment_cnt - 1) {
+        // only the last segments should call dQ post process to down cast dQ accum
+        typename PostprocessKernel::Arguments postprocess_args {
+            static_cast<ElementAccum const*>(params.dq_accum_ptr),
+            {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
+            {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
+            static_cast<Element*>(params.dq_ptr),
+            {seqlen_q, params.d, params.h, batch_q},  // shape_dQ
+            {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
+            params.scale_softmax,
+            params.cu_seqlens_q,
+            params.seqused_q
+        };
+        typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
+        int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
+        dim3 grid_m_postprocess(num_m_block_postprocess, params.h, params.b);
+        int smem_size_postprocess = PostprocessKernel::SharedStorageSize;
+        if (smem_size_postprocess >= 48 * 1024) {
+            CHECK_CUDA(cudaFuncSetAttribute(flash::cutlass_flashmask_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
+        }
+        flash::flashmask_kernel_launch<PostprocessKernel>(grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_params, false /*launch_with_pdl*/);
+        CHECK_CUDA_KERNEL_LAUNCH();
     }
-    flash::flashmask_kernel_launch<PostprocessKernel>(grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_params, false /*launch_with_pdl*/);
-    CHECK_CUDA_KERNEL_LAUNCH();
 
     if constexpr (GQA) {
         using TileShape_NK = cute::Shape<Int<kBlockN>, Int<kHeadDim>>;
@@ -350,13 +386,27 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             typename AttnKernel::CollectiveMainloop::TiledMmadKV,
             AttnKernel::CollectiveMainloop::dKV_swapAB
             >;
+
+        Element* dk_buffer = static_cast<Element*>(params.dk_ptr);
+        Element* dv_buffer = static_cast<Element*>(params.dv_ptr);
+        const int batch_stride_dkv = params.d_rounded * params.seqlen_k_rounded * params.h_k;
+        if (overlap_rs) {
+            auto& comm_singleton = flashmask::comm::singleton();
+            // post-process outputs to send buffer so that we can directly send it.
+            dk_buffer = static_cast<Element*>(comm_singleton.dk_send());
+            dv_buffer = static_cast<Element*>(comm_singleton.dv_send());
+        }
+        // Note(heqianyue): when RS-overlap is switched ON, the shape of dk_ptr (and dv_ptr) is (B, S_local, H, D)
+        // while the dk_accum & dv_accum & dk_send, dv_send (NVSHMEM buffer) have shape (B, S_local * chunks_per_seg, H, D)
+        // we therefore need to re-route the output of post-process kernels to dk_send, dv_send. The final reduced output
+        // dk_ptr and dv_ptr requires is produced by rs_overlap_kernel.
         typename PostprocessKerneldKV::Arguments postprocess_dK_args {
             static_cast<ElementAccum const*>(params.dk_accum_ptr),
             {seqlen_k_rounded * params.d_rounded, params.h_k, batch_k},  // shape_dKaccum
-            {_1{}, seqlen_k_rounded * params.d_rounded, !is_varlen_k ? params.d_rounded * params.seqlen_k_rounded * params.h_k : 0},  // stride_dKaccum
-            static_cast<Element*>(params.dk_ptr),
+            {_1{}, seqlen_k_rounded * params.d_rounded, !is_varlen_k ? batch_stride_dkv : 0},  // stride_dKaccum
+            dk_buffer,
             {seqlen_k, params.d, params.h_k, batch_k},  // shape_dK
-            {params.dk_row_stride, _1{}, params.dk_head_stride, params.dk_batch_stride},  // stride_dK
+            {params.dk_row_stride, _1{}, params.dk_head_stride, overlap_rs ? batch_stride_dkv : params.dk_batch_stride},  // stride_dK
             1.f,
             params.cu_seqlens_k,
             params.seqused_k
@@ -365,10 +415,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         typename PostprocessKerneldKV::Arguments postprocess_dV_args {
             static_cast<ElementAccum const*>(params.dv_accum_ptr),
             {seqlen_k_rounded * params.d_rounded, params.h_k, batch_k},  // shape_dVaccum
-            {_1{}, seqlen_k_rounded * params.d_rounded, !is_varlen_k ? params.d_rounded * params.seqlen_k_rounded * params.h_k : 0},  // stride_dVaccum
-            static_cast<Element*>(params.dv_ptr),
+            {_1{}, seqlen_k_rounded * params.d_rounded, !is_varlen_k ? batch_stride_dkv : 0},  // stride_dVaccum
+            dv_buffer,
             {seqlen_k, params.d, params.h_k, batch_k},  // shape_dV
-            {params.dv_row_stride, _1{}, params.dv_head_stride, params.dv_batch_stride},  // stride_dV
+            {params.dv_row_stride, _1{}, params.dv_head_stride, overlap_rs ? batch_stride_dkv : params.dv_batch_stride},  // stride_dV
             1.f,
             params.cu_seqlens_k,
             params.seqused_k
@@ -385,7 +435,27 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         flash::flashmask_kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
-
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+    // TODO(heqianyue): we don't need to constrain the function with 'GQA', but
+    // for simplicity of output pointer, GQA is required for now
+    if (overlap_rs) {
+        auto& comm_singleton = flashmask::comm::singleton();
+        // dk_ptr and dv_ptr is the output
+        comm_singleton.run_overlap_rs_kernel(
+            static_cast<Element*>(params.dk_ptr),
+            static_cast<Element*>(params.dv_ptr),
+            segment_idx,
+            stream
+        );
+        segment_idx ++;
+        if (segment_idx < segment_cnt) {
+            updater->inplace_update();
+            goto SEGMENT_LOOP_START;
+        }
+        // consumer (dKdV reduce) stream will record event for compute stream to wait for
+        comm_singleton.notify_dkv_reduce_done(stream);
+    }
+#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 }
 
 template<int Arch, typename T, int kBlockM, int kBlockN, int kHeadDim, bool Is_causal, bool Is_local, bool Has_softcap,

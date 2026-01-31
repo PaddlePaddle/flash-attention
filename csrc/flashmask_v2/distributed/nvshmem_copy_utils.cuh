@@ -94,17 +94,47 @@ __device__ NVSHMEMI_DEVICE_ALWAYS_INLINE void __internal_two_buffer_get_threadgr
     threadgroup_sync<SCOPE>();
 }
 
-#define DEFINE_TWO_BUFFERS_GETMEM_THREADGROUP(Group)                                                \
-    NVSHMEMI_DEVICE_PREFIX NVSHMEMI_DEVICE_ALWAYS_INLINE void two_buffers_getmem_##Group(           \
+template <threadgroup_t SCOPE>
+__device__ NVSHMEMI_DEVICE_ALWAYS_INLINE void __internal_two_buffer_put_threadgroup(
+    char* const __restrict__ dest1,
+    char* const __restrict__ dest2,
+    const char* const __restrict__ source1,
+    const char* const __restrict__ source2,
+    const int nelems, const int pe                                                                       
+) {
+    threadgroup_sync<SCOPE>();
+    void *peer_base_addr =
+        (void *)__ldg((const long long unsigned *)nvshmemi_device_state_d.peer_heap_base_p2p + pe);
+    if (peer_base_addr) {
+        char *dest_actual1 =
+            (char *)(peer_base_addr) + ((char *)dest1 - (char *)(nvshmemi_device_state_d.heap_base));
+        char *dest_actual2 =
+            (char *)(peer_base_addr) + ((char *)dest2 - (char *)(nvshmemi_device_state_d.heap_base));
+        memcpy_two_buffer<SCOPE, int4>(
+            (void *)dest_actual1, (void *)dest_actual2,
+            (const void *)source1, (const void *)source2,
+            nelems              // number of bytes to copy
+        );
+    } else {
+        nvshmemi_transfer_rma<SCOPE, NVSHMEMI_OP_PUT>((void *)dest1, (void *)source1, nelems, pe);
+        nvshmemi_transfer_rma<SCOPE, NVSHMEMI_OP_PUT>((void *)dest2, (void *)source2, nelems, pe);
+    }
+    threadgroup_sync<SCOPE>();
+}
+
+#define DEFINE_TWO_BUFFERS_MEMOP_THREADGROUP(Group, Op)                                             \
+    NVSHMEMI_DEVICE_PREFIX NVSHMEMI_DEVICE_ALWAYS_INLINE void two_buffers_##Op##mem_##Group(        \
         void* __restrict__ dest1, void* __restrict__ dest2,                                         \
         const void* const __restrict__ source1,  const void* const __restrict__ source2,            \
         size_t bytes, int pe) {                                                                     \
-        __internal_two_buffer_get_threadgroup<nvshmemi_threadgroup_##Group>(                        \
+        __internal_two_buffer_##Op##_threadgroup<nvshmemi_threadgroup_##Group>(                     \
             (char *)dest1, (char *)dest2, (const char *)source1, (const char *)source2, bytes, pe); \
     }
 
-DEFINE_TWO_BUFFERS_GETMEM_THREADGROUP(warp)
-DEFINE_TWO_BUFFERS_GETMEM_THREADGROUP(block)
+DEFINE_TWO_BUFFERS_MEMOP_THREADGROUP(warp, get)
+DEFINE_TWO_BUFFERS_MEMOP_THREADGROUP(block, get)
+DEFINE_TWO_BUFFERS_MEMOP_THREADGROUP(warp, put)
+DEFINE_TWO_BUFFERS_MEMOP_THREADGROUP(block, put)
 
 }   // namespace shmem
 }   // namespace flashmask

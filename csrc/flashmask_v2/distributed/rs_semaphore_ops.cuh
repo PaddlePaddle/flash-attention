@@ -9,11 +9,11 @@ namespace rs {
 
 // num thread: 1
 template <typename SemaphoreT>
-__global__ void SetSemaphoreValueKernel(
+__global__ void SetValueKernel(
     SemaphoreT* const __restrict__ semaphore,
     const int value
 ) {
-    *semaphore = static_cast<SemaphoreT>(value);
+    *(semaphore + threadIdx.x) = static_cast<SemaphoreT>(value);
 }
 
 __global__ void ProducerNotifyFull(
@@ -28,7 +28,7 @@ __global__ void ProducerNotifyFull(
     nvshmem_quiet();
     semaphores[target_rank] = 0;        // clear the local status (set by the remote target)
     // clear remote bit (uint64_t cannot use atomic_add negative values)
-    nvshmem_long_atomic_add(semaphores + target_rank, -(1 << target_rank), target_rank);
+    nvshmem_long_atomic_add(semaphores + target_rank, -(1 << self_rank), target_rank);
 }
 
 __global__ void ConsumerNotifyEmpty(
@@ -43,6 +43,34 @@ __global__ void ConsumerNotifyEmpty(
     target_rank = target_rank >= 0 ? target_rank : target_rank + cp_size;
     if (target_rank == self_rank) return;
     nvshmem_int64_p(semaphores + self_rank, 1, target_rank);
+}
+
+__global__ void Print16Semaphores(
+    int64_t* const semaphores,
+    int self_rank
+) {
+    printf("rank %d: [%lx, %lx, %lx, %lx], [%lx, %lx, %lx, %lx], [%lx, %lx, %lx, %lx], [%lx, %lx, %lx, %lx]\n", 
+        self_rank,
+        semaphores[0], semaphores[1], semaphores[2], semaphores[3],
+        semaphores[4], semaphores[5], semaphores[6], semaphores[7],
+        semaphores[8], semaphores[9], semaphores[10], semaphores[11],
+        semaphores[12], semaphores[13], semaphores[14], semaphores[15]
+    );
+}
+
+__global__ void PrintWritePtrKernel(
+    int* const wptr,
+    int self_rank
+) {
+    printf("rank %d: debug print wptr: %d, int max is: %d\n", self_rank, wptr[0], INT_MAX);
+}
+
+void debug_print_semaphore(
+    int64_t* const semaphores,
+    int self_rank,
+    cudaStream_t comm_stream
+) {
+    Print16Semaphores<<<1, 1, 0, comm_stream>>>(semaphores, self_rank);
 }
 
 // [local consumer (dk dv reducer and recv buffer)] sends out an empty 
@@ -63,7 +91,7 @@ void notify_consumer_empty(
         local_flag |= 1 << target_rank;
     }
     // step 1. set self (inform reduce kernel that we haven't got data from other ranks, so we wait)
-    SetSemaphoreValueKernel<<<1, 1, 0, comm_stream>>>(semaphores + self_rank, local_flag);
+    SetValueKernel<<<1, 1, 0, comm_stream>>>(semaphores + self_rank, local_flag);
     // step 2. notify all other src ranks: you can start putting data to this rank
     // for example: local_rank is 7, we notify rank 0,1,2,3 to put data by setting sema[7] to 1
     // set remote empty state can not start before we set the local state

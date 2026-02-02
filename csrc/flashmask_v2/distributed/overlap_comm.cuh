@@ -110,12 +110,12 @@ public:
     // for RS overlap, returns number of chunks per segment
     int chunk_per_seg() const;
     void reset_dkv_semaphores(cudaStream_t stream);
-    void notify_dkv_reduce_done(cudaStream_t stream);
 
     // wptr_init: comp_stream notifies comm_stream, write_ptr is usable
     // bwd_done (only when RS-overlap): comp_stream notifies aux_streams, bwd post-proc done
-    // reduce_done (only when RS-overlap): aux_stream notifies comp_stream, dK, dV are reduced
-    cudaEvent_t wptr_init, bwd_done, reduce_done;
+    // reduce_done (only when RS-overlap): aux_c_stream notifies comp_stream, dk/v recv buffer are released and ready 
+    // send_done (only when RS-overlap): aux_p_stream notifies comp_stream, dk/v send buffer are released and ready 
+    cudaEvent_t wptr_init, bwd_done, reduce_done, send_done;
 private:
     std::unique_ptr<SRBuffer<KVType>> kv_buffer;
     /**

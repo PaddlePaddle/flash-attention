@@ -59,6 +59,8 @@ public:
     inline SemaphoreType* semaphores() const { return _semaphores; }
 
     void reset(cudaStream_t comm_stream);
+    // clear recv buffer (so that reduce won't op on dirty data)
+    void zero_recv_buf(cudaStream_t comm_stream);
 
     inline bool is_valid() const noexcept {
         return _allocated && _k_data && _v_data && _semaphores && _team != NVSHMEM_TEAM_INVALID;

@@ -177,6 +177,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         cudaStreamCreateWithFlags(&aux_c_stream, cudaStreamNonBlocking);
         cudaEventCreateWithFlags(&bwd_done, cudaEventDisableTiming);
         cudaEventCreateWithFlags(&reduce_done, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&send_done, cudaEventDisableTiming);
 
         dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
             _cp_chunk_size * b_kv,      // single chunk K numel (B * S_local * H * D)
@@ -184,6 +185,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
             num_chunks,
             cp_team
         );
+        WARN_PRINT("[FlashMask Overlap] Using RS-Overlap!\n");
     }
     kv_buffer->team_bar();
     // copy to the last position of the SR buffer
@@ -202,6 +204,7 @@ OverlapCommunicator<KVType>::~OverlapCommunicator() {
     if (dkv_buffer) {
         CUDA_DEBUG_CHECK(cudaEventDestroy(bwd_done));
         CUDA_DEBUG_CHECK(cudaEventDestroy(reduce_done));
+        CUDA_DEBUG_CHECK(cudaEventDestroy(send_done));
         CUDA_DEBUG_CHECK(cudaStreamDestroy(aux_p_stream));
         CUDA_DEBUG_CHECK(cudaStreamDestroy(aux_c_stream));
         dkv_buffer->release();
@@ -367,6 +370,7 @@ void OverlapCommunicator<KVType>::compute_chunk_mask(
             dim3 grids = dim3(valid_seqlen_k / (num_reduce_warp * 32 * 4), B, 1);
             EXPAND_MACRO(CallBlockSparsityKernel, grids, false, BlockChunkKernelTrait);
         } else {
+            WARN_PRINT("(%d) Before compute_chunk_mask (bwd).\n", _my_pe);
             // RS overlap: for bwd AG overlap, the splitted remote_put requires not to skip the local chunk
             if (dkv_buffer) {
                 dim3 grids = dim3((valid_seqlen_k + S_chunk) / (num_reduce_warp * 32 * 4), B, 1);
@@ -375,6 +379,7 @@ void OverlapCommunicator<KVType>::compute_chunk_mask(
                 dim3 grids = dim3(valid_seqlen_k / (num_reduce_warp * 32 * 4), B, 1);
                 EXPAND_MACRO(CallBlockSparsityKernel, grids, true, BlockChunkKernelTrait);
             }
+            WARN_PRINT_SYNC(stream, "(%d) After compute_chunk_mask (bwd).\n", _my_pe);
         }
     }
 }
@@ -384,12 +389,6 @@ int OverlapCommunicator<KVType>::chunk_per_seg() const {
     // TODO(heqianyue): this is fixed for now, we can make this
     // dynamic in the future (for example, for 32K CP4, chunk might be 2)
     return num_chunks;
-}
-
-template <typename KVType>
-void OverlapCommunicator<KVType>::notify_dkv_reduce_done(cudaStream_t stream) {
-    cudaEventRecord(reduce_done, aux_c_stream);
-    cudaStreamWaitEvent(stream, reduce_done);
 }
 
 /**
@@ -494,17 +493,17 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
     int& S,
     int segment_idx
 ) {
+    WARN_PRINT("(%d) Before run_overlap_splitted_ag_kernel, segment: %d\n", _my_pe, segment_idx);
     constexpr int S_chunk = 8192;
     if (S_chunk != S_local) {
         throw std::runtime_error("Local KV seqlen should be equal to S-chunk size (8192).");
     }
     S = S_local * num_chunks;
-    // set 0 every time we start the comm kernel --- meanning that we don't have any available attn-blocks
-    constexpr int work_to_skip = S_chunk / (num_warps * RDMA_ROW_PER_WARP);
     if (segment_idx) {
         cudaMemsetAsync(block_work_ids, 0, sizeof(int) * num_blocks, comm_stream);
     } else {
-        // TODO(heqianyue): set all num_blocks to be work_to_skip (*)
+        constexpr int work_to_skip = S_chunk / (num_warps * RDMA_ROW_PER_WARP);
+        sema::rs::SetValueKernel<<<1, num_blocks, 0, comm_stream>>>(block_work_ids, work_to_skip);
     }
 
     if constexpr (USE_SPARSE_LARGE_CHUNK) {
@@ -518,6 +517,7 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
     if constexpr (USE_SEMAPHORES) {
         printf("Warning: Splitted AG does not support semaphore ops yet.\n");
     }
+    WARN_PRINT_SYNC(comm_stream, "(%d) After run_overlap_splitted_ag_kernel, segment: %d\n", _my_pe, segment_idx);
 }
 #undef SparseLargeChunkSplittedKernel
 #undef SeqlenDispatchSplitted
@@ -549,6 +549,7 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
     int segment_idx,
     cudaStream_t comp_stream
 ) {
+    WARN_PRINT("(%d) Before run_overlap_rs_kernel, seg: %d\n", _my_pe, segment_idx);
     static constexpr int S_chunk = 8192;
     // step 1 (pre-process and prepare) comp_stream should notify aux_p_stream, post-process is done.
     // also, reset the block_cnt_semaphore for remote_put dynamic scheduling
@@ -562,10 +563,12 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
     const int remote_producer_end_rank = (_my_pe - num_chunks * segment_idx) % _total_n_pes;
     const int remote_consumer_start_rank = (_my_pe + num_chunks * segment_idx) % _total_n_pes;
 
+    // local consumer clears recv buffer so that places where remote_put kernel does not put data to are clean 
     // set local state: local consumer needs data (this prevents dk_dv reducer starts before other remote ranks 
     // put their data). Also, notify remote producer after setting local state, so that they won't change our local 
     // state before we've set it, which might cause deadlock hang). After the following function call:
     // local consumer (recv_buffer and reduce kernel) is ready to wait for the buffer to be full
+    dkv_buffer->zero_recv_buf(aux_c_stream);
     sema::rs::notify_consumer_empty(
         dkv_buffer->semaphores(),
         remote_producer_end_rank,
@@ -588,6 +591,8 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         num_chunks,
         aux_p_stream
     );                          // local producer
+    // bwd-attn post-process will wait for the following event (release of dk/v send buffer)
+    cudaEventRecord(send_done, aux_p_stream);
 
     // step 4. the local rank consumer (reduce) wait full (from other remote rank)
     // This actually starts simultaneously with the previous kernels
@@ -608,6 +613,10 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         aux_c_stream
     );                          // local consumer
     // the end state should be: semaphore is all zero
+    WARN_PRINT_SYNC(aux_c_stream, "(%d) After run_overlap_rs_kernel.\n", _my_pe);
+    // the next post process should wait for the current reduce to be done
+    // otherwise, the local dk/v_send will risk being overwritten by the next post-process
+    cudaEventRecord(reduce_done, aux_c_stream);
 }
 
 #undef SegmentIdxPutKernelDispatch

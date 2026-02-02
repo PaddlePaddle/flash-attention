@@ -58,27 +58,32 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 
     using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
     using PreprocessKernel = flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, ArchTag, /*Clear_dQaccum=*/true, Varlen>;
-    typename PreprocessKernel::Arguments preprocess_args {
-        static_cast<Element const*>(params.o_ptr),
-        {seqlen_q, params.d, params.h, batch_q},  // shape_O
-        {params.o_row_stride, _1{}, params.o_head_stride, !is_varlen_q ? params.o_batch_stride : 0},  // stride_O
-        static_cast<Element const*>(params.do_ptr),
-        {params.do_row_stride, _1{}, params.do_head_stride, !is_varlen_q ? params.do_batch_stride : 0},  // stride_dO
-        static_cast<float*>(params.dsoftmax_sum),
-        {seqlen_q_rounded, params.h, batch_q},  // shape_dPsum
-        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
-        static_cast<float*>(params.softmax_lse_ptr),
-        {_1{}, seqlen_q, !is_varlen_q ? params.h * params.seqlen_q : 0},  // stride_LSE
-        static_cast<float*>(params.softmax_lse_log2_ptr),
-        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
-        static_cast<ElementAccum*>(params.dq_accum_ptr),
-        {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
-        {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * seqlen_q_rounded * params.h : 0},  // stride_dQaccum
-        params.b,
-        params.dq_semaphore,
-        params.cu_seqlens_q,
-        params.seqused_q
-    };
+
+#define MakePreprocessKernelArgs(KernelFuncType, var_name)          \
+    typename KernelFuncType::Arguments var_name {                   \
+        static_cast<Element const*>(params.o_ptr),                  \
+        {seqlen_q, params.d, params.h, batch_q},  /* Shape O */     \
+        {params.o_row_stride, _1{}, params.o_head_stride, !is_varlen_q ? params.o_batch_stride : 0},  /* Stride O */    \
+        static_cast<Element const*>(params.do_ptr),                                                                     \
+        {params.do_row_stride, _1{}, params.do_head_stride, !is_varlen_q ? params.do_batch_stride : 0}, /* Stride dO */ \
+        static_cast<float*>(params.dsoftmax_sum),                                                                       \
+        {seqlen_q_rounded, params.h, batch_q},  /* Shape dP Sum */                                                      \
+        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  /* Stride dP Sum */           \
+        static_cast<float*>(params.softmax_lse_ptr),                                                                    \
+        {_1{}, seqlen_q, !is_varlen_q ? params.h * params.seqlen_q : 0},  /* stride_LSE */                              \
+        static_cast<float*>(params.softmax_lse_log2_ptr),                                                               \
+        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  /* stride_LSE_log2 */         \
+        static_cast<ElementAccum*>(params.dq_accum_ptr),                                                                \
+        {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  /* shape_dQaccum */                                  \
+        {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * seqlen_q_rounded * params.h : 0},  /* stride_dQaccum */ \
+        params.b,               \
+        params.dq_semaphore,    \
+        params.cu_seqlens_q,    \
+        params.seqused_q        \
+    }
+
+    MakePreprocessKernelArgs(PreprocessKernel, preprocess_args);
+
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
     dim3 grid_m(num_m_block, params.h, params.b);
@@ -87,7 +92,18 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     // flash::print_addr_value<<<1, 1,0,stream>>>(params.lt_start_ptr, 0);
     // printf("point2\n");
     CHECK_CUDA_KERNEL_LAUNCH();
-    CHECK_CUDA(cudaGetLastError());
+
+    auto call_preprocess_without_cleanup = [&](int seg_idx) {
+        // split calls do not clear dQ accum
+        using PreprocessKernelSplit = flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, ArchTag, /*Clear_dQaccum=*/false, Varlen>;
+        MakePreprocessKernelArgs(PreprocessKernelSplit, split_args);
+        typename PreprocessKernelSplit::Params split_params = PreprocessKernelSplit::to_underlying_arguments(split_args);
+        flash::flashmask_kernel_launch<PreprocessKernelSplit>(grid_m, PreprocessKernelSplit::MaxThreadsPerBlock,
+                        PreprocessKernelSplit::SharedStorageSize, stream, split_params, false /*launch_with_pdl*/);
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA_KERNEL_LAUNCH();
+    };  
+
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<_1, Int<1>, _1>;  // Currently doesn't not support cluster
     // Stages_dS_or_QSm80 is Stages_dS if Sm90 and Stages if Sm80
@@ -158,9 +174,11 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         throw std::runtime_error("Overlap singleton instance is null but we try using overlap mechanism. This should be buggy.");
     }
 
+    const int sm_margin = overlap_rs ? 0 : 0;
+
 SEGMENT_LOOP_START:
     if constexpr (Arch >= 90) {
-        prepare_flashmask(params, stream, params.num_sm,
+        prepare_flashmask(params, stream, params.num_sm - sm_margin,
             use_overlap ? &flashmask::comm::singleton().wptr_init : nullptr,
             use_overlap ? flashmask::comm::singleton().get_block_cnt_semaphore() : nullptr);
     }
@@ -186,7 +204,16 @@ SEGMENT_LOOP_START:
 #endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 
     if (segment_idx == 0) {
-        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream);
+        // scanMinMax is called only once
+        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream, false /* is_forward */, segment_cnt);
+    } else {
+        // reset grad semaphores, otherwise the program will hang
+        call_preprocess_without_cleanup(segment_idx);
+        if constexpr (Deterministic) {
+            size_t total_bytes = (params.seqlen_k + kBlockN - 1) / kBlockN * params.b * params.h_k * sizeof(int);
+            cudaMemsetAsync(params.dk_semaphore, 0, total_bytes, stream);
+            cudaMemsetAsync(params.dv_semaphore, 0, total_bytes, stream);
+        }
     }
 
     typename CollectiveMainloop::Arguments mainloop_args = [&] () {
@@ -304,7 +331,7 @@ SEGMENT_LOOP_START:
     CHECK_CUDA(cudaGetDevice(&device));
     CHECK_CUDA(cudaGetLastError());
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
-        mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
+        mainloop_args, epilogue_args, {device, params.num_sm - sm_margin}, scheduler_args
     });
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
@@ -430,6 +457,15 @@ SEGMENT_LOOP_START:
         if (smem_size_postprocess >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(flash::cutlass_flashmask_kernel<PostprocessKerneldKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
         }
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+        if (overlap_rs && segment_idx) {
+            // post-process kernel must wait for the RS-reduce finishing. Since we redirect the output buffer of post-process to dk/v_send
+            // these two buffers are also used in RS-overlap (remote put and reduce), so we cannot overwrite these before they are released. 
+            auto& comm_singleton = flashmask::comm::singleton();
+            cudaStreamWaitEvent(stream, comm_singleton.send_done);      // wait RS-overlap producer finishing using dk/dv-send
+            cudaStreamWaitEvent(stream, comm_singleton.reduce_done);    // wait RS-overlap producer finishing using dk/dv-send
+        }
+#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
         flash::flashmask_kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
         flash::flashmask_kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/);
@@ -449,11 +485,20 @@ SEGMENT_LOOP_START:
         );
         segment_idx ++;
         if (segment_idx < segment_cnt) {
+            // Note(heqianyue): this is so damned, be extra careful here: for GQA, epilogue
+            // does not set blocks to zero if they are masked. So we need to manually set zero
+            if constexpr (GQA) {
+                // need to set dk/v_accum to zero, so that the dK, dV from previous segments won't 
+                // contaminate the later computation (GQA epilgue store_zero does nothing) 
+                size_t accum_bytes = params.b * params.seqlen_k_rounded * params.h_k * params.d_rounded * sizeof(float);
+                cudaMemsetAsync(params.dk_accum_ptr, 0, accum_bytes, stream);
+                cudaMemsetAsync(params.dv_accum_ptr, 0, accum_bytes, stream);
+            }
             updater->inplace_update();
             goto SEGMENT_LOOP_START;
         }
         // consumer (dKdV reduce) stream will record event for compute stream to wait for
-        comm_singleton.notify_dkv_reduce_done(stream);
+        cudaStreamWaitEvent(stream, comm_singleton.reduce_done);
     }
 #endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 }

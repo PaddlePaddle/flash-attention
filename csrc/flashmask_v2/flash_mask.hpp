@@ -160,15 +160,16 @@ namespace flashmask {
   }
 
   template <int kBlockN>
-  void prepare_block_maxmin(Flash_fwd_params &params, cudaStream_t stream, bool is_forward = false) {
+  void prepare_block_maxmin(Flash_fwd_params &params, cudaStream_t stream, bool is_forward = false, int seqlen_scale = 1) {
     if (params.lt_start_ptr == nullptr &&
         params.ut_end_ptr == nullptr) {
       return;
     }
     int *nblock_smask = params.flashmask_maxmin_ptr;
+    const int seqlen_k = seqlen_scale * params.seqlen_k;
 
     // only used in forward pass and SM90 (FlashMaskV3)
-    const int nblock_seqlen = ((params.seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc; // umiswing: padding for int4 load
+    const int nblock_seqlen = ((seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc; // umiswing: padding for int4 load
     int nblock_masklen = 0;
 
     const bool use_aligned_chunk = params.arch == 90 && is_forward; 
@@ -194,7 +195,7 @@ namespace flashmask {
       scanMaxMinGpu<kBlockN>(
           params.lt_start_ptr,
           params.b * params.h_flashmask,
-          params.seqlen_k,
+          seqlen_k,
           params.lt_start_nblockmax,
           params.lt_start_nblockmin,
           stream,
@@ -207,7 +208,7 @@ namespace flashmask {
       scanMaxMinGpu<kBlockN>(
                     params.ut_end_ptr,
                     params.b * params.h_flashmask,
-                    params.seqlen_k,
+                    seqlen_k,
                     params.ut_end_nblockmax,
                     params.ut_end_nblockmin,
                     stream,
@@ -220,7 +221,7 @@ namespace flashmask {
       scanMaxMinGpu<kBlockN>(
           params.lt_end_ptr,
           params.b * params.h_flashmask,
-          params.seqlen_k,
+          seqlen_k,
           params.lt_end_nblockmax,
           params.lt_end_nblockmin,
           stream,
@@ -233,7 +234,7 @@ namespace flashmask {
       scanMaxMinGpu<kBlockN>(
           params.ut_start_ptr,
           params.b * params.h_flashmask,
-          params.seqlen_k,
+          seqlen_k,
           params.ut_start_nblockmax,
           params.ut_start_nblockmin,
           stream,

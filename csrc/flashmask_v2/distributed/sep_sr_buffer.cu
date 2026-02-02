@@ -116,6 +116,11 @@ void SepSRBuffer<KVType>::reset(cudaStream_t comm_stream) {
 }
 
 template <typename KVType>
+void SepSRBuffer<KVType>::zero_recv_buf(cudaStream_t comm_stream) {
+    cudaMemsetAsync(_k_data + _buf_offset, 0, sizeof(KVType) * _buf_offset, comm_stream);
+}
+
+template <typename KVType>
 void SepSRBuffer<KVType>::swap(SepSRBuffer& other) {
     std::swap(_k_data, other._k_data);
     std::swap(_v_data, other._v_data);

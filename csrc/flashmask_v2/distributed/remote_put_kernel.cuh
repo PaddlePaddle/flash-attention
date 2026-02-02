@@ -52,8 +52,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int batch_stride = S_chunk * r2_num_chunk * S_stride;         // use rounded chunk to compute batch_stride
     __shared__ int cached_empty[r2_num_chunk];
     __shared__ int next_work_id;
-    if (threadIdx.x * 2 < num_chunk) {
-        *(reinterpret_cast<int2*>(cached_empty) + threadIdx.x) = make_int2(0, 0);
+    if (threadIdx.x < r2_num_chunk) {
+        cached_empty[threadIdx.x] = 0;
     }
     __syncthreads();
 

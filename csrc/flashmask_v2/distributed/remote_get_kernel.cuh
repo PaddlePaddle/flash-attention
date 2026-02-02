@@ -7,23 +7,6 @@
 
 namespace flashmask {
 
-// #define NVSHMEM_DEBUG
-
-inline void CheckCudaErrorAux(const char *file, unsigned line,
-                                       const char *statement, cudaError_t err) {
-    if (err == cudaSuccess)
-        return;
-    printf("%s returned %s(%d) at %s:%u\n", statement, cudaGetErrorString(err),
-           err, file, line);
-    exit(1);
-}
-
-#if defined(NVSHMEM_DEBUG)
-#define CUDA_DEBUG_CHECK(value) CheckCudaErrorAux(__FILE__, __LINE__, #value, value)
-#else
-#define CUDA_DEBUG_CHECK(value) (value)
-#endif
-
 /**
  * This kernel assumes num head is small, like <= 3, so that we directly copy
  * the entire head dimension, without the need to calculate index

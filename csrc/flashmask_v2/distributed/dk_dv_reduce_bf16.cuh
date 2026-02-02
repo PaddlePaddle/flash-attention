@@ -44,7 +44,6 @@ void ReducedKdVKernel(
     const bf16* __restrict__ dv_recv,
     bf16* __restrict__ dk_accum,
     bf16* __restrict__ dv_accum,
-    const int H, const int D,
     const int num_tasks_per_batch       // S_chunk * H * D / 512
 ) {
     static constexpr int elem_per_block = 512;
@@ -55,7 +54,11 @@ void ReducedKdVKernel(
     const int b_offset_sr = b_offset_accum * num_chunks;
 
     // task offset is small_chunk offset + thread offset
-    auto reduce_op = [&](const bf16* src_send, const bf16* src_recv, bf16* dst_accum, int task_offset) {
+    auto reduce_op = [&](
+        const bf16* const __restrict__ src_send,
+        const bf16* const __restrict__ src_recv,
+        bf16* const __restrict__ dst_accum, int task_offset
+    ) {
         // step 1. load values to SMEM
         const void* initial_ptr = is_first ? (const void*)(src_send + b_offset_sr + task_offset)
                                            : (const void*)(dst_accum + b_offset_accum + task_offset);
@@ -79,6 +82,7 @@ void ReducedKdVKernel(
         *reinterpret_cast<bf16x4*>(dst_accum + b_offset_accum + task_offset) = result;
     };
 
+    // TODO(heqianyue): batch = 1 the following seems correct, what about batch > 1 ?
     for (int task_idx = blockIdx.x; task_idx < num_tasks_per_batch; task_idx += gridDim.x) {
         const int task_offset = task_idx * elem_per_block + 4 * threadIdx.x;
 
@@ -118,10 +122,10 @@ void launch_dk_dv_reduce(
     dim3 grid(std::max(2048 / B, 128), B); 
     if (is_first) {
         ReducedKdVKernel<S_chunk_exp, num_chunks, true><<<grid, 128, 0, stream>>>(
-            dk_send, dv_send, dk_recv, dv_recv, dk_accum, dv_accum, H, D, num_tasks_per_chunk);
+            dk_send, dv_send, dk_recv, dv_recv, dk_accum, dv_accum, num_tasks_per_chunk);
     } else {
         ReducedKdVKernel<S_chunk_exp, num_chunks, false><<<grid, 128, 0, stream>>>(
-            dk_send, dv_send, dk_recv, dv_recv, dk_accum, dv_accum, H, D, num_tasks_per_chunk);
+            dk_send, dv_send, dk_recv, dv_recv, dk_accum, dv_accum, num_tasks_per_chunk);
     }
 }
 

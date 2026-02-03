@@ -174,11 +174,9 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         throw std::runtime_error("Overlap singleton instance is null but we try using overlap mechanism. This should be buggy.");
     }
 
-    const int sm_margin = overlap_rs ? 0 : 0;
-
 SEGMENT_LOOP_START:
     if constexpr (Arch >= 90) {
-        prepare_flashmask(params, stream, params.num_sm - sm_margin,
+        prepare_flashmask(params, stream, params.num_sm,
             use_overlap ? &flashmask::comm::singleton().wptr_init : nullptr,
             use_overlap ? flashmask::comm::singleton().get_block_cnt_semaphore() : nullptr);
     }
@@ -191,6 +189,11 @@ SEGMENT_LOOP_START:
             comm_singleton.run_overlap_splitted_ag_kernel(
                 params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k, segment_idx
             );
+            // offset K and V by one chunk
+            params.k_ptr = comm_singleton.k_data(segment_idx ? 1 : 0);
+            params.v_ptr = comm_singleton.v_data(segment_idx ? 1 : 0);
+            // make sure computation kernels are scheduled with SMs later than communication kernels
+            comm_singleton.wait_reset_stream_coordinator(segment_idx > 0, stream);
         } else {
             comm_singleton.run_overlap_ag_kernel(
                 params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k, false /*fwd*/
@@ -331,7 +334,7 @@ SEGMENT_LOOP_START:
     CHECK_CUDA(cudaGetDevice(&device));
     CHECK_CUDA(cudaGetLastError());
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
-        mainloop_args, epilogue_args, {device, params.num_sm - sm_margin}, scheduler_args
+        mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
     });
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);

@@ -562,13 +562,14 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 // the local read ptr is exceeded by the write ptr and load KV can procede if true. Therefore, we can choose to
 // start the AG-overlap kernel (non-splitted version) just once at the beginning of the BWD kernel. We only need to
 // inform the bwd kernel one more thing: what is the current segment ID? For now, use the splitted version.
-template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunks=4>
+template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunks=4, bool use_stream_coord=false>
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkSplittedRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,
     int* const __restrict__ block_work_idx,
     int* const __restrict__ block_cnt_semaphore,      // for dynamic scheduling
+    int* const __restrict__ stream_coordinator,
     const int* const __restrict__ copy_chunk_mask,
     const int start_rank,               // first call is my_pe + 1
     const int segment_idx,
@@ -577,6 +578,10 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int S_stride,                 // H * D
     const int num_segments = 4
 ) {
+    if constexpr (use_stream_coord) {
+        // notify computation stream that one of the CTAs for communication kernel is running
+        if (threadIdx.x == 0) atomicOr(stream_coordinator, 1 << blockIdx.x);
+    }
     constexpr bool has_local = (num_chunks & 1) > 0;
     constexpr int row_per_block = num_warps * row_per_warp;
     // round the num_chunks to include the local chunk
@@ -584,8 +589,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     constexpr int S = S_chunk * rounded_num_chunks;         // seqlen of this segment
     constexpr int work_per_seg = S / row_per_block;
     // for each segment, get the number of work we can skip (due to being local). Note that
-    // for each batch, if work_to_skip is not 0, there will be some skippable works
+    // if work_to_skip is not 0, there will be some skippable works for **each batch**
     constexpr int work_to_skip = has_local ? (S_chunk / row_per_block) : 0;
+    constexpr int seqlen_offset = has_local ? 0 : S_chunk;
     // though the actual skippable work is `num_batch * (work_per_seg - work_to_skip)`
     // for batch_idx > 0, those skippable local works cannot be skipped **directly**.
     const int total_works = num_batch * work_per_seg;
@@ -644,7 +650,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 
         // copy upto 4 heads (S_stride = H * D), and row_per_block rows (seqlen axis) per CTA
         const int src_addr = batch_id * batch_stride + (seqlen_id % S_chunk) * S_stride;
-        const int dst_addr = batch_id * batch_stride + seqlen_id * S_stride;
+        // if there is no local chunk, we offset the dst by one chunk (seqlen_offset = S_chunk)
+        const int dst_addr = batch_id * batch_stride + (seqlen_id + seqlen_offset) * S_stride;
         shmem::two_buffers_getmem_block(
             k_sr + dst_addr,
             v_sr + dst_addr,

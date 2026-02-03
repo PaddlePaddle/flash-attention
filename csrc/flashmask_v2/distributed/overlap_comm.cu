@@ -16,9 +16,12 @@ static constexpr bool USE_SEMAPHORES = false;           // no team_bar but fine-
 // If true, we will scale up the transfering chunk for one CTA (16 rows per chunk ---> 256-512 rows per chunk)
 // and calculate per-chunk sparsity to skip some comm (avg 50% of the chunks are not needed)
 static constexpr bool USE_SPARSE_LARGE_CHUNK = true;
+// whether to use stream coordinator to make sure the scheduling order of comm & comp kernels
+static constexpr bool USE_STREAM_COORD = true;
 
 // allowed value: [16, 32, 64] (larger number is generally better for KV with larger num_head and higher CP)
 static constexpr int RDMA_ROW_PER_WARP = 64;
+static constexpr int STREAM_COORD_OFFSET = 2;   // 0 means stream coordinator is off, 2 by default.
 
 // allowed value: 16 or 8 (16 warps are generally better for KV with larger num_head and higher CP)
 static constexpr int num_warps = 16;    // making the grid larger is generally better
@@ -150,8 +153,11 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     }
     _cp_stride = _total_n_pes / cp_size;
 
-    // TODO(heqianyue): cudaStreamCreateWithPriority
-    cudaStreamCreateWithFlags(&comm_stream, cudaStreamNonBlocking);
+    int least_priority, greatest_priority;
+    cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
+    cudaStreamCreateWithPriority(&comm_stream, 
+                                  cudaStreamNonBlocking,
+                                  greatest_priority);
     cudaEventCreateWithFlags(&wptr_init, cudaEventDisableTiming);
     _cp_chunk_size = s_kv * h_kv * d_kv;
     _total_numel = _cp_chunk_size * b_kv * cp_size;             // won't overflow, but should be careful
@@ -164,21 +170,28 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     }
     if constexpr (USE_SPARSE_LARGE_CHUNK) {
         const int num_copy_chunks = b_kv * s_kv * cp_size / (RDMA_ROW_PER_WARP * num_warps);
-        // block_cnt_semaphore (AG overlap only requires only 1 extra int, 2 is for RS overlap)
-        CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (num_blocks + num_copy_chunks + 2), comm_stream));
+        // block_cnt_semaphore (AG overlap only requires only 1 extra int, 2 is for RS overlap, 2 more for padding)
+        CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (num_blocks + num_copy_chunks + 4), comm_stream));
         copy_chunk_mask = block_work_ids + num_blocks;
         block_cnt_semaphore = copy_chunk_mask + num_copy_chunks;
     } else {
-        CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * num_blocks, comm_stream));
+        CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (num_blocks + 4), comm_stream));    // +4 for stream coordinator and padding
     }
     if (overlap_rs) {
         // auxilary stream for RS-overlap (for used in reduce)
+        if (B > 1) {
+            throw std::runtime_error("[RS-overlap] Batch size > 1 is not supported for now.");
+        }
         cudaStreamCreateWithFlags(&aux_p_stream, cudaStreamNonBlocking);
         cudaStreamCreateWithFlags(&aux_c_stream, cudaStreamNonBlocking);
         cudaEventCreateWithFlags(&bwd_done, cudaEventDisableTiming);
         cudaEventCreateWithFlags(&reduce_done, cudaEventDisableTiming);
         cudaEventCreateWithFlags(&send_done, cudaEventDisableTiming);
-
+        if constexpr (USE_STREAM_COORD) {
+            // allocate stream coordinator and set the value to 0, so that comp stream will wait until comm stream have set this
+            stream_coordinator = block_cnt_semaphore + STREAM_COORD_OFFSET;
+            cudaMemsetAsync(stream_coordinator, 0, sizeof(int), comm_stream);
+        }
         dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
             _cp_chunk_size * b_kv,      // single chunk K numel (B * S_local * H * D)
             _total_n_pes,
@@ -220,6 +233,29 @@ void OverlapCommunicator<KVType>::wait_wptr_init() {
 }
 
 template <typename KVType>
+void OverlapCommunicator<KVType>::wait_reset_stream_coordinator(bool should_wait, cudaStream_t stream) {
+    static_assert(num_blocks <= 32, "To correctly use stream coordinator, num CTAs for comm kernels cannot exceed 32.");
+    if constexpr (USE_STREAM_COORD) {
+        if (dkv_buffer && should_wait) {
+            CUdeviceptr sc_ptr = (CUdeviceptr)stream_coordinator;
+            cuStreamWaitValue32(
+                stream, 
+                sc_ptr, 
+                0xffffffff,             // wait until all bits are 1: all comm CTAs are on
+                CU_STREAM_WAIT_VALUE_EQ
+            );
+
+            cuStreamWriteValue32(       // reset immediately
+                stream, 
+                sc_ptr, 
+                0, 
+                CU_STREAM_WRITE_VALUE_DEFAULT
+            );
+        }
+    }
+}
+
+template <typename KVType>
 void OverlapCommunicator<KVType>::wait_sr_buffer_empty() {
     // TBH, since there is enough time between two attention call,
     // for an unsafe impl, we actually don't need to wait.
@@ -250,6 +286,8 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     // bwd copies the data to the start chunk of the SR, while fwd copies to the last chunk
     const int local_offset = fwd ? (_cp_chunk_size * (_cp_size - 1)) : 0;
     const int batch_stride = _cp_chunk_size * _cp_size;
+    // FIXME(heqianyue): Note that for RS-overlap, batch size > 1 is currently not correct!
+    // there is a mismatch between RS-overlap stride and SR buffer stride.
     for (int bid = 0; bid < B; bid++) {
         CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->k_data() + local_offset + bid * batch_stride,
                                 new_k_data + bid * _cp_chunk_size, 
@@ -391,6 +429,18 @@ int OverlapCommunicator<KVType>::chunk_per_seg() const {
     return num_chunks;
 }
 
+template <typename KVType>
+void* OverlapCommunicator<KVType>::k_data(int chunk_id) const {
+    static constexpr int S_chunk = 8192;
+    return kv_buffer->k_data() + chunk_id * S_chunk * H * D; 
+}
+
+template <typename KVType>
+void* OverlapCommunicator<KVType>::v_data(int chunk_id) const {
+    static constexpr int S_chunk = 8192;
+    return kv_buffer->v_data() + chunk_id * S_chunk * H * D; 
+}
+
 /**
  * run the overlap kernel asynchronously
  * @param S the seqlen of local K (for example, 32K full length, CP=4, local S=8K)
@@ -458,15 +508,16 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
 #undef FewHeadKernel
 #undef MultiHeadKernel
 
-#define SparseLargeChunkSplittedKernel(start_rank, seg_idx, num_segments)           \
+#define SparseLargeChunkSplittedKernel(start_rank, seg_idx, num_chunk, num_segments)\
     SparseLargeKVChunkSplittedRemoteGetKernel<KVType, S_chunk,                      \
-        num_warps, RDMA_ROW_PER_WARP, num_chunks>                                   \
+        num_warps, RDMA_ROW_PER_WARP, num_chunk, USE_STREAM_COORD>                  \
         <<<num_blocks, num_warps * 32, 0, comm_stream>>>(                           \
                         kv_buffer->k_data(),                                        \
                         kv_buffer->v_data(),                                        \
                         write_ptr,                                                  \
                         block_work_ids,                                             \
                         block_cnt_semaphore,                                        \
+                        stream_coordinator,                                         \
                         copy_chunk_mask,                                            \
                         start_rank,                                                 \
                         seg_idx,                                                    \
@@ -493,26 +544,26 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
     int& S,
     int segment_idx
 ) {
+    if constexpr (!USE_SPARSE_LARGE_CHUNK) {
+        throw std::runtime_error("Overlap splitted AG kernel must use sparse large chunk.");
+    }
     WARN_PRINT("(%d) Before run_overlap_splitted_ag_kernel, segment: %d\n", _my_pe, segment_idx);
     constexpr int S_chunk = 8192;
     if (S_chunk != S_local) {
         throw std::runtime_error("Local KV seqlen should be equal to S-chunk size (8192).");
     }
     S = S_local * num_chunks;
+    int start_pe = (_my_pe + segment_idx * num_chunks) % _total_n_pes;
+    int num_segments = _cp_size / num_chunks;
     if (segment_idx) {
         cudaMemsetAsync(block_work_ids, 0, sizeof(int) * num_blocks, comm_stream);
+        SeqlenDispatchSplitted(SparseLargeChunkSplittedKernel, S, start_pe, segment_idx, num_chunks, num_segments);
     } else {
         constexpr int work_to_skip = S_chunk / (num_warps * RDMA_ROW_PER_WARP);
         sema::rs::SetValueKernel<<<1, num_blocks, 0, comm_stream>>>(block_work_ids, work_to_skip);
+        SeqlenDispatchSplitted(SparseLargeChunkSplittedKernel, S, start_pe, segment_idx, num_chunks - 1, num_segments);
     }
 
-    if constexpr (USE_SPARSE_LARGE_CHUNK) {
-        int start_pe = (_my_pe + segment_idx * num_chunks) % _total_n_pes;
-        int num_segments = _cp_size / num_chunks;
-        SeqlenDispatchSplitted(SparseLargeChunkSplittedKernel, S, start_pe, segment_idx, num_segments);
-    } else {
-        throw std::runtime_error("Overlap splitted AG kernel must use sparse large chunk.");
-    }
     // TODO(heqianyue): support AG semaphores for this kernel and delete this
     if constexpr (USE_SEMAPHORES) {
         printf("Warning: Splitted AG does not support semaphore ops yet.\n");
@@ -698,7 +749,7 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     if (!overlap_comm) {
         overlap_comm = std::make_unique<OverlapCommunicator<cutlass::bfloat16_t>>(
             k_data, v_data, b_kv, s_kv, h_kv, d_kv, rank, nranks, 
-            cp_size, unique_id_ptr, mask_head, h_kv > rs_overlap_min_h_k
+            cp_size, unique_id_ptr, mask_head, h_kv >= rs_overlap_min_h_k && nranks > 4
         );
     }
     return *overlap_comm;

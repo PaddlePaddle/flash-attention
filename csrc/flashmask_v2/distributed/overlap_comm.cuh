@@ -71,12 +71,16 @@ public:
 
     void* k_data() const { return kv_buffer->k_data(); }
     void* v_data() const { return kv_buffer->v_data(); }
+    void* k_data(int chunk_id) const;
+    void* v_data(int chunk_id) const;
 
     // we need to reroute the bwd dx_accum output buffer to dk_send and dv_send
     // so that the output of post-proc kernel can be directly sent
     // DO NOT call the following methods, if overlap_rs = false
     void* dk_send() const { return dkv_buffer->k_send(); }
     void* dv_send() const { return dkv_buffer->v_send(); }
+
+    void wait_reset_stream_coordinator(bool should_wait, cudaStream_t stream);
 
     void update_kv_buffer(
         const KVType* const new_k_data,
@@ -143,6 +147,7 @@ private:
     int* block_work_ids;
     int* block_cnt_semaphore;
     int* copy_chunk_mask;
+    int* stream_coordinator;        // make sure comm kernel is scheduled to GPU before computation kernel
 
     // returns the team and stride between teams
     static nvshmem_team_t simple_collective_topology_setter(int my_global_pe, int stride, int n_pes);

@@ -135,10 +135,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     >;
 
     bool use_overlap = false, overlap_rs = false;
-    int segment_idx = 0, segment_cnt = 1;
+    int segment_idx = 0, segment_cnt = 1, overlap_sm_margin = 0;
 #ifdef NVSHMEM_DISTRIBUTED_OVERLAP
     use_overlap = params.nranks > 1 && (!flashmask::comm::is_singleton_null());
-    std::unique_ptr<flash::flashmask::MaskPtrUpdater<kBlockN>> updater = nullptr;
+    std::unique_ptr<flash::flashmask::MaskPtrUpdater<kBlockN>> mask_ptr_updater = nullptr;
 
     // in bwd, we don't need to set rank, cp_size for params, since overlap_comm instance already knew these in fwd
     // also, when nranks == 1, overlap mode is not used
@@ -146,13 +146,14 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         auto& comm_singleton = flashmask::comm::singleton();
         segment_cnt = comm_singleton.num_segments();
         overlap_rs = segment_cnt > 1;
+        overlap_sm_margin = comm_singleton.overlap_sm_margin();
 
         // Chunk mask does not affect sync behavior, and it does not need to be computed in a splitted way.
         // Also, only one chunk (the local chunk) needs to be moved to the SR buffer. For RS-overlap, only the first
         // segment needs to call 'update_kv_buffer' since the following segments do not have local chunks. The
         // chunk_mask and update_kv_buffer can actually be called only once. AG and RS overlap are called 4 (num_segs) times.
         comm_singleton.wait_sr_buffer_empty();
-        comm_singleton.reset_dkv_semaphores(stream);        // RS-overlap: reset dK, dV semaphores to all 0
+        comm_singleton.prepare_dkv_buffer(stream);        // RS-overlap: reset dK, dV semaphores to all 0
         comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.ut_end_ptr, stream, false /* fwd */);
         comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr, false /*fwd*/);     // copy new KV data
 
@@ -165,10 +166,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         // Re-route the KV data to the nvshmem_alloc SR buffer.
         params.k_ptr = comm_singleton.k_data();
         params.v_ptr = comm_singleton.v_data();
-        // prepare mask_ptr updater and set params.num_segments to enable correct mask access in bwd kernel
+        // prepare mask_ptr mask_ptr_updater and set params.num_segments to enable correct mask access in bwd kernel
         if (overlap_rs) {
             static constexpr int cp_chunk_size = 8192;
-            updater = std::make_unique<flash::flashmask::MaskPtrUpdater<kBlockN>>(params, cp_chunk_size, comm_singleton.chunk_per_seg());
+            mask_ptr_updater = std::make_unique<flash::flashmask::MaskPtrUpdater<kBlockN>>(params, cp_chunk_size, comm_singleton.chunk_per_seg());
         }
     } else if (params.nranks > 1) {
         throw std::runtime_error("Overlap singleton instance is null but we try using overlap mechanism. This should be buggy.");
@@ -176,7 +177,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 
 SEGMENT_LOOP_START:
     if constexpr (Arch >= 90) {
-        prepare_flashmask(params, stream, params.num_sm,
+        prepare_flashmask(params, stream, params.num_sm - overlap_sm_margin,
             use_overlap ? &flashmask::comm::singleton().wptr_init : nullptr,
             use_overlap ? flashmask::comm::singleton().get_block_cnt_semaphore() : nullptr);
     }
@@ -248,7 +249,7 @@ SEGMENT_LOOP_START:
                 params.cu_seqlens_q, params.cu_seqlens_k,
                 params.seqused_q, params.seqused_k,
                 params.h_flashmask, params.h_h_flashmask_ratio,
-                // RS-overlap: the following mask ptrs will be updated by the updater
+                // RS-overlap: the following mask ptrs will be updated by the mask_ptr_updater
                 params.lt_start_ptr, params.lt_end_ptr,
                 params.ut_start_ptr, params.ut_end_ptr,
                 params.lt_start_nblockmax, params.lt_start_nblockmin,
@@ -334,7 +335,7 @@ SEGMENT_LOOP_START:
     CHECK_CUDA(cudaGetDevice(&device));
     CHECK_CUDA(cudaGetLastError());
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
-        mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
+        mainloop_args, epilogue_args, {device, params.num_sm - overlap_sm_margin}, scheduler_args
     });
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
@@ -423,8 +424,8 @@ SEGMENT_LOOP_START:
         if (overlap_rs) {
             auto& comm_singleton = flashmask::comm::singleton();
             // post-process outputs to send buffer so that we can directly send it.
-            dk_buffer = static_cast<Element*>(comm_singleton.dk_send());
-            dv_buffer = static_cast<Element*>(comm_singleton.dv_send());
+            dk_buffer = static_cast<Element*>(comm_singleton.dk_send(segment_idx));
+            dv_buffer = static_cast<Element*>(comm_singleton.dv_send(segment_idx));
         }
         // Note(heqianyue): when RS-overlap is switched ON, the shape of dk_ptr (and dv_ptr) is (B, S_local, H, D)
         // while the dk_accum & dv_accum & dk_send, dv_send (NVSHMEM buffer) have shape (B, S_local * chunks_per_seg, H, D)
@@ -465,7 +466,7 @@ SEGMENT_LOOP_START:
             // post-process kernel must wait for the RS-reduce finishing. Since we redirect the output buffer of post-process to dk/v_send
             // these two buffers are also used in RS-overlap (remote put and reduce), so we cannot overwrite these before they are released. 
             auto& comm_singleton = flashmask::comm::singleton();
-            cudaStreamWaitEvent(stream, comm_singleton.send_done);      // wait RS-overlap producer finishing using dk/dv-send
+            comm_singleton.dkv_buffer->wait_buffer(segment_idx, stream);
             cudaStreamWaitEvent(stream, comm_singleton.reduce_done);    // wait RS-overlap producer finishing using dk/dv-send
         }
 #endif  // NVSHMEM_DISTRIBUTED_OVERLAP
@@ -497,7 +498,7 @@ SEGMENT_LOOP_START:
                 cudaMemsetAsync(params.dk_accum_ptr, 0, accum_bytes, stream);
                 cudaMemsetAsync(params.dv_accum_ptr, 0, accum_bytes, stream);
             }
-            updater->inplace_update();
+            mask_ptr_updater->inplace_update();
             goto SEGMENT_LOOP_START;
         }
         // consumer (dKdV reduce) stream will record event for compute stream to wait for

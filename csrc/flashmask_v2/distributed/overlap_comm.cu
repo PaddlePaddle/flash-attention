@@ -18,6 +18,9 @@ static constexpr bool USE_SEMAPHORES = false;           // no team_bar but fine-
 static constexpr bool USE_SPARSE_LARGE_CHUNK = true;
 // whether to use stream coordinator to make sure the scheduling order of comm & comp kernels
 static constexpr bool USE_STREAM_COORD = true;
+// whether to use double buffer for dK, dV SepSRBuffer, either 1 (single) or 2 (double buffer)
+static constexpr int RS_BUFFER_CAPACITY = 1;
+static constexpr int OVERLAP_SM_MARGIN = 0;
 
 // allowed value: [16, 32, 64] (larger number is generally better for KV with larger num_head and higher CP)
 static constexpr int RDMA_ROW_PER_WARP = 64;
@@ -182,11 +185,10 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         if (B > 1) {
             throw std::runtime_error("[RS-overlap] Batch size > 1 is not supported for now.");
         }
-        cudaStreamCreateWithFlags(&aux_p_stream, cudaStreamNonBlocking);
-        cudaStreamCreateWithFlags(&aux_c_stream, cudaStreamNonBlocking);
+        cudaStreamCreateWithPriority(&aux_p_stream, cudaStreamNonBlocking, std::min(greatest_priority + 1, least_priority));
+        cudaStreamCreateWithPriority(&aux_c_stream, cudaStreamNonBlocking, std::min(greatest_priority + 1, least_priority));
         cudaEventCreateWithFlags(&bwd_done, cudaEventDisableTiming);
         cudaEventCreateWithFlags(&reduce_done, cudaEventDisableTiming);
-        cudaEventCreateWithFlags(&send_done, cudaEventDisableTiming);
         if constexpr (USE_STREAM_COORD) {
             // allocate stream coordinator and set the value to 0, so that comp stream will wait until comm stream have set this
             stream_coordinator = block_cnt_semaphore + STREAM_COORD_OFFSET;
@@ -196,9 +198,10 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
             _cp_chunk_size * b_kv,      // single chunk K numel (B * S_local * H * D)
             _total_n_pes,
             num_chunks,
+            RS_BUFFER_CAPACITY,
             cp_team
         );
-        WARN_PRINT("[FlashMask Overlap] Using RS-Overlap!\n");
+        WARN_PRINT("[FlashMask Overlap] Using RS-Overlap, buffer capacity: %d\n", RS_BUFFER_CAPACITY);
     }
     kv_buffer->team_bar();
     // copy to the last position of the SR buffer
@@ -217,7 +220,6 @@ OverlapCommunicator<KVType>::~OverlapCommunicator() {
     if (dkv_buffer) {
         CUDA_DEBUG_CHECK(cudaEventDestroy(bwd_done));
         CUDA_DEBUG_CHECK(cudaEventDestroy(reduce_done));
-        CUDA_DEBUG_CHECK(cudaEventDestroy(send_done));
         CUDA_DEBUG_CHECK(cudaStreamDestroy(aux_p_stream));
         CUDA_DEBUG_CHECK(cudaStreamDestroy(aux_c_stream));
         dkv_buffer->release();
@@ -577,10 +579,10 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
 #define SegmentIdxPutKernelDispatch(_num_chunks, seg_idx)                                       \
 SparseLargeKVChunkRemotePutKernel<KVType, S_chunk, num_warps, RDMA_ROW_PER_WARP, _num_chunks>   \
             <<<num_blocks, num_warps * 32, 0, aux_p_stream>>>(                                  \
-        dkv_buffer->k_send(),                                                                   \
-        dkv_buffer->v_send(),                                                                   \
-        dkv_buffer->k_recv(),                                                                   \
-        dkv_buffer->v_recv(),                                                                   \
+        dkv_buffer->k_send(seg_idx),                                                            \
+        dkv_buffer->v_send(seg_idx),                                                            \
+        dkv_buffer->k_recv(seg_idx),                                                            \
+        dkv_buffer->v_recv(seg_idx),                                                            \
         block_cnt_semaphore + 1,                                                                \
         copy_chunk_mask,                                                                        \
         _my_pe,                                                                                 \
@@ -589,7 +591,7 @@ SparseLargeKVChunkRemotePutKernel<KVType, S_chunk, num_warps, RDMA_ROW_PER_WARP,
         seg_idx,                                                                                \
         B,                                                                                      \
         H * D,                                                                                  \
-        dkv_buffer->semaphores(),                                                               \
+        dkv_buffer->semaphores(seg_idx),                                                        \
         num_segments()                                                                          \
     )
 
@@ -619,9 +621,9 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
     // put their data). Also, notify remote producer after setting local state, so that they won't change our local 
     // state before we've set it, which might cause deadlock hang). After the following function call:
     // local consumer (recv_buffer and reduce kernel) is ready to wait for the buffer to be full
-    dkv_buffer->zero_recv_buf(aux_c_stream);
+    dkv_buffer->zero_recv_buf(segment_idx, aux_c_stream);
     sema::rs::notify_consumer_empty(
-        dkv_buffer->semaphores(),
+        dkv_buffer->semaphores(segment_idx),
         remote_producer_end_rank,
         num_chunks, _cp_size, _my_pe,
         aux_c_stream
@@ -636,28 +638,28 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
 
     // step 3. local producer notifies remote consumer: put done. Can start reduce.
     sema::rs::producer_commit_all(
-        dkv_buffer->semaphores(),
+        dkv_buffer->semaphores(segment_idx),
         remote_consumer_start_rank,
         _cp_size, _my_pe,
         num_chunks,
         aux_p_stream
     );                          // local producer
     // bwd-attn post-process will wait for the following event (release of dk/v send buffer)
-    cudaEventRecord(send_done, aux_p_stream);
+    dkv_buffer->release_buffer(segment_idx, aux_p_stream);
 
     // step 4. the local rank consumer (reduce) wait full (from other remote rank)
     // This actually starts simultaneously with the previous kernels
     sema::rs::consumer_wait_full(
-        dkv_buffer->semaphores(),
+        dkv_buffer->semaphores(segment_idx),
         _my_pe, aux_c_stream
     );                          // local consumer
 
     // step 5. zero-copy reduce
     launch_dk_dv_reduce(
-        dkv_buffer->k_send(),
-        dkv_buffer->v_send(),
-        dkv_buffer->k_recv(),
-        dkv_buffer->v_recv(),
+        dkv_buffer->k_send(segment_idx),
+        dkv_buffer->v_send(segment_idx),
+        dkv_buffer->k_recv(segment_idx),
+        dkv_buffer->v_recv(segment_idx),
         dk_accum, dv_accum,
         B, S_chunk, H, D,
         segment_idx == 0,       // is_first
@@ -690,6 +692,11 @@ int OverlapCommunicator<KVType>::num_segments() const {
     }
 }
 
+template <typename KVType>
+int OverlapCommunicator<KVType>::overlap_sm_margin() const {
+    return dkv_buffer ? OVERLAP_SM_MARGIN : 0;
+}
+
 // returns the team and stride between teams
 template <typename KVType>
 nvshmem_team_t OverlapCommunicator<KVType>::simple_collective_topology_setter(int my_global_pe, int stride, int n_pes) {
@@ -720,7 +727,7 @@ nvshmem_team_t OverlapCommunicator<KVType>::simple_collective_topology_setter(in
 }
 
 template <typename KVType>
-void OverlapCommunicator<KVType>::reset_dkv_semaphores(cudaStream_t stream) {
+void OverlapCommunicator<KVType>::prepare_dkv_buffer(cudaStream_t stream) {
     if (dkv_buffer) {
         dkv_buffer->reset(stream);
     }

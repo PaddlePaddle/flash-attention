@@ -77,8 +77,8 @@ public:
     // we need to reroute the bwd dx_accum output buffer to dk_send and dv_send
     // so that the output of post-proc kernel can be directly sent
     // DO NOT call the following methods, if overlap_rs = false
-    void* dk_send() const { return dkv_buffer->k_send(); }
-    void* dv_send() const { return dkv_buffer->v_send(); }
+    void* dk_send(int seg_idx) const { return dkv_buffer->k_send(seg_idx); }
+    void* dv_send(int seg_idx) const { return dkv_buffer->v_send(seg_idx); }
 
     void wait_reset_stream_coordinator(bool should_wait, cudaStream_t stream);
 
@@ -113,15 +113,13 @@ public:
     int num_segments() const;
     // for RS overlap, returns number of chunks per segment
     int chunk_per_seg() const;
-    void reset_dkv_semaphores(cudaStream_t stream);
+    int overlap_sm_margin() const;
+    void prepare_dkv_buffer(cudaStream_t stream);
 
     // wptr_init: comp_stream notifies comm_stream, write_ptr is usable
     // bwd_done (only when RS-overlap): comp_stream notifies aux_streams, bwd post-proc done
     // reduce_done (only when RS-overlap): aux_c_stream notifies comp_stream, dk/v recv buffer are released and ready 
-    // send_done (only when RS-overlap): aux_p_stream notifies comp_stream, dk/v send buffer are released and ready 
-    cudaEvent_t wptr_init, bwd_done, reduce_done, send_done;
-private:
-    std::unique_ptr<SRBuffer<KVType>> kv_buffer;
+    cudaEvent_t wptr_init, bwd_done, reduce_done;
     /**
      * If overlap_rs is set, dkv_buffer will be populated.
      * and since the fwd AG buffer is always bigger than bwd AG
@@ -129,6 +127,8 @@ private:
      * can be reused (carefully).
     */
     std::unique_ptr<SepSRBuffer<KVType>> dkv_buffer;
+private:
+    std::unique_ptr<SRBuffer<KVType>> kv_buffer;
     cudaStream_t comm_stream;
     cudaStream_t aux_p_stream;      // RS-overlap: producer (put) stream
     cudaStream_t aux_c_stream;      // RS-overlap: consumer (reduce) stream

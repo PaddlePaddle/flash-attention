@@ -621,7 +621,7 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
     // put their data). Also, notify remote producer after setting local state, so that they won't change our local 
     // state before we've set it, which might cause deadlock hang). After the following function call:
     // local consumer (recv_buffer and reduce kernel) is ready to wait for the buffer to be full
-    dkv_buffer->zero_recv_buf(segment_idx, aux_c_stream);
+    if (segment_idx) dkv_buffer->zero_recv_buf(segment_idx, aux_c_stream);
     sema::rs::notify_consumer_empty(
         dkv_buffer->semaphores(segment_idx),
         remote_producer_end_rank,
@@ -633,8 +633,19 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
     if (segment_idx) {
         SegmentIdxPutKernelDispatch(num_chunks, segment_idx);        // local producer
     } else {
+        // local chunk is copied from send to recv buffer using copy engine
+        const int S_stride = H * D;
+        const int batch_stride = num_chunks * S_chunk * S_stride;
+        KVType* const dk_dst = dkv_buffer->k_recv(0), *const dv_dst = dkv_buffer->v_recv(0);
+        const KVType* const dk_src = dkv_buffer->k_send(0), *const dv_src = dkv_buffer->v_send(0);
+        for (int batch_offset = 0, bid = 0; bid < B; bid ++, batch_offset += batch_stride) {
+            cudaMemcpyAsync(dk_dst + batch_offset, dk_src + batch_offset, sizeof(KVType) * S_chunk * S_stride, cudaMemcpyDeviceToDevice, aux_p_stream);
+            cudaMemcpyAsync(dv_dst + batch_offset, dv_src + batch_offset, sizeof(KVType) * S_chunk * S_stride, cudaMemcpyDeviceToDevice, aux_p_stream);
+        }
         SegmentIdxPutKernelDispatch(num_chunks - 1, segment_idx);    // local producer
     }
+    // ensure put (data sending) is completed on aux_p_stream
+    nvshmemx_quiet_on_stream(aux_p_stream);
 
     // step 3. local producer notifies remote consumer: put done. Can start reduce.
     sema::rs::producer_commit_all(
@@ -656,8 +667,6 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
 
     // step 5. zero-copy reduce
     launch_dk_dv_reduce(
-        dkv_buffer->k_send(segment_idx),
-        dkv_buffer->v_send(segment_idx),
         dkv_buffer->k_recv(segment_idx),
         dkv_buffer->v_recv(segment_idx),
         dk_accum, dv_accum,

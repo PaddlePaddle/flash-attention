@@ -23,11 +23,9 @@ __global__ void ProducerNotifyFull(
     int self_rank
 ) {
     const int target_rank = (remote_consumer_start_rank + threadIdx.x) % cp_size;
-    if (target_rank == self_rank) return;
     // quiet make sure the previous put/get on this stream is done, then we can clear bit
-    nvshmem_quiet();
+    if (self_rank == target_rank) return;
     semaphores[target_rank] = 0;        // clear the local status (set by the remote target)
-    // clear remote bit (uint64_t cannot use atomic_add negative values)
     nvshmem_long_atomic_add(semaphores + target_rank, -(1 << self_rank), target_rank);
 }
 
@@ -56,6 +54,22 @@ __global__ void Print16Semaphores(
         semaphores[8], semaphores[9], semaphores[10], semaphores[11],
         semaphores[12], semaphores[13], semaphores[14], semaphores[15]
     );
+}
+
+__global__ void DebugWaitAndResetKernel(
+    int64_t* const volatile semaphores,
+    const int64_t target_value
+) {
+    while (true) {
+        int64_t cur_val;
+        asm volatile("ld.volatile.global.s64 %0, [%1];" 
+             : "=l"(cur_val) 
+             : "l"(semaphores));
+        if (cur_val == target_value) break;
+        // printf("Current: %lx, while target: %lx\n", cur_val, target_value);
+        // __nanosleep(1000000);
+    }
+    *semaphores = 0;
 }
 
 __global__ void PrintWritePtrKernel(
@@ -87,8 +101,7 @@ void notify_consumer_empty(
     for (int i = 0; i < seg_size; i++) {
         int target_rank = remote_producer_end_rank - i;
         target_rank = target_rank >= 0 ? target_rank : target_rank + cp_size;
-        if (target_rank == self_rank) continue;
-        local_flag |= 1 << target_rank;
+        local_flag |= target_rank == self_rank ? 0 : (1 << target_rank);
     }
     // step 1. set self (inform reduce kernel that we haven't got data from other ranks, so we wait)
     SetValueKernel<<<1, 1, 0, comm_stream>>>(semaphores + self_rank, local_flag);

@@ -80,7 +80,17 @@ SepSRBuffer<KVType>::~SepSRBuffer() {
 
 template <typename KVType>
 void SepSRBuffer<KVType>::reset(cudaStream_t comm_stream) {
-    cudaMemsetAsync(_semaphores, 0, sizeof(KVType) * _semaphore_size * (1 + _idx_mask), comm_stream);
+    size_t semaphore_bytes = _semaphore_size * sizeof(int) / sizeof(KVType);
+    size_t recv_buffer_bytes = _buf_offset * sizeof(KVType);
+    // set recv buffer and semaphores to be 0 all at once
+    if (_idx_mask == 0) {
+        cudaMemsetAsync(_k_data + _buf_offset, 0, semaphore_bytes + recv_buffer_bytes, comm_stream);
+    } else {
+        // TODO(heqianyue): which one is better? [K1, V1] [K2, V2] [sema] or [K1, K2] [V1, V2] [sema] ?
+        cudaMemsetAsync(_k_data + _buf_offset, 0, recv_buffer_bytes, comm_stream);
+        // the second buffer: recv buffer is contiguous to semaphores
+        cudaMemsetAsync(_k_data + 3 * _buf_offset, 0, recv_buffer_bytes + 2 * semaphore_bytes, comm_stream);
+    }
 }
 
 template <typename KVType>

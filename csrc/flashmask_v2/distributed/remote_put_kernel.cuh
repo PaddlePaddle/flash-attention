@@ -50,10 +50,20 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 
     const int total_works = num_batch * (work_per_chunk * num_chunk);
     const int batch_stride = S_chunk * r2_num_chunk * S_stride;         // use rounded chunk to compute batch_stride
+
+    extern __shared__ int smem_chunk_mask[];
     __shared__ int cached_empty[r2_num_chunk];
     __shared__ int next_work_id;
-    if (threadIdx.x < r2_num_chunk) {
-        cached_empty[threadIdx.x] = 0;
+
+    if (threadIdx.x < total_works) {
+        // copies everything, even the chunk mask of the local chunk
+        const int batch_id = threadIdx.x / (work_per_chunk * num_chunk);
+        constexpr int start_offset = chunk_offset * work_per_chunk;
+        auto* src_ptr = copy_chunk_mask + (segment_idx + batch_id * num_segments) * r2_num_chunk * work_per_chunk + threadIdx.x;
+        smem_chunk_mask[batch_id * num_chunk * work_per_chunk + start_offset + threadIdx.x] = *(src_ptr + start_offset);
+        if (threadIdx.x < r2_num_chunk) {
+            cached_empty[threadIdx.x] = 0;
+        }
     }
     __syncthreads();
 
@@ -90,9 +100,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 
         // Note(heqianyue): this copy_chunk_mask is computed without sharding. Therefore we need to compute
         // the correct index, considering the stride of the full seqlen_k
-        int mask_index = seq_work_id + work_per_chunk * (seg_chunk_id + r2_num_chunk * (segment_idx + batch_id * num_segments));
+        int mask_index = seq_work_id + work_per_chunk * (seg_chunk_id + num_chunk * batch_id);
 
-        if (copy_chunk_mask[mask_index]) {
+        if (smem_chunk_mask[mask_index]) {
             // __syncthreads() here is necessary: in case some of the warp haven't updated
             // the work_id and warp 0 overwrites next_work_id first, which will be bad.
             __syncthreads();

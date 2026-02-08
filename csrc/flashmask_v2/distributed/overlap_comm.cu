@@ -576,23 +576,24 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
 #undef SeqlenDispatchSplitted
 #undef SeqlenCase
 
-#define SegmentIdxPutKernelDispatch(_num_chunks, seg_idx)                                       \
-SparseLargeKVChunkRemotePutKernel<KVType, S_chunk, num_warps, RDMA_ROW_PER_WARP, _num_chunks>   \
-            <<<num_blocks, num_warps * 32, 0, aux_p_stream>>>(                                  \
-        dkv_buffer->k_send(seg_idx),                                                            \
-        dkv_buffer->v_send(seg_idx),                                                            \
-        dkv_buffer->k_recv(seg_idx),                                                            \
-        dkv_buffer->v_recv(seg_idx),                                                            \
-        block_cnt_semaphore + 1,                                                                \
-        copy_chunk_mask,                                                                        \
-        _my_pe,                                                                                 \
-        remote_consumer_start_rank,                                                             \
-        _total_n_pes,                                                                           \
-        seg_idx,                                                                                \
-        B,                                                                                      \
-        H * D,                                                                                  \
-        dkv_buffer->semaphores(seg_idx),                                                        \
-        num_segments()                                                                          \
+#define SegmentIdxPutKernelDispatch(_num_chunks, seg_idx)                   \
+SparseLargeKVChunkRemotePutKernel<KVType, S_chunk, num_warps,               \
+            RDMA_ROW_PER_WARP, _num_chunks>                                 \
+            <<<num_blocks, num_warps * 32, dynamic_smem, aux_p_stream>>>(   \
+        dkv_buffer->k_send(seg_idx),                                        \
+        dkv_buffer->v_send(seg_idx),                                        \
+        dkv_buffer->k_recv(seg_idx),                                        \
+        dkv_buffer->v_recv(seg_idx),                                        \
+        block_cnt_semaphore + 1,                                            \
+        copy_chunk_mask,                                                    \
+        _my_pe,                                                             \
+        remote_consumer_start_rank,                                         \
+        _total_n_pes,                                                       \
+        seg_idx,                                                            \
+        B,                                                                  \
+        H * D,                                                              \
+        dkv_buffer->semaphores(seg_idx),                                    \
+        num_segments()                                                      \
     )
 
 template <typename KVType>
@@ -630,6 +631,7 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
     );                          // local consumer
 
     // step 2. local producer (put) wait empty (in the kernel) and start remote_put
+    const int dynamic_smem = B * sizeof(int) * S_chunk * num_chunks / (num_warps * RDMA_ROW_PER_WARP);
     if (segment_idx) {
         SegmentIdxPutKernelDispatch(num_chunks, segment_idx);        // local producer
     } else {

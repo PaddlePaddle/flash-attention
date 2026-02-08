@@ -80,7 +80,7 @@ SepSRBuffer<KVType>::~SepSRBuffer() {
 
 template <typename KVType>
 void SepSRBuffer<KVType>::reset(cudaStream_t comm_stream) {
-    size_t semaphore_bytes = _semaphore_size * sizeof(int) / sizeof(KVType);
+    size_t semaphore_bytes = _semaphore_size * sizeof(SemaphoreType);
     size_t recv_buffer_bytes = _buf_offset * sizeof(KVType);
     // set recv buffer and semaphores to be 0 all at once
     if (_idx_mask == 0) {

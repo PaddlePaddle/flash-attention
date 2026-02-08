@@ -43,19 +43,6 @@ __global__ void ConsumerNotifyEmpty(
     nvshmem_int64_p(semaphores + self_rank, 1, target_rank);
 }
 
-__global__ void Print16Semaphores(
-    int64_t* const semaphores,
-    int self_rank
-) {
-    printf("rank %d: [%lx, %lx, %lx, %lx], [%lx, %lx, %lx, %lx], [%lx, %lx, %lx, %lx], [%lx, %lx, %lx, %lx]\n", 
-        self_rank,
-        semaphores[0], semaphores[1], semaphores[2], semaphores[3],
-        semaphores[4], semaphores[5], semaphores[6], semaphores[7],
-        semaphores[8], semaphores[9], semaphores[10], semaphores[11],
-        semaphores[12], semaphores[13], semaphores[14], semaphores[15]
-    );
-}
-
 __global__ void DebugWaitAndResetKernel(
     int64_t* const volatile semaphores,
     const int64_t target_value
@@ -70,21 +57,6 @@ __global__ void DebugWaitAndResetKernel(
         // __nanosleep(1000000);
     }
     *semaphores = 0;
-}
-
-__global__ void PrintWritePtrKernel(
-    int* const wptr,
-    int self_rank
-) {
-    printf("rank %d: debug print wptr: %d, int max is: %d\n", self_rank, wptr[0], INT_MAX);
-}
-
-void debug_print_semaphore(
-    int64_t* const semaphores,
-    int self_rank,
-    cudaStream_t comm_stream
-) {
-    Print16Semaphores<<<1, 1, 0, comm_stream>>>(semaphores, self_rank);
 }
 
 // [local consumer (dk dv reducer and recv buffer)] sends out an empty 
@@ -126,19 +98,6 @@ void producer_commit_all(
 ) {
     ProducerNotifyFull<<<1, chunks_per_seg, 0, comm_stream>>>(
         semaphores, remote_consumer_start_rank, cp_size, self_rank);
-}
-
-// self rank notifies one specified consumer that needs dK, dV data 
-// from the local rank that the data is ready (sent)
-void producer_commit_one(
-    int64_t* const semaphores,
-    int target_rank,
-    int cp_size,
-    int self_rank,
-    cudaStream_t comm_stream
-) {
-    ProducerNotifyFull<<<1, 1, 0, comm_stream>>>(
-        semaphores, target_rank, cp_size, self_rank);
 }
 
 /**

@@ -93,17 +93,6 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     // printf("point2\n");
     CHECK_CUDA_KERNEL_LAUNCH();
 
-    auto call_preprocess_without_cleanup = [&](int seg_idx) {
-        // split calls do not clear dQ accum
-        using PreprocessKernelSplit = flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, ArchTag, /*Clear_dQaccum=*/false, Varlen>;
-        MakePreprocessKernelArgs(PreprocessKernelSplit, split_args);
-        typename PreprocessKernelSplit::Params split_params = PreprocessKernelSplit::to_underlying_arguments(split_args);
-        flash::flashmask_kernel_launch<PreprocessKernelSplit>(grid_m, PreprocessKernelSplit::MaxThreadsPerBlock,
-                        PreprocessKernelSplit::SharedStorageSize, stream, split_params, false /*launch_with_pdl*/);
-        CHECK_CUDA(cudaGetLastError());
-        CHECK_CUDA_KERNEL_LAUNCH();
-    };  
-
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<_1, Int<1>, _1>;  // Currently doesn't not support cluster
     // Stages_dS_or_QSm80 is Stages_dS if Sm90 and Stages if Sm80
@@ -212,11 +201,12 @@ SEGMENT_LOOP_START:
         flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream, false /* is_forward */, segment_cnt);
     } else {
         // reset grad semaphores, otherwise the program will hang
-        call_preprocess_without_cleanup(segment_idx);
         if constexpr (Deterministic) {
-            size_t total_bytes = (params.seqlen_k + kBlockN - 1) / kBlockN * params.b * params.h_k * sizeof(int);
-            cudaMemsetAsync(params.dk_semaphore, 0, total_bytes, stream);
-            cudaMemsetAsync(params.dv_semaphore, 0, total_bytes, stream);
+            size_t total_q_bytes = (seqlen_q + kBlockM - 1) / kBlockM * params.b * params.h * sizeof(int);
+            cudaMemsetAsync(params.dq_semaphore, 0, total_q_bytes, stream);
+            size_t total_kv_bytes = (params.seqlen_k + kBlockN - 1) / kBlockN * params.b * params.h_k * sizeof(int);
+            cudaMemsetAsync(params.dk_semaphore, 0, total_kv_bytes, stream);
+            cudaMemsetAsync(params.dv_semaphore, 0, total_kv_bytes, stream);
         }
     }
 
@@ -467,7 +457,6 @@ SEGMENT_LOOP_START:
             // these two buffers are also used in RS-overlap (remote put and reduce), so we cannot overwrite these before they are released. 
             auto& comm_singleton = flashmask::comm::singleton();
             comm_singleton.dkv_buffer->wait_buffer(segment_idx, stream);
-            cudaStreamWaitEvent(stream, comm_singleton.reduce_done);    // wait RS-overlap producer finishing using dk/dv-send
         }
 #endif  // NVSHMEM_DISTRIBUTED_OVERLAP
         flash::flashmask_kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/);
@@ -502,7 +491,7 @@ SEGMENT_LOOP_START:
             goto SEGMENT_LOOP_START;
         }
         // consumer (dKdV reduce) stream will record event for compute stream to wait for
-        cudaStreamWaitEvent(stream, comm_singleton.reduce_done);
+        comm_singleton.wait_reduce_done(stream);
     }
 #endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 }

@@ -680,7 +680,6 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
     WARN_PRINT_SYNC(aux_c_stream, "(%d) After run_overlap_rs_kernel.\n", _my_pe);
     // the next post process should wait for the current reduce to be done
     // otherwise, the local dk/v_send will risk being overwritten by the next post-process
-    cudaEventRecord(reduce_done, aux_c_stream);
 }
 
 #undef SegmentIdxPutKernelDispatch
@@ -742,6 +741,23 @@ void OverlapCommunicator<KVType>::prepare_dkv_buffer(cudaStream_t stream) {
     if (dkv_buffer) {
         dkv_buffer->reset(stream);
     }
+}
+
+template <typename KVType>
+void OverlapCommunicator<KVType>::reset_recv_status(
+    int segment_idx
+) { // local consumer behavior
+    // Note(heqianyue): remote_producer: who is putting data to us. 
+    // for remote producer, it is easier to compute the last rank.
+
+    dkv_buffer->zero_recv_buf(segment_idx, aux_c_stream);
+    const int remote_producer_end_rank = (_my_pe - num_chunks * segment_idx) % _total_n_pes;
+    sema::rs::notify_consumer_empty(
+        dkv_buffer->semaphores(segment_idx),
+        remote_producer_end_rank,
+        num_chunks, _cp_size, _my_pe,
+        aux_c_stream
+    );                          
 }
 
 // explicit instantiation and singleton management

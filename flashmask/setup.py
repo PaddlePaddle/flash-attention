@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from setuptools import setup, find_packages
+from setuptools import find_packages
+from paddle.utils.cpp_extension import CUDAExtension, setup
+
+import os
+# lib_dir = os.path.abspath('flash_mask/build')
+lib_dir = '/usr/local/lib/python3.10/dist-packages/paddle/libs/'
 
 setup(
     name='flash_mask',
@@ -26,4 +31,29 @@ setup(
         'typing_extensions',
     ],
     python_requires='>=3.10',
+    ext_modules=[
+        CUDAExtension(
+            # [BQW_CHANGE] 保持原始名称 'flash_mask'，Paddle 会自动生成 flash_mask_pd_.so
+            name='flash_mask',
+            sources=[
+                'flash_mask/flashmask_attention_v3/csrc/flashmask_v3.cpp',
+                'flash_mask/flashmask_attention_v3/csrc/flashmask_v3_kernel.cu',
+                # [BQW_CHANGE] 启用 flash_attn_v3_utils.cu 编译 (之前被注释掉导致链接错误)
+                'flash_mask/flashmask_attention_v3/csrc/flash_attn_v3_utils.cu',
+            ],
+            # [BQW_CHANGE] 添加 include 目录，确保头文件能正确找到
+            include_dirs=[
+                'flash_mask/flashmask_attention_v3/csrc',
+                'flash_mask/flashmask_attention_v3',
+            ],
+            library_dirs=[lib_dir],
+            libraries=['flashmaskv2'],
+            extra_compile_args={
+                'nvcc': ['-gencode', 'arch=compute_90,code=sm_90', '-O3', '-DPADDLE_WITH_FLASHATTN_V3=1'],
+                'cxx': ['-O3', '-DPADDLE_WITH_FLASHATTN_V3=1'],
+            },
+            # [BQW_CHANGE] 添加 rpath，确保运行时能找到 libflashmaskv2.so
+            extra_link_args=['-Wl,-rpath,' + lib_dir],
+        )
+    ]
 )

@@ -201,9 +201,9 @@ SEGMENT_LOOP_START:
         flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream, false /* is_forward */, segment_cnt);
     } else {
         // reset grad semaphores, otherwise the program will hang
+        size_t total_q_bytes = (seqlen_q + kBlockM - 1) / kBlockM * params.b * params.h * sizeof(int);
+        cudaMemsetAsync(params.dq_semaphore, 0, total_q_bytes, stream);
         if constexpr (Deterministic) {
-            size_t total_q_bytes = (seqlen_q + kBlockM - 1) / kBlockM * params.b * params.h * sizeof(int);
-            cudaMemsetAsync(params.dq_semaphore, 0, total_q_bytes, stream);
             size_t total_kv_bytes = (params.seqlen_k + kBlockN - 1) / kBlockN * params.b * params.h_k * sizeof(int);
             cudaMemsetAsync(params.dk_semaphore, 0, total_kv_bytes, stream);
             cudaMemsetAsync(params.dv_semaphore, 0, total_kv_bytes, stream);

@@ -335,21 +335,21 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                     )
 
 
-#define SparseLargeChunkKernel(_S, KernelTraits, bwd)                               \
-    SparseLargeKVChunkRemoteGet##KernelTraits##Kernel<KVType, _S, S_chunk,          \
-        num_warps, RDMA_ROW_PER_WARP, USE_SEMAPHORES, bwd>                          \
-        <<<num_blocks, num_warps * 32, 0, comm_stream>>>(                           \
-                        kv_buffer->k_data(),                                        \
-                        kv_buffer->v_data(),                                        \
-                        write_ptr,                                                  \
-                        block_work_ids,                                             \
-                        block_cnt_semaphore,                                        \
-                        copy_chunk_mask,                                            \
-                        _my_pe,                                                     \
-                        _total_n_pes,                                               \
-                        B,                                                          \
-                        H * D,                                                      \
-                        kv_buffer->semaphores()                                     \
+#define SparseLargeChunkKernel(_S, KernelTraits, bwd)                       \
+    SparseLargeKVChunkRemoteGet##KernelTraits##Kernel<KVType, _S, S_chunk,  \
+        num_warps, RDMA_ROW_PER_WARP, USE_SEMAPHORES, bwd>                  \
+        <<<num_blocks, num_warps * 32, 0, comm_stream>>>(                   \
+                        kv_buffer->k_data(),                                \
+                        kv_buffer->v_data(),                                \
+                        write_ptr,                                          \
+                        block_work_ids,                                     \
+                        block_cnt_semaphore,                                \
+                        copy_chunk_mask,                                    \
+                        _my_pe,                                             \
+                        _total_n_pes,                                       \
+                        B,                                                  \
+                        H * D,                                              \
+                        kv_buffer->semaphores()                             \
                     )
 
 #define FewHeadKernel(_S, KernelTraits)                                             \
@@ -510,23 +510,24 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
 #undef FewHeadKernel
 #undef MultiHeadKernel
 
-#define SparseLargeChunkSplittedKernel(start_rank, seg_idx, num_chunk, num_segments)\
-    SparseLargeKVChunkSplittedRemoteGetKernel<KVType, S_chunk,                      \
-        num_warps, RDMA_ROW_PER_WARP, num_chunk, USE_STREAM_COORD>                  \
-        <<<num_blocks, num_warps * 32, 0, comm_stream>>>(                           \
-                        kv_buffer->k_data(),                                        \
-                        kv_buffer->v_data(),                                        \
-                        write_ptr,                                                  \
-                        block_work_ids,                                             \
-                        block_cnt_semaphore,                                        \
-                        stream_coordinator,                                         \
-                        copy_chunk_mask,                                            \
-                        start_rank,                                                 \
-                        seg_idx,                                                    \
-                        _total_n_pes,                                               \
-                        B,                                                          \
-                        H * D,                                                      \
-                        num_segments                                                \
+#define SparseLargeChunkSplittedKernel(start_rank, seg_idx, num_chunk, num_segs, smem_bytes)\
+    SparseLargeKVChunkSplittedRemoteGetKernel<KVType, S_chunk,                              \
+        num_warps, RDMA_ROW_PER_WARP, num_chunk, USE_STREAM_COORD, USE_SEMAPHORES>          \
+        <<<num_blocks, num_warps * 32, smem_bytes, comm_stream>>>(                          \
+                        kv_buffer->k_data(),                                                \
+                        kv_buffer->v_data(),                                                \
+                        write_ptr,                                                          \
+                        block_work_ids,                                                     \
+                        block_cnt_semaphore,                                                \
+                        stream_coordinator,                                                 \
+                        copy_chunk_mask,                                                    \
+                        start_rank,                                                         \
+                        seg_idx,                                                            \
+                        _total_n_pes,                                                       \
+                        B,                                                                  \
+                        H * D,                                                              \
+                        num_segs,                                                           \
+                        kv_buffer->semaphores()                                             \
                     )
 
 #define SeqlenDispatchSplitted(MACRO_FUNC, _S, ...)         \
@@ -556,19 +557,26 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
     }
     S = S_local * num_chunks;
     int start_pe = (_my_pe + segment_idx * num_chunks) % _total_n_pes;
-    int num_segments = _cp_size / num_chunks;
+    int num_segs = _cp_size / num_chunks;
+    const int mask_smem_bytes = B * sizeof(int) * num_chunks * S_chunk / (num_warps * RDMA_ROW_PER_WARP);
     if (segment_idx) {
         cudaMemsetAsync(block_work_ids, 0, sizeof(int) * num_blocks, comm_stream);
-        SeqlenDispatchSplitted(SparseLargeChunkSplittedKernel, S, start_pe, segment_idx, num_chunks, num_segments);
+        SeqlenDispatchSplitted(SparseLargeChunkSplittedKernel, S, start_pe, segment_idx, num_chunks, num_segs, mask_smem_bytes);
     } else {
         constexpr int work_to_skip = S_chunk / (num_warps * RDMA_ROW_PER_WARP);
         sema::rs::SetValueKernel<<<1, num_blocks, 0, comm_stream>>>(block_work_ids, work_to_skip);
-        SeqlenDispatchSplitted(SparseLargeChunkSplittedKernel, S, start_pe, segment_idx, num_chunks - 1, num_segments);
+        SeqlenDispatchSplitted(SparseLargeChunkSplittedKernel, S, start_pe, segment_idx, num_chunks - 1, num_segs, mask_smem_bytes);
     }
 
-    // TODO(heqianyue): support AG semaphores for this kernel and delete this
     if constexpr (USE_SEMAPHORES) {
-        printf("Warning: Splitted AG does not support semaphore ops yet.\n");
+        WARN_PRINT("Before notify_all_empty kernel (split AG)\n");
+        sema::ag::notify_all_empty(
+            kv_buffer->semaphores(),
+            _my_pe,
+            _total_n_pes,
+            comm_stream
+        );
+        WARN_PRINT_SYNC(comm_stream, "After notify_all_empty kernel (split AG)\n");
     }
     WARN_PRINT_SYNC(comm_stream, "(%d) After run_overlap_splitted_ag_kernel, segment: %d\n", _my_pe, segment_idx);
 }

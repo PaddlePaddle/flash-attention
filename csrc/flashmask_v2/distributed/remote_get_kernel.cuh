@@ -533,7 +533,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes; 
         }
         if constexpr (use_semaphore) {
-            if ((threadIdx.x & 31) == 0 && cached_semaphores[remote_pe] == 0) {
+            if (threadIdx.x == 0 && cached_semaphores[remote_pe] == 0) {
                 sema::ag::wait_full(semaphores, remote_pe);
                 cached_semaphores[remote_pe] = 1;
                 // no need to sync, since `two_buffers_getmem_<scope>` will sync 
@@ -562,7 +562,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 // the local read ptr is exceeded by the write ptr and load KV can procede if true. Therefore, we can choose to
 // start the AG-overlap kernel (non-splitted version) just once at the beginning of the BWD kernel. We only need to
 // inform the bwd kernel one more thing: what is the current segment ID? For now, use the splitted version.
-template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunks=4, bool use_stream_coord=false>
+template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunks=4, bool use_stream_coord=false, bool use_semaphore=false>
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkSplittedRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
@@ -576,7 +576,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int total_n_pes,
     const int num_batch,                // B
     const int S_stride,                 // H * D
-    const int num_segments = 4
+    const int num_segments = 4,
+    const int64_t* const __restrict__ semaphores = nullptr
 ) {
     if constexpr (use_stream_coord) {
         // notify computation stream that one of the CTAs for communication kernel is running
@@ -597,8 +598,23 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int total_works = num_batch * work_per_seg;
     // this batch_stride is the segment batch stride, not full (num_segs * segment_size) batch stride
     const int batch_stride = S * S_stride;
-    
+
+    extern __shared__ int smem_chunk_mask[];
+    __shared__ int cached_semaphores[16];
     __shared__ int next_work_id;
+
+    if (threadIdx.x < total_works) {
+        // global address to local segment address. total_works are usually small (<128), no need for vectorization
+        const int batch_id = threadIdx.x / work_per_seg;
+        auto* src_ptr = copy_chunk_mask + (segment_idx + batch_id * num_segments) * work_per_seg + threadIdx.x;
+        smem_chunk_mask[batch_id * work_per_seg + threadIdx.x] = *src_ptr;
+    }
+
+    if constexpr (use_semaphore) {
+        if (threadIdx.x < total_n_pes) {
+            cached_semaphores[threadIdx.x] = 0;
+        }
+    }
 
     // block_cnt_semaphore starts from 1, and we can offset it
     auto update_wptr_and_work_id_sync = [&](int wid) {
@@ -634,11 +650,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         const int work_id_m1 = work_id - 1;
         const int batch_id = work_id_m1 / work_per_seg;
         const int seq_work_id = work_id_m1 % work_per_seg;
-        // within_segment_offset + segment_offset + batch_offset
-        int mask_index = seq_work_id + work_per_seg * (segment_idx + batch_id * num_segments);
         // if there is local_chunk and B > 1, we might have some of the 
         // work to be skipped (due to being local) directly.
-        if (seq_work_id < work_to_skip || copy_chunk_mask[mask_index]) {
+        if (seq_work_id < work_to_skip || smem_chunk_mask[seq_work_id + work_per_seg * batch_id]) {
             __syncthreads();
             work_id = update_wptr_and_work_id_sync(work_id);
             continue;
@@ -647,6 +661,14 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         int seqlen_id = seq_work_id * row_per_block;
         int remote_pe = start_rank + seqlen_id / S_chunk;
         remote_pe = remote_pe < total_n_pes ? remote_pe : remote_pe - total_n_pes;
+
+        if constexpr (use_semaphore) {
+            if (threadIdx.x == 0 && cached_semaphores[remote_pe] == 0) {
+                sema::ag::wait_full(semaphores, remote_pe);
+                cached_semaphores[remote_pe] = 1;
+                // no need to sync, since `two_buffers_getmem_<scope>` will sync 
+            }
+        }
 
         // copy upto 4 heads (S_stride = H * D), and row_per_block rows (seqlen axis) per CTA
         const int src_addr = batch_id * batch_stride + (seqlen_id % S_chunk) * S_stride;

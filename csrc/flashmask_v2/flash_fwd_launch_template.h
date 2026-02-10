@@ -143,6 +143,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         comm_singleton.wait_wptr_init();        // wait until wptr is initialized
         // TODO(heqianyue): add more mask type support
         comm_singleton.run_overlap_ag_kernel(params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k);
+        // Note(heqianyue): if we don't use a cudaStreamSync at the end of update_kv_buffer, for team_bar
+        // the comm_stream itself might get blocked so comp_stream will load all the CTAs on the SMs, causing a deadlock.
+        // This is also true for semaphore syncs: we cannot take the risks of SMs being fully occupied.
+        // So no matter what, in this circumstance we need to make sure comm kernels occupies part of the SMs first.
+        comm_singleton.wait_reset_stream_coordinator(stream);
         params.k_batch_stride *= params.cp_size;
         params.v_batch_stride *= params.cp_size;
         // `run_overlap_ag_kernel` is async. Then, re-route the KV data to the nvshmem_alloc SR buffer.

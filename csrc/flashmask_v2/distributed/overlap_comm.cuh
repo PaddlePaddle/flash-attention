@@ -80,7 +80,7 @@ public:
     void* dk_send(int seg_idx) const { return dkv_buffer->k_send(seg_idx); }
     void* dv_send(int seg_idx) const { return dkv_buffer->v_send(seg_idx); }
 
-    void wait_reset_stream_coordinator(bool should_wait, cudaStream_t stream);
+    void wait_reset_stream_coordinator(cudaStream_t stream);
 
     void update_kv_buffer(
         const KVType* const new_k_data,

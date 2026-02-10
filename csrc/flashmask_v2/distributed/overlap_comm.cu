@@ -24,7 +24,7 @@ static constexpr int OVERLAP_SM_MARGIN = 0;
 
 // allowed value: [16, 32, 64] (larger number is generally better for KV with larger num_head and higher CP)
 static constexpr int RDMA_ROW_PER_WARP = 64;
-static constexpr int STREAM_COORD_OFFSET = 2;   // 0 means stream coordinator is off, 2 by default.
+static constexpr int STREAM_COORD_OFFSET = USE_STREAM_COORD ? 2 : 0;   // do not adjust the value if you don't know what ur doing
 
 // allowed value: 16 or 8 (16 warps are generally better for KV with larger num_head and higher CP)
 static constexpr int num_warps = 16;    // making the grid larger is generally better
@@ -177,8 +177,14 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (num_blocks + num_copy_chunks + 4), comm_stream));
         copy_chunk_mask = block_work_ids + num_blocks;
         block_cnt_semaphore = copy_chunk_mask + num_copy_chunks;
+        stream_coordinator = block_cnt_semaphore + STREAM_COORD_OFFSET;
     } else {
         CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (num_blocks + 4), comm_stream));    // +4 for stream coordinator and padding
+        stream_coordinator = block_work_ids + num_blocks + STREAM_COORD_OFFSET;
+    }
+    if constexpr (USE_STREAM_COORD) {
+        // allocate stream coordinator and set the value to 0, so that comp stream will wait until comm stream have set this
+        cudaMemsetAsync(stream_coordinator, 0, sizeof(int), comm_stream);
     }
     if (overlap_rs) {
         // auxilary stream for RS-overlap (for used in reduce)
@@ -189,11 +195,6 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         cudaStreamCreateWithPriority(&aux_c_stream, cudaStreamNonBlocking, std::min(greatest_priority + 1, least_priority));
         cudaEventCreateWithFlags(&bwd_done, cudaEventDisableTiming);
         cudaEventCreateWithFlags(&reduce_done, cudaEventDisableTiming);
-        if constexpr (USE_STREAM_COORD) {
-            // allocate stream coordinator and set the value to 0, so that comp stream will wait until comm stream have set this
-            stream_coordinator = block_cnt_semaphore + STREAM_COORD_OFFSET;
-            cudaMemsetAsync(stream_coordinator, 0, sizeof(int), comm_stream);
-        }
         dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
             _cp_chunk_size * b_kv,      // single chunk K numel (B * S_local * H * D)
             _total_n_pes,
@@ -234,26 +235,24 @@ void OverlapCommunicator<KVType>::wait_wptr_init() {
     cudaStreamWaitEvent(comm_stream, wptr_init);
 }
 
+__global__ void WaitAndResetStreamCoordKernel(
+    int* const stream_coordinator
+) {
+    do {
+        int old_wptr_val = 0;
+        asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(old_wptr_val) : "l"(stream_coordinator));
+        if (old_wptr_val == 0xffffffff) break;
+        __nanosleep(10);
+    } while (true);
+    *stream_coordinator = 0;
+    __threadfence();
+}
+
 template <typename KVType>
-void OverlapCommunicator<KVType>::wait_reset_stream_coordinator(bool should_wait, cudaStream_t stream) {
+void OverlapCommunicator<KVType>::wait_reset_stream_coordinator(cudaStream_t stream) {
     static_assert(num_blocks <= 32, "To correctly use stream coordinator, num CTAs for comm kernels cannot exceed 32.");
     if constexpr (USE_STREAM_COORD) {
-        if (dkv_buffer && should_wait) {
-            CUdeviceptr sc_ptr = (CUdeviceptr)stream_coordinator;
-            cuStreamWaitValue32(
-                stream, 
-                sc_ptr, 
-                0xffffffff,             // wait until all bits are 1: all comm CTAs are on
-                CU_STREAM_WAIT_VALUE_EQ
-            );
-
-            cuStreamWriteValue32(       // reset immediately
-                stream, 
-                sc_ptr, 
-                0, 
-                CU_STREAM_WRITE_VALUE_DEFAULT
-            );
-        }
+        WaitAndResetStreamCoordKernel<<<1, 1, 0, stream>>>(stream_coordinator);
     }
 }
 
@@ -303,6 +302,7 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                                 comm_stream));
     }
     if constexpr (USE_SEMAPHORES) {
+        nvshmemx_quiet_on_stream(comm_stream);
         // notify all other PEs that the local data is ready (1. set self to be `total_pes - 1`. 2. broadcast to other PEs)
         sema::ag::notify_full(
             kv_buffer->semaphores(),
@@ -314,8 +314,11 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
         // this can be slow if the pace difference of PEs is large  
         kv_buffer->team_bar_on_stream(comm_stream);
     }
-    // sync, otherwise it might hang unexceptedly
-    CUDA_DEBUG_CHECK(cudaStreamSynchronize(comm_stream));
+    if constexpr (!USE_STREAM_COORD) {
+        // sync, otherwise it might hang unexceptedly. The culprit is that computation CTAs
+        // are scheduled before communication kernels, occupying all the SMs, causing deadlock.
+        CUDA_DEBUG_CHECK(cudaStreamSynchronize(comm_stream));
+    }
     WARN_PRINT("After cudaMemcpyAsync and notify full\n");
 }
 
@@ -335,15 +338,16 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                     )
 
 
-#define SparseLargeChunkKernel(_S, KernelTraits, bwd)                       \
-    SparseLargeKVChunkRemoteGet##KernelTraits##Kernel<KVType, _S, S_chunk,  \
-        num_warps, RDMA_ROW_PER_WARP, USE_SEMAPHORES, bwd>                  \
+#define SparseLargeChunkKernel(_S, bwd)                                     \
+    SparseLargeKVChunkRemoteGetKernel<KVType, _S, S_chunk,                  \
+        num_warps, RDMA_ROW_PER_WARP, USE_STREAM_COORD, USE_SEMAPHORES, bwd>\
         <<<num_blocks, num_warps * 32, 0, comm_stream>>>(                   \
                         kv_buffer->k_data(),                                \
                         kv_buffer->v_data(),                                \
                         write_ptr,                                          \
                         block_work_ids,                                     \
                         block_cnt_semaphore,                                \
+                        stream_coordinator,                                 \
                         copy_chunk_mask,                                    \
                         _my_pe,                                             \
                         _total_n_pes,                                       \
@@ -383,7 +387,6 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     }
 
 // can be adjust to use non-specialized version
-#define KernelTrait
 #define BlockChunkKernelTrait Specialized
 #define FwdKernelTrait Specialized
 #define BwdKernelTrait SpecializedBwd
@@ -471,9 +474,9 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
     // make sure the head of KV is no more than 4. Multi-head kernels are removed temporarily.
     if constexpr (USE_SPARSE_LARGE_CHUNK) {
         if (fwd) {
-            SeqlenDispatch(SparseLargeChunkKernel, S, KernelTrait, false);
+            SeqlenDispatch(SparseLargeChunkKernel, S, false);
         } else {
-            SeqlenDispatch(SparseLargeChunkKernel, S, KernelTrait, true);
+            SeqlenDispatch(SparseLargeChunkKernel, S, true);
         }
     } else {
         if constexpr (USE_DENSE_COPY) {
@@ -512,7 +515,7 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
 
 #define SparseLargeChunkSplittedKernel(start_rank, seg_idx, num_chunk, num_segs, smem_bytes)\
     SparseLargeKVChunkSplittedRemoteGetKernel<KVType, S_chunk,                              \
-        num_warps, RDMA_ROW_PER_WARP, num_chunk, USE_STREAM_COORD, USE_SEMAPHORES>          \
+        num_warps, RDMA_ROW_PER_WARP, num_chunk, USE_STREAM_COORD, false>                   \
         <<<num_blocks, num_warps * 32, smem_bytes, comm_stream>>>(                          \
                         kv_buffer->k_data(),                                                \
                         kv_buffer->v_data(),                                                \

@@ -183,12 +183,12 @@ SEGMENT_LOOP_START:
             params.k_ptr = comm_singleton.k_data(segment_idx ? 1 : 0);
             params.v_ptr = comm_singleton.v_data(segment_idx ? 1 : 0);
             // make sure computation kernels are scheduled with SMs later than communication kernels
-            comm_singleton.wait_reset_stream_coordinator(segment_idx > 0, stream);
         } else {
             comm_singleton.run_overlap_ag_kernel(
                 params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k, false /*fwd*/
             );
         }
+        comm_singleton.wait_reset_stream_coordinator(stream);
     }
 #else
     if constexpr (Arch >= 90) {

@@ -449,13 +449,14 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityC
  *  load-imbalance for this communication kernel (which is crucial to overlap performance), a chunk-cnt semaphore
  *  is used so every CTA use atomic op to get a chunk ID to process.
 */
-template <typename T, int S, int S_chunk, int num_warps=8, int row_per_warp=32, bool use_semaphore=false, bool bwd=false>
+template <typename T, int S, int S_chunk, int num_warps=8, int row_per_warp=32, bool use_stream_coord=false, bool use_semaphore=false, bool bwd=false>
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,
     int* const __restrict__ block_work_idx,
     int* const __restrict__ block_cnt_semaphore,      // for dynamic scheduling
+    int* const __restrict__ stream_coordinator,
     const int* const __restrict__ copy_chunk_mask,
     const int my_pe,
     const int total_n_pes,
@@ -463,6 +464,10 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int S_stride,                 // H * D
     const int64_t* const __restrict__ semaphores = nullptr
 ) {
+    if constexpr (use_stream_coord) {
+        // notify computation stream that one of the CTAs for communication kernel is running
+        if (threadIdx.x == 0) atomicOr(stream_coordinator, 1 << blockIdx.x);
+    }
     constexpr int row_per_block = num_warps * row_per_warp;     // 256 or 512 row per block (32 or 64 per warp)
     constexpr int seqlen_offset = bwd ? 0 : (S - S_chunk);
     constexpr int chunk_per_batch = (S - S_chunk) / row_per_block;

@@ -70,13 +70,12 @@ void FlashMaskV2BaseKernel(
     paddle::Tensor *softmax_lse,
     paddle::Tensor *out_accum,
     paddle::Tensor *softmax_lse_accum)
-    
-  // {
-  //   printf("now in FlashMaskV2BaseKernel\n");
-  // }
-  
-    
-    
+
+#if 0
+  {
+    printf("now in FlashMaskV2BaseKernel\n");
+  } 
+#else   
 {
 #ifdef PADDLE_WITH_FLASHATTN_V3
   printf("now in FlashMaskV2BaseKernel\n");
@@ -1226,7 +1225,7 @@ void FlashMaskV2BaseKernel(
   RaiseNotSupportedError();
 #endif
 }
-
+#endif
 
 
 // [BQW_CHANGE] phi::dtype::bfloat16 → paddle::bfloat16 (外迁后不直接使用 phi 命名空间)

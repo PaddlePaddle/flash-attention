@@ -73,7 +73,7 @@ public:
         cudaEventRecord(_empty_states[CLAMP_IDX(seg_idx)], stream);
     }
 
-    void reset(cudaStream_t comm_stream);
+    void reset_semaphores();
     // clear recv buffer (so that reduce won't op on dirty data)
     void zero_recv_buf(int seg_idx, cudaStream_t comm_stream);
 

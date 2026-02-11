@@ -204,6 +204,8 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
             RS_BUFFER_CAPACITY,
             cp_team
         );
+        // zero initialize the dkv semaphores
+        dkv_buffer->reset_semaphores();
         WARN_PRINT("[FlashMask Overlap] Using RS-Overlap, buffer capacity: %d\n", RS_BUFFER_CAPACITY);
     }
     kv_buffer->team_bar();
@@ -756,9 +758,10 @@ nvshmem_team_t OverlapCommunicator<KVType>::simple_collective_topology_setter(in
 
 template <typename KVType>
 void OverlapCommunicator<KVType>::prepare_dkv_buffer(cudaStream_t stream) {
-    if (dkv_buffer) {
-        dkv_buffer->reset(stream);
-    }
+    if (!dkv_buffer) return;
+    // we need to use compute stream to zero the recv buffer
+    // to make sure the buffer is zero-ed before producer/consumer starts
+    dkv_buffer->zero_recv_buf(0, stream);
 }
 
 template <typename KVType>

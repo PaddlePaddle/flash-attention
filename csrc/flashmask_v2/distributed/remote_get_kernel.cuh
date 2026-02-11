@@ -502,8 +502,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     };
 
     if constexpr (use_semaphore) {
-        if (threadIdx.x * 4 < total_n_pes) {
-            *(reinterpret_cast<int4*>(cached_semaphores) + threadIdx.x) = make_int4(0, 0, 0, 0);
+        if (threadIdx.x < total_n_pes) {
+            cached_semaphores[threadIdx.x] = 0;
         }
     }
 

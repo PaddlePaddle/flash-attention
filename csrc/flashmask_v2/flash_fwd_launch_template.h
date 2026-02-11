@@ -288,6 +288,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                            Arch >= 90 && Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);
     }
     CHECK_CUDA_KERNEL_LAUNCH();
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+    if (need_overlap_comm) flashmask::comm::singleton().set_sr_usable(stream);
+#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 }
 
 template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>

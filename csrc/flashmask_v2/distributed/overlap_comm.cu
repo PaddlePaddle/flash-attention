@@ -12,7 +12,7 @@ namespace flashmask {
 // deprecation warning: will be removed in the future
 static constexpr bool SHOULD_MANAGE_NVSHMEM = true;
 static constexpr bool USE_DENSE_COPY = true;            // no sparse mask KV skipping
-static constexpr bool USE_SEMAPHORES = false;           // no team_bar but fine-grained signaling
+static constexpr bool USE_SEMAPHORES = true;           // no team_bar but fine-grained signaling
 // If true, we will scale up the transfering chunk for one CTA (16 rows per chunk ---> 256-512 rows per chunk)
 // and calculate per-chunk sparsity to skip some comm (avg 50% of the chunks are not needed)
 static constexpr bool USE_SPARSE_LARGE_CHUNK = true;
@@ -162,6 +162,8 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
                                   cudaStreamNonBlocking,
                                   greatest_priority);
     cudaEventCreateWithFlags(&wptr_init, cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&sr_usable, cudaEventDisableTiming);
+    cudaEventRecord(sr_usable, comm_stream);                    // set initial status for SR buffer
     _cp_chunk_size = s_kv * h_kv * d_kv;
     _total_numel = _cp_chunk_size * b_kv * cp_size;             // won't overflow, but should be careful
 
@@ -216,6 +218,7 @@ OverlapCommunicator<KVType>::~OverlapCommunicator() {
     CUDA_DEBUG_CHECK(cudaFreeAsync(block_work_ids, comm_stream));
     CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
     CUDA_DEBUG_CHECK(cudaEventDestroy(wptr_init));
+    CUDA_DEBUG_CHECK(cudaEventDestroy(sr_usable));
     CUDA_DEBUG_CHECK(cudaStreamDestroy(comm_stream));
     kv_buffer->release();           // do not depend on auto-release
     if (dkv_buffer) {
@@ -263,8 +266,11 @@ void OverlapCommunicator<KVType>::wait_sr_buffer_empty() {
     // This would save some time, but not entirely safe if
     // the attention's workload is too too small. Yet currently
     // we haven't trigger unsafe problems even once
+    cudaStreamWaitEvent(comm_stream, sr_usable);
     if constexpr (USE_SEMAPHORES) {
         WARN_PRINT("Before wait_self_empty\n");
+        // block if computation that uses the local chunk is not finished
+        // so that we won't corrupt the local buffer being used
         sema::ag::wait_self_empty(
             kv_buffer->semaphores(),
             _my_pe,
@@ -302,7 +308,6 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                                 comm_stream));
     }
     if constexpr (USE_SEMAPHORES) {
-        nvshmemx_quiet_on_stream(comm_stream);
         // notify all other PEs that the local data is ready (1. set self to be `total_pes - 1`. 2. broadcast to other PEs)
         sema::ag::notify_full(
             kv_buffer->semaphores(),
@@ -515,7 +520,7 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
 
 #define SparseLargeChunkSplittedKernel(start_rank, seg_idx, num_chunk, num_segs, smem_bytes)\
     SparseLargeKVChunkSplittedRemoteGetKernel<KVType, S_chunk,                              \
-        num_warps, RDMA_ROW_PER_WARP, num_chunk, USE_STREAM_COORD, false>                   \
+        num_warps, RDMA_ROW_PER_WARP, num_chunk, USE_STREAM_COORD, USE_SEMAPHORES>          \
         <<<num_blocks, num_warps * 32, smem_bytes, comm_stream>>>(                          \
                         kv_buffer->k_data(),                                                \
                         kv_buffer->v_data(),                                                \
@@ -573,9 +578,11 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
 
     if constexpr (USE_SEMAPHORES) {
         WARN_PRINT("Before notify_all_empty kernel (split AG)\n");
-        sema::ag::notify_all_empty(
+        sema::ag::notify_segment_empty(
             kv_buffer->semaphores(),
             _my_pe,
+            start_pe,
+            num_chunks,
             _total_n_pes,
             comm_stream
         );

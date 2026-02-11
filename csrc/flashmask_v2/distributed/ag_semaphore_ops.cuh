@@ -7,6 +7,23 @@ namespace flashmask {
 namespace sema {
 namespace ag {
 
+/**
+ * @brief (Device Function) Used in `remote_get` kernels. The remote get kernels need to
+   wait for the readiness of data. For example: PE0 will first get data from PE3, but PE3
+   need to finish cudaMemcpyAsync (local KV) to the SR buffer so that the data is not dirty.
+   We only need to wait for non-zero status, since if one PE is ready, it will broadcast its
+   status (`total_pes - 1`) to other ranks.
+
+ * @param semaphores int semaphores allocated by nvshmem: size is total_n_pes
+ * @param target_pe the rank to get data from, 
+*/
+__device__ __forceinline__ void wait_full(
+    const int64_t* const __restrict__ semaphores,
+    const int target_pe
+) {
+    nvshmem_int64_wait_until(const_cast<int64_t*>(semaphores) + target_pe, NVSHMEM_CMP_GT, 0);   // wait until not 0
+}
+
 // Note(heqianyue): single node AMO can use int (4B) as semaphore types, but when in multi-node
 // env, IBRC does not allow 4B AMO. Check NVSHMEM 3.2.5 src/modules/transport/ibrc/ibrc.cpp:1265
 // So we need to use int64_t semaphores. If we know for sure that our CP distributed overlap
@@ -15,11 +32,11 @@ namespace ag {
 // num thread: total_pes
 __global__ void NotifySemaphoreEmptyKernel(
     int64_t* const __restrict__ semaphores,
-    const int my_pe,
-    const int total_pes
+    const int my_pe
 ) {
     if (threadIdx.x != my_pe) {
         // the other PE will not notify us before we reset
+        wait_full(semaphores, threadIdx.x);
         semaphores[threadIdx.x] = 0;
         // Note(heqianyue): bitwise op is generally safer than add, if we are using only 1 node
         // we can opt for the following atomic_and approach
@@ -29,31 +46,48 @@ __global__ void NotifySemaphoreEmptyKernel(
     }
 }
 
+// notify some of the remote kernels: local rank has finished 
+// using the data of yours. Used in RS-overlap splitted AG
+__global__ void NotifySegmentSemaphoreEmptyKernel(
+    int64_t* const __restrict__ semaphores,
+    const int my_pe,
+    const int start_rank,
+    const int total_pes
+) {
+    const int target_rank = (start_rank + threadIdx.x) % total_pes;
+    if (target_rank != my_pe) {
+        // the other PE will not notify us before we reset
+        wait_full(semaphores, target_rank);
+        semaphores[target_rank] = 0;
+        nvshmem_long_atomic_add(semaphores + target_rank, -(1 << my_pe), target_rank);
+    }
+}
+
 // A debug kernel for `wait_self_empty`. Spins until the max-cycles or predicate is true.
 // If max-cycles is reached, skip this kernel and report status with print
 __global__ void DebugWaitOnStreamLocalKernel(
     int64_t* const __restrict__ semaphore,
-    const int64_t target_val // Changed to int64_t to match semaphore
+    const int64_t target_val
 ) {
-    static constexpr int64_t max_allowed_wait_cycles = 10000000; 
+    static constexpr int64_t max_allowed_wait_cycles = 100000000000; 
     int64_t start_cycles = clock64();
     int64_t current_val = 0;
 
     while (true) {
-        // Use "l" for 64-bit destination and "l" for 64-bit address pointer
-        // Added .acquire to ensure data visibility after the flag is set
-        asm volatile("ld.acquire.sys.global.s64 %0, [%1];" 
+        asm volatile("ld.volatile.global.s64 %0, [%1];" 
                      : "=l"(current_val) : "l"(semaphore) : "memory");
 
-        if (current_val == target_val) return;
+        if (current_val == target_val) {
+            printf("Semaphore is already empty, quit waiting\n");
+            return;
+        }
 
-        if (clock64() - start_cycles > max_allowed_wait_cycles) break;
-        
-        // Optional: __nanosleep() or yield to prevent blinding the SM
+        if (clock64() - start_cycles > max_allowed_wait_cycles) {
+            printf("[WaitOnStreamKernel TimeOut] Wait for %ld, but still got: %ld\n", 
+                target_val, current_val);
+            start_cycles = clock64();
+        } 
     }
-
-    printf("[WaitOnStreamKernel TimeOut] Wait for %ld, but still got: %ld\n", 
-            target_val, current_val);
 }
 
 // num thread: 1
@@ -62,6 +96,15 @@ __global__ void SetSemaphoreValueKernel(
     const int value
 ) {
     *semaphore = int64_t(value);
+}
+
+__global__ void SetFullForOtherRanks(
+    int64_t* const __restrict__ semaphores,
+    int self_rank
+) {
+    if (threadIdx.x == self_rank) return;
+    // set the semaphores[self_rank] = 1 for all remote ranks
+    nvshmem_int64_p(semaphores + self_rank, 1, threadIdx.x);
 }
 
 /**
@@ -112,7 +155,18 @@ void notify_all_empty(
     int total_pes,
     cudaStream_t stream
 ) {
-    NotifySemaphoreEmptyKernel<<<1, total_pes, 0, stream>>>(semaphore, my_pe, total_pes);
+    NotifySemaphoreEmptyKernel<<<1, total_pes, 0, stream>>>(semaphore, my_pe);
+}
+
+void notify_segment_empty(
+    int64_t* const __restrict__ semaphore,
+    int my_pe,
+    int start_rank,
+    int chunk_per_seg,
+    int total_pes,
+    cudaStream_t stream
+) {
+    NotifySegmentSemaphoreEmptyKernel<<<1, chunk_per_seg, 0, stream>>>(semaphore, my_pe, start_rank, total_pes);
 }
 
 /**
@@ -136,33 +190,11 @@ void notify_full(
     // step 1: set the self pos to be `total_pes - 1`
     int bit_val = (1 << total_pes) - (1 << my_pe) - 1;
     SetSemaphoreValueKernel<<<1, 1, 0, stream>>>(semaphores + my_pe, bit_val);
-    // step 2: broadcast this to other PE, to notify other PEs that data is ready (full) 
-    nvshmemx_int64_broadcast_on_stream(team,
-        &semaphores[my_pe],            // dst (remote)
-        &semaphores[my_pe],            // src (local)
-        1,                             // n_elems
-        my_pe,                         // root
-        stream);
+    // make sure local store is visible to other ranks
+    nvshmemx_quiet_on_stream(stream);
+    // step 2: notify other PE that data is ready (full) 
+    SetFullForOtherRanks<<<1, total_pes, 0, stream>>>(semaphores, my_pe);
 }
-
-
-/**
- * @brief (Device Function) Used in `remote_get` kernels. The remote get kernels need to
-   wait for the readiness of data. For example: PE0 will first get data from PE3, but PE3
-   need to finish cudaMemcpyAsync (local KV) to the SR buffer so that the data is not dirty.
-   We only need to wait for non-zero status, since if one PE is ready, it will broadcast its
-   status (`total_pes - 1`) to other ranks.
-
- * @param semaphores int semaphores allocated by nvshmem: size is total_n_pes
- * @param target_pe the rank to get data from, 
-*/
-__device__ __forceinline__ void wait_full(
-    const int64_t* const __restrict__ semaphores,
-    const int target_pe
-) {
-    nvshmem_int64_wait_until(const_cast<int64_t*>(semaphores) + target_pe, NVSHMEM_CMP_GT, 0);   // wait until not 0
-}
-
 
 }   // namespace ag
 }   // namespace sema

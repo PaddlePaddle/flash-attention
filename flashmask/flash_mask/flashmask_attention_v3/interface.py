@@ -1,10 +1,21 @@
+# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import paddle
 from paddle import Tensor
 from typing import Optional
 
-# [BQW_CHANGE] 使用 paddle._C_ops._run_custom_op 调用 PD_BUILD_OP 注册的自定义算子
-# Paddle CUDAExtension 生成的自定义算子通过全局注册表访问
-# SO 文件在 flash_mask/__init__.py 中通过 load_op_meta_info_and_register_op 加载
 from paddle import _C_ops
 
 def flashmask_attention(
@@ -797,7 +808,7 @@ def flashmask_attention(
 
         if fa_version == 2:
             assert softmax_scale is None, (
-                "flashmask_attention does not support setting softmax_scale, use flashmask_attention_v2 instead"
+                "flashmask_attention does not support setting softmax_scale, use flashmask_attention_v3 instead"
             )
 
             assert block_mask is None, (
@@ -824,23 +835,23 @@ def flashmask_attention(
 
         elif fa_version == 3:
             assert dropout == 0.0, (
-                "flashmask_attention_v2 does not support dropout"
+                "flashmask_attention_v3 does not support dropout"
             )
             assert not return_seed_offset, (
-                "flashmask_attention_v2 does not support return seed_offset"
+                "flashmask_attention_v3 does not support return seed_offset"
             )
             assert fixed_seed_offset is None, (
-                "flashmask_attention_v2 does not support setting seed_offset"
+                "flashmask_attention_v3 does not support setting seed_offset"
             )
             assert rng_name == "", (
-                "flashmask_attention_v2 does not support setting rng_name"
+                "flashmask_attention_v3 does not support setting rng_name"
             )
             assert training, (
-                "flashmask_attention_v2 does not support setting training to False"
+                "flashmask_attention_v3 does not support setting training to False"
             )
 
             assert name is None, (
-                "flashmask_attention_v2 does not support setting name"
+                "flashmask_attention_v3 does not support setting name"
             )
 
             if softmax_scale is None:
@@ -849,7 +860,7 @@ def flashmask_attention(
             # (
             #     out,
             #     result_softmax_lse,
-            # ) = _C_ops.flashmask_attention_v2(
+            # ) = _C_ops.flashmask_attention_v3(
             #     query,
             #     key,
             #     value,
@@ -863,7 +874,7 @@ def flashmask_attention(
                 out,
                 result_softmax_lse,
             ) = _C_ops._run_custom_op(
-                "flashmask_attention_v2",
+                "flashmask_attention_v3",
                 query,
                 key,
                 value,

@@ -1,5 +1,19 @@
 /******************************************************************************
- * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+ * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar,
+ * Pradeep Ramani, Tri Dao.
+ *
+ * Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  ******************************************************************************/
 
 #pragma once
@@ -233,7 +247,7 @@ class PreemptivePersistentTileScheduler {
     // **PPT** scheduler: performs correct synchronization for producer (generate_n_block) and consumer (KV load and computation pipeline)
     // This scheduler has the same coordinate computation logic as StaticPersistentTileSch, the difference is that
     // we employ a preemptive scheduling strategy based on a rough estimation of the workload for the consumer
-    // In PPT, NumConsumerThreads is the total number of threads for (KV load and computation pipeline), and for FlashMask V2
+    // In PPT, NumConsumerThreads is the total number of threads for (KV load and computation pipeline), and for FlashMask V3
     // it will be the #threads for (wg_id = 0, wp_id = 0) + (wg_id > 0, wp_id = *). The NumProducerThreads is simply 96 (hard-coded).
     static_assert(NumProducerThreads == 96, "PreemptivePersistentTileScheduler has incorrect producer thread num.");
     static constexpr int NumThreads = NumConsumerThreads + NumProducerThreads;
@@ -302,7 +316,7 @@ public:
         // when all the blocks (SMs) done initializing and no SM has done the first task, tile_count_semaphore will be
         // at least `gridDim.x`, then, we just let prefetch_next_work and non-deterministic schedule (workload-related) take over 
 
-        // For FlashMask V2, only generate_n_block pipeline is the big brother producer to be preemptively scheduled!
+        // For FlashMask V3, only generate_n_block pipeline is the big brother producer to be preemptively scheduled!
         // since the initial work is assigned deterministically via blockIdx.x, we need to ensure that the initial state of
         // tile_count_semaphore is gridDim.x. Can't use atomicAdd here, since if we do, for example, SM1 is really fast, it performs
         // prefetch_next_work even before SM2 calls get_initial_work, then SM1 will risk computing the same block as SM2.
@@ -480,7 +494,7 @@ class DualPreemptivePersistentTileExecutionScheduler {
     // **PPT** scheduler: performs correct synchronization for producer (generate_n_block) and consumer (KV load and computation pipeline)
     // This scheduler has the same coordinate computation logic as StaticPersistentTileSch, the difference is that
     // we employ a preemptive scheduling strategy based on a rough estimation of the workload for the consumer
-    // In PPT, NumConsumerThreads is the total number of threads for (KV load and computation pipeline), and for FlashMask V2
+    // In PPT, NumConsumerThreads is the total number of threads for (KV load and computation pipeline), and for FlashMask V3
     // it will be the #threads for (wg_id = 0, wp_id = 0) + (wg_id > 0, wp_id = *). The NumProducerThreads is simply 96 (hard-coded).
 
     // The following static_assert is NOT compulsory, it's just that we found that 64 producer threads performs worse
@@ -548,7 +562,7 @@ public:
         // when all the blocks (SMs) done initializing and no SM has done the first task, tile_count_semaphore will be
         // at least `gridDim.x`, then, we just let prefetch_next_work and non-deterministic schedule (workload-related) take over 
 
-        // For FlashMask V2, only generate_n_block pipeline is the big brother producer to be preemptively scheduled!
+        // For FlashMask V3, only generate_n_block pipeline is the big brother producer to be preemptively scheduled!
         // since the initial work is assigned deterministically via blockIdx.x, we need to ensure that the initial state of
         // tile_count_semaphore is gridDim.x. Can't use atomicAdd here, since if we do, for example, SM1 is really fast, it performs
         // prefetch_next_work even before SM2 calls get_initial_work, then SM1 will risk computing the same block as SM2.

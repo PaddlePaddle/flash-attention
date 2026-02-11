@@ -8,9 +8,7 @@ print("="*60)
 print("Testing FlashMask Import")
 print("="*60)
 
-from flash_mask import flashmask_attention
-
-# from flash_mask.flashmask_attention_v3.interface import flashmask_attention
+from flash_mask.flashmask_attention_v3.interface import flashmask_attention
 
 try:
     import paddle

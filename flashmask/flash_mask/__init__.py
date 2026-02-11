@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 # [BQW_CHANGE] 在 import 前先加载 flash_mask_pd_.so 并注册自定义算子
 # Paddle CUDAExtension 生成 flash_mask_pd_.so，需要手动加载注册
 import os

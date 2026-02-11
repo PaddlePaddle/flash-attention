@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# [BQW_CHANGE] 整合 cmake 构建流程到 setup.py，pip install . 一步到位
+# 整合 cmake 构建流程到 setup.py，pip install . 一步到位
 # 不再需要手动 mkdir build && cmake .. && make
 #
 # 使用方法:
@@ -20,10 +20,10 @@
 #   pip install -e . --no-build-isolation  # 开发安装
 #
 # 环境变量:
-#   FLASH_MASK_SKIP_CMAKE=1   跳过 cmake（假设 libflashmaskv3.so 已存在）
+#   FLASH_MASK_SKIP_CMAKE=1    跳过 cmake（假设 libflashmaskv3.so 已存在）
 #   FLASH_MASK_FORCE_REBUILD=1 强制重新 cmake
-#   FLASH_MASK_CMAKE_ARGS     额外 cmake 参数（空格分隔）
-#   FLASH_MASK_LIB_DIR        手动指定 libflashmaskv2/v3.so 所在目录
+#   FLASH_MASK_CMAKE_ARGS      额外 cmake 参数（空格分隔）
+#   FLASH_MASK_LIB_DIR         手动指定 libflashmaskv2/v3.so 所在目录
 
 import os
 import sys
@@ -39,7 +39,7 @@ from paddle.utils.cpp_extension import CUDAExtension, setup
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 FLASH_MASK_DIR = os.path.join(ROOT_DIR, 'flash_mask')
 BUILD_DIR = os.path.join(FLASH_MASK_DIR, 'build')
-# [BQW_CHANGE] libflashmaskv3.so 安装到 flash_mask/lib/ 下，随 package_data 分发
+# libflashmaskv3.so 安装到 flash_mask/lib/ 下，随 package_data 分发
 INSTALL_LIB_DIR = os.path.join(FLASH_MASK_DIR, 'lib')
 
 SKIP_CMAKE = os.environ.get('FLASH_MASK_SKIP_CMAKE', '0') == '1'
@@ -103,9 +103,7 @@ LIB_DIR, LIB_NAME = find_or_build_lib()
 LIB_DIR = os.path.abspath(LIB_DIR)
 LIB_FILE = f'lib{LIB_NAME}.so'
 
-# [BQW_CHANGE] 将 libflashmaskv3.so 拷贝到 flash_mask/lib/ 下
-# 这样 pip install . 时会作为 package_data 安装到 site-packages/flash_mask/lib/
-# __init__.py 可以通过 __file__ 相对路径可靠地找到它
+# 将 libflashmaskv3.so 拷贝到 flash_mask/lib/ 下
 os.makedirs(INSTALL_LIB_DIR, exist_ok=True)
 src_lib = os.path.join(LIB_DIR, LIB_FILE)
 dst_lib = os.path.join(INSTALL_LIB_DIR, LIB_FILE)
@@ -117,19 +115,10 @@ if os.path.exists(src_lib) and (not os.path.exists(dst_lib) or
 # ============================================================
 # Step 2: 构建自定义算子
 # ============================================================
-# [BQW_CHANGE] CUDAExtension name 改为 'flashmask_ops'，避免与 flash_mask/ 包目录冲突
-# 旧方案 name='flash_mask' 导致：
-#   1. Paddle 自动生成 flash_mask.py (wrapper) 被 flash_mask/ 目录覆盖
-#   2. pip install . 时 flash_mask_pd_.so 安装位置与 __init__.py 搜索路径不匹配
-# 新方案 name='flashmask_ops'：
-#   - 生成 flashmask_ops_pd_.so + flashmask_ops.py (auto wrapper)
-#   - flashmask_ops.py 不与任何包目录冲突
-#   - __init__.py 中 import flashmask_ops 即可触发 SO 加载和算子注册
 setup(
     name='flash_mask',
     version='4.0',
     packages=find_packages(),
-    # [BQW_CHANGE] 将 libflashmaskv3.so 作为 package data 分发
     package_data={
         'flash_mask': ['lib/*.so'],
     },
@@ -141,7 +130,6 @@ setup(
     python_requires='>=3.10',
     ext_modules=[
         CUDAExtension(
-            # [BQW_CHANGE] 使用与包名相同的名称，确保生成的包装器能被正确导入
             name='flash_mask_package',
             sources=[
                 'flash_mask/flashmask_attention_v3/csrc/flashmask_v3.cpp',
@@ -160,13 +148,13 @@ setup(
                     '-gencode', 'arch=compute_90,code=sm_90',
                     '-O3',
                     '-DPADDLE_WITH_FLASHATTN_V3=1',
+                    '-std=c++17',
                 ],
-                'cxx': ['-O3', '-DPADDLE_WITH_FLASHATTN_V3=1'],
+                'cxx': [
+                    '-O3',
+                    '-DPADDLE_WITH_FLASHATTN_V3=1',
+                    '-std=c++17'],
             },
-            # [BQW_CHANGE] rpath 设置
-            # $ORIGIN/flash_mask/lib : pip install . 时 SO 在 site-packages/ 下
-            # $ORIGIN               : 同目录兜底
-            # 绝对路径               : 开发模式兜底
             extra_link_args=[
                 '-Wl,-rpath,$ORIGIN/flash_mask/lib',
                 '-Wl,-rpath,$ORIGIN',

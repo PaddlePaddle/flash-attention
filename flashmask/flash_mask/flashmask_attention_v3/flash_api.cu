@@ -1,5 +1,19 @@
 /******************************************************************************
- * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+ * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar,
+ * Pradeep Ramani, Tri Dao.
+ *
+ * Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  ******************************************************************************/
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
@@ -42,7 +56,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                     SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
                         if (!params.is_e4m3) {
                             if (params.is_bf16) {
-                                #ifndef FLASHMASK_V2_DISABLE_HDIM64
+                                #ifndef FLASHMASK_V3_DISABLE_HDIM64
                                 if (params.d <= 64) {
                                     if (params.dv > 64 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
@@ -52,13 +66,13 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                     }
                                 }
                                 #endif
-                                #ifndef FLASHMASK_V2_DISABLE_HDIM96
+                                #ifndef FLASHMASK_V3_DISABLE_HDIM96
                                 if (params.d <= 96) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 96, 96, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
-                                #ifndef FLASHMASK_V2_DISABLE_HDIM128
+                                #ifndef FLASHMASK_V3_DISABLE_HDIM128
                                 if (params.d <= 128) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
-                                #ifndef FLASHMASK_V2_DISABLE_HDIM192
+                                #ifndef FLASHMASK_V3_DISABLE_HDIM192
                                 if (params.d <= 192) {
                                     if (params.dv <= 128 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
@@ -67,12 +81,12 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                     }
                                 }
                                 #endif
-                                #ifndef FLASHMASK_V2_DISABLE_HDIM256
+                                #ifndef FLASHMASK_V3_DISABLE_HDIM256
                                 if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
                             } else {
-                                #ifndef FLASHMASK_V2_DISABLE_FP16
-                                #ifndef FLASHMASK_V2_DISABLE_HDIM64
+                                #ifndef FLASHMASK_V3_DISABLE_FP16
+                                #ifndef FLASHMASK_V3_DISABLE_HDIM64
                                 if (params.d <= 64) {
                                     if (params.dv > 64 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
@@ -82,13 +96,13 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                     }
                                 }
                                 #endif
-                                #ifndef FLASHMASK_V2_DISABLE_HDIM96
+                                #ifndef FLASHMASK_V3_DISABLE_HDIM96
                                 if (params.d <= 96) { return run_mha_fwd_<Arch, cutlass::half_t, 96, 96, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
-                                #ifndef FLASHMASK_V2_DISABLE_HDIM128
+                                #ifndef FLASHMASK_V3_DISABLE_HDIM128
                                 if (params.d <= 128) { return run_mha_fwd_<Arch, cutlass::half_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
-                                #ifndef FLASHMASK_V2_DISABLE_HDIM192
+                                #ifndef FLASHMASK_V3_DISABLE_HDIM192
                                 if (params.d <= 192) {
                                     if (params.dv <= 128 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
@@ -97,7 +111,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                     }
                                 }
                                 #endif
-                                #ifndef FLASHMASK_V2_DISABLE_HDIM256
+                                #ifndef FLASHMASK_V3_DISABLE_HDIM256
                                 if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::half_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
                                 #else
@@ -105,17 +119,17 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 #endif
                             }
                         } else {
-                            #ifndef FLASHMASK_V2_DISABLE_FP8
-                            #ifndef FLASHMASK_V2_DISABLE_HDIM64
+                            #ifndef FLASHMASK_V3_DISABLE_FP8
+                            #ifndef FLASHMASK_V3_DISABLE_HDIM64
                             if (params.d <= 64) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                             #endif
-                            #ifndef FLASHMASK_V2_DISABLE_HDIM96
+                            #ifndef FLASHMASK_V3_DISABLE_HDIM96
                             if (params.d <= 96) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 96, 96, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                             #endif
-                            #ifndef FLASHMASK_V2_DISABLE_HDIM128
+                            #ifndef FLASHMASK_V3_DISABLE_HDIM128
                             if (params.d <= 128) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                             #endif
-                            #ifndef FLASHMASK_V2_DISABLE_HDIM192
+                            #ifndef FLASHMASK_V3_DISABLE_HDIM192
                             if (params.d <= 192) {
                                 if (params.dv <= 128 && Arch == 90) {
                                     return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
@@ -124,7 +138,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 }
                             }
                             #endif
-                            #ifndef FLASHMASK_V2_DISABLE_HDIM256
+                            #ifndef FLASHMASK_V3_DISABLE_HDIM256
                             if (params.d <= 256) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                             #endif
                             #else
@@ -138,7 +152,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl=false) {
-    #ifndef FLASHMASK_V2_DISABLE_SPLIT
+    #ifndef FLASHMASK_V3_DISABLE_SPLIT
     // If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
     // so that kBlockM is smaller and we have more parallelism.
     if (params.is_fp32) {
@@ -185,7 +199,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation and binary size.
     // Has little effect on speed.
     if (params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1) { return true; }
-    #ifdef FLASHMASK_V2_DISABLE_PACKGQA
+    #ifdef FLASHMASK_V3_DISABLE_PACKGQA
     return false;
     #else
     // params.page_table must already be set
@@ -199,7 +213,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
 }
 
 inline int get_num_splits(Flash_fwd_params const& params) {
-    #ifdef FLASHMASK_V2_DISABLE_SPLIT
+    #ifdef FLASHMASK_V3_DISABLE_SPLIT
     return 1;
     #else
     // Always enable PackGQA for Split
@@ -231,7 +245,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
-    #ifndef FLASHMASK_V2_DISABLE_BACKWARD
+    #ifndef FLASHMASK_V3_DISABLE_BACKWARD
         // FP16_SWITCH(!params.is_bf16, [&] {
         //     HEADDIM_SWITCH(params.d, [&] {
         //         run_mha_bwd_<elem_type, kHeadDim>(params, stream);
@@ -243,39 +257,39 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
                 BOOL_SWITCH(params.deterministic, Deterministic, [&] {
                     if (!params.is_bf16) {
-                        #ifndef FLASHMASK_V2_DISABLE_FP16
-                        #ifndef FLASHMASK_V2_DISABLE_HDIM64
+                        #ifndef FLASHMASK_V3_DISABLE_FP16
+                        #ifndef FLASHMASK_V3_DISABLE_HDIM64
                         if (params.d <= 64) { return run_mha_bwd_<Arch, cutlass::half_t, 64, Has_softcap, Is_causal, Deterministic>(params, stream); }
                         #endif
-                        #ifndef FLASHMASK_V2_DISABLE_HDIM96
+                        #ifndef FLASHMASK_V3_DISABLE_HDIM96
                         if (params.d <= 96) { return run_mha_bwd_<Arch, cutlass::half_t, 96, Has_softcap, Is_causal, Deterministic>(params, stream); }
                         #endif
-                        #ifndef FLASHMASK_V2_DISABLE_HDIM128
+                        #ifndef FLASHMASK_V3_DISABLE_HDIM128
                         if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::half_t, 128, Has_softcap, Is_causal, Deterministic>(params, stream); }
                         #endif
-                        #ifndef FLASHMASK_V2_DISABLE_HDIM192
+                        #ifndef FLASHMASK_V3_DISABLE_HDIM192
                         if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::half_t, 192, Has_softcap, Is_causal, Deterministic>(params, stream); }
                         #endif
-                        #ifndef FLASHMASK_V2_DISABLE_HDIM256
+                        #ifndef FLASHMASK_V3_DISABLE_HDIM256
                         if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::half_t, 256, Has_softcap, Is_causal, Deterministic>(params, stream); }
                         #endif
                         #else
                         PADDLE_CHECK(false, "This flash attention build does not support FP16.");
                         #endif
                     } else {
-                        #ifndef FLASHMASK_V2_DISABLE_HDIM64
+                        #ifndef FLASHMASK_V3_DISABLE_HDIM64
                         if (params.d <= 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, Has_softcap, Is_causal, Deterministic>(params, stream); }
                         #endif
-                        #ifndef FLASHMASK_V2_DISABLE_HDIM96
+                        #ifndef FLASHMASK_V3_DISABLE_HDIM96
                         if (params.d <= 96) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 96, Has_softcap, Is_causal, Deterministic>(params, stream); }
                         #endif
-                        #ifndef FLASHMASK_V2_DISABLE_HDIM128
+                        #ifndef FLASHMASK_V3_DISABLE_HDIM128
                         if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 128, Has_softcap, Is_causal, Deterministic>(params, stream); }
                         #endif
-                        #ifndef FLASHMASK_V2_DISABLE_HDIM192
+                        #ifndef FLASHMASK_V3_DISABLE_HDIM192
                         if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap, Is_causal, Deterministic>(params, stream); }
                         #endif
-                        #ifndef FLASHMASK_V2_DISABLE_HDIM256
+                        #ifndef FLASHMASK_V3_DISABLE_HDIM256
                         if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap, Is_causal, Deterministic>(params, stream); }
                         #endif
                         PADDLE_CHECK(false, "This flash attention build does not support ");
@@ -290,7 +304,7 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 #ifdef __cplusplus
 extern "C" {
 #endif
-Flash_fwd_params* flashmaskv2_create_fwd_params_handle() {
+Flash_fwd_params* flashmaskv3_create_fwd_params_handle() {
   Flash_fwd_params* params_handle = (Flash_fwd_params*)malloc(sizeof(Flash_fwd_params));
   if(params_handle) {
     *params_handle = Flash_fwd_params{};
@@ -298,7 +312,7 @@ Flash_fwd_params* flashmaskv2_create_fwd_params_handle() {
   return params_handle;
 }
 
-Flash_bwd_params* flashmaskv2_create_bwd_params_handle() {
+Flash_bwd_params* flashmaskv3_create_bwd_params_handle() {
   Flash_bwd_params* params_handle = (Flash_bwd_params*)malloc(sizeof(Flash_bwd_params));
   if(params_handle) {
     *params_handle = Flash_bwd_params{};
@@ -306,62 +320,62 @@ Flash_bwd_params* flashmaskv2_create_bwd_params_handle() {
   return params_handle;
 }
 
-void flashmaskv2_clear_fwd_params_handle(Flash_fwd_params* params_handle) {
+void flashmaskv3_clear_fwd_params_handle(Flash_fwd_params* params_handle) {
   if(params_handle) {
     *params_handle = Flash_fwd_params{};
   }
 }
 
-void flashmaskv2_clear_bwd_params_handle(Flash_bwd_params* params_handle) {
+void flashmaskv3_clear_bwd_params_handle(Flash_bwd_params* params_handle) {
   if(params_handle) {
     *params_handle = Flash_bwd_params{};
   }
 }
 
-Flash_fwd_params* flashmaskv2_cast_to_fwd_params_handle(Flash_bwd_params* params_handle) {
+Flash_fwd_params* flashmaskv3_cast_to_fwd_params_handle(Flash_bwd_params* params_handle) {
   return static_cast<Flash_fwd_params*>(params_handle);
 }
 
-void flashmaskv2_destroy_fwd_params_handle(Flash_fwd_params* params_handle) {
+void flashmaskv3_destroy_fwd_params_handle(Flash_fwd_params* params_handle) {
     PADDLE_CHECK(params_handle, "params_handle is nullptr");
     free(params_handle);
 }
 
-void flashmaskv2_destroy_bwd_params_handle(Flash_bwd_params* params_handle) {
+void flashmaskv3_destroy_bwd_params_handle(Flash_bwd_params* params_handle) {
     PADDLE_CHECK(params_handle, "params_handle is nullptr");
     free(params_handle);
 }
 
-void flashmaskv2_run_mha_fwd_combine(Flash_fwd_params* params_handle, cudaStream_t stream, bool enable_pdl=false) {
+void flashmaskv3_run_mha_fwd_combine(Flash_fwd_params* params_handle, cudaStream_t stream, bool enable_pdl=false) {
     run_mha_fwd_combine(*params_handle, stream, enable_pdl);
 }
 
-void flashmaskv2_run_mha_fwd(Flash_fwd_params* params_handle, cudaStream_t stream) {
+void flashmaskv3_run_mha_fwd(Flash_fwd_params* params_handle, cudaStream_t stream) {
     run_mha_fwd(*params_handle, stream);
 }
 
-void flashmaskv2_run_mha_bwd(Flash_bwd_params* params_handle, cudaStream_t stream) {
+void flashmaskv3_run_mha_bwd(Flash_bwd_params* params_handle, cudaStream_t stream) {
     // printf("point1\n");
     run_mha_bwd(*params_handle, stream);
 }
 
-bool flashmaskv2_get_pagedkv_tma(Flash_fwd_params* params_handle) {
+bool flashmaskv3_get_pagedkv_tma(Flash_fwd_params* params_handle) {
     return get_pagedkv_tma(*params_handle);
 }
 
-bool flashmaskv2_get_pack_gqa(Flash_fwd_params* params_handle) {
+bool flashmaskv3_get_pack_gqa(Flash_fwd_params* params_handle) {
     return get_pack_gqa(*params_handle);
 }
 
-int flashmaskv2_get_num_splits(Flash_fwd_params* params_handle) {
+int flashmaskv3_get_num_splits(Flash_fwd_params* params_handle) {
     return get_num_splits(*params_handle);
 }
 
 #define DEFINE_GETTER_SETTER(type, member) \
-type flashmaskv2_fwd_params_get_##member(const Flash_fwd_params* params_handle) { return params_handle->member; } \
-void flashmaskv2_fwd_params_set_##member(Flash_fwd_params* params_handle, type value) { params_handle->member = value; } \
-type flashmaskv2_bwd_params_get_##member(const Flash_bwd_params* params_handle) { return params_handle->member; } \
-void flashmaskv2_bwd_params_set_##member(Flash_bwd_params* params_handle, type value) { params_handle->member = value; }
+type flashmaskv3_fwd_params_get_##member(const Flash_fwd_params* params_handle) { return params_handle->member; } \
+void flashmaskv3_fwd_params_set_##member(Flash_fwd_params* params_handle, type value) { params_handle->member = value; } \
+type flashmaskv3_bwd_params_get_##member(const Flash_bwd_params* params_handle) { return params_handle->member; } \
+void flashmaskv3_bwd_params_set_##member(Flash_bwd_params* params_handle, type value) { params_handle->member = value; }
 
 // The QKV matrices.
 DEFINE_GETTER_SETTER(void *, q_ptr)
@@ -545,8 +559,8 @@ DEFINE_GETTER_SETTER(int, n_block_dim)
 DEFINE_GETTER_SETTER(int32_t *, block_mask_ptr)
 
 #define DEFINE_BWD_GETTER_SETTER(type, member) \
-type flashmaskv2_bwd_params_get_##member(const Flash_bwd_params* params_handle) { return params_handle->member; } \
-void flashmaskv2_bwd_params_set_##member(Flash_bwd_params* params_handle, type value) { params_handle->member = value; }
+type flashmaskv3_bwd_params_get_##member(const Flash_bwd_params* params_handle) { return params_handle->member; } \
+void flashmaskv3_bwd_params_set_##member(Flash_bwd_params* params_handle, type value) { params_handle->member = value; }
 
 // The dO and dQKV matrices.
 DEFINE_BWD_GETTER_SETTER(void *, do_ptr)

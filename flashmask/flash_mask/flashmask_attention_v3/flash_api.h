@@ -1,3 +1,21 @@
+/******************************************************************************
+ * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar,
+ * Pradeep Ramani, Tri Dao.
+ *
+ * Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
 #pragma once
 
 #include "cuda.h"
@@ -11,25 +29,25 @@ extern "C" {
 typedef struct Flash_fwd_params FlashMask_fwd_params;
 typedef struct Flash_bwd_params FlashMask_bwd_params;
 
-Flash_fwd_params* flashmaskv2_create_fwd_params_handle();
-Flash_bwd_params* flashmaskv2_create_bwd_params_handle();
-void flashmaskv2_clear_fwd_params_handle(Flash_fwd_params* params_handle);
-void flashmaskv2_clear_bwd_params_handle(Flash_bwd_params* params_handle);
-Flash_fwd_params* flashmaskv2_cast_to_fwd_params_handle(Flash_bwd_params* params_handle);
-void flashmaskv2_destroy_fwd_params_handle(Flash_fwd_params* params_handle);
-void flashmaskv2_destroy_bwd_params_handle(Flash_bwd_params* params_handle);
-void flashmaskv2_run_mha_fwd_combine(Flash_fwd_params* params_handle, cudaStream_t stream, bool enable_pdl=false);
-void flashmaskv2_run_mha_fwd(Flash_fwd_params* params_handle, cudaStream_t stream);
-bool flashmaskv2_get_pagedkv_tma(Flash_fwd_params* params_handle);
-bool flashmaskv2_get_pack_gqa(Flash_fwd_params* params_handle);
-int flashmaskv2_get_num_splits(Flash_fwd_params* params_handle);
-void flashmaskv2_run_mha_bwd(Flash_bwd_params* params_handle, cudaStream_t stream);
+Flash_fwd_params* flashmaskv3_create_fwd_params_handle();
+Flash_bwd_params* flashmaskv3_create_bwd_params_handle();
+void flashmaskv3_clear_fwd_params_handle(Flash_fwd_params* params_handle);
+void flashmaskv3_clear_bwd_params_handle(Flash_bwd_params* params_handle);
+Flash_fwd_params* flashmaskv3_cast_to_fwd_params_handle(Flash_bwd_params* params_handle);
+void flashmaskv3_destroy_fwd_params_handle(Flash_fwd_params* params_handle);
+void flashmaskv3_destroy_bwd_params_handle(Flash_bwd_params* params_handle);
+void flashmaskv3_run_mha_fwd_combine(Flash_fwd_params* params_handle, cudaStream_t stream, bool enable_pdl=false);
+void flashmaskv3_run_mha_fwd(Flash_fwd_params* params_handle, cudaStream_t stream);
+bool flashmaskv3_get_pagedkv_tma(Flash_fwd_params* params_handle);
+bool flashmaskv3_get_pack_gqa(Flash_fwd_params* params_handle);
+int flashmaskv3_get_num_splits(Flash_fwd_params* params_handle);
+void flashmaskv3_run_mha_bwd(Flash_bwd_params* params_handle, cudaStream_t stream);
 
 #define DECLARE_GETTER_SETTER(type, member) \
-type flashmaskv2_fwd_params_get_##member(const Flash_fwd_params* params_handle); \
-void flashmaskv2_fwd_params_set_##member(Flash_fwd_params* params_handle, const type value); \
-type flashmaskv2_bwd_params_get_##member(const Flash_bwd_params* params_handle); \
-void flashmaskv2_bwd_params_set_##member(Flash_bwd_params* params_handle, type value);
+type flashmaskv3_fwd_params_get_##member(const Flash_fwd_params* params_handle); \
+void flashmaskv3_fwd_params_set_##member(Flash_fwd_params* params_handle, const type value); \
+type flashmaskv3_bwd_params_get_##member(const Flash_bwd_params* params_handle); \
+void flashmaskv3_bwd_params_set_##member(Flash_bwd_params* params_handle, type value);
 
 // The QKV matrices.
 DECLARE_GETTER_SETTER(void *, q_ptr)
@@ -204,8 +222,8 @@ DECLARE_GETTER_SETTER(int, n_block_dim)
 DECLARE_GETTER_SETTER(int32_t *, block_mask_ptr)
 
 #define DECLARE_BWD_GETTER_SETTER(type, member) \
-type flashmaskv2_bwd_params_get_##member(const Flash_bwd_params* params_handle); \
-void flashmaskv2_bwd_params_set_##member(Flash_bwd_params* params_handle, type value);
+type flashmaskv3_bwd_params_get_##member(const Flash_bwd_params* params_handle); \
+void flashmaskv3_bwd_params_set_##member(Flash_bwd_params* params_handle, type value);
 
 // The dO and dQKV matrices.
 DECLARE_BWD_GETTER_SETTER(void *, do_ptr)

@@ -1,5 +1,19 @@
 /******************************************************************************
- * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+ * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar,
+ * Pradeep Ramani, Tri Dao.
+ *
+ * Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  ******************************************************************************/
 
 #pragma once
@@ -1949,7 +1963,7 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
             ++smem_pipe_read;
         } else {  // No intra-WG overlap
-            static_assert(!Is_flashmask, "flashmaskv2 does not support no intra-wg overlap");
+            static_assert(!Is_flashmask, "flashmaskv3 does not support no intra-wg overlap");
         }
         ++work_idx;
         return true;

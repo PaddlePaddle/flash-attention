@@ -1,20 +1,20 @@
-// Inspired by
-// https://github.com/NVIDIA/DALI/blob/main/include/dali/core/static_switch.h
-// and https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/Dispatch.h
-
-#pragma once
-
-/// @param COND       - a boolean expression to switch by
-/// @param CONST_NAME - a name given for the constexpr bool variable.
-/// @param ...       - code to execute for true and false
-///
-/// Usage:
-/// ```
-/// BOOL_SWITCH(flag, BoolConst, [&] {
-///     some_function<BoolConst>(...);
-/// });
-/// ```
-//
+/******************************************************************************
+ * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar,
+ * Pradeep Ramani, Tri Dao.
+ *
+ * Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
 
 #define BOOL_SWITCH(COND, CONST_NAME, ...)                                                       \
   [&] {                                                                                          \
@@ -50,7 +50,7 @@
     }                                                                                                        \
   }()
 
-#ifdef FLASHMASK_V2_DISABLE_LOCAL
+#ifdef FLASHMASK_V3_DISABLE_LOCAL
   #define CAUSAL_LOCAL_SWITCH(CAUSAL_COND, LOCAL_COND, CAUSAL_CONST_NAME, LOCAL_CONST_NAME, ...) \
     [&] {                                                                                        \
       constexpr static bool LOCAL_CONST_NAME = false;                                            \
@@ -81,7 +81,7 @@
     }()
 #endif
 
-#ifdef FLASHMASK_V2_DISABLE_SOFTCAP
+#ifdef FLASHMASK_V3_DISABLE_SOFTCAP
   #define SOFTCAP_SWITCH(COND, CONST_NAME, ...)                                                  \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -91,7 +91,7 @@
   #define SOFTCAP_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHMASK_V2_DISABLE_PAGEDKV
+#ifdef FLASHMASK_V3_DISABLE_PAGEDKV
   #define PAGEDKV_SWITCH(COND, CONST_NAME, ...)                                                  \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -101,7 +101,7 @@
   #define PAGEDKV_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHMASK_V2_DISABLE_SPLIT
+#ifdef FLASHMASK_V3_DISABLE_SPLIT
   #define SPLIT_SWITCH(COND, CONST_NAME, ...)                                                    \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -111,7 +111,7 @@
   #define SPLIT_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHMASK_V2_DISABLE_APPENDKV
+#ifdef FLASHMASK_V3_DISABLE_APPENDKV
   #define APPENDKV_SWITCH(COND, CONST_NAME, ...)                                                 \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -121,7 +121,7 @@
   #define APPENDKV_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHMASK_V2_DISABLE_PACKGQA
+#ifdef FLASHMASK_V3_DISABLE_PACKGQA
   #define PACKGQA_SWITCH(COND, CONST_NAME, ...)                                                  \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -131,7 +131,7 @@
   #define PACKGQA_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHMASK_V2_DISABLE_VARLEN
+#ifdef FLASHMASK_V3_DISABLE_VARLEN
   #define VARLEN_SWITCH(COND, CONST_NAME, ...)                                                   \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -141,7 +141,7 @@
   #define VARLEN_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHMASK_V2_DISABLE_CLUSTER
+#ifdef FLASHMASK_V3_DISABLE_CLUSTER
   #define CLUSTER_SWITCH(COND, CONST_NAME, ...)                                                  \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
@@ -151,7 +151,7 @@
   #define CLUSTER_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHMASK_V2_DISABLE_SM8x
+#ifdef FLASHMASK_V3_DISABLE_SM8x
   #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
   [&] {                                                                                          \
     constexpr static int ARCH_NAME = 90;                                                         \
@@ -173,7 +173,7 @@
   }()
 #endif
 
-#ifndef FLASHMASK_V2_ENABLE_VCOLMAJOR
+#ifndef FLASHMASK_V3_ENABLE_VCOLMAJOR
   #define VCOLMAJOR_SWITCH(COND, CONST_NAME, ...)                                                \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \

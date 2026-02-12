@@ -167,6 +167,7 @@ In this equation:
 ---
 
 ## 🚀 Performance
+🔧 Optimal performance optimizations are currently under review for upstream integration.
 
 ### FlashMask
 #### End-to-End Training Speedup
@@ -223,14 +224,13 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
 #### MARCO vs Magi-Attention (32K & 128K Sequences)
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/0ef6e015-b242-4285-b5fe-1cf7cca4c208" width="32%" alt="MARCO Bench 1"/>
-  <img src="https://github.com/user-attachments/assets/cd04b1da-5b5e-492e-918a-dcdd61d4c748" width="32%" alt="MARCO Bench 2"/>
-  <img src="https://github.com/user-attachments/assets/c1bb5f9d-e592-4a05-92b0-2a1078b2a5ca" width="32%" alt="MARCO Bench 3"/>
+  <img src="https://github.com/user-attachments/assets/a1dbf4df-6e51-47e8-9c5a-c883dd094166" width="32%" alt="MARCO Bench 1"/>
+  <img src="https://github.com/user-attachments/assets/604583f8-c149-4888-ab2a-db8c9ad12985" width="32%" alt="MARCO Bench 2"/>
+  <img src="https://github.com/user-attachments/assets/7753cb34-5d1d-4432-89f6-e587b86ffda6" width="32%" alt="MARCO Bench 3"/>
 </p>
 
 <details>
 <summary><b>📊 Detailed Runtime Comparison (ms)</b></summary>
-
 <table>
   <thead>
     <tr>
@@ -253,27 +253,27 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
       <td>3.34</td>
       <td>5.22</td>
       <td>8.56</td>
-      <td>0.64</td>
-      <td>2.09</td>
-      <td>2.73</td>
+      <td>0.63</td>
+      <td>2.07</td>
+      <td>2.70</td>
     </tr>
     <tr>
       <td>Document Mask</td>
       <td>3.54</td>
       <td>5.33</td>
       <td>8.88</td>
-      <td>0.93</td>
-      <td>2.46</td>
-      <td>3.38</td>
+      <td>0.92</td>
+      <td>2.44</td>
+      <td>3.37</td>
     </tr>
     <tr>
       <td>Prefix LM Document Mask</td>
       <td>3.39</td>
       <td>5.16</td>
       <td>8.55</td>
-      <td>0.65</td>
-      <td>2.09</td>
-      <td>2.74</td>
+      <td>0.63</td>
+      <td>2.07</td>
+      <td>2.70</td>
     </tr>
     <tr>
       <td rowspan="3">b=2, hq=32<br>hkv=4, d=128</td>
@@ -281,27 +281,27 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
       <td>3.88</td>
       <td>7.62</td>
       <td>11.50</td>
-      <td>1.25</td>
-      <td>6.89</td>
-      <td>8.13</td>
+      <td>1.64</td>
+      <td>7.26</td>
+      <td>8.90</td>
     </tr>
     <tr>
       <td>Document Mask</td>
       <td>4.88</td>
       <td>11.95</td>
       <td>16.83</td>
-      <td>1.98</td>
-      <td>8.13</td>
-      <td>10.11</td>
+      <td>2.70</td>
+      <td>8.74</td>
+      <td>11.44</td>
     </tr>
     <tr>
       <td>Prefix LM Document Mask</td>
       <td>3.98</td>
       <td>8.05</td>
       <td>12.03</td>
-      <td>1.27</td>
-      <td>6.91</td>
-      <td>8.18</td>
+      <td>1.63</td>
+      <td>7.26</td>
+      <td>8.89</td>
     </tr>
     <tr>
       <td rowspan="3">b=2, hq=64<br>hkv=8, d=128</td>
@@ -309,27 +309,27 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
       <td>5.07</td>
       <td>13.71</td>
       <td>18.78</td>
-      <td>2.00</td>
-      <td>13.15</td>
-      <td>15.16</td>
+      <td>3.00</td>
+      <td>14.19</td>
+      <td>17.18</td>
     </tr>
     <tr>
       <td>Document Mask</td>
       <td>7.37</td>
       <td>22.30</td>
       <td>29.67</td>
-      <td>3.34</td>
-      <td>15.59</td>
-      <td>18.93</td>
+      <td>5.08</td>
+      <td>17.15</td>
+      <td>22.24</td>
     </tr>
     <tr>
       <td>Prefix LM Document Mask</td>
       <td>5.27</td>
       <td>14.03</td>
       <td>19.30</td>
-      <td>2.05</td>
-      <td>13.20</td>
-      <td>15.25</td>
+      <td>2.98</td>
+      <td>14.20</td>
+      <td>17.18</td>
     </tr>
     <tr>
       <td rowspan="9" align="center" style="vertical-align: middle;"><strong>128K</strong></td>
@@ -338,27 +338,27 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
       <td>3.53</td>
       <td>5.65</td>
       <td>9.17</td>
-      <td>1.02</td>
-      <td>3.59</td>
-      <td>4.61</td>
+      <td>0.98</td>
+      <td>3.57</td>
+      <td>4.55</td>
     </tr>
     <tr>
       <td>Document Mask</td>
       <td>3.71</td>
       <td>6.77</td>
       <td>10.48</td>
-      <td>1.66</td>
-      <td>4.32</td>
-      <td>5.98</td>
+      <td>1.64</td>
+      <td>4.28</td>
+      <td>5.92</td>
     </tr>
     <tr>
       <td>Prefix LM Document Mask</td>
       <td>3.55</td>
       <td>5.68</td>
       <td>9.23</td>
-      <td>1.11</td>
-      <td>3.61</td>
-      <td>4.72</td>
+      <td>1.08</td>
+      <td>3.59</td>
+      <td>4.67</td>
     </tr>
     <tr>
       <td rowspan="3">b=1, hq=32<br>hkv=4, d=128</td>
@@ -366,27 +366,27 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
       <td>4.42</td>
       <td>10.41</td>
       <td>14.83</td>
-      <td>1.89</td>
-      <td>12.11</td>
-      <td>14.00</td>
+      <td>2.53</td>
+      <td>9.65</td>
+      <td>12.18</td>
     </tr>
     <tr>
       <td>Document Mask</td>
       <td>5.50</td>
       <td>15.44</td>
       <td>20.94</td>
-      <td>3.37</td>
-      <td>14.72</td>
-      <td>18.10</td>
+      <td>4.69</td>
+      <td>13.58</td>
+      <td>18.28</td>
     </tr>
     <tr>
       <td>Prefix LM Document Mask</td>
       <td>4.44</td>
       <td>10.53</td>
       <td>14.97</td>
-      <td>2.05</td>
-      <td>12.26</td>
-      <td>14.31</td>
+      <td>2.81</td>
+      <td>9.85</td>
+      <td>12.67</td>
     </tr>
     <tr>
       <td rowspan="3">b=1, hq=64<br>hkv=8, d=128</td>
@@ -394,31 +394,45 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
       <td>6.18</td>
       <td>19.10</td>
       <td>25.27</td>
-      <td>3.10</td>
-      <td>23.23</td>
-      <td>26.33</td>
+      <td>4.66</td>
+      <td>18.71</td>
+      <td>23.37</td>
     </tr>
     <tr>
       <td>Document Mask</td>
       <td>8.81</td>
       <td>29.39</td>
       <td>38.20</td>
-      <td>5.66</td>
-      <td>28.43</td>
-      <td>34.09</td>
+      <td>8.78</td>
+      <td>27.18</td>
+      <td>35.96</td>
     </tr>
     <tr>
       <td>Prefix LM Document Mask</td>
       <td>6.35</td>
       <td>19.70</td>
       <td>26.05</td>
-      <td>3.31</td>
-      <td>23.55</td>
-      <td>26.86</td>
+      <td>5.14</td>
+      <td>19.12</td>
+      <td>24.26</td>
     </tr>
   </tbody>
 </table>
-</details>
+
+### FlashMask V4
+
+Baseline: FA4 with mask_mod
+Config: Head dim = 128
+
+| Sequence Length | Speedup vs FA4 |
+|-----------|---------------|
+| 8k | **-0.4% ~ +57.2%** |
+| 32k | **-0.7% ~ +39.5%** |
+| 128k | **-3.4% ~ +20.9%** |
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/27085b7b-6e86-44c0-9ec1-6922ea8c2325" width="85%" alt="V3 Performance"/>
+</p>
 
 ---
 

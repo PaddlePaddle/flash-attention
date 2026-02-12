@@ -194,9 +194,9 @@ Note: Benchmark data is sourced from the associated research paper.
 | 128 | +40.2% ~ +141.1% | +7.3% ~ +67.5% |
 | 256 | +11.1% ~ +106.2% | +66.9% ~ +212.2% |
 
-attention-gym: 0.0.5.dev16+gd955666e8
+Attention-Gym: commit f6ff20
 
-pytorch: 2.9.0.dev20250901+cu129
+PyTorch: 2.9.0.dev20250901+cu129
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/cc8c0913-d3a8-4d0d-b6c3-83a299886225" width="85%" alt="V3 Performance"/>

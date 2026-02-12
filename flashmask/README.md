@@ -202,7 +202,6 @@ pytorch: 2.9.0.dev20250901+cu129
   <img src="https://github.com/user-attachments/assets/cc8c0913-d3a8-4d0d-b6c3-83a299886225" width="85%" alt="V3 Performance"/>
 </p>
 
-Note: Benchmark data is sourced from the associated research paper.
 
 ### Block Mask
 

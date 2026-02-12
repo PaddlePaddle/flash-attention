@@ -176,6 +176,7 @@ FlashMask achieves **1.65× to 3.22×** end-to-end speedup compared to dense Fla
   <img src="https://github.com/user-attachments/assets/6ca490b4-b57b-4e6a-a913-57517754a47e" width="80%" alt="Training Throughput"/>
 </p>
 
+Note: Benchmark data is sourced from the associated research paper.
 
 #### Kernel-Level Benchmarks (A100-SXM 80GB)
 FlashMask surpasses **FlexAttention (PyTorch 2.6.0)** by **12.1% to 60.7%** in kernel TFLOPs/s, achieving **37.8% to 62.3%** of theoretical peak FLOPs/s.
@@ -184,6 +185,7 @@ FlashMask surpasses **FlexAttention (PyTorch 2.6.0)** by **12.1% to 60.7%** in k
   <img src="https://github.com/user-attachments/assets/2239af39-1787-4338-bfa3-cfc623e88151" width="80%" alt="Kernel Speed Comparison"/>
 </p>
 
+Note: Benchmark data is sourced from the associated research paper.
 
 ### FlashMask V3 (Hopper Optimized)
 
@@ -192,10 +194,15 @@ FlashMask surpasses **FlexAttention (PyTorch 2.6.0)** by **12.1% to 60.7%** in k
 | 128 | +40.2% ~ +141.1% | +7.3% ~ +67.5% |
 | 256 | +11.1% ~ +106.2% | +66.9% ~ +212.2% |
 
+attention-gym: 0.0.5.dev16+gd955666e8
+
+pytorch: 2.9.0.dev20250901+cu129
+
 <p align="center">
   <img src="https://github.com/user-attachments/assets/cc8c0913-d3a8-4d0d-b6c3-83a299886225" width="85%" alt="V3 Performance"/>
 </p>
 
+Note: Benchmark data is sourced from the associated research paper.
 
 ### Block Mask
 
@@ -217,7 +224,7 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
 ### MARCO
 🔧 Performance optimizations have been implemented and are currently being pushed upstream.
 
-**MARCO: Mask-Aware Responsive Communication Overlap** eliminates CP bottlenecks through:
+**MARCO: Mask-Aware Responsive Communication Overlap** eliminates Context Parallel bottlenecks through:
 
 1. **Dynamic Load Balancing** — On-the-fly workload estimation for even distribution
 2. **Communication Overlapping** — Hides KV all-gather latency via computation overlap

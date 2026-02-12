@@ -418,6 +418,7 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
     </tr>
   </tbody>
 </table>
+</details>
 
 ### FlashMask V4
 

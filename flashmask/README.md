@@ -423,6 +423,7 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
 ### FlashMask V4
 
 Baseline: FA4 with mask_mod
+
 Config: Head dim = 128
 
 | Sequence Length | Speedup vs FA4 |

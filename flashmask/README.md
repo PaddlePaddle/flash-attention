@@ -431,6 +431,7 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
 🔧 Performance optimizations have been implemented and are currently being pushed upstream.
 
 Baseline: FA4 with mask_mod
++ flash-attention commit: 4f8924
 
 Config: Head dim = 128
 

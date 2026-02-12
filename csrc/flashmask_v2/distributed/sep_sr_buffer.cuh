@@ -19,8 +19,8 @@ class SepSRBuffer {
 using SemaphoreType = int64_t;
 
 private:
-    KVType* _k_data;
-    KVType* _v_data;
+    KVType* _dk_data;
+    KVType* _dv_data;
     SemaphoreType* _semaphores;
     bool _allocated;
     nvshmem_team_t _team;
@@ -59,10 +59,10 @@ public:
     ~SepSRBuffer();
 
     // [K_send, V_send] --> buf_offset size, therefore 2 * buf_offset is the double buffer offset
-    inline KVType* k_send(int seg_idx) const { return _k_data + CLAMP_IDX(seg_idx) * 2 * _buf_offset; }
-    inline KVType* v_send(int seg_idx) const { return _v_data + CLAMP_IDX(seg_idx) * 2 * _buf_offset; }
-    inline KVType* k_recv(int seg_idx) const { return _k_data + (CLAMP_IDX(seg_idx) * 2 + 1) * _buf_offset; }
-    inline KVType* v_recv(int seg_idx) const { return _v_data + (CLAMP_IDX(seg_idx) * 2 + 1) * _buf_offset; }
+    inline KVType* k_send(int seg_idx) const { return _dk_data + CLAMP_IDX(seg_idx) * 2 * _buf_offset; }
+    inline KVType* v_send(int seg_idx) const { return _dv_data + CLAMP_IDX(seg_idx) * 2 * _buf_offset; }
+    inline KVType* k_recv(int seg_idx) const { return _dk_data + (CLAMP_IDX(seg_idx) * 2 + 1) * _buf_offset; }
+    inline KVType* v_recv(int seg_idx) const { return _dv_data + (CLAMP_IDX(seg_idx) * 2 + 1) * _buf_offset; }
     inline SemaphoreType* semaphores(int seg_idx) const { return _semaphores + CLAMP_IDX(seg_idx) * _semaphore_size; }
 
     void wait_buffer(int seg_idx, cudaStream_t stream) {
@@ -78,7 +78,7 @@ public:
     void zero_recv_buf(int seg_idx, cudaStream_t comm_stream);
 
     inline bool is_valid() const noexcept {
-        return _allocated && _k_data && _v_data && _semaphores && _team != NVSHMEM_TEAM_INVALID;
+        return _allocated && _dk_data && _dv_data && _semaphores && _team != NVSHMEM_TEAM_INVALID;
     }
 
     nvshmem_team_t team() const noexcept {

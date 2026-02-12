@@ -88,6 +88,16 @@ void ReducedKdVKernel(
     }
 }
 
+#define ChunkDipatchKernelLaunch(num_chunk, is_first)                                   \
+    switch (num_chunk) {                                                                \
+        case 4: { ReducedKdVKernel<S_chunk_exp, 4, is_first><<<grid, 128, 0, stream>>>( \
+            dk_recv, dv_recv, dk_accum, dv_accum, num_tasks_per_chunk); break; }        \
+        case 2: { ReducedKdVKernel<S_chunk_exp, 2, is_first><<<grid, 128, 0, stream>>>( \
+            dk_recv, dv_recv, dk_accum, dv_accum, num_tasks_per_chunk); break; }        \
+    default:                                                                            \
+        throw std::invalid_argument("Num chunk per segment must be 2 or 4. Other segment size is not supported."); \
+    }
+
 /**
  * This function calls the dK, dV reduce kernel.
  * @param is_first The first segment to call this function has special
@@ -100,12 +110,11 @@ void launch_dk_dv_reduce(
     const bf16* dv_recv,
     bf16* dk_accum, bf16* dv_accum,
     int B, int S_chunk, int H, int D,
-    bool is_first, cudaStream_t stream
+    int num_chunks, bool is_first, cudaStream_t stream
 ) {
     // 128 threads, each reduces 4 bf16
     static constexpr int elem_per_block = 512;
     static constexpr int S_chunk_exp = 8192;        // expected S_chunk
-    static constexpr int num_chunks = 4;
     if (S_chunk != S_chunk_exp) {
         throw std::runtime_error("Chunk seqlen should be 8192.");
     }
@@ -117,12 +126,12 @@ void launch_dk_dv_reduce(
     // the reduce speed shouldn't be a bottleneck, so it's OK to allocate more SMs
     dim3 grid(std::max(2048 / B, 128), B); 
     if (is_first) {
-        ReducedKdVKernel<S_chunk_exp, num_chunks, true><<<grid, 128, 0, stream>>>(
-            dk_recv, dv_recv, dk_accum, dv_accum, num_tasks_per_chunk);
+        ChunkDipatchKernelLaunch(num_chunks, true);
     } else {
-        ReducedKdVKernel<S_chunk_exp, num_chunks, false><<<grid, 128, 0, stream>>>(
-            dk_recv, dv_recv, dk_accum, dv_accum, num_tasks_per_chunk);
+        ChunkDipatchKernelLaunch(num_chunks, false);
     }
 }
+
+#undef ChunkDipatchKernelLaunch
 
 }   // namespace flashmask

@@ -571,6 +571,8 @@ template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkSplittedRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
+    const T* const __restrict__ local_k,
+    const T* const __restrict__ local_v,
     int* const __restrict__ wptr,
     int* const __restrict__ block_work_idx,
     int* const __restrict__ block_cnt_semaphore,      // for dynamic scheduling
@@ -597,12 +599,12 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     // for each segment, get the number of work we can skip (due to being local). Note that
     // if work_to_skip is not 0, there will be some skippable works for **each batch**
     constexpr int work_to_skip = has_local ? (S_chunk / row_per_block) : 0;
-    constexpr int seqlen_offset = has_local ? 0 : S_chunk;
     // though the actual skippable work is `num_batch * (work_per_seg - work_to_skip)`
     // for batch_idx > 0, those skippable local works cannot be skipped **directly**.
     const int total_works = num_batch * work_per_seg;
     // this batch_stride is the segment batch stride, not full (num_segs * segment_size) batch stride
     const int batch_stride = S * S_stride;
+    const int local_batch_stride = S_chunk * S_stride;
 
     extern __shared__ int smem_chunk_mask[];
     __shared__ int cached_semaphores[16];
@@ -612,7 +614,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         // global address to local segment address. total_works are usually small (<128), no need for vectorization
         const int batch_id = threadIdx.x / work_per_seg;
         auto* src_ptr = copy_chunk_mask + (segment_idx + batch_id * num_segments) * work_per_seg + threadIdx.x;
-        smem_chunk_mask[batch_id * work_per_seg + threadIdx.x] = *src_ptr;
+        smem_chunk_mask[threadIdx.x] = *src_ptr;
     }
 
     if constexpr (use_semaphore) {
@@ -657,7 +659,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         const int seq_work_id = work_id_m1 % work_per_seg;
         // if there is local_chunk and B > 1, we might have some of the 
         // work to be skipped (due to being local) directly.
-        if (seq_work_id < work_to_skip || smem_chunk_mask[seq_work_id + work_per_seg * batch_id]) {
+        if (seq_work_id < work_to_skip || smem_chunk_mask[work_id_m1]) {
             __syncthreads();
             work_id = update_wptr_and_work_id_sync(work_id);
             continue;
@@ -676,14 +678,13 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         }
 
         // copy upto 4 heads (S_stride = H * D), and row_per_block rows (seqlen axis) per CTA
-        const int src_addr = batch_id * batch_stride + (seqlen_id % S_chunk) * S_stride;
-        // if there is no local chunk, we offset the dst by one chunk (seqlen_offset = S_chunk)
-        const int dst_addr = batch_id * batch_stride + (seqlen_id + seqlen_offset) * S_stride;
+        const int src_addr = batch_id * local_batch_stride + (seqlen_id % S_chunk) * S_stride;
+        const int dst_addr = batch_id * batch_stride + seqlen_id * S_stride;
         shmem::two_buffers_getmem_block(
             k_sr + dst_addr,
             v_sr + dst_addr,
-            k_sr + src_addr,
-            v_sr + src_addr,
+            local_k + src_addr,
+            local_v + src_addr,
             row_per_block * S_stride * sizeof(T), remote_pe
         );
         // buffer getmem_block will call syncthreads(), so next_work_id will not be updated.

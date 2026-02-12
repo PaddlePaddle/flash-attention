@@ -23,7 +23,7 @@ SepSRBuffer<KVType>::SepSRBuffer(
     int buffer_capacity,
     nvshmem_team_t team
 ) : 
-    _k_data(nullptr), _v_data(nullptr), _semaphores(nullptr), 
+    _dk_data(nullptr), _dv_data(nullptr), _semaphores(nullptr), 
     _allocated(false), _idx_mask(buffer_capacity - 1), _team(team), 
     _buf_offset(2 * chunks_per_seg * single_k_numel), 
     _semaphore_size(semaphore_size)
@@ -45,26 +45,26 @@ SepSRBuffer<KVType>::SepSRBuffer(
 
     size_t total_bytes = total_elements * sizeof(KVType);
     
-    _k_data = static_cast<KVType*>(nvshmem_malloc(total_bytes));
-    if (!_k_data) {
+    _dk_data = static_cast<KVType*>(nvshmem_malloc(total_bytes));
+    if (!_dk_data) {
         throw std::bad_alloc();
     }
-    _v_data = _k_data + chunks_per_seg * single_k_numel;
-    _semaphores = reinterpret_cast<SemaphoreType*>(_k_data + 2 * buffer_capacity * _buf_offset);
+    _dv_data = _dk_data + chunks_per_seg * single_k_numel;
+    _semaphores = reinterpret_cast<SemaphoreType*>(_dk_data + 2 * buffer_capacity * _buf_offset);
     _allocated = true;
 }
 
 template <typename KVType>
 void SepSRBuffer<KVType>::release() {
-    if (_allocated && _k_data) {
+    if (_allocated && _dk_data) {
         if constexpr (MANUAL_CLEANUP) {
-            nvshmem_free(_k_data);
+            nvshmem_free(_dk_data);
         }
         for (int i = 0; i < _idx_mask + 1; i++) {
             CUDA_DEBUG_CHECK(cudaEventDestroy(_empty_states[i]));
         }
-        _k_data = nullptr;
-        _v_data = nullptr;
+        _dk_data = nullptr;
+        _dv_data = nullptr;
         _semaphores = nullptr;
         _allocated = false;
         _team = NVSHMEM_TEAM_INVALID;
@@ -87,7 +87,7 @@ void SepSRBuffer<KVType>::reset_semaphores() {
 
 template <typename KVType>
 void SepSRBuffer<KVType>::zero_recv_buf(int seg_idx, cudaStream_t comm_stream) {
-    cudaMemsetAsync(_k_data + _buf_offset * (1 + 2 * (seg_idx & _idx_mask)), 0, sizeof(KVType) * _buf_offset, comm_stream);
+    cudaMemsetAsync(_dk_data + _buf_offset * (1 + 2 * (seg_idx & _idx_mask)), 0, sizeof(KVType) * _buf_offset, comm_stream);
 }
 
 template class SepSRBuffer<cutlass::bfloat16_t>;

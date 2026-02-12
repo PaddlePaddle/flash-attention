@@ -179,9 +179,6 @@ SEGMENT_LOOP_START:
             comm_singleton.run_overlap_splitted_ag_kernel(
                 params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k, segment_idx
             );
-            // offset K and V by one chunk
-            params.k_ptr = comm_singleton.k_data(segment_idx ? 1 : 0);
-            params.v_ptr = comm_singleton.v_data(segment_idx ? 1 : 0);
             // make sure computation kernels are scheduled with SMs later than communication kernels
         } else {
             comm_singleton.run_overlap_ag_kernel(

@@ -71,8 +71,6 @@ public:
 
     void* k_data() const { return kv_buffer->k_data(); }
     void* v_data() const { return kv_buffer->v_data(); }
-    void* k_data(int chunk_id) const;
-    void* v_data(int chunk_id) const;
 
     // we need to reroute the bwd dx_accum output buffer to dk_send and dv_send
     // so that the output of post-proc kernel can be directly sent
@@ -145,6 +143,26 @@ public:
     */
     std::unique_ptr<SepSRBuffer<KVType>> dkv_buffer;
 private:
+    /**
+     * Note(heqianyue): for B > 1, RS-overlap, we need a place to store the local KV chunk
+     * so that each split AG remote_get call can correctly send the data to other ranks.
+     * We choose to store one more copy of the local KV chunk data at the end of the SR buffer.
+     * Note that this makes it two copies of the local KV chunks: the first copy is ordered
+     * with a batch stride of num_chunks * S_local * H * D, so that for the first segement,
+     * attention kernel can directly use SR buffer for bwd recompute. This copy of local KV chunks
+     * will be overwritten by the upcoming segments, so we need the second copy (gauranteed:
+     * will never be overwritten) for remote ranks to get from.
+     * 
+     * return the last B * S_local * H * D elems in the respective SR buffer
+     * 
+    */ 
+    inline KVType* local_k_data() const {
+        return kv_buffer->k_data() + _total_numel - B * _cp_chunk_size;
+    }
+    inline KVType* local_v_data() const {
+        return kv_buffer->v_data() + _total_numel - B * _cp_chunk_size;
+    }
+private:
     std::unique_ptr<SRBuffer<KVType>> kv_buffer;
     cudaStream_t comm_stream;
     cudaStream_t aux_p_stream;      // RS-overlap: producer (put) stream
@@ -155,6 +173,7 @@ private:
     const int H_mask;       // mask head
     const int D;
     const int _cp_size;
+    const int num_chunks;
     int _my_pe;
     int _total_n_pes;
     int _cp_stride;

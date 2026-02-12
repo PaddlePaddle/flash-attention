@@ -12,7 +12,7 @@ namespace flashmask {
 // deprecation warning: will be removed in the future
 static constexpr bool SHOULD_MANAGE_NVSHMEM = true;
 static constexpr bool USE_DENSE_COPY = true;            // no sparse mask KV skipping
-static constexpr bool USE_SEMAPHORES = true;           // no team_bar but fine-grained signaling
+static constexpr bool USE_SEMAPHORES = false;           // no team_bar but fine-grained signaling
 // If true, we will scale up the transfering chunk for one CTA (16 rows per chunk ---> 256-512 rows per chunk)
 // and calculate per-chunk sparsity to skip some comm (avg 50% of the chunks are not needed)
 static constexpr bool USE_SPARSE_LARGE_CHUNK = true;
@@ -666,6 +666,9 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         }
         SegmentIdxPutKernelDispatch(num_chunks - 1, segment_idx);    // local producer
     }
+    // bwd-attn post-process will wait for the following event (release of dk/v send buffer)
+    // we can safely release buffer as soon as remote_put (non-blocking ver) is done
+    dkv_buffer->release_buffer(segment_idx, aux_p_stream);
     // ensure put (data sending) is completed on aux_p_stream
     nvshmemx_quiet_on_stream(aux_p_stream);
 
@@ -677,8 +680,6 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         num_chunks,
         aux_p_stream
     );                          // local producer
-    // bwd-attn post-process will wait for the following event (release of dk/v send buffer)
-    dkv_buffer->release_buffer(segment_idx, aux_p_stream);
 
     // step 4. the local rank consumer (reduce) wait full (from other remote rank)
     // This actually starts simultaneously with the previous kernels
@@ -703,6 +704,11 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
 }
 
 #undef SegmentIdxPutKernelDispatch
+
+template <typename KVType>
+int OverlapCommunicator<KVType>::dkv_buffer_stage() const {
+    return RS_BUFFER_CAPACITY;
+}
 
 template <typename KVType>
 int OverlapCommunicator<KVType>::seqlen_scale() const {

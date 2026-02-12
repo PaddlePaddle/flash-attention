@@ -459,11 +459,13 @@ SEGMENT_LOOP_START:
             CHECK_CUDA(cudaFuncSetAttribute(flash::cutlass_flashmask_kernel<PostprocessKerneldKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
         }
 #ifdef NVSHMEM_DISTRIBUTED_OVERLAP
-        if (overlap_rs && segment_idx) {
+        if (overlap_rs) {
             // post-process kernel must wait for the RS-reduce finishing. Since we redirect the output buffer of post-process to dk/v_send
             // these two buffers are also used in RS-overlap (remote put and reduce), so we cannot overwrite these before they are released. 
             auto& comm_singleton = flashmask::comm::singleton();
-            comm_singleton.dkv_buffer->wait_buffer(segment_idx, stream);
+            if (segment_idx >= comm_singleton.dkv_buffer_stage()) {
+                comm_singleton.dkv_buffer->wait_buffer(segment_idx, stream);
+            }
         }
 #endif  // NVSHMEM_DISTRIBUTED_OVERLAP
         flash::flashmask_kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/);

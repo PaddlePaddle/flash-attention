@@ -93,6 +93,8 @@ public:
         const bool fwd = true
     );
 
+    int dkv_buffer_stage() const;
+
     // reset local recv buffer and semaphores given segment_idx. 
     // Called after dK, dV reduction is done
     void reset_recv_status(int segment_idx);

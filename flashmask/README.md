@@ -194,8 +194,6 @@ Note: Benchmark data is sourced from the associated research paper.
 | 128 | +40.2% ~ +141.1% | +7.3% ~ +67.5% |
 | 256 | +11.1% ~ +106.2% | +66.9% ~ +212.2% |
 
-Attention-Gym: commit f6ff20
-
 PyTorch: 2.9.0.dev20250901+cu129
 
 <p align="center">

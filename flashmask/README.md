@@ -167,7 +167,6 @@ In this equation:
 ---
 
 ## 🚀 Performance
-🔧 Optimal performance optimizations are currently under review for upstream integration.
 
 ### FlashMask
 #### End-to-End Training Speedup
@@ -216,6 +215,8 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
 
 
 ### MARCO
+🔧 Performance optimizations have been implemented and are currently being pushed upstream.
+
 **MARCO: Mask-Aware Responsive Communication Overlap** eliminates CP bottlenecks through:
 
 1. **Dynamic Load Balancing** — On-the-fly workload estimation for even distribution
@@ -421,6 +422,7 @@ FlashMask V3 demonstrates a substantial performance advantage over [Block Attent
 </details>
 
 ### FlashMask V4
+🔧 Performance optimizations have been implemented and are currently being pushed upstream.
 
 Baseline: FA4 with mask_mod
 

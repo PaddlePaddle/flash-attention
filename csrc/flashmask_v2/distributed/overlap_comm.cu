@@ -422,8 +422,8 @@ void OverlapCommunicator<KVType>::compute_chunk_mask(
     if constexpr (USE_SPARSE_LARGE_CHUNK) {
         constexpr int S_chunk = 8192;
         constexpr int num_reduce_warp = RDMA_ROW_PER_WARP == 16 ? 4 : num_warps;
-        const int valid_seqlen_k = S_local * _cp_size - S_chunk;
         const int head_stride = S_local * _cp_size;
+        const int valid_seqlen_k = head_stride - S_chunk;
 #define CallBlockSparsityKernel(grid, skip_local, Trait)                                                      \
     BlockSparsityCheck##Trait##Kernel<S_chunk, num_reduce_warp, RDMA_ROW_PER_WARP, skip_local>    \
                 <<< grid, num_reduce_warp * 32, 0, stream >>>(lt_start_ptr, ut_end_ptr, copy_chunk_mask, H_mask, head_stride)

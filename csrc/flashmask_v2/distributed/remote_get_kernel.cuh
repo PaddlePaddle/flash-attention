@@ -613,7 +613,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     if (threadIdx.x < total_works) {
         // global address to local segment address. total_works are usually small (<128), no need for vectorization
         const int batch_id = threadIdx.x / work_per_seg;
-        auto* src_ptr = copy_chunk_mask + (segment_idx + batch_id * num_segments) * work_per_seg + threadIdx.x;
+        auto* src_ptr = copy_chunk_mask + (segment_idx + batch_id * num_segments) * work_per_seg 
+            + (threadIdx.x % work_per_seg);
         smem_chunk_mask[threadIdx.x] = *src_ptr;
     }
 

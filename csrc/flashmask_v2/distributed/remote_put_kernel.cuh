@@ -47,8 +47,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     static constexpr int r2_num_chunk = has_local ? (num_chunk + 1) : num_chunk;  // round-even num chunk
     static constexpr int row_per_block = num_warps * row_per_warp;     // 256 or 512 row per block (32 or 64 per warp)
     static constexpr int work_per_chunk = S_chunk / row_per_block;
+    static constexpr int work_per_seg = work_per_chunk * num_chunk;
 
-    const int total_works = num_batch * (work_per_chunk * num_chunk);
+    const int total_works = num_batch * work_per_seg;
     const int batch_stride = S_chunk * r2_num_chunk * S_stride;         // use rounded chunk to compute batch_stride
 
     extern __shared__ int smem_chunk_mask[];
@@ -57,10 +58,11 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 
     if (threadIdx.x < total_works) {
         // copies everything, even the chunk mask of the local chunk
-        const int batch_id = threadIdx.x / (work_per_chunk * num_chunk);
+        const int batch_id = threadIdx.x / work_per_seg;
+        const int seqlen_id = threadIdx.x % work_per_seg;
         constexpr int start_offset = chunk_offset * work_per_chunk;
-        auto* src_ptr = copy_chunk_mask + (segment_idx + batch_id * num_segments) * r2_num_chunk * work_per_chunk + threadIdx.x;
-        smem_chunk_mask[batch_id * num_chunk * work_per_chunk + start_offset + threadIdx.x] = *(src_ptr + start_offset);
+        auto* src_ptr = copy_chunk_mask + (segment_idx + batch_id * num_segments) * r2_num_chunk * work_per_chunk + seqlen_id;
+        smem_chunk_mask[start_offset + threadIdx.x] = *(src_ptr + start_offset);
         if (threadIdx.x < r2_num_chunk) {
             cached_empty[threadIdx.x] = 0;
         }

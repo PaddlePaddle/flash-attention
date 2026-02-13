@@ -5,7 +5,7 @@ import cutlass
 from cutlass import Boolean, Int32, Int8, const_expr
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-import paddle
+import torch
 
 from flash_mask.cute.block_sparsity import BlockSparseTensors
 from flash_mask.cute.utils import hash_callable, scalar_to_ssa, ssa_to_scalar
@@ -263,7 +263,7 @@ def compute_block_sparsity(
     device,
     compute_full_blocks: bool = True,
     use_fast_sampling: bool = False,
-) -> Tuple[BlockSparseTensors, Tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor, paddle.Tensor]]:
+) -> Tuple[BlockSparseTensors, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     Computes block sparsity for a given `mask_mod`.
 
@@ -281,33 +281,28 @@ def compute_block_sparsity(
         use_fast_sampling: Whether to use 5-point sampling (4 corners + center). This is much faster, but only suitable for masks where this check is sufficient.
 
     Returns:
-        A tuple of `BlockSparseTensors` and the underlying paddle tensors.
+        A tuple of `BlockSparseTensors` and the underlying torch tensors.
     """
     num_m_blocks = (seqlen_q + tile_m - 1) // tile_m
     num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
 
-    mask_block_cnt = paddle.zeros((batch_size, num_heads, num_m_blocks), dtype=paddle.int32)
-    mask_block_idx = paddle.zeros(
-        (batch_size, num_heads, num_m_blocks, num_n_blocks), dtype=paddle.int32
+    mask_block_cnt = torch.zeros((batch_size, num_heads, num_m_blocks), dtype=torch.int32, device=device)
+    mask_block_idx = torch.zeros(
+        (batch_size, num_heads, num_m_blocks, num_n_blocks), dtype=torch.int32, device=device
     )
-    full_block_cnt = paddle.zeros((batch_size, num_heads, num_m_blocks), dtype=paddle.int32)
-    full_block_idx = paddle.zeros(
-        (batch_size, num_heads, num_m_blocks, num_n_blocks), dtype=paddle.int32
+    full_block_cnt = torch.zeros((batch_size, num_heads, num_m_blocks), dtype=torch.int32, device=device)
+    full_block_idx = torch.zeros(
+        (batch_size, num_heads, num_m_blocks, num_n_blocks), dtype=torch.int32, device=device
     )
+    def _wrap(t, dim):
+        # (Capsule) -> from_dlpack (Cute Tensor)
+        return from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=dim)
 
     # Convert to cute tensors
-    mask_cnt_cute = from_dlpack(mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=2
-    )
-    mask_idx_cute = from_dlpack(mask_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=3
-    )
-    full_cnt_cute = from_dlpack(full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=2
-    )
-    full_idx_cute = from_dlpack(full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=3
-    )
+    mask_cnt_cute = _wrap(mask_block_cnt, 2)
+    mask_idx_cute = _wrap(mask_block_idx, 3)
+    full_cnt_cute = _wrap(full_block_cnt, 2)
+    full_idx_cute = _wrap(full_block_idx, 3)
 
     blocksparse_tensors = BlockSparseTensors(
         mask_block_cnt=mask_cnt_cute,
@@ -350,7 +345,7 @@ def compute_block_sparsity(
         aux_tensors,
     )
 
-    # Return both the BlockSparseTensors (cute) and the underlying paddle tensors
+    # Return both the BlockSparseTensors (cute) and the underlying torch tensors
     return blocksparse_tensors, (full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx)
 
 
@@ -359,6 +354,9 @@ compute_block_sparsity.compile_cache = {}
 
 def run():
     """Test the BlockSparsityKernel with a simple causal mask."""
+    if not torch.cuda.is_available():
+        print("Skipping test: CUDA not available.")
+        return
 
     print("Testing BlockSparsityKernel...")
 

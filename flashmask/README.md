@@ -1052,7 +1052,7 @@ v = scatter_balance(full_v, group = cp_group, axis=1, buckets = buckets
 If you use FlashMask in your research or project, we appreciate that you use the following citations:
 
 ```bibtex
-@inproceedings{ICLR2025_wang2024flashmask,
+@inproceedings{ICLR2025_wang2025flashmask,
   author = {Wang, Guoxia and Zeng, Jinle and Xiao, Xiyuan and Wu, Siming and Yang, Jiabin and Zheng, Lujing and Chen, Zeyu and Bian, Jiang and Yu, Dianhai and Wang, Haifeng},
   booktitle = {International Conference on Learning Representations},
   editor = {Y. Yue and A. Garg and N. Peng and F. Sha and R. Yu},

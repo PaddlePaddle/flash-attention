@@ -1052,11 +1052,16 @@ v = scatter_balance(full_v, group = cp_group, axis=1, buckets = buckets
 If you use FlashMask in your research or project, we appreciate that you use the following citations:
 
 ```bibtex
-@article{wang2024flashmask,
-  title={Flashmask: Efficient and rich mask extension of flashattention},
-  author={Wang, Guoxia and Zeng, Jinle and Xiao, Xiyuan and Wu, Siming and Yang, Jiabin and Zheng, Lujing and Chen, Zeyu and Bian, Jiang and Yu, Dianhai and Wang, Haifeng},
-  journal={arXiv preprint arXiv:2410.01359},
-  year={2024}
+@inproceedings{ICLR2025_wang2024flashmask,
+  author = {Wang, Guoxia and Zeng, Jinle and Xiao, Xiyuan and Wu, Siming and Yang, Jiabin and Zheng, Lujing and Chen, Zeyu and Bian, Jiang and Yu, Dianhai and Wang, Haifeng},
+  booktitle = {International Conference on Learning Representations},
+  editor = {Y. Yue and A. Garg and N. Peng and F. Sha and R. Yu},
+  pages = {27641--27661},
+  title = {FlashMask: Efficient and Rich Mask Extension of FlashAttention},
+  url = {https://proceedings.iclr.cc/paper_files/paper/2025/file/44c624d8f4e802453ad12593b2aa8e38-Paper-Conference.pdf},
+  note = {arXiv preprint arXiv:2410.01359},
+  volume = {2025},
+  year = {2025}
 }
 ```
 

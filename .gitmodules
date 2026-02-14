@@ -10,3 +10,6 @@
 [submodule "csrc/flashmask_v2/cutlass"]
 	path = csrc/flashmask_v2/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
+[submodule "flashmask/flash_mask/flashmask_attention_v3/cutlass"]
+	path = flashmask/flash_mask/flashmask_attention_v3/cutlass
+	url = https://github.com/NVIDIA/cutlass.git

@@ -5,6 +5,7 @@
 #include "remote_get_kernel_specialized.cuh"
 #include "remote_put_kernel.cuh"
 #include "dk_dv_reduce_bf16.cuh"
+#include "cp_heuristic.cuh"
 
 namespace flashmask {
 
@@ -79,12 +80,12 @@ void init_with_unique_id(
     nvshmemx_init_attr_t attr;
     std::memcpy(
         &root_unique_id, root_unique_id_val.data(), sizeof(nvshmemx_uniqueid_t));
-    DEBUG_PRINT("Start to set unique ID args...\n");
+    WARN_PRINT("Start to set unique ID args...\n");
     nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr);
-    DEBUG_PRINT("Start to set init attr...\n");
+    WARN_PRINT("Start to set init attr...\n");
     nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
     // TODO(heqianyue): Do we need to bar here?
-    DEBUG_PRINT("%d / %d bars before completing the init.\n", rank, num_ranks);
+    WARN_PRINT("%d / %d bars before completing the init.\n", rank, num_ranks);
     nvshmem_barrier_all();
 }
 
@@ -95,7 +96,7 @@ void init_distributed_environment(
     int& n_pes,
     const uint8_t* unique_id_ptr
 ) {
-    DEBUG_PRINT("[FlashMask Overlap] Initializing NVSHMEM... Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
+    WARN_PRINT("[FlashMask Overlap] Initializing NVSHMEM... Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
     std::vector<uint8_t> unique_id_val;
     if (unique_id_ptr == nullptr) {         
         // TODO(heqianyue): deprecate in the future, we do not allow local shared file
@@ -105,26 +106,20 @@ void init_distributed_environment(
             unique_id_val = UniqueIdFileSync::wait_and_read_unique_id(rank);
         }
     } else {
-        DEBUG_PRINT("Extracting unique ID...");
+        WARN_PRINT("Extracting unique ID...");
         unique_id_val.resize(sizeof(nvshmemx_uniqueid_t));
         std::memcpy(unique_id_val.data(), unique_id_ptr, sizeof(nvshmemx_uniqueid_t));
     }
     init_with_unique_id(std::move(unique_id_val), rank, nranks);
     get_nvshmem_info(my_pe, n_pes);
-    DEBUG_PRINT("[FlashMask Overlap] NVSHMEM initialized. Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
+    WARN_PRINT("[FlashMask Overlap] NVSHMEM initialized. Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
     UniqueIdFileSync::clean_up_file();
 }
 
 void finalize_distributed_environment() {
-    DEBUG_PRINT("[FlashMask Overlap] Finalizing...\n");
+    WARN_PRINT("[FlashMask Overlap] Finalizing...\n");
     nvshmem_finalize();
-    DEBUG_PRINT("[FlashMask Overlap] NVSHMEM env finalized.\n");
-}
-
-int cp_ranks_to_num_chunks(int cp_size) {
-    if (cp_size == 16) return 4;
-    else if (cp_size <= 4) return 2;
-    throw std::runtime_error("CP size must be 4 or 16. Other values are not supported currently.");
+    WARN_PRINT("[FlashMask Overlap] NVSHMEM env finalized.\n");
 }
 
 template <typename KVType>
@@ -150,7 +145,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
    H_mask(mask_head),
    D(d_kv),
    _cp_size(cp_size),
-   num_chunks(cp_ranks_to_num_chunks(nranks)),
+   num_chunks(get_num_chunk_per_segment(s_kv, nranks, h_kv)),
    block_work_ids(nullptr),
    block_cnt_semaphore(nullptr),
    copy_chunk_mask(nullptr)

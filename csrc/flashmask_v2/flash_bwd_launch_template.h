@@ -415,12 +415,14 @@ SEGMENT_LOOP_START:
         Element* dk_buffer = static_cast<Element*>(params.dk_ptr);
         Element* dv_buffer = static_cast<Element*>(params.dv_ptr);
         const int batch_stride_dkv = params.d_rounded * params.seqlen_k_rounded * params.h_k;
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
         if (overlap_rs) {
             auto& comm_singleton = flashmask::comm::singleton();
             // post-process outputs to send buffer so that we can directly send it.
             dk_buffer = static_cast<Element*>(comm_singleton.dk_send(segment_idx));
             dv_buffer = static_cast<Element*>(comm_singleton.dv_send(segment_idx));
         }
+#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
         // Note(heqianyue): when RS-overlap is switched ON, the shape of dk_ptr (and dv_ptr) is (B, S_local, H, D)
         // while the dk_accum & dv_accum & dk_send, dv_send (NVSHMEM buffer) have shape (B, S_local * chunks_per_seg, H, D)
         // we therefore need to re-route the output of post-process kernels to dk_send, dv_send. The final reduced output

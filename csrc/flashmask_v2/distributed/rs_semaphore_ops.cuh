@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <nvshmem.h>
 #include <nvshmemx.h>
+#include "debug_logger.cuh"
 
 namespace flashmask {
 namespace sema {
@@ -14,6 +15,11 @@ __global__ void SetValueKernel(
     const int value
 ) {
     *(semaphore + threadIdx.x) = static_cast<SemaphoreT>(value);
+#ifdef NVSHMEM_DEBUG
+    if (gridDim.x == 1) {
+        DEBUG_PRINT("Consumer sets self empty value: %d\n", value);
+    }
+#endif  // NVSHMEM_DEBUG
 }
 
 __global__ void ProducerNotifyFull(
@@ -26,7 +32,12 @@ __global__ void ProducerNotifyFull(
     // quiet make sure the previous put/get on this stream is done, then we can clear bit
     if (self_rank == target_rank) return;
     semaphores[target_rank] = 0;        // clear the local status (set by the remote target)
+#ifdef NVSHMEM_DEBUG
+    auto fetched = nvshmem_long_atomic_fetch_add(semaphores + target_rank, -(1 << self_rank), target_rank);
+    DEBUG_PRINT("Producer %d notifies remote %d full, fetched: %ld\n", self_rank, target_rank, fetched);
+#else
     nvshmem_long_atomic_add(semaphores + target_rank, -(1 << self_rank), target_rank);
+#endif  // NVSHMEM_DEBUG
 }
 
 __global__ void ConsumerNotifyEmpty(
@@ -41,6 +52,30 @@ __global__ void ConsumerNotifyEmpty(
     target_rank = target_rank >= 0 ? target_rank : target_rank + cp_size;
     if (target_rank == self_rank) return;
     nvshmem_int64_p(semaphores + self_rank, 1, target_rank);
+    DEBUG_PRINT("Consumer %d notifies remote %d empty, end_rank: %d\n", self_rank, target_rank, remote_producer_end_rank);
+}
+
+__global__ void FusedConsumerNotifyEmpty(
+    int64_t* const __restrict__ semaphores,
+    int remote_producer_end_rank,
+    int cp_size,
+    int value,
+    int self_rank
+) {
+    // for example: rank 3 local consumer needs the data from [12, 15] (remote producer) for seg 1
+    // remote_producer_end_rank will be 15 (computed by mod_cp_size(3 - 4 * seg_idx) --> (-1 % 16) --> 15)
+    if (threadIdx.x == 0) {
+        semaphores[self_rank] = value;
+        DEBUG_PRINT("Consumer %d fused, sets self empty value: %d, \
+            cp_size: %d, end_rank: %d\n", self_rank, value, cp_size, remote_producer_end_rank);
+    }
+    __threadfence_system();
+    __syncwarp();
+    int target_rank = remote_producer_end_rank - threadIdx.x;
+    target_rank = target_rank >= 0 ? target_rank : target_rank + cp_size;
+    if (target_rank == self_rank) return;
+    nvshmem_int64_p(semaphores + self_rank, 1, target_rank);
+    DEBUG_PRINT("Consumer %d notifies remote %d empty, end_rank: %d\n", self_rank, target_rank, remote_producer_end_rank);
 }
 
 __global__ void DebugWaitAndResetKernel(
@@ -69,19 +104,23 @@ void notify_consumer_empty(
     int self_rank,
     cudaStream_t comm_stream
 ) {
-    int64_t local_flag = 0;
+    int local_flag = 0;
     for (int i = 0; i < seg_size; i++) {
         int target_rank = remote_producer_end_rank - i;
         target_rank = target_rank >= 0 ? target_rank : target_rank + cp_size;
         local_flag |= target_rank == self_rank ? 0 : (1 << target_rank);
     }
     // step 1. set self (inform reduce kernel that we haven't got data from other ranks, so we wait)
-    SetValueKernel<<<1, 1, 0, comm_stream>>>(semaphores + self_rank, local_flag);
+    // SetValueKernel<<<1, 1, 0, comm_stream>>>(semaphores + self_rank, local_flag);
     // step 2. notify all other src ranks: you can start putting data to this rank
     // for example: local_rank is 7, we notify rank 0,1,2,3 to put data by setting sema[7] to 1
     // set remote empty state can not start before we set the local state
     // otherwise there will be corrupted read-write
-    ConsumerNotifyEmpty<<<1, seg_size, 0, comm_stream>>>(semaphores, remote_producer_end_rank, cp_size, self_rank);
+    // ConsumerNotifyEmpty<<<1, seg_size, 0, comm_stream>>>(semaphores, remote_producer_end_rank, cp_size, self_rank);
+
+    // TODO(heqianyue): we'll decide whether to keep fused or non-fused version.
+    FusedConsumerNotifyEmpty<<<1, seg_size, 0, comm_stream>>>(semaphores,
+                    remote_producer_end_rank, cp_size, local_flag, self_rank);
     nvshmemx_quiet_on_stream(comm_stream);
 }
 
@@ -123,7 +162,9 @@ __device__ void producer_wait_empty(
     const int64_t* const __restrict__ semaphores,
     const int target_pe
 ) {
+    WARN_PRINT("Producer block %d waits remote %d empty ...\n", blockIdx.x, target_pe);
     nvshmem_int64_wait_until(const_cast<int64_t*>(semaphores) + target_pe, NVSHMEM_CMP_NE, 0);   // wait until not 0
+    WARN_PRINT("Producer block %d waits remote %d empty succeeded.\n", blockIdx.x, target_pe);
 }
 
 }   // namespace rs

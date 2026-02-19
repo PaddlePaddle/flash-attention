@@ -41,6 +41,11 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int64_t* const __restrict__ semaphores,
     const int num_segments = 4
 ) {
+#ifdef NVSHMEM_DEBUG
+    if (threadIdx.x == 0) {
+       DEBUG_PRINT("Remote put starts, blockIdx: %d, self rank: %d, segment_idx: %d / %d\n", blockIdx.x, my_pe, segment_idx, num_segments);
+    }
+#endif  // NVSHMEM_DEBUG
     static constexpr bool has_local = (num_chunk & 0x01) > 0;
     // skip the local chunk by using 1 as offset
     static constexpr int chunk_offset = has_local ? 1 : 0;
@@ -57,7 +62,6 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     __shared__ int next_work_id;
 
     if (threadIdx.x < total_works) {
-        // copies everything, even the chunk mask of the local chunk
         const int batch_id = threadIdx.x / work_per_seg;
         const int seqlen_id = threadIdx.x % work_per_seg;
         constexpr int start_offset = chunk_offset * work_per_chunk;
@@ -127,6 +131,11 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         // before some threads reading it. Safe!
         work_id = update_work_id_sync();
     }
+#ifdef NVSHMEM_DEBUG
+    if (threadIdx.x == 0) {
+       DEBUG_PRINT("Remote put quits, blockIdx: %d, self rank: %d, segment_idx: %d\n", blockIdx.x, my_pe, segment_idx);
+    }
+#endif  // NVSHMEM_DEBUG
 }
 
 }   // namespace flashmask

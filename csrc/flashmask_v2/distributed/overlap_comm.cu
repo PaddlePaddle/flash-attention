@@ -204,7 +204,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         );
         // zero initialize the dkv semaphores
         dkv_buffer->reset_semaphores();
-        WARN_PRINT("[FlashMask Overlap] Using RS-Overlap, buffer capacity: %d\n", RS_BUFFER_CAPACITY);
+        WARN_PRINT("[FlashMask Overlap] Using RS-Overlap, buffer capacity: %d, num_chunks: %d\n", RS_BUFFER_CAPACITY, num_chunks);
     }
     kv_buffer->team_bar();
     // copy to the last position of the SR buffer
@@ -544,8 +544,10 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
         case 2: { MACRO_FUNC(2, __VA_ARGS__); break; }          \
         case 3: { MACRO_FUNC(3, __VA_ARGS__); break; }          \
         case 1: { MACRO_FUNC(1, __VA_ARGS__); break; }          \
+        case 8: { MACRO_FUNC(8, __VA_ARGS__); break; }          \
+        case 7: { MACRO_FUNC(7, __VA_ARGS__); break; }          \
     default:                                                    \
-        throw std::invalid_argument("Num chunk per segment must be 2 or 4. 1 and 3 cases considers local chunk skipping. Other segment size is not supported."); \
+        throw std::invalid_argument("Num chunk per segment must be in [2, 4, 8]. [1, 3, 7] cases considers local chunk skipping. Other segment size is not supported."); \
     }
 
 template <typename KVType>

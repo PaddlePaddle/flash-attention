@@ -40,21 +40,6 @@ __global__ void ProducerNotifyFull(
 #endif  // NVSHMEM_DEBUG
 }
 
-__global__ void ConsumerNotifyEmpty(
-    int64_t* const __restrict__ semaphores,
-    int remote_producer_end_rank,
-    int cp_size,
-    int self_rank
-) {
-    // for example: rank 3 local consumer needs the data from [12, 15] (remote producer) for seg 1
-    // remote_producer_end_rank will be 15 (computed by mod_cp_size(3 - 4 * seg_idx) --> (-1 % 16) --> 15)
-    int target_rank = remote_producer_end_rank - threadIdx.x;
-    target_rank = target_rank >= 0 ? target_rank : target_rank + cp_size;
-    if (target_rank == self_rank) return;
-    nvshmem_int64_p(semaphores + self_rank, 1, target_rank);
-    DEBUG_PRINT("Consumer %d notifies remote %d empty, end_rank: %d\n", self_rank, target_rank, remote_producer_end_rank);
-}
-
 __global__ void FusedConsumerNotifyEmpty(
     int64_t* const __restrict__ semaphores,
     int remote_producer_end_rank,
@@ -69,6 +54,7 @@ __global__ void FusedConsumerNotifyEmpty(
         DEBUG_PRINT("Consumer %d fused, sets self empty value: %d, \
             cp_size: %d, end_rank: %d\n", self_rank, value, cp_size, remote_producer_end_rank);
     }
+    // the following fence makes sure semaphore setting is visible across all CP ranks 
     __threadfence_system();
     __syncwarp();
     int target_rank = remote_producer_end_rank - threadIdx.x;
@@ -110,15 +96,12 @@ void notify_consumer_empty(
         target_rank = target_rank >= 0 ? target_rank : target_rank + cp_size;
         local_flag |= target_rank == self_rank ? 0 : (1 << target_rank);
     }
+    // Fused step 1 & 2 in one kernel. Should the following gets buggy, you can revert to 1540b3438fb8 for testing
     // step 1. set self (inform reduce kernel that we haven't got data from other ranks, so we wait)
-    // SetValueKernel<<<1, 1, 0, comm_stream>>>(semaphores + self_rank, local_flag);
     // step 2. notify all other src ranks: you can start putting data to this rank
     // for example: local_rank is 7, we notify rank 0,1,2,3 to put data by setting sema[7] to 1
     // set remote empty state can not start before we set the local state
     // otherwise there will be corrupted read-write
-    // ConsumerNotifyEmpty<<<1, seg_size, 0, comm_stream>>>(semaphores, remote_producer_end_rank, cp_size, self_rank);
-
-    // TODO(heqianyue): we'll decide whether to keep fused or non-fused version.
     FusedConsumerNotifyEmpty<<<1, seg_size, 0, comm_stream>>>(semaphores,
                     remote_producer_end_rank, cp_size, local_flag, self_rank);
     nvshmemx_quiet_on_stream(comm_stream);

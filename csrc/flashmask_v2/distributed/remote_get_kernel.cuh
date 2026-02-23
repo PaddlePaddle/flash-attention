@@ -368,6 +368,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityC
         if (threadIdx.x == 0) {
             // two warps will produce the masking result of one 256/512-row block
             const int4* smem_int4 = reinterpret_cast<const int4*>(warps_masked);
+            // TODO(heqianyue): #warp = 16 reduces result to int4 instead of int2 
             if constexpr (rows_per_cta >= 512) {
                 int2 result;
                 int4 src = *smem_int4;

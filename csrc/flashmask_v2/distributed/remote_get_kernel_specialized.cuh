@@ -337,12 +337,24 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityC
             *(reinterpret_cast<int2*>(copy_chunk_mask) + block_offset) = result;
         }
         if constexpr (rows_per_cta == 512) {        // reduce 4 int
-            int2 result;
             int4 src = *smem_int4;
-            result.x = src.x & src.y & src.z & src.w;
-            src = *(smem_int4 + 1);
-            result.y = src.x & src.y & src.z & src.w;
-            *(reinterpret_cast<int2*>(copy_chunk_mask) + block_offset) = result;
+            if constexpr (num_warps == 16) {
+                int4 result;
+                result.x = src.x & src.y & src.z & src.w;
+                src = *(smem_int4 + 1);
+                result.y = src.x & src.y & src.z & src.w;
+                src = *(smem_int4 + 2);
+                result.z = src.x & src.y & src.z & src.w;
+                src = *(smem_int4 + 3);
+                result.w = src.x & src.y & src.z & src.w;
+                *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = result;
+            } else {
+                int2 result;
+                result.x = src.x & src.y & src.z & src.w;
+                src = *(smem_int4 + 1);
+                result.y = src.x & src.y & src.z & src.w;
+                *(reinterpret_cast<int2*>(copy_chunk_mask) + block_offset) = result;
+            }
         }
         if constexpr (rows_per_cta == 256) {        // reduce 2 int
             int4 result;

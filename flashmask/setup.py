@@ -126,6 +126,8 @@ setup(
     description='FlashMask: Efficient and Rich Mask Extension of FlashAttention',
     install_requires=[
         'typing_extensions',
+        'nvidia-cutlass==4.2.0.0',
+        'nvidia-cutlass-dsl==4.3.0',
     ],
     python_requires='>=3.10',
     ext_modules=[

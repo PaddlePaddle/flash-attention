@@ -12,21 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+flashmask_attention - 带 mask 的 FlashAttention V3
+"""
 
-# [BQW_CHANGE] 在 import 前先加载 flash_mask_pd_.so 并注册自定义算子
-# Paddle CUDAExtension 生成 flash_mask_pd_.so，需要手动加载注册
-import os
-import paddle
-
-_curr_dir = os.path.dirname(os.path.abspath(__file__))
-_parent_dir = os.path.dirname(_curr_dir)
-_so_path = os.path.join(_parent_dir, "flash_mask_pd_.so")
-
-if os.path.exists(_so_path):
-    paddle.utils.cpp_extension.load_op_meta_info_and_register_op(_so_path)
-else:
-    print(f"[WARNING] flash_mask_pd_.so not found at {_so_path}, custom ops may not be available")
-
-from .flashmask_attention_v3.interface import flashmask_attention
+from .interface import flashmask_attention
 
 __all__ = ["flashmask_attention"]
+

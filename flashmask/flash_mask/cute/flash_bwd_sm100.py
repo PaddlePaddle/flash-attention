@@ -62,8 +62,8 @@ class FlashAttentionBackwardSm100:
         deterministic: bool = False,
         cluster_size: int = 1,
     ):
-        # padding head_dim to a multiple of 16 as k_block_size
-        hdim_multiple_of = 16
+        # padding head_dim to a multiple of 64 to match head_dim_rounded in interface
+        hdim_multiple_of = 64
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         head_dim_v = head_dim_v if head_dim_v is not None else head_dim
         self.same_hdim_kv = head_dim == head_dim_v
@@ -182,7 +182,7 @@ class FlashAttentionBackwardSm100:
         # LSE_stage = Q_stage and dPsum_stage = dO_stage
         # self.sdKVaccum_stage = 2
         # number of tma reduce adds per dQacc mma
-        self.dQ_reduce_ncol = 32
+        self.dQ_reduce_ncol = 32 if self.tile_hdim % 32 == 0 else 16
         self.sdQaccum_stage = 64 // self.dQ_reduce_ncol
         assert self.tile_hdim % self.dQ_reduce_ncol == 0
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol

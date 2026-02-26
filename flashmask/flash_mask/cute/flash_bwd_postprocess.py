@@ -51,8 +51,8 @@ class FlashAttentionBackwardPostprocess:
             "Only Ampere (80), Hopper (90), and Blackwell (100) are supported"
         )
         self.arch = arch
-        # padding head_dim to a multiple of 32 as k_block_size
-        hdim_multiple_of = 32
+        # padding head_dim to a multiple of 64 for SM100 (32 for others) to match head_dim_rounded
+        hdim_multiple_of = 64 if arch == 100 else 32
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.num_threads = num_threads
@@ -159,7 +159,7 @@ class FlashAttentionBackwardPostprocess:
                 (self.tile_m * self.tile_hdim // num_mma_warp_groups, num_mma_warp_groups)
             )
         else:
-            self.dQ_reduce_ncol = 32
+            self.dQ_reduce_ncol = 32 if self.tile_hdim % 32 == 0 else 16
             dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
             assert self.num_threads == 128  # TODO: currently hard-coded
             self.s2r_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(

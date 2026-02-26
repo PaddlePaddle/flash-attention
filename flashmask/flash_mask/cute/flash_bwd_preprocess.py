@@ -29,6 +29,7 @@ class FlashAttentionBackwardPreprocess:
         head_dim: int,
         m_block_size: int = 128,
         num_threads: int = 128,
+        dq_head_dim: Optional[int] = None,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -40,6 +41,8 @@ class FlashAttentionBackwardPreprocess:
         :type m_block_size: int
         :param num_threads: number of threads
         :type num_threads: int
+        :param dq_head_dim: head dimension for dQaccum zeroing (defaults to head_dim if None)
+        :type dq_head_dim: int or None
         """
         self.dtype = dtype
         self.m_block_size = m_block_size
@@ -47,6 +50,11 @@ class FlashAttentionBackwardPreprocess:
         hdim_multiple_of = 32
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_oob = head_dim != self.head_dim_padded
+        # dQaccum may use a different head_dim_rounded (e.g., 128 for SM100 with head_dim=80)
+        if dq_head_dim is not None:
+            self.dq_head_dim_padded = int(math.ceil(dq_head_dim / hdim_multiple_of) * hdim_multiple_of)
+        else:
+            self.dq_head_dim_padded = self.head_dim_padded
         self.num_threads = num_threads
 
     @staticmethod
@@ -97,7 +105,7 @@ class FlashAttentionBackwardPreprocess:
         universal_copy_bits = 128
         num_copy_elems_dQaccum = universal_copy_bits // Float32.width
         assert (
-            self.m_block_size * self.head_dim_padded // num_copy_elems_dQaccum
+            self.m_block_size * self.dq_head_dim_padded // num_copy_elems_dQaccum
         ) % self.num_threads == 0
         self.gmem_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
             Float32, self.num_threads, num_copy_elems_dQaccum
@@ -279,6 +287,11 @@ class FlashAttentionBackwardPreprocess:
 
             tOrO = cute.make_fragment_like(tOgO)
             tOrdO = cute.make_fragment_like(tOgdO)
+            # Zero-fill fragments before predicated copy to avoid NaN in reduction
+            # when head_dim is not a multiple of head_dim_padded
+            if cutlass.const_expr(self.check_hdim_oob):
+                tOrO.fill(0)
+                tOrdO.fill(0)
             assert cute.size(tOgO, mode=[0]) == cute.size(tOgdO, mode=[0])
             assert cute.size(tOgO, mode=[1]) == cute.size(tOgdO, mode=[1])
             assert cute.size(tOgO, mode=[2]) == cute.size(tOgdO, mode=[2])
@@ -327,7 +340,7 @@ class FlashAttentionBackwardPreprocess:
                 else:
                     padded_offset_q = seqlen.offset_q + batch_size * self.m_block_size
                     mdQaccum_cur = cute.domain_offset(
-                        (padded_offset_q * self.head_dim_padded,), mdQaccum[num_head, None]
+                        (padded_offset_q * self.dq_head_dim_padded,), mdQaccum[num_head, None]
                     )
 
                     # HACK: Compiler doesn't seem to recognize that padding
@@ -342,7 +355,7 @@ class FlashAttentionBackwardPreprocess:
                     )
                     mdQaccum_cur = cute.make_tensor(mdQaccum_cur_ptr, mdQaccum_cur.layout)
 
-                blkdQaccum_shape = (self.m_block_size * self.head_dim_padded,)
+                blkdQaccum_shape = (self.m_block_size * self.dq_head_dim_padded,)
                 gdQaccum = cute.local_tile(mdQaccum_cur, blkdQaccum_shape, (m_block,))
                 gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
                 tdQgdQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)

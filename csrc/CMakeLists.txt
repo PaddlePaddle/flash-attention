@@ -628,7 +628,33 @@ if(NOT SKIP_BUILD_FA)
     if(WITH_DISTRIBUTED_OVERLAP)
         message(STATUS "Enabling NVSHMEM for distributed overlap support")
         
-        include(${CMAKE_CURRENT_SOURCE_DIR}/flashmask_v2/distributed/cmake/nvshmem.cmake)
+        if(NVSHMEM_INSTALL_DIR)
+            message(STATUS "Reusing external NVSHMEM from: ${NVSHMEM_INSTALL_DIR}")
+            set(NVSHMEM_INCLUDE_DIR "${NVSHMEM_INSTALL_DIR}/include" CACHE PATH "" FORCE)
+            set(NVSHMEM_LIB "${NVSHMEM_INSTALL_DIR}/lib/libnvshmem.a")
+            set(NVSHMEM_BOOTSTRAP_MPI_LIB
+                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_bootstrap_mpi.so.3)
+            set(NVSHMEM_BOOTSTRAP_UID_LIB
+                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_bootstrap_uid.so.3)
+            set(NVSHMEM_BOOTSTRAP_PMI_LIB
+                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_bootstrap_pmi.so.3)
+            set(NVSHMEM_BOOTSTRAP_PMI2_LIB
+                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_bootstrap_pmi2.so.3)
+            set(NVSHMEM_TRANSPORT_IBRC_LIB
+                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_transport_ibrc.so.3)
+            set(NVSHMEM_TRANSPORT_IBGDA_LIB
+                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_transport_ibgda.so.3)
+            
+            add_library(nvshmem STATIC IMPORTED GLOBAL)
+            set_property(TARGET nvshmem PROPERTY IMPORTED_LOCATION ${NVSHMEM_LIB})
+            # No need for add_dependencies(nvshmem extern_nvshmem), since paddle end made sure of this
+        else()
+            # We still support standalone compilation with self downloaded NVSHMEM package
+            # This is used when the FA repo is built independently
+            message(STATUS "Standalone FlashMask builting with NVSHMEM support (distributed overlap)")
+            include(${CMAKE_CURRENT_SOURCE_DIR}/flashmask_v2/distributed/cmake/nvshmem.cmake)
+        endif()
+        
         add_subdirectory(flashmask_v2/distributed)
         add_compile_definitions(NVSHMEM_DISTRIBUTED_OVERLAP)
     endif()

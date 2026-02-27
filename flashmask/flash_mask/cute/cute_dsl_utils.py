@@ -2,11 +2,11 @@
 
 import os
 import pathlib
-from typing import Tuple
+from typing import Union, Tuple
 from functools import partial, lru_cache
 from dataclasses import dataclass, fields
 
-import paddle
+import torch
 
 try:
     from triton.tools.disasm import extract
@@ -26,10 +26,10 @@ load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data
 cute_compile_og = cute.compile
 
 
-paddle2cute_dtype_map = {
-    paddle.float16: cutlass.Float16,
-    paddle.bfloat16: cutlass.BFloat16,
-    paddle.float32: cutlass.Float32,
+torch2cute_dtype_map = {
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
 }
 
 
@@ -39,8 +39,8 @@ def get_max_active_clusters(cluster_size):
 
 
 @lru_cache
-def get_device_capacity(device: paddle.device = None) -> Tuple[int, int]:
-    return paddle.cuda.get_device_capability(device)
+def get_device_capacity(device: Union[int, str, torch.device, None] = None) -> Tuple[int, int]:
+    return torch.cuda.get_device_capability(device)
 
 
 @dataclass

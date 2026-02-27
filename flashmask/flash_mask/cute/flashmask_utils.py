@@ -20,7 +20,7 @@
 
 from typing import Optional, NamedTuple
 from dataclasses import dataclass
-import paddle
+import torch                  
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
@@ -30,7 +30,7 @@ import operator
 
 __all__ = [
     "prepare_block_maxmin",
-    "FlashMaskInfoPaddle"
+    "FlashMaskInfoTorch",          
 ]
 
 
@@ -72,18 +72,18 @@ class FlashMaskInfo(NamedTuple):
 
 
 @dataclass
-class FlashMaskInfoPaddle:
+class FlashMaskInfoTorch:
     is_causal: bool
-    startend_row_indices: paddle.Tensor
-    LTS_nblock_max: Optional[paddle.Tensor] = None
-    LTS_nblock_min: Optional[paddle.Tensor] = None
-    LTE_nblock_max: Optional[paddle.Tensor] = None
-    LTE_nblock_min: Optional[paddle.Tensor] = None
-    UTS_nblock_max: Optional[paddle.Tensor] = None
-    UTS_nblock_min: Optional[paddle.Tensor] = None
-    UTE_nblock_max: Optional[paddle.Tensor] = None
-    UTE_nblock_min: Optional[paddle.Tensor] = None
-    valid_block_count: Optional[paddle.Tensor] = None
+    startend_row_indices: torch.Tensor
+    LTS_nblock_max: Optional[torch.Tensor] = None
+    LTS_nblock_min: Optional[torch.Tensor] = None
+    LTE_nblock_max: Optional[torch.Tensor] = None
+    LTE_nblock_min: Optional[torch.Tensor] = None
+    UTS_nblock_max: Optional[torch.Tensor] = None
+    UTS_nblock_min: Optional[torch.Tensor] = None
+    UTE_nblock_max: Optional[torch.Tensor] = None
+    UTE_nblock_min: Optional[torch.Tensor] = None
+    valid_block_count: Optional[torch.Tensor] = None
 
 
 def _compute_nblock_seqlen(seqlen_k: int, kBlockN: int) -> int:
@@ -184,18 +184,19 @@ def scan_max_min_cute(
     )
 
 def _scan_max_min(
-    mInput: paddle.Tensor,
+    mInput: torch.Tensor,          
     b: int,
     n: int,
-    mMaxO: paddle.Tensor,
-    mMinO: paddle.Tensor,
+    mMaxO: torch.Tensor,             
+    mMinO: torch.Tensor,             
     kBlockN: int,
 ):
-    input_tensor = from_dlpack(mInput.contiguous(), assumed_align=4).mark_layout_dynamic(leading_dim=2)
+    mInput_contig = mInput.contiguous()
+    input_tensor = from_dlpack(mInput_contig, assumed_align=4).mark_layout_dynamic(leading_dim=2)
     max_tensor = from_dlpack(mMaxO, assumed_align=4).mark_layout_dynamic(leading_dim=2)
     min_tensor = from_dlpack(mMinO, assumed_align=4).mark_layout_dynamic(leading_dim=2)
 
-    current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compile_key = (b, kBlockN,)
     if compile_key not in _scan_max_min.compile_cache:
@@ -217,7 +218,7 @@ def _scan_max_min(
 
 _scan_max_min.compile_cache = {}
 
-def prepare_block_maxmin(flashmask_info: FlashMaskInfoPaddle, kBlockN: int = 128):
+def prepare_block_maxmin(flashmask_info: FlashMaskInfoTorch, kBlockN: int = 128): 
     """Prepare block-sparse max/min tensors for flashmask.
 
     The function will compute derived pointers/offsets and call scanMaxMinGpu
@@ -227,28 +228,33 @@ def prepare_block_maxmin(flashmask_info: FlashMaskInfoPaddle, kBlockN: int = 128
     batch, heads, seqlen_k, num_vecs = flashmask_info.startend_row_indices.shape
     nblocks = _compute_nblock_seqlen(seqlen_k, kBlockN)
 
+    device = flashmask_info.startend_row_indices.device
+
+    def create_buffer():
+        return torch.zeros(batch, heads, nblocks, dtype=torch.int32, device=device)
+
     if num_vecs == 1 and flashmask_info.LTS_nblock_max is None and flashmask_info.LTS_nblock_min is None:
-        flashmask_info.LTS_nblock_max = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.LTS_nblock_min = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
+        flashmask_info.LTS_nblock_max = create_buffer()
+        flashmask_info.LTS_nblock_min = create_buffer()
         _scan_max_min(flashmask_info.startend_row_indices[..., 0], batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
     elif num_vecs == 2 and flashmask_info.is_causal and (
             flashmask_info.LTS_nblock_max is None and flashmask_info.LTS_nblock_min is None and
             flashmask_info.LTE_nblock_max is None and flashmask_info.LTE_nblock_min is None
     ):
-        flashmask_info.LTS_nblock_max = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.LTS_nblock_min = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.LTE_nblock_max = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.LTE_nblock_min = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
+        flashmask_info.LTS_nblock_max = create_buffer()
+        flashmask_info.LTS_nblock_min = create_buffer()
+        flashmask_info.LTE_nblock_max = create_buffer()
+        flashmask_info.LTE_nblock_min = create_buffer()
         _scan_max_min(flashmask_info.startend_row_indices[..., 0], batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
         _scan_max_min(flashmask_info.startend_row_indices[..., 1], batch * heads, seqlen_k, flashmask_info.LTE_nblock_max, flashmask_info.LTE_nblock_min, kBlockN)
     elif num_vecs == 2 and not flashmask_info.is_causal and (
             flashmask_info.LTS_nblock_max is None and flashmask_info.LTS_nblock_min is None and
             flashmask_info.UTE_nblock_max is None and flashmask_info.UTE_nblock_min is None
     ):
-        flashmask_info.LTS_nblock_max = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.LTS_nblock_min = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.UTE_nblock_max = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.UTE_nblock_min = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
+        flashmask_info.LTS_nblock_max = create_buffer()
+        flashmask_info.LTS_nblock_min = create_buffer()
+        flashmask_info.UTE_nblock_max = create_buffer()
+        flashmask_info.UTE_nblock_min = create_buffer()
         _scan_max_min(flashmask_info.startend_row_indices[..., 0], batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
         _scan_max_min(flashmask_info.startend_row_indices[..., 1], batch * heads, seqlen_k, flashmask_info.UTE_nblock_max, flashmask_info.UTE_nblock_min, kBlockN)
     elif num_vecs == 4 and (
@@ -258,14 +264,14 @@ def prepare_block_maxmin(flashmask_info: FlashMaskInfoPaddle, kBlockN: int = 128
             flashmask_info.UTE_nblock_max is None and flashmask_info.UTE_nblock_min is None
             
     ):
-        flashmask_info.LTS_nblock_max = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.LTS_nblock_min = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.LTE_nblock_max = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.LTE_nblock_min = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.UTS_nblock_max = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.UTS_nblock_min = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.UTE_nblock_max = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
-        flashmask_info.UTE_nblock_min = paddle.zeros([batch, heads, nblocks], dtype=paddle.int32)
+        flashmask_info.LTS_nblock_max = create_buffer()
+        flashmask_info.LTS_nblock_min = create_buffer()
+        flashmask_info.LTE_nblock_max = create_buffer()
+        flashmask_info.LTE_nblock_min = create_buffer()
+        flashmask_info.UTS_nblock_max = create_buffer()
+        flashmask_info.UTS_nblock_min = create_buffer()
+        flashmask_info.UTE_nblock_max = create_buffer()
+        flashmask_info.UTE_nblock_min = create_buffer()
         _scan_max_min(flashmask_info.startend_row_indices[..., 0], batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
         _scan_max_min(flashmask_info.startend_row_indices[..., 1], batch * heads, seqlen_k, flashmask_info.LTE_nblock_max, flashmask_info.LTE_nblock_min, kBlockN)
         _scan_max_min(flashmask_info.startend_row_indices[..., 2], batch * heads, seqlen_k, flashmask_info.UTS_nblock_max, flashmask_info.UTS_nblock_min, kBlockN)
@@ -274,7 +280,7 @@ def prepare_block_maxmin(flashmask_info: FlashMaskInfoPaddle, kBlockN: int = 128
         raise ValueError(f"Unsupported num_vecs={num_vecs} in flashmask_info")
     
 
-def is_flashmask_enabled(flashmask_info: FlashMaskInfoPaddle) -> bool:
+def is_flashmask_enabled(flashmask_info: FlashMaskInfoTorch) -> bool:
     return any(t is not None for t in (
         flashmask_info.LTS_nblock_max,
         flashmask_info.LTS_nblock_min,
@@ -286,11 +292,16 @@ def is_flashmask_enabled(flashmask_info: FlashMaskInfoPaddle) -> bool:
         flashmask_info.UTE_nblock_min,
     ))
 
-def to_cute_flashmask_info(flashmask_info: FlashMaskInfoPaddle) -> Optional[FlashMaskInfo]:
+def to_cute_flashmask_info(flashmask_info: FlashMaskInfoTorch) -> Optional[FlashMaskInfo]:
     if not is_flashmask_enabled(flashmask_info):
         return None
 
     batch, heads, seqlen_k, num_vecs = flashmask_info.startend_row_indices.shape
+
+    def _wrap(t):
+        if t is None:
+            return None
+        return from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=2)
 
     startend_row_indices_tensor = from_dlpack(flashmask_info.startend_row_indices, assumed_align=4).mark_layout_dynamic(leading_dim=3)
     LTS_nblock_max_tensor = None
@@ -303,32 +314,32 @@ def to_cute_flashmask_info(flashmask_info: FlashMaskInfoPaddle) -> Optional[Flas
     UTE_nblock_min_tensor = None
 
     if num_vecs == 1:
-        LTS_nblock_max_tensor = from_dlpack(flashmask_info.LTS_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTS_nblock_min_tensor = from_dlpack(flashmask_info.LTS_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
+        LTS_nblock_max_tensor = _wrap(flashmask_info.LTS_nblock_max)
+        LTS_nblock_min_tensor = _wrap(flashmask_info.LTS_nblock_min)
     elif num_vecs == 2 and flashmask_info.is_causal:
-        LTS_nblock_max_tensor = from_dlpack(flashmask_info.LTS_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTS_nblock_min_tensor = from_dlpack(flashmask_info.LTS_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTE_nblock_max_tensor = from_dlpack(flashmask_info.LTE_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTE_nblock_min_tensor = from_dlpack(flashmask_info.LTE_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
+        LTS_nblock_max_tensor = _wrap(flashmask_info.LTS_nblock_max)
+        LTS_nblock_min_tensor = _wrap(flashmask_info.LTS_nblock_min)
+        LTE_nblock_max_tensor = _wrap(flashmask_info.LTE_nblock_max)
+        LTE_nblock_min_tensor = _wrap(flashmask_info.LTE_nblock_min)
     elif num_vecs == 2 and not flashmask_info.is_causal:
-        LTS_nblock_max_tensor = from_dlpack(flashmask_info.LTS_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTS_nblock_min_tensor = from_dlpack(flashmask_info.LTS_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        UTE_nblock_max_tensor = from_dlpack(flashmask_info.UTE_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        UTE_nblock_min_tensor = from_dlpack(flashmask_info.UTE_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
+        LTS_nblock_max_tensor = _wrap(flashmask_info.LTS_nblock_max)
+        LTS_nblock_min_tensor = _wrap(flashmask_info.LTS_nblock_min)
+        UTE_nblock_max_tensor = _wrap(flashmask_info.UTE_nblock_max)
+        UTE_nblock_min_tensor = _wrap(flashmask_info.UTE_nblock_min)
     elif num_vecs == 4:
-        LTS_nblock_max_tensor = from_dlpack(flashmask_info.LTS_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTS_nblock_min_tensor = from_dlpack(flashmask_info.LTS_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTE_nblock_max_tensor = from_dlpack(flashmask_info.LTE_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTE_nblock_min_tensor = from_dlpack(flashmask_info.LTE_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        UTS_nblock_max_tensor = from_dlpack(flashmask_info.UTS_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        UTS_nblock_min_tensor = from_dlpack(flashmask_info.UTS_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        UTE_nblock_max_tensor = from_dlpack(flashmask_info.UTE_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        UTE_nblock_min_tensor = from_dlpack(flashmask_info.UTE_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
+        LTS_nblock_max_tensor = _wrap(flashmask_info.LTS_nblock_max)
+        LTS_nblock_min_tensor = _wrap(flashmask_info.LTS_nblock_min)
+        LTE_nblock_max_tensor = _wrap(flashmask_info.LTE_nblock_max)
+        LTE_nblock_min_tensor = _wrap(flashmask_info.LTE_nblock_min)
+        UTS_nblock_max_tensor = _wrap(flashmask_info.UTS_nblock_max)
+        UTS_nblock_min_tensor = _wrap(flashmask_info.UTS_nblock_min)
+        UTE_nblock_max_tensor = _wrap(flashmask_info.UTE_nblock_max)
+        UTE_nblock_min_tensor = _wrap(flashmask_info.UTE_nblock_min)
     else:
         raise ValueError(f"Unsupported num_vecs={num_vecs} in flashmask_info")
 
     if flashmask_info.valid_block_count is not None:
-        valid_block_count = from_dlpack(flashmask_info.valid_block_count, assumed_align=4).mark_layout_dynamic(leading_dim=2)
+        valid_block_count = _wrap(flashmask_info.valid_block_count)
     else:
         valid_block_count = None
 
@@ -462,7 +473,7 @@ def reduce_block_count_cute(
 
 # Note(wusiming): make sure call reduce_block_count after scan_max_min
 def reduce_block_count(
-    flashmask_info: FlashMaskInfo,
+    flashmask_info: FlashMaskInfoTorch,
     is_causal: bool,
     kBlockM: int,
     kBlockN: int,
@@ -489,7 +500,7 @@ def reduce_block_count(
         has_uts = False
         has_ute = False
 
-    current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # TODO(wusiming): Are all of these compile keys necessary?
     compile_key = (is_causal, kBlockM, kBlockN, batch, heads, has_lte, has_uts, has_ute)

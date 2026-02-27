@@ -754,7 +754,7 @@ def _flash_attn_bwd(
 
     if cu_seqlens_q is None:
         seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
-        dq_accum = paddle.zeros(
+        dq_accum = paddle.empty(
             shape=[batch_size, num_head, seqlen_q_rounded * head_dim_rounded], dtype=paddle.float32
         )
         dpsum = paddle.empty(shape=[batch_size, num_head, seqlen_q_rounded], dtype=paddle.float32)
@@ -765,7 +765,7 @@ def _flash_attn_bwd(
         total_q_rounded_padded = (
             (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
         )
-        dq_accum = paddle.zeros(
+        dq_accum = paddle.empty(
             shape=[num_head, total_q_rounded_padded * head_dim_rounded], dtype=paddle.float32
         )
         dpsum = paddle.empty(shape=[num_head, total_q_rounded_padded], dtype=paddle.float32)

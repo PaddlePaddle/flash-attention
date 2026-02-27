@@ -33,6 +33,22 @@ import shutil
 from setuptools import find_packages
 from paddle.utils.cpp_extension import CUDAExtension, setup
 
+
+def get_git_commit():
+    """获取当前 git short commit hash，失败时返回 'unknown'"""
+    try:
+        commit = subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL,
+        ).decode('ascii').strip()
+        return commit
+    except Exception:
+        return 'unknown'
+
+
+VERSION = '4.0+g' + get_git_commit()
+
 # ============================================================
 # 配置区
 # ============================================================
@@ -117,7 +133,7 @@ if os.path.exists(src_lib) and (not os.path.exists(dst_lib) or
 # ============================================================
 setup(
     name='flash_mask',
-    version='4.0',
+    version=VERSION,
     packages=find_packages(),
     package_data={
         'flash_mask': ['lib/*.so'],

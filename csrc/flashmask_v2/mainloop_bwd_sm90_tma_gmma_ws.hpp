@@ -700,10 +700,10 @@ struct CollectiveMainloopBwdSm90 {
             shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
 
             // Used in distributed overlap
-            if (params.write_ptr && bidh == 0) {
-                // for example: 8K local, CP4, hd128 ---> 32K --> 256 blocks, Hopper has 132-144 SMs
-                // so by the time bidh increment from 0 to 1, 1-KV-head KV blocks are loaded
-                // so for bidh >= 1, we don't need to wait for KV write ptr anymore
+            if (params.write_ptr && bidh <= 1) {
+                // for example: 8K local, CP4, hd128 ---> 16K --> 128 blocks, Hopper has 132-144 SMs
+                // so by the time bidh increase from 1 to 2, 1-KV-head KV blocks are loaded
+                // so for bidh > 1, we don't need to wait for KV write ptr anymore
                 static constexpr int chunk_size = 8192;
                 const int nblock_id = (n_block + 1) * kBlockN;      // right bound of this block
                 // different behavior: when num_segments > 1 (RS-overlap), the first chunk is not skipped

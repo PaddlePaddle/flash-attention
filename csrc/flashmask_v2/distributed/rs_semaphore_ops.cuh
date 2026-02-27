@@ -55,7 +55,7 @@ __global__ void FusedConsumerNotifyEmpty(
             cp_size: %d, end_rank: %d\n", self_rank, value, cp_size, remote_producer_end_rank);
     }
     // the following fence makes sure semaphore setting is visible across all CP ranks 
-    __threadfence_system();
+    __threadfence();
     __syncwarp();
     int target_rank = remote_producer_end_rank - threadIdx.x;
     target_rank = target_rank >= 0 ? target_rank : target_rank + cp_size;
@@ -104,7 +104,6 @@ void notify_consumer_empty(
     // otherwise there will be corrupted read-write
     FusedConsumerNotifyEmpty<<<1, seg_size, 0, comm_stream>>>(semaphores,
                     remote_producer_end_rank, cp_size, local_flag, self_rank);
-    nvshmemx_quiet_on_stream(comm_stream);
 }
 
 // self rank notifies all remote consumers that needs dK, dV data 

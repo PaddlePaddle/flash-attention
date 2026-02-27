@@ -4,6 +4,7 @@
 
 namespace flashmask {
 
+// Note(heqianyue): using 2 chunks per segement is actually faster for CP16
 inline int get_num_chunk_per_segment(int local_seqlen_k, int cp_size, int kv_head) {
     // 32K+ seqlen does not need chunk grouping
     if (local_seqlen_k >= 32768) return 1;

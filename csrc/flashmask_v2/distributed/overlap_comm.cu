@@ -24,7 +24,7 @@ static constexpr int RS_BUFFER_CAPACITY = 1;
 static constexpr int OVERLAP_SM_MARGIN = 0;
 
 // allowed value: [16, 32, 64] (larger number is generally better for KV with larger num_head and higher CP)
-static constexpr int RDMA_ROW_PER_WARP = 64;
+static constexpr int RDMA_ROW_PER_WARP = 32;
 static constexpr int STREAM_COORD_OFFSET = USE_STREAM_COORD ? 2 : 0;   // do not adjust the value if you don't know what ur doing
 
 // allowed value: 16 or 8 (16 warps are generally better for KV with larger num_head and higher CP)
@@ -575,7 +575,7 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
     } else {
         constexpr int work_to_skip = S_chunk / (num_warps * RDMA_ROW_PER_WARP);
         sema::rs::SetValueKernel<<<1, num_blocks, 0, comm_stream>>>(block_work_ids, work_to_skip);
-        NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks - 1, start_pe, segment_idx,  num_segs, mask_smem_bytes);
+        NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks - 1, start_pe, segment_idx, num_segs, mask_smem_bytes);
     }
 
     if constexpr (USE_SEMAPHORES) {
@@ -767,25 +767,6 @@ void OverlapCommunicator<KVType>::prepare_dkv_buffer(cudaStream_t stream) {
     // we need to use compute stream to zero the recv buffer
     // to make sure the buffer is zero-ed before producer/consumer starts
     dkv_buffer->zero_recv_buf(0, stream);
-}
-
-// Deprecate warning: if changing sync point continues to trigger dV mismatch
-// then we will abandon this function 
-template <typename KVType>
-void OverlapCommunicator<KVType>::reset_recv_status(
-    int segment_idx
-) { // local consumer behavior
-    // Note(heqianyue): remote_producer: who is putting data to us. 
-    // for remote producer, it is easier to compute the last rank.
-
-    dkv_buffer->zero_recv_buf(segment_idx, aux_c_stream);
-    const int remote_producer_end_rank = (_my_pe - num_chunks * segment_idx) % _total_n_pes;
-    sema::rs::notify_consumer_empty(
-        dkv_buffer->semaphores(segment_idx),
-        remote_producer_end_rank,
-        num_chunks, _cp_size, _my_pe,
-        aux_c_stream
-    );                          
 }
 
 // explicit instantiation and singleton management

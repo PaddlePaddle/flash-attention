@@ -90,18 +90,16 @@ __global__ void DebugWaitOnStreamLocalKernel(
     }
 }
 
-// num thread: 1
-__global__ void SetSemaphoreValueKernel(
-    int64_t* const __restrict__ semaphore,
-    const int value
-) {
-    *semaphore = int64_t(value);
-}
-
-__global__ void SetFullForOtherRanks(
+__global__ void SetFullKernel(
     int64_t* const __restrict__ semaphores,
+    int value,
     int self_rank
 ) {
+    if (threadIdx.x == 0) {
+        semaphores[self_rank] = int64_t(value);
+    }
+    __threadfence();
+    __syncwarp();
     if (threadIdx.x == self_rank) return;
     // set the semaphores[self_rank] = 1 for all remote ranks
     nvshmem_int64_p(semaphores + self_rank, 1, threadIdx.x);
@@ -187,13 +185,9 @@ void notify_full(
     nvshmem_team_t team,
     cudaStream_t stream
 ) {
-    // step 1: set the self pos to be `total_pes - 1`
     int bit_val = (1 << total_pes) - (1 << my_pe) - 1;
-    SetSemaphoreValueKernel<<<1, 1, 0, stream>>>(semaphores + my_pe, bit_val);
-    // make sure local store is visible to other ranks
-    nvshmemx_quiet_on_stream(stream);
-    // step 2: notify other PE that data is ready (full) 
-    SetFullForOtherRanks<<<1, total_pes, 0, stream>>>(semaphores, my_pe);
+    // make sure local store is visible to other ranks and notify other PE that data is ready (full) 
+    SetFullKernel<<<1, total_pes, 0, stream>>>(semaphores, bit_val, my_pe);
 }
 
 }   // namespace ag

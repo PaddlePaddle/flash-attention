@@ -93,10 +93,6 @@ public:
 
     int dkv_buffer_stage() const;
 
-    // reset local recv buffer and semaphores given segment_idx. 
-    // Called after dK, dV reduction is done
-    void reset_recv_status(int segment_idx);
-
     void wait_reduce_done(cudaStream_t stream) const {
         cudaEventRecord(reduce_done, aux_c_stream);
         cudaStreamWaitEvent(stream, reduce_done);

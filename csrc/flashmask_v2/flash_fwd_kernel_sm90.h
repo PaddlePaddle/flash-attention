@@ -87,8 +87,32 @@ public:
     // static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
     // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
 
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
+    // static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
+    // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
+
+    static constexpr int kHeadDim = CollectiveMainloop::kHeadDim;
+
+    static constexpr uint32_t NBlockRegisterRequirement = [] {
+        if constexpr (kHeadDim <= 64) {
+            return 56;
+        } else {
+            return NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
+        }
+    }();
+    static constexpr uint32_t LoadRegisterRequirement = [] {
+        if constexpr (kHeadDim <= 64) {
+            return 32;
+        } else {
+            return NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
+        }
+    }();
+    static constexpr uint32_t MmaRegisterRequirement = [] {
+        if constexpr (kHeadDim <= 64) {
+            return 224;
+        } else {
+            return NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
+        }
+    }();
 
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
@@ -272,7 +296,7 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0 && warp_idx_in_warpgroup != 0) { // n_block generator
-          cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+          cutlass::arch::warpgroup_reg_dealloc<NBlockRegisterRequirement>();
           cutlass::PipelineState<CollectiveMainloop::kNBlockStages> n_block_pipe_write = cutlass::make_producer_start_state<MainloopPipelineNBlock>();
           // Manually specify the scheduler role: producer. For StaticPersistentTileSch, passing template args won't change the behavior
           for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler); 

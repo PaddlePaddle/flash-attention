@@ -197,7 +197,7 @@ def _scan_max_min(
 
     current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
 
-    compile_key = (b, kBlockN,)
+    compile_key = (kBlockN,)
     if compile_key not in _scan_max_min.compile_cache:
         _scan_max_min.compile_cache[compile_key] = cute.compile(
             scan_max_min_cute,
@@ -492,7 +492,7 @@ def reduce_block_count(
     current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
 
     # TODO(wusiming): Are all of these compile keys necessary?
-    compile_key = (is_causal, kBlockM, kBlockN, batch, heads, has_lte, has_uts, has_ute)
+    compile_key = (is_causal, kBlockM, kBlockN, has_lte, has_uts, has_ute)
     if compile_key not in reduce_block_count.compile_cache:
         reduce_block_count.compile_cache[compile_key] = cute.compile(
             reduce_block_count_cute,

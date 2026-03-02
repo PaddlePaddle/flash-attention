@@ -100,6 +100,8 @@ public:
 
     void compute_chunk_mask(
         const int* const lt_start_ptr,
+        const int* const lt_end_ptr,
+        const int* const ut_start_ptr,
         const int* const ut_end_ptr,
         cudaStream_t stream,
         const bool fwd = true
@@ -180,9 +182,6 @@ private:
     int* block_cnt_semaphore;
     int* copy_chunk_mask;
     int* stream_coordinator;        // make sure comm kernel is scheduled to GPU before computation kernel
-
-    // returns the team and stride between teams
-    static nvshmem_team_t simple_collective_topology_setter(int my_global_pe, int stride, int n_pes);
 };
 
 namespace comm {

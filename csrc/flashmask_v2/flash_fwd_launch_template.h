@@ -90,7 +90,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
         flash::enable_sm80_to_sm89<flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
-
+    int overlap_sm_margin = 0;
 #ifdef NVSHMEM_DISTRIBUTED_OVERLAP
     params.cp_size = params.nranks;
     bool need_overlap_comm = false;
@@ -119,13 +119,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 params.h_flashmask
             );
             // initial step does not need to wait for SR buffer's emptyness.
-            comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
+            comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
             comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
         } else {
             // do not update the SR buffer if other ranks did not finish using it
             auto& comm_singleton = flashmask::comm::singleton();
             comm_singleton.wait_sr_buffer_empty();
-            comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
+            comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
             comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
         }
         need_overlap_comm = true;
@@ -133,7 +133,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
     if constexpr (Arch >= 90) {
         // setting scheduler tile_count_semaphore / zeroing write_ptr / record write_ptr ready event
-        prepare_flashmask(params, stream, params.num_sm, Scheduler::pipelining, 
+        overlap_sm_margin = need_overlap_comm ? flashmask::comm::singleton().overlap_sm_margin() : 0;
+        prepare_flashmask(params, stream, params.num_sm - overlap_sm_margin, Scheduler::pipelining, 
             need_overlap_comm ? &flashmask::comm::singleton().wptr_init : nullptr,
             need_overlap_comm ? flashmask::comm::singleton().get_block_cnt_semaphore() : nullptr);
     }
@@ -262,7 +263,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     int device;
     CHECK_CUDA(cudaGetDevice(&device));
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
-        mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
+        mainloop_args, epilogue_args, {device, params.num_sm - overlap_sm_margin}, scheduler_args
     });
     CHECK_CUDA(cudaGetLastError());
 

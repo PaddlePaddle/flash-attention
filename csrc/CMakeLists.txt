@@ -626,7 +626,7 @@ if(NOT SKIP_BUILD_FA)
     message(STATUS "Auto generated CUDA source files for flashmask_v2: ${FLASHMASKV2_SOURCES_CU_SOURCES}")
 
     if(WITH_DISTRIBUTED_OVERLAP)
-        message(STATUS "Enabling NVSHMEM for distributed overlap support")
+        message(STATUS "Enabling NVSHMEM for distributed overlap support. NVSHMEM: ${NVSHMEM_INSTALL_DIR}")
         
         if(NVSHMEM_INSTALL_DIR)
             message(STATUS "Reusing external NVSHMEM from: ${NVSHMEM_INSTALL_DIR}")
@@ -686,8 +686,14 @@ if(NOT SKIP_BUILD_FA)
       >)
 
     if(WITH_DISTRIBUTED_OVERLAP)
+        target_include_directories(flashmaskv2 PRIVATE ${NVSHMEM_INCLUDE_DIR})
         target_link_libraries(flashmaskv2 PRIVATE flashmaskv2_distributed)
         add_dependencies(flashmaskv2 flashmaskv2_distributed)
+        set_target_properties(flashmaskv2 PROPERTIES
+            BUILD_RPATH "$ORIGIN"
+            INSTALL_RPATH "$ORIGIN"
+            BUILD_WITH_INSTALL_RPATH ON
+        )
     endif()
 
     INSTALL(TARGETS flashmaskv2 LIBRARY DESTINATION "lib")

@@ -39,7 +39,11 @@ target_link_libraries(flashmaskv2_distributed PRIVATE
     nvshmem
     ${NVSHMEM_BOOTSTRAP_UID_LIB}        # using MPI_Init, mpi bootstrap
 )
-add_dependencies(flashmaskv2_distributed extern_nvshmem)
+
+if(TARGET extern_nvshmem)
+    # There is no extern_nvshmem in non-standalone building
+    add_dependencies(flashmaskv2_distributed extern_nvshmem)
+endif()
 
 set_target_properties(flashmaskv2_distributed PROPERTIES
     POSITION_INDEPENDENT_CODE ON

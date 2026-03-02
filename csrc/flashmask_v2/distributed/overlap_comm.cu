@@ -1,8 +1,7 @@
 #include <fstream>
 #include <iostream>
 #include "overlap_comm.cuh"
-#include "nvshmem_handle.h"
-#include "remote_get_kernel_specialized.cuh"
+#include "remote_get_kernel.cuh"
 #include "remote_put_kernel.cuh"
 #include "dk_dv_reduce_bf16.cuh"
 #include "cp_heuristic.cuh"
@@ -12,15 +11,18 @@ namespace flashmask {
 // whether should we manually manage nvshmem related environment setups
 // deprecation warning: will be removed in the future
 static constexpr bool SHOULD_MANAGE_NVSHMEM = true;
-static constexpr bool USE_DENSE_COPY = true;            // no sparse mask KV skipping
-static constexpr bool USE_SEMAPHORES = false;           // no team_bar but fine-grained signaling
+// no team_bar but fine-grained signaling, good for single node CUDA IPC
+static constexpr bool USE_SEMAPHORES = false;
 // If true, we will scale up the transfering chunk for one CTA (16 rows per chunk ---> 256-512 rows per chunk)
 // and calculate per-chunk sparsity to skip some comm (avg 50% of the chunks are not needed)
 static constexpr bool USE_SPARSE_LARGE_CHUNK = true;
 // whether to use stream coordinator to make sure the scheduling order of comm & comp kernels
+// Note(heqianyue): If we can make sure CUDA_DEVICE_MAX_CONNECTION=1, stream_coord is actually not required
 static constexpr bool USE_STREAM_COORD = true;
 // whether to use double buffer for dK, dV SepSRBuffer, either 1 (single) or 2 (double buffer)
+// Note(heqianyue): double buffering might be deprecated in the future
 static constexpr int RS_BUFFER_CAPACITY = 1;
+// SM_MARGIN works for 128K CP16, but for 32K CP4, the performance is a bit degraded.
 static constexpr int OVERLAP_SM_MARGIN = 0;
 
 // allowed value: [16, 32, 64] (larger number is generally better for KV with larger num_head and higher CP)
@@ -98,22 +100,12 @@ void init_distributed_environment(
 ) {
     WARN_PRINT("[FlashMask Overlap] Initializing NVSHMEM... Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
     std::vector<uint8_t> unique_id_val;
-    if (unique_id_ptr == nullptr) {         
-        // TODO(heqianyue): deprecate in the future, we do not allow local shared file
-        if (rank == 0) {
-            unique_id_val = UniqueIdFileSync::generate_and_write_unique_id(rank);
-        } else {
-            unique_id_val = UniqueIdFileSync::wait_and_read_unique_id(rank);
-        }
-    } else {
-        WARN_PRINT("Extracting unique ID...");
-        unique_id_val.resize(sizeof(nvshmemx_uniqueid_t));
-        std::memcpy(unique_id_val.data(), unique_id_ptr, sizeof(nvshmemx_uniqueid_t));
-    }
+    WARN_PRINT("Extracting unique ID...");
+    unique_id_val.resize(sizeof(nvshmemx_uniqueid_t));
+    std::memcpy(unique_id_val.data(), unique_id_ptr, sizeof(nvshmemx_uniqueid_t));
     init_with_unique_id(std::move(unique_id_val), rank, nranks);
     get_nvshmem_info(my_pe, n_pes);
     WARN_PRINT("[FlashMask Overlap] NVSHMEM initialized. Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
-    UniqueIdFileSync::clean_up_file();
 }
 
 void finalize_distributed_environment() {
@@ -169,7 +161,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     _total_numel = _cp_chunk_size * b_kv * cp_size;             // won't overflow, but should be careful
 
     // This variable is simply a int32_t, so can be passed by value
-    nvshmem_team_t cp_team = simple_collective_topology_setter(_my_pe, _cp_stride, _total_n_pes);
+    nvshmem_team_t cp_team = NVSHMEM_TEAM_WORLD;
     kv_buffer = std::make_unique<SRBuffer<KVType>>(_total_numel, cp_team, USE_SEMAPHORES ? _total_n_pes : 0);
     if constexpr (USE_SEMAPHORES) {
         cudaMemset(kv_buffer->semaphores(), 0, sizeof(int64_t) * _total_n_pes);
@@ -329,7 +321,7 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
         // this can be slow if the pace difference of PEs is large  
         kv_buffer->team_bar_on_stream(comm_stream);
     }
-    if constexpr (!USE_STREAM_COORD) {
+    if constexpr (!USE_STREAM_COORD && OVERLAP_SM_MARGIN == 0) {
         // sync, otherwise it might hang unexceptedly. The culprit is that computation CTAs
         // are scheduled before communication kernels, occupying all the SMs, causing deadlock.
         CUDA_DEBUG_CHECK(cudaStreamSynchronize(comm_stream));
@@ -337,14 +329,14 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     WARN_PRINT("After cudaMemcpyAsync and notify full\n");
 }
 
-#define DenseFewHeadKernel(_S, KernelTraits)                                        \
-    DenseKVFewHeadRemoteGet##KernelTraits##Kernel<KVType, _S, S_chunk, num_blocks,  \
+#define DenseFewHeadKernel(_S, self_rank)                                           \
+    DenseKVFewHeadRemoteGetKernel<KVType, _S, S_chunk, num_blocks,                  \
         num_warps, USE_SEMAPHORES><<<num_blocks, num_warps * 32, 0, comm_stream>>>( \
                         kv_buffer->k_data(),                                        \
                         kv_buffer->v_data(),                                        \
                         write_ptr,                                                  \
                         block_work_ids,                                             \
-                        _my_pe,                                                     \
+                        self_rank,                                                  \
                         _cp_stride,                                                 \
                         _total_n_pes,                                               \
                         B,                                                          \
@@ -371,23 +363,6 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                         kv_buffer->semaphores()                             \
                     )
 
-#define FewHeadKernel(_S, KernelTraits)                                             \
-    SparseKVFewHeadRemoteGet##KernelTraits##Kernel<KVType, _S, S_chunk, num_blocks, \
-        num_warps, USE_SEMAPHORES><<<num_blocks, num_warps * 32, 0, comm_stream>>>( \
-                        kv_buffer->k_data(),                                        \
-                        kv_buffer->v_data(),                                        \
-                        write_ptr,                                                  \
-                        block_work_ids,                                             \
-                        lt_start_ptr,                                               \
-                        ut_end_ptr,                                                 \
-                        _my_pe,                                                     \
-                        _cp_stride,                                                 \
-                        _total_n_pes,                                               \
-                        B,                                                          \
-                        H * D,                                                      \
-                        kv_buffer->semaphores()                                     \
-                    )
-
 #define SeqlenCase(MACRO_FUNC, _S, KernelTraits, ...)       \
     case _S: {                                              \
         MACRO_FUNC(_S, KernelTraits, ##__VA_ARGS__); break; \
@@ -403,17 +378,24 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
 
 // can be adjust to use non-specialized version
 #define BlockChunkKernelTrait Specialized
-#define FwdKernelTrait Specialized
-#define BwdKernelTrait SpecializedBwd
 #define EXPAND_MACRO(MACRO, ...) MACRO(__VA_ARGS__)
 
 template <typename KVType>
 void OverlapCommunicator<KVType>::compute_chunk_mask(
     const int* const lt_start_ptr,
+    const int* const lt_end_ptr,
+    const int* const ut_start_ptr,
     const int* const ut_end_ptr,
     cudaStream_t stream,
     const bool fwd
 ) {
+    if (lt_end_ptr || ut_start_ptr) {
+        std::cerr << "[Warning] FlashMask Overlap does not support mask with lt_end and ut_start ptrs yet. Will be added soon.\n";
+    }
+    if (ut_end_ptr == nullptr || lt_start_ptr == nullptr) {
+        std::cerr << "For FlashMask Overlap, lt_start_ptr and ut_end_ptr can't be null.\n";
+        throw std::runtime_error("nullptr found for mask pointers.");
+    }
     if constexpr (USE_SPARSE_LARGE_CHUNK) {
         constexpr int S_chunk = 8192;
         constexpr int num_reduce_warp = RDMA_ROW_PER_WARP == 16 ? 4 : num_warps;
@@ -482,18 +464,10 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
             SeqlenDispatch(SparseLargeChunkKernel, S, true);
         }
     } else {
-        if constexpr (USE_DENSE_COPY) {
-            if (fwd) {
-                SeqlenDispatch(DenseFewHeadKernel, S, FwdKernelTrait);
-            } else {
-                SeqlenDispatch(DenseFewHeadKernel, S, BwdKernelTrait);
-            }
+        if (fwd) {
+            SeqlenDispatch(DenseFewHeadKernel, S, _my_pe);
         } else {
-            if (fwd) {
-                SeqlenDispatch(FewHeadKernel, S, FwdKernelTrait);
-            } else {
-                SeqlenDispatch(FewHeadKernel, S, BwdKernelTrait);
-            }
+            SeqlenDispatch(DenseFewHeadKernel, S, _my_pe);
         }
     }
 
@@ -730,35 +704,6 @@ int OverlapCommunicator<KVType>::num_segments() const {
 template <typename KVType>
 int OverlapCommunicator<KVType>::overlap_sm_margin() const {
     return dkv_buffer ? OVERLAP_SM_MARGIN : 0;
-}
-
-// returns the team and stride between teams
-template <typename KVType>
-nvshmem_team_t OverlapCommunicator<KVType>::simple_collective_topology_setter(int my_global_pe, int stride, int n_pes) {
-    if (stride == 1) {       
-        // the launch world only has 4 GPUs, we consider this a single node use case
-        // the world group is the CP communication group
-        return NVSHMEM_TEAM_WORLD; 
-    } else {
-        // for example: 2 node (4, 4, 16, 4) ---> comm group [0, 4, 8, 12], stride 4
-        // 4 node （8, 4, 32, 4） ---> comm group [0, 8, 16, 24], stride 8
-        int my_group_start_pe = my_global_pe % stride;
-
-        nvshmem_team_t cp_team;
-        nvshmem_team_config_t config; // Default config
-        long config_mask = 0;
-
-        int status = nvshmem_team_split_strided(
-            NVSHMEM_TEAM_WORLD,  // Parent team
-            my_group_start_pe,   // Start PE (rank in parent)
-            stride,              // Stride
-            n_pes / stride,      // Size (num PEs in new team)
-            &config,
-            config_mask,
-            &cp_team
-        );
-        return cp_team;
-    }
 }
 
 template <typename KVType>

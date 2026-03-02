@@ -1,3 +1,7 @@
+# Standalone NVSHMEM building: the following code is adapted from
+# Paddle nvshmem.cmake and will only be used when FlashMask is built
+# outside of the scope of Paddle third_party, when we specify `WITH_DISTRIBUTED_OVERLAP` manually.
+
 include(ExternalProject)
 
 set(GDRCOPY_HOME

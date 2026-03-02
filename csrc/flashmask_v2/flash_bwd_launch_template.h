@@ -142,7 +142,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         // segment needs to call 'update_kv_buffer' since the following segments do not have local chunks. The
         // chunk_mask and update_kv_buffer can actually be called only once. AG and RS overlap are called 4 (num_segs) times.
         comm_singleton.prepare_dkv_buffer(stream);        // RS-overlap: reset dK, dV semaphores to all 0
-        comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.ut_end_ptr, stream, false /* fwd */);
+        comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr, stream, false /* fwd */);
         comm_singleton.wait_sr_buffer_empty();
         comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr, false /*fwd*/);     // copy new KV data
 

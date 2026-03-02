@@ -307,7 +307,7 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                 BOOL_SWITCH(params.lt_start_ptr != nullptr, Is_flashmask, [&] {
                     static constexpr bool Enable_cluster = Arch == 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKVNonTMA && !Varlen && !Is_flashmask;
                     BOOL_SWITCH(params.qv_ptr, HasQV_, [&] {
-                        BOOL_SWITCH(params.seqlen_k < 128 && params.seqlen_q <= 128, ShortSeqlen, [&] {
+                        BOOL_SWITCH(params.seqlen_k < 128 && params.seqlen_q < 128, ShortSeqlen, [&] {
                             // If the sequence length is (extremely) short, we should cut down the tile size
                             static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, 
                                                         sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, ShortSeqlen)) : 128;

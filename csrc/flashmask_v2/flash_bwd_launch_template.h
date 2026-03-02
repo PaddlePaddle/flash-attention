@@ -59,30 +59,27 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
     using PreprocessKernel = flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, ArchTag, /*Clear_dQaccum=*/true, Varlen>;
 
-#define MakePreprocessKernelArgs(KernelFuncType, var_name)          \
-    typename KernelFuncType::Arguments var_name {                   \
-        static_cast<Element const*>(params.o_ptr),                  \
-        {seqlen_q, params.d, params.h, batch_q},  /* Shape O */     \
-        {params.o_row_stride, _1{}, params.o_head_stride, !is_varlen_q ? params.o_batch_stride : 0},  /* Stride O */    \
-        static_cast<Element const*>(params.do_ptr),                                                                     \
-        {params.do_row_stride, _1{}, params.do_head_stride, !is_varlen_q ? params.do_batch_stride : 0}, /* Stride dO */ \
-        static_cast<float*>(params.dsoftmax_sum),                                                                       \
-        {seqlen_q_rounded, params.h, batch_q},  /* Shape dP Sum */                                                      \
-        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  /* Stride dP Sum */           \
-        static_cast<float*>(params.softmax_lse_ptr),                                                                    \
-        {_1{}, seqlen_q, !is_varlen_q ? params.h * params.seqlen_q : 0},  /* stride_LSE */                              \
-        static_cast<float*>(params.softmax_lse_log2_ptr),                                                               \
-        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  /* stride_LSE_log2 */         \
-        static_cast<ElementAccum*>(params.dq_accum_ptr),                                                                \
-        {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  /* shape_dQaccum */                                  \
-        {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * seqlen_q_rounded * params.h : 0},  /* stride_dQaccum */ \
-        params.b,               \
-        params.dq_semaphore,    \
-        params.cu_seqlens_q,    \
-        params.seqused_q        \
-    }
-
-    MakePreprocessKernelArgs(PreprocessKernel, preprocess_args);
+    typename PreprocessKernel::Arguments preprocess_args {
+        static_cast<Element const*>(params.o_ptr),
+        {seqlen_q, params.d, params.h, batch_q},  // shape_O
+        {params.o_row_stride, _1{}, params.o_head_stride, !is_varlen_q ? params.o_batch_stride : 0},  // stride_O
+        static_cast<Element const*>(params.do_ptr),
+        {params.do_row_stride, _1{}, params.do_head_stride, !is_varlen_q ? params.do_batch_stride : 0},  // stride_dO
+        static_cast<float*>(params.dsoftmax_sum),
+        {seqlen_q_rounded, params.h, batch_q},  // shape_dPsum
+        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
+        static_cast<float*>(params.softmax_lse_ptr),
+        {_1{}, seqlen_q, !is_varlen_q ? params.h * params.seqlen_q : 0},  // stride_LSE
+        static_cast<float*>(params.softmax_lse_log2_ptr),
+        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
+        static_cast<ElementAccum*>(params.dq_accum_ptr),
+        {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
+        {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * seqlen_q_rounded * params.h : 0},  // stride_dQaccum
+        params.b,
+        params.dq_semaphore,
+        params.cu_seqlens_q,
+        params.seqused_q
+    };
 
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
@@ -92,6 +89,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     // flash::print_addr_value<<<1, 1,0,stream>>>(params.lt_start_ptr, 0);
     // printf("point2\n");
     CHECK_CUDA_KERNEL_LAUNCH();
+    CHECK_CUDA(cudaGetLastError());
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<_1, Int<1>, _1>;  // Currently doesn't not support cluster

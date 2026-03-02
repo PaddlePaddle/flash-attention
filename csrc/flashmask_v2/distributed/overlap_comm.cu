@@ -437,8 +437,6 @@ int OverlapCommunicator<KVType>::chunk_per_seg() const {
 */
 template <typename KVType>
 void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
-    const int* const lt_start_ptr,
-    const int* const ut_end_ptr,
     int* const write_ptr,
     int& S,
     const bool fwd
@@ -526,8 +524,6 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
 
 template <typename KVType>
 void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
-    const int* const lt_start_ptr,
-    const int* const ut_end_ptr,
     int* const write_ptr,
     int& S,
     int segment_idx

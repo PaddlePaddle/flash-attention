@@ -44,8 +44,6 @@ public:
      * TODO(heqianyue): extend to more mask types!
     */
     void run_overlap_ag_kernel(
-        const int* const lt_start_ptr,
-        const int* const ut_end_ptr,
         int* const write_ptr,
         int& S,
         const bool fwd = true
@@ -53,8 +51,6 @@ public:
 
     // only used when use_rs_overlap and in the bwd
     void run_overlap_splitted_ag_kernel(
-        const int* const lt_start_ptr,
-        const int* const ut_end_ptr,
         int* const write_ptr,
         int& S,
         int segment_idx

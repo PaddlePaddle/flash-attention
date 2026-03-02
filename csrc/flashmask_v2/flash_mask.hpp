@@ -262,8 +262,14 @@ public:
     int chunk_size, 
     int chunks_per_seg
   ): _params(params), 
-     seqlen_offset(chunk_size * chunks_per_seg),
-     nblock_seqlen(((seqlen_offset + kBlockN - 1) / kBlockN + 3) & 0xfffffffc) {}
+      seqlen_offset(chunk_size * chunks_per_seg),
+      nblock_seqlen(((seqlen_offset + kBlockN - 1) / kBlockN + 3) & 0xfffffffc) {
+    if (kBlockN & (kBlockN - 1)) {    // not the power of 2
+      std::cerr << "[RS-Overlap Error] MaskPtrUpater currently supports block size being the power of 2. Got: " 
+                << kBlockN << std::endl;
+      throw std::runtime_error("Unsupported kBlockN for RS overlap.");
+    }
+  }
 
   void inplace_update() {
     // TODO(heqianyue): assert kBlockN to be the power of 2

@@ -174,14 +174,10 @@ SEGMENT_LOOP_START:
         // Note(heqianyue): for RS-overlap, before the last computation kernel, communication kernel won't start
         comm_singleton.wait_wptr_init();        // wait until wptr is initialized
         if (overlap_rs) {  // RS-overlap splits the AG and attn kernel
-            comm_singleton.run_overlap_splitted_ag_kernel(
-                params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k, segment_idx
-            );
+            comm_singleton.run_overlap_splitted_ag_kernel(params.write_ptr, params.seqlen_k, segment_idx);
             // make sure computation kernels are scheduled with SMs later than communication kernels
         } else {
-            comm_singleton.run_overlap_ag_kernel(
-                params.lt_start_ptr, params.ut_end_ptr, params.write_ptr, params.seqlen_k, false /*fwd*/
-            );
+            comm_singleton.run_overlap_ag_kernel(params.write_ptr, params.seqlen_k, false /*fwd*/);
         }
         comm_singleton.wait_reset_stream_coordinator(stream);
     }

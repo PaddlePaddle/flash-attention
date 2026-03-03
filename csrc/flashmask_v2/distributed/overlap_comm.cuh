@@ -128,7 +128,8 @@ public:
     // sr_usable: comp_stream notifies comm_stream, KV SR buffer local chunk can be reused (since computation is done)
     // bwd_done (only when RS-overlap): comp_stream notifies aux_streams, bwd post-proc done
     // reduce_done (only when RS-overlap): aux_c_stream notifies comp_stream, dk/v recv buffer are released and ready 
-    cudaEvent_t wptr_init, sr_usable, bwd_done, reduce_done;
+    // local_moved (only when RS-overlap): for segment 0, aux_p_stream notifies aux_c_stream whether the memcpy d2d is completed. 
+    cudaEvent_t wptr_init, sr_usable, bwd_done, reduce_done, local_moved;
     /**
      * If overlap_rs is set, dkv_buffer will be populated.
      * and since the fwd AG buffer is always bigger than bwd AG

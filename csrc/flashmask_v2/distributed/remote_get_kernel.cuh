@@ -94,8 +94,10 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) DenseKVFewHead
             int work_idx = threadIdx.x == blockIdx.x ? work_id : block_work_idx[threadIdx.x];
             work_idx = __reduce_min_sync(0xffffffff, work_idx);
             work_idx = work_idx == work_per_block ? INT_MAX : (work_idx * seqlen_stride);
-            if (threadIdx.x == 0)
-                atomicMax(wptr, work_idx);     // 128 * work_idx, or INT_MAX
+            if (threadIdx.x == 0) {
+                __threadfence();            // prevent the change on L2 visibility order (make sure previous stores are done) 
+                atomicMax(wptr, work_idx);  // 128 * work_idx, or INT_MAX
+            }
         }
     }
 }
@@ -159,8 +161,10 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) DenseKVFewHead
             int work_idx = threadIdx.x == blockIdx.x ? work_id : block_work_idx[threadIdx.x];
             work_idx = __reduce_min_sync(0xffffffff, work_idx);
             work_idx = work_idx == work_per_block ? INT_MAX : (work_idx * seqlen_stride);
-            if (threadIdx.x == 0)
-                atomicMax(wptr, work_idx);     // 128 * work_idx, or INT_MAX
+            if (threadIdx.x == 0) {
+                __threadfence();            // prevent the change on L2 visibility order (make sure previous stores are done) 
+                atomicMax(wptr, work_idx);  // 128 * work_idx, or INT_MAX
+            }
         }
     }
 }
@@ -417,6 +421,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             wid = threadIdx.x != blockIdx.x ? block_work_idx[threadIdx.x] : wid;
             wid = __reduce_min_sync(0xffffffff, wid);
             if (threadIdx.x == blockIdx.x) {
+                __threadfence();                // prevent the change on L2 visibility order (make sure previous stores are done) 
                 atomicMax(wptr, wid == INT_MAX ? INT_MAX : (wid * row_per_block));     // 256 or 512 * wid, or INT_MAX
             }
         }
@@ -563,6 +568,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             wid = threadIdx.x != blockIdx.x ? block_work_idx[threadIdx.x] : wid;
             wid = __reduce_min_sync(0xffffffff, wid);
             if (threadIdx.x == blockIdx.x) {
+                __threadfence();            // prevent the change on L2 visibility order (make sure previous stores are done) 
                 atomicMax(wptr, wid == INT_MAX ? INT_MAX : (wid * row_per_block));     // 256 or 512 * wid, or INT_MAX
             }
         }

@@ -187,6 +187,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         cudaStreamCreateWithPriority(&aux_c_stream, cudaStreamNonBlocking, std::min(greatest_priority + 1, least_priority));
         cudaEventCreateWithFlags(&bwd_done, cudaEventDisableTiming);
         cudaEventCreateWithFlags(&reduce_done, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&local_moved, cudaEventDisableTiming);
         dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
             _cp_chunk_size * b_kv,      // single chunk K numel (B * S_local * H * D)
             _total_n_pes,
@@ -216,6 +217,7 @@ OverlapCommunicator<KVType>::~OverlapCommunicator() {
     if (dkv_buffer) {
         CUDA_DEBUG_CHECK(cudaEventDestroy(bwd_done));
         CUDA_DEBUG_CHECK(cudaEventDestroy(reduce_done));
+        CUDA_DEBUG_CHECK(cudaEventDestroy(local_moved));
         CUDA_DEBUG_CHECK(cudaStreamDestroy(aux_p_stream));
         CUDA_DEBUG_CHECK(cudaStreamDestroy(aux_c_stream));
         dkv_buffer->release();
@@ -633,6 +635,8 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
             cudaMemcpyAsync(dk_dst + batch_offset, dk_src + batch_offset, sizeof(KVType) * S_chunk * S_stride, cudaMemcpyDeviceToDevice, aux_p_stream);
             cudaMemcpyAsync(dv_dst + batch_offset, dv_src + batch_offset, sizeof(KVType) * S_chunk * S_stride, cudaMemcpyDeviceToDevice, aux_p_stream);
         }
+        cudaEventRecord(local_moved, aux_p_stream);
+        cudaStreamWaitEvent(aux_c_stream, local_moved); // consumer reduce must starts after the local send2recv
         NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks - 1, segment_idx);    // local producer
     }
     // bwd-attn post-process will wait for the following event (release of dk/v send buffer)

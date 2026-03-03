@@ -15,6 +15,7 @@
 
 #include "flash_attn_v3_utils.h"
 #include "flashmask_v3.h"
+#include "flash_api_internal.h"
 
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
@@ -555,8 +556,8 @@ void FlashMaskV3GradBaseKernel(
     }
   }
 
-  FlashMask_bwd_params *params_handle = get_flashmask_bwd_params_handle();
-  flashmaskv3_clear_bwd_params_handle(params_handle);
+  Flash_bwd_params params_obj = {};
+  Flash_bwd_params *params_handle = &params_obj;
   set_flashmaskv3_params_dgrad(
       params_handle, batch_size, seqlen_q, seqlen_k, seqlen_q_rounded,
       seqlen_k_rounded, num_heads, num_heads_k, head_size, head_size_rounded, q,
@@ -573,33 +574,31 @@ void FlashMaskV3GradBaseKernel(
       softmax_d ? (softmax_d->data()) : nullptr,
       /*p_dropout=*/0.f, softmax_scale, window_size_left, window_size_right,
       dprops, softcap, deterministic, sm_margin);
-  flashmaskv3_bwd_params_set_total_q(params_handle, total_q);
-  flashmaskv3_bwd_params_set_total_k(params_handle, total_k);
-  flashmaskv3_bwd_params_set_softmax_lse_log2_ptr(
-      params_handle, softmax_lse_log2 ? softmax_lse_log2->data() : nullptr);
-  flashmaskv3_bwd_params_set_dv(params_handle,
-                                head_size); // We don't support hdim_v being
-                                            // different from hdim_qk for now
+  params_handle->total_q = total_q;
+  params_handle->total_k = total_k;
+  params_handle->softmax_lse_log2_ptr =
+      softmax_lse_log2 ? softmax_lse_log2->data() : nullptr;
+  params_handle->dv = head_size; // We don't support hdim_v being
+                                 // different from hdim_qk for now
   paddle::Tensor tile_count_semaphore;
   if (arch >= 90) {
     tile_count_semaphore = paddle::full({1}, 0, paddle::DataType::INT32, place);
 
-    flashmaskv3_bwd_params_set_tile_count_semaphore(
-        params_handle, tile_count_semaphore.data<int>());
+    params_handle->tile_count_semaphore =
+        tile_count_semaphore.data<int>();
   } else {
-    flashmaskv3_bwd_params_set_tile_count_semaphore(params_handle, nullptr);
+    params_handle->tile_count_semaphore = nullptr;
   }
 
   paddle::Tensor dq_semaphore =
       paddle::empty({(seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads},
                     paddle::DataType::INT32, place);
-  flashmaskv3_bwd_params_set_dq_semaphore(params_handle,
-                                          dq_semaphore.data<int>());
+  params_handle->dq_semaphore = const_cast<int *>(dq_semaphore.data<int>());
 
   paddle::Tensor dk_semaphore;
   paddle::Tensor dv_semaphore;
   if (num_heads_k != num_heads &&
-      flashmaskv3_bwd_params_get_deterministic(params_handle)) {
+      params_handle->deterministic) {
     // xiangrui: we need to zero them out
     dk_semaphore = paddle::full(
         {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, 0,
@@ -609,62 +608,60 @@ void FlashMaskV3GradBaseKernel(
         {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, 0,
         paddle::DataType::INT32, place);
 
-    flashmaskv3_bwd_params_set_dk_semaphore(params_handle,
-                                            dk_semaphore.data<int>());
-    flashmaskv3_bwd_params_set_dv_semaphore(params_handle,
-                                            dv_semaphore.data<int>());
+    params_handle->dk_semaphore = const_cast<int *>(dk_semaphore.data<int>());
+    params_handle->dv_semaphore = const_cast<int *>(dv_semaphore.data<int>());
   }
 
   if (is_flashmask) {
-    flashmaskv3_bwd_params_set_lt_start_ptr(
-        params_handle, const_cast<int32_t *>(lt_start_ptr));
-    flashmaskv3_bwd_params_set_lt_end_ptr(params_handle,
-                                          const_cast<int32_t *>(lt_end_ptr));
-    flashmaskv3_bwd_params_set_ut_start_ptr(
-        params_handle, const_cast<int32_t *>(ut_start_ptr));
-    flashmaskv3_bwd_params_set_ut_end_ptr(params_handle,
-                                          const_cast<int32_t *>(ut_end_ptr));
+    params_handle->lt_start_ptr =
+        const_cast<int32_t *>(lt_start_ptr);
+    params_handle->lt_end_ptr =
+        const_cast<int32_t *>(lt_end_ptr);
+    params_handle->ut_start_ptr =
+        const_cast<int32_t *>(ut_start_ptr);
+    params_handle->ut_end_ptr =
+        const_cast<int32_t *>(ut_end_ptr);
 
     if (flashmask_maxmin.initialized())
-      flashmaskv3_bwd_params_set_flashmask_maxmin_ptr(
-          params_handle, (flashmask_maxmin.data<int32_t>()));
+      params_handle->flashmask_maxmin_ptr =
+          const_cast<int32_t *>(flashmask_maxmin.data<int32_t>());
     else
-      flashmaskv3_bwd_params_set_flashmask_maxmin_ptr(params_handle, nullptr);
+      params_handle->flashmask_maxmin_ptr = nullptr;
 
-    flashmaskv3_bwd_params_set_h_flashmask(params_handle,
-                                           startend_row_indices.dims()[1]);
-    flashmaskv3_bwd_params_set_h_h_flashmask_ratio(
-        params_handle, num_heads / startend_row_indices.dims()[1]);
+    params_handle->h_flashmask =
+        startend_row_indices.dims()[1];
+    params_handle->h_h_flashmask_ratio =
+        num_heads / startend_row_indices.dims()[1];
   } else {
-    flashmaskv3_bwd_params_set_lt_start_ptr(params_handle, nullptr);
-    flashmaskv3_bwd_params_set_lt_end_ptr(params_handle, nullptr);
-    flashmaskv3_bwd_params_set_ut_start_ptr(params_handle, nullptr);
-    flashmaskv3_bwd_params_set_ut_end_ptr(params_handle, nullptr);
-    flashmaskv3_bwd_params_set_flashmask_maxmin_ptr(params_handle, nullptr);
-    flashmaskv3_bwd_params_set_h_flashmask(params_handle, 0);
-    flashmaskv3_bwd_params_set_h_h_flashmask_ratio(params_handle, 0);
+    params_handle->lt_start_ptr = nullptr;
+    params_handle->lt_end_ptr = nullptr;
+    params_handle->ut_start_ptr = nullptr;
+    params_handle->ut_end_ptr = nullptr;
+    params_handle->flashmask_maxmin_ptr = nullptr;
+    params_handle->h_flashmask = 0;
+    params_handle->h_h_flashmask_ratio = 0;
   }
 
   if (is_blockmask) {
     // xhy: blockmask is now only support blockdim_q k = 128
-    flashmaskv3_bwd_params_set_m_block_dim(params_handle, 128);
-    flashmaskv3_bwd_params_set_n_block_dim(params_handle, 128);
-    flashmaskv3_bwd_params_set_block_mask_ptr(params_handle,
-                                              (block_mask.data<int32_t>()));
+    params_handle->m_block_dim = 128;
+    params_handle->n_block_dim = 128;
+    params_handle->block_mask_ptr =
+        const_cast<int32_t *>(block_mask.data<int32_t>());
   }
 #ifdef FLASHATTENTION_DISABLE_LOCAL
   PADDLE_ENABLE_EQ(
-      !flashmaskv3_bwd_params_get_is_local(params_handle), true,
+      !params_handle->is_local, true,
       "This flash attention build does not support local attention.");
 #endif
 #ifdef FLASHATTENTION_DISABLE_SOFTCAP
   PADDLE_ENABLE_EQ(
-      flashmaskv3_bwd_params_get_softcap(params_handle), 0.0,
+      params_handle->softcap, 0.0,
       "This flash attention build does not support tanh softcapping.");
 #endif
 
   if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
-    flashmaskv3_run_mha_bwd(params_handle, stream);
+    run_mha_bwd(*params_handle, stream);
   } else if (total_k > 0 && num_heads_k > 0) {
     *dk = paddle::full(dk->shape(), T{0}, q_type, place);
     *dv = paddle::full(dv->shape(), T{0}, q_type, place);

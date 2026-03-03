@@ -14,6 +14,7 @@
  ******************************************************************************/
 
 #include "flash_attn_v3_utils.h"
+#include "flash_api_internal.h"
 #include "flashmask_v3.h"
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
@@ -372,8 +373,8 @@ void FlashMaskV3BaseKernel(
   *softmax_lse = paddle::empty({batch_size, num_heads, seqlen_q},
                                paddle::DataType::FLOAT32, place);
 
-  FlashMask_fwd_params *params_handle = get_flashmask_fwd_params_handle();
-  flashmaskv3_clear_fwd_params_handle(params_handle);
+  Flash_fwd_params params_obj = {};
+  Flash_fwd_params *params_handle = &params_obj;
   set_flashmaskv3_params_fprop(
       params_handle, batch_size, seqlen_q, seqlen_k, seqlen_q_rounded,
       seqlen_k_rounded, num_heads, num_heads_k, head_size, head_size_rounded, q,
@@ -386,25 +387,22 @@ void FlashMaskV3BaseKernel(
       softmax_lse->data(),
       /*p_dropout=*/0.f, softmax_scale, window_size_left, window_size_right,
       dprops, softcap, sm_margin);
-  flashmaskv3_fwd_params_set_total_q(params_handle, total_q);
-  flashmaskv3_fwd_params_set_total_k(params_handle, total_k);
-  flashmaskv3_fwd_params_set_b_k(params_handle, batch_size_k);
-  flashmaskv3_fwd_params_set_dv(params_handle, head_size_v);
-  flashmaskv3_fwd_params_set_dv_rounded(params_handle, head_size_v_rounded);
+  params_handle->total_q = total_q;
+  params_handle->total_k = total_k;
+  params_handle->b_k = batch_size_k;
+  params_handle->dv = head_size_v;
+  params_handle->dv_rounded = head_size_v_rounded;
 
   if (leftpad_k_
           .is_initialized()) { // This needs to be set before get_pagedkv_tma
-    flashmaskv3_fwd_params_set_leftpad_k(params_handle,
-                                         leftpad_k_.get().data<int>());
+    params_handle->leftpad_k = const_cast<int *>(leftpad_k_.get().data<int>());
   }
   if (paged_KV) {
-    flashmaskv3_fwd_params_set_page_table(params_handle,
-                                          page_table.data<int>());
-    flashmaskv3_fwd_params_set_page_table_batch_stride(params_handle,
-                                                       page_table.strides()[0]);
+    params_handle->page_table = const_cast<int *>(page_table.data<int>());
+    params_handle->page_table_batch_stride = page_table.strides()[0];
   }
-  flashmaskv3_fwd_params_set_page_size(params_handle, page_size);
-  flashmaskv3_fwd_params_set_num_pages(params_handle, num_pages);
+  params_handle->page_size = page_size;
+  params_handle->num_pages = num_pages;
 
   if (k_new_.is_initialized()) { // This needs to be set before get_pagedkv_tma
     paddle::Tensor k_new, v_new;
@@ -461,64 +459,55 @@ void FlashMaskV3BaseKernel(
       CHECK_SHAPE(cu_seqlens_k_new, batch_size + 1);
     }
     // umiswing: dump this to shared library
-    flashmaskv3_fwd_params_set_seqlen_knew(params_handle, seqlen_k_new);
-    flashmaskv3_fwd_params_set_total_knew(params_handle, total_k_new);
-    flashmaskv3_fwd_params_set_knew_ptr(params_handle, (k_new.data()));
-    flashmaskv3_fwd_params_set_vnew_ptr(params_handle, (v_new.data()));
+    params_handle->seqlen_knew = seqlen_k_new;
+    params_handle->total_knew = total_k_new;
+    params_handle->knew_ptr = (k_new.data());
+    params_handle->vnew_ptr = (v_new.data());
     // All stride are in elements, not bytes.
-    flashmaskv3_fwd_params_set_knew_row_stride(
-        params_handle, k_new.strides()[k_new.strides().size() - 3]);
-    flashmaskv3_fwd_params_set_vnew_row_stride(
-        params_handle, v_new.strides()[v_new.strides().size() - 3]);
-    flashmaskv3_fwd_params_set_knew_head_stride(
-        params_handle, k_new.strides()[k_new.strides().size() - 2]);
-    flashmaskv3_fwd_params_set_vnew_head_stride(
-        params_handle, v_new.strides()[v_new.strides().size() - 2]);
+    params_handle->knew_row_stride = k_new.strides()[k_new.strides().size() - 3];
+    params_handle->vnew_row_stride = v_new.strides()[v_new.strides().size() - 3];
+    params_handle->knew_head_stride = k_new.strides()[k_new.strides().size() - 2];
+    params_handle->vnew_head_stride = v_new.strides()[v_new.strides().size() - 2];
     if (!is_varlen_k_new) {
-      flashmaskv3_fwd_params_set_knew_batch_stride(params_handle,
-                                                   k_new.strides()[0]);
-      flashmaskv3_fwd_params_set_vnew_batch_stride(params_handle,
-                                                   v_new.strides()[0]);
+      params_handle->knew_batch_stride = k_new.strides()[0];
+      params_handle->vnew_batch_stride = v_new.strides()[0];
     }
     if (is_varlen_k_new) {
-      flashmaskv3_fwd_params_set_cu_seqlens_knew(params_handle,
-                                                 cu_seqlens_k_new.data<int>());
+      params_handle->cu_seqlens_knew = const_cast<int *>(cu_seqlens_k_new.data<int>());
     }
   }
 
   // 992 = 32 * 31 is the max supported batch in prepare_varlen_num_blocks
   // kernel
   bool const use_dynamic_split =
-      is_varlen && flashmaskv3_fwd_params_get_b(params_handle) <= 992;
+      is_varlen && params_handle->b <= 992;
   // Temporarily set num_splits_dynamic_ptr to 1 since get_num_splits checks it
-  flashmaskv3_fwd_params_set_num_splits_dynamic_ptr(
-      params_handle, !use_dynamic_split ? nullptr : reinterpret_cast<int *>(1));
+  params_handle->num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int *>(1);
 
-  flashmaskv3_fwd_params_set_pagedkv_tma(
-      params_handle, flashmaskv3_get_pagedkv_tma(params_handle));
+  params_handle->pagedkv_tma = get_pagedkv_tma(*params_handle);
   if (num_splits <= 0) {
-    num_splits = flashmaskv3_get_num_splits(params_handle);
+    num_splits = get_num_splits(*params_handle);
   }
-  flashmaskv3_fwd_params_set_num_splits(params_handle, num_splits);
+  params_handle->num_splits = num_splits;
 
   // Always enable PackGQA for Split, and get_pack_gqa requires
   // params.num_splits to decide
   const bool pack_gqa =
-      manual_set_pack_gqa ? pack_gqa_ : flashmaskv3_get_pack_gqa(params_handle);
-  flashmaskv3_fwd_params_set_pack_gqa(params_handle, pack_gqa);
+      manual_set_pack_gqa ? pack_gqa_ : get_pack_gqa(*params_handle);
+  params_handle->pack_gqa = pack_gqa;
 
   // This needs to be set after get_num_splits
   paddle::Tensor tile_count_semaphore; // Contains the semaphore and optionally
                                        // num_splits_dynamic
   // We don't use the persistent scheduler if Split and not Varlen
   const bool params_is_causal =
-      flashmaskv3_fwd_params_get_is_causal(params_handle);
+      params_handle->is_causal;
   const bool params_is_local =
-      flashmaskv3_fwd_params_get_is_local(params_handle);
+      params_handle->is_local;
   const int params_num_splits =
-      flashmaskv3_fwd_params_get_num_splits(params_handle);
-  const int params_b = flashmaskv3_fwd_params_get_b(params_handle);
-  const int params_arch = flashmaskv3_fwd_params_get_arch(params_handle);
+      params_handle->num_splits;
+  const int params_b = params_handle->b;
+  const int params_arch = params_handle->arch;
   bool const scheduler_needs_semaphore =
       params_arch >= 90 ? true
                         : ((params_is_causal && !is_varlen) ||
@@ -528,8 +517,7 @@ void FlashMaskV3BaseKernel(
     metadata_size = static_cast<int>(scheduler_needs_semaphore) +
                     static_cast<int>(use_dynamic_split) * params_b;
 
-    flashmaskv3_fwd_params_set_skip_scheduler_metadata_computation(
-        params_handle, scheduler_metadata_.is_initialized());
+    params_handle->skip_scheduler_metadata_computation = scheduler_metadata_.is_initialized();
 
     if (scheduler_metadata_.is_initialized()) {
       paddle::Tensor scheduler_metadata = scheduler_metadata_.get();
@@ -550,13 +538,11 @@ void FlashMaskV3BaseKernel(
           paddle::full(tile_count_semaphore.shape(), int32_t{0},
                        paddle::DataType::INT32, place);
     }
-    flashmaskv3_fwd_params_set_tile_count_semaphore(
-        params_handle, scheduler_needs_semaphore
-                           ? (tile_count_semaphore.data<int>())
-                           : nullptr);
-    flashmaskv3_fwd_params_set_num_splits_dynamic_ptr(
-        params_handle,
-        use_dynamic_split ? (tile_count_semaphore.data<int>()) + 1 : nullptr);
+    params_handle->tile_count_semaphore = scheduler_needs_semaphore
+                                              ? const_cast<int *>(tile_count_semaphore.data<int>())
+                                              : nullptr;
+    params_handle->num_splits_dynamic_ptr =
+        use_dynamic_split ? const_cast<int *>(tile_count_semaphore.data<int>()) + 1 : nullptr;
   }
 
   if (q_v_.is_initialized()) {
@@ -584,15 +570,12 @@ void FlashMaskV3BaseKernel(
     } else {
       CHECK_SHAPE(q_v, total_q, num_heads, head_size_v);
     }
-    flashmaskv3_fwd_params_set_qv_ptr(params_handle, (q_v.data()));
+    params_handle->qv_ptr = (q_v.data());
     // All stride are in elements, not bytes.
-    flashmaskv3_fwd_params_set_qv_row_stride(
-        params_handle, q_v.strides()[q_v.strides().size() - 3]);
-    flashmaskv3_fwd_params_set_qv_head_stride(
-        params_handle, q_v.strides()[q_v.strides().size() - 2]);
+    params_handle->qv_row_stride = q_v.strides()[q_v.strides().size() - 3];
+    params_handle->qv_head_stride = q_v.strides()[q_v.strides().size() - 2];
     if (!is_varlen_q) {
-      flashmaskv3_fwd_params_set_qv_batch_stride(params_handle,
-                                                 q_v.strides()[0]);
+      params_handle->qv_batch_stride = q_v.strides()[0];
     }
   }
 
@@ -606,7 +589,7 @@ void FlashMaskV3BaseKernel(
     CHECK_DEVICE(rotary_cos);
     CHECK_CONTIGUOUS(rotary_cos);
     int params_rotary_dim = rotary_cos.dims()[1] * 2;
-    flashmaskv3_fwd_params_set_rotary_dim(params_handle, params_rotary_dim);
+    params_handle->rotary_dim = params_rotary_dim;
     PADDLE_ENFORCE_LE(
         params_rotary_dim, head_size,
         common::errors::InvalidArgument("rotary_dim must be <= headdim"));
@@ -641,14 +624,11 @@ void FlashMaskV3BaseKernel(
                       common::errors::InvalidArgument(
                           "rotary_cos must have the same dtype as query"));
 
-    flashmaskv3_fwd_params_set_rotary_cos_ptr(params_handle,
-                                              (rotary_cos.data()));
-    flashmaskv3_fwd_params_set_rotary_sin_ptr(params_handle,
-                                              (rotary_sin.data()));
-    flashmaskv3_fwd_params_set_is_rotary_interleaved(params_handle,
-                                                     is_rotary_interleaved);
+    params_handle->rotary_cos_ptr = (rotary_cos.data());
+    params_handle->rotary_sin_ptr = (rotary_sin.data());
+    params_handle->is_rotary_interleaved = is_rotary_interleaved;
   } else {
-    flashmaskv3_fwd_params_set_rotary_dim(params_handle, 0);
+    params_handle->rotary_dim = 0;
   }
 
   if (kv_batch_idx_.is_initialized()) {
@@ -658,56 +638,47 @@ void FlashMaskV3BaseKernel(
     PADDLE_ENFORCE_EQ(
         kv_batch_idx.dtype(), paddle::DataType::INT32,
         common::errors::InvalidArgument("kv_batch_idx must have dtype int32"));
-    flashmaskv3_fwd_params_set_kv_batch_idx(
-        params_handle, reinterpret_cast<int *>(kv_batch_idx.data()));
+    params_handle->kv_batch_idx = reinterpret_cast<int *>(kv_batch_idx.data());
   }
 
-  if (flashmaskv3_fwd_params_get_num_splits(params_handle) > 1) {
+  if (params_handle->num_splits > 1) {
     PADDLE_ENFORCE_LE(
-        flashmaskv3_fwd_params_get_num_splits(params_handle), 256,
+        params_handle->num_splits, 256,
         common::errors::InvalidArgument("num_splits > 256 not supported"));
     if (!is_varlen_q) {
 
       *out_accum =
-          paddle::empty({flashmaskv3_fwd_params_get_num_splits(params_handle),
+          paddle::empty({params_handle->num_splits,
                          batch_size, num_heads, seqlen_q, head_size_v},
                         paddle::DataType::FLOAT32, place);
 
       *softmax_lse_accum =
-          paddle::empty({flashmaskv3_fwd_params_get_num_splits(params_handle),
+          paddle::empty({params_handle->num_splits,
                          batch_size, num_heads, seqlen_q},
                         paddle::DataType::FLOAT32, place);
 
-      flashmaskv3_fwd_params_set_oaccum_batch_stride(params_handle,
-                                                     out_accum->strides()[1]);
-      flashmaskv3_fwd_params_set_lseaccum_batch_stride(
-          params_handle, softmax_lse_accum->strides()[1]);
+      params_handle->oaccum_batch_stride = out_accum->strides()[1];
+      params_handle->lseaccum_batch_stride = softmax_lse_accum->strides()[1];
     } else {
       *out_accum =
-          paddle::empty({flashmaskv3_fwd_params_get_num_splits(params_handle),
+          paddle::empty({params_handle->num_splits,
                          num_heads, total_q, head_size_v},
                         paddle::DataType::FLOAT32, place);
 
       *softmax_lse_accum =
-          paddle::empty({flashmaskv3_fwd_params_get_num_splits(params_handle),
+          paddle::empty({params_handle->num_splits,
                          num_heads, total_q},
                         paddle::DataType::FLOAT32, place);
     }
-    flashmaskv3_fwd_params_set_is_fp32(params_handle, false);
-    flashmaskv3_fwd_params_set_oaccum_ptr(params_handle, (out_accum->data()));
-    flashmaskv3_fwd_params_set_softmax_lseaccum_ptr(
-        params_handle, (softmax_lse_accum->data()));
-    flashmaskv3_fwd_params_set_oaccum_split_stride(params_handle,
-                                                   out_accum->strides()[0]);
-    flashmaskv3_fwd_params_set_oaccum_row_stride(
-        params_handle, out_accum->strides()[out_accum->strides().size() - 2]);
-    flashmaskv3_fwd_params_set_oaccum_head_stride(
-        params_handle, out_accum->strides()[out_accum->strides().size() - 3]);
-    flashmaskv3_fwd_params_set_lseaccum_split_stride(
-        params_handle, softmax_lse_accum->strides()[0]);
-    flashmaskv3_fwd_params_set_lseaccum_head_stride(
-        params_handle,
-        softmax_lse_accum->strides()[softmax_lse_accum->strides().size() - 2]);
+    params_handle->is_fp32 = false;
+    params_handle->oaccum_ptr = (out_accum->data());
+    params_handle->softmax_lseaccum_ptr = (softmax_lse_accum->data());
+    params_handle->oaccum_split_stride = out_accum->strides()[0];
+    params_handle->oaccum_row_stride = out_accum->strides()[out_accum->strides().size() - 2];
+    params_handle->oaccum_head_stride = out_accum->strides()[out_accum->strides().size() - 3];
+    params_handle->lseaccum_split_stride = softmax_lse_accum->strides()[0];
+    params_handle->lseaccum_head_stride =
+        softmax_lse_accum->strides()[softmax_lse_accum->strides().size() - 2];
   }
 
   if (q_type == paddle::DataType::FLOAT8_E4M3FN) {
@@ -715,75 +686,66 @@ void FlashMaskV3BaseKernel(
       paddle::Tensor q_descale = q_descale_.get();
       CHECK_DEVICE(q_descale);
       CHECK_SHAPE(q_descale, batch_size, num_heads_k);
-      flashmaskv3_fwd_params_set_q_descale_ptr(params_handle,
-                                               (q_descale.data<float>()));
-      flashmaskv3_fwd_params_set_q_descale_batch_stride(params_handle,
-                                                        q_descale.strides()[0]);
-      flashmaskv3_fwd_params_set_q_descale_head_stride(params_handle,
-                                                       q_descale.strides()[1]);
+      params_handle->q_descale_ptr = const_cast<float *>(q_descale.data<float>());
+      params_handle->q_descale_batch_stride = q_descale.strides()[0];
+      params_handle->q_descale_head_stride = q_descale.strides()[1];
     } else {
-      flashmaskv3_fwd_params_set_q_descale_ptr(params_handle, nullptr);
+      params_handle->q_descale_ptr = nullptr;
     }
     if (k_descale_.is_initialized()) {
       paddle::Tensor k_descale = k_descale_.get();
       CHECK_DEVICE(k_descale);
       CHECK_SHAPE(k_descale, batch_size, num_heads_k);
-      flashmaskv3_fwd_params_set_k_descale_ptr(params_handle,
-                                               (k_descale.data<float>()));
-      flashmaskv3_fwd_params_set_k_descale_batch_stride(params_handle,
-                                                        k_descale.strides()[0]);
-      flashmaskv3_fwd_params_set_k_descale_head_stride(params_handle,
-                                                       k_descale.strides()[1]);
+      params_handle->k_descale_ptr = const_cast<float *>(k_descale.data<float>());
+      params_handle->k_descale_batch_stride = k_descale.strides()[0];
+      params_handle->k_descale_head_stride = k_descale.strides()[1];
     } else {
-      flashmaskv3_fwd_params_set_k_descale_ptr(params_handle, nullptr);
+      params_handle->k_descale_ptr = nullptr;
     }
     if (v_descale_.is_initialized()) {
       paddle::Tensor v_descale = v_descale_.get();
       CHECK_DEVICE(v_descale);
       CHECK_SHAPE(v_descale, batch_size, num_heads_k);
-      flashmaskv3_fwd_params_set_v_descale_ptr(params_handle,
-                                               (v_descale.data<float>()));
-      flashmaskv3_fwd_params_set_v_descale_batch_stride(params_handle,
-                                                        v_descale.strides()[0]);
-      flashmaskv3_fwd_params_set_v_descale_head_stride(params_handle,
-                                                       v_descale.strides()[1]);
+      params_handle->v_descale_ptr = const_cast<float *>(v_descale.data<float>());
+      params_handle->v_descale_batch_stride = v_descale.strides()[0];
+      params_handle->v_descale_head_stride = v_descale.strides()[1];
     } else {
-      flashmaskv3_fwd_params_set_v_descale_ptr(params_handle, nullptr);
+      params_handle->v_descale_ptr = nullptr;
     }
   }
 
 #ifdef FLASHATTENTION_DISABLE_LOCAL
   PADDLE_ENFORCE_EQ(
-      !flashmaskv3_fwd_params_get_is_local(params_handle), true,
+      !params_handle->is_local, true,
       common::errors::InvalidArgument(
           "This flash attention build does not support local attention."));
 #endif
 #ifdef FLASHATTENTION_DISABLE_SOFTCAP
   PADDLE_ENFORCE_EQ(
-      flashmaskv3_fwd_params_get_softcap(params_handle), 0.0,
+      params_handle->softcap, 0.0,
       common::errors::InvalidArgument(
           "This flash attention build does not support tanh softcapping."));
 #endif
 #ifdef FLASHATTENTION_DISABLE_SPLIT
-  PADDLE_ENFORCE_EQ(flashmaskv3_fwd_params_get_num_splits(params_handle), 1,
+  PADDLE_ENFORCE_EQ(params_handle->num_splits, 1,
                     common::errors::InvalidArgument(
                         "This flash attention build does not support splits."));
 #endif
 #ifdef FLASHATTENTION_DISABLE_PACKGQA
   PADDLE_ENFORCE_EQ(
-      (!flashmaskv3_fwd_params_get_pack_gqa(params_handle) ||
-       flashmaskv3_fwd_params_get_arch(params_handle) < 90 ||
-       (flashmaskv3_fwd_params_get_page_table(params_handle) &&
-        !flashmaskv3_fwd_params_get_pagedkv_tma(params_handle)) ||
-       flashmaskv3_fwd_params_get_num_splits(params_handle) > 1),
+      (!params_handle->pack_gqa ||
+       params_handle->arch < 90 ||
+       (params_handle->page_table &&
+        !params_handle->pagedkv_tma) ||
+       params_handle->num_splits > 1),
       true,
       common::errors::InvalidArgument(
           "This flash attention build does not support pack_gqa."));
 #endif
 #ifdef FLASHATTENTION_DISABLE_PAGEDKV
   PADDLE_ENFORCE_EQ(
-      (!(flashmaskv3_fwd_params_get_page_table(params_handle) &&
-         !flashmaskv3_fwd_params_get_pagedkv_tma(params_handle))),
+      (!(params_handle->page_table &&
+         !params_handle->pagedkv_tma)),
       true,
       common::errors::InvalidArgument(
           "This flash attention build does not support paged KV."));
@@ -931,52 +893,44 @@ void FlashMaskV3BaseKernel(
 
   if (is_blockmask) {
     // xhy: blockmask is now only support blockdim_q k = 128
-    flashmaskv3_fwd_params_set_m_block_dim(params_handle, 128);
-    flashmaskv3_fwd_params_set_n_block_dim(params_handle, 128);
-    flashmaskv3_fwd_params_set_block_mask_ptr(params_handle,
-                                              (block_mask.data<int32_t>()));
+    params_handle->m_block_dim = 128;
+    params_handle->n_block_dim = 128;
+    params_handle->block_mask_ptr = const_cast<int32_t *>(block_mask.data<int32_t>());
   }
 
   if (is_flashmask) {
-    flashmaskv3_fwd_params_set_lt_start_ptr(
-        params_handle, const_cast<int32_t *>(lt_start_ptr));
-    flashmaskv3_fwd_params_set_lt_end_ptr(params_handle,
-                                          const_cast<int32_t *>(lt_end_ptr));
-    flashmaskv3_fwd_params_set_ut_start_ptr(
-        params_handle, const_cast<int32_t *>(ut_start_ptr));
-    flashmaskv3_fwd_params_set_ut_end_ptr(params_handle,
-                                          const_cast<int32_t *>(ut_end_ptr));
+    params_handle->lt_start_ptr = const_cast<int32_t *>(lt_start_ptr);
+    params_handle->lt_end_ptr = const_cast<int32_t *>(lt_end_ptr);
+    params_handle->ut_start_ptr = const_cast<int32_t *>(ut_start_ptr);
+    params_handle->ut_end_ptr = const_cast<int32_t *>(ut_end_ptr);
 
     if (flashmask_maxmin.initialized())
-      flashmaskv3_fwd_params_set_flashmask_maxmin_ptr(
-          params_handle, (flashmask_maxmin.data<int32_t>()));
+      params_handle->flashmask_maxmin_ptr = const_cast<int32_t *>(flashmask_maxmin.data<int32_t>());
     else
-      flashmaskv3_fwd_params_set_flashmask_maxmin_ptr(params_handle, nullptr);
+      params_handle->flashmask_maxmin_ptr = nullptr;
 
-    flashmaskv3_fwd_params_set_h_flashmask(params_handle,
-                                           startend_row_indices.dims()[1]);
-    flashmaskv3_fwd_params_set_h_h_flashmask_ratio(
-        params_handle, num_heads / startend_row_indices.dims()[1]);
+    params_handle->h_flashmask = startend_row_indices.dims()[1];
+    params_handle->h_h_flashmask_ratio = num_heads / startend_row_indices.dims()[1];
   } else {
-    flashmaskv3_fwd_params_set_lt_start_ptr(params_handle, nullptr);
-    flashmaskv3_fwd_params_set_lt_end_ptr(params_handle, nullptr);
-    flashmaskv3_fwd_params_set_ut_start_ptr(params_handle, nullptr);
-    flashmaskv3_fwd_params_set_ut_end_ptr(params_handle, nullptr);
-    flashmaskv3_fwd_params_set_flashmask_maxmin_ptr(params_handle, nullptr);
-    flashmaskv3_fwd_params_set_h_flashmask(params_handle, 0);
-    flashmaskv3_fwd_params_set_h_h_flashmask_ratio(params_handle, 0);
+    params_handle->lt_start_ptr = nullptr;
+    params_handle->lt_end_ptr = nullptr;
+    params_handle->ut_start_ptr = nullptr;
+    params_handle->ut_end_ptr = nullptr;
+    params_handle->flashmask_maxmin_ptr = nullptr;
+    params_handle->h_flashmask = 0;
+    params_handle->h_h_flashmask_ratio = 0;
   }
 
   if (total_q > 0 &&
-      (total_k + flashmaskv3_fwd_params_get_total_knew(params_handle)) > 0 &&
+      (total_k + params_handle->total_knew) > 0 &&
       num_heads_k > 0) {
-    // flashmaskv3_run_mha_fwd(params_handle, dev_ctx.stream());
-    flashmaskv3_run_mha_fwd(params_handle, stream);
-    if (flashmaskv3_fwd_params_get_num_splits(params_handle) > 1) {
+    // run_mha_fwd(*params_handle, dev_ctx.stream());
+    run_mha_fwd(*params_handle, stream);
+    if (params_handle->num_splits > 1) {
       if (out_type == paddle::DataType::BFLOAT16) {
         // Since we want output in BF16. Otherwise fwd_combine will output to
         // FP16
-        flashmaskv3_fwd_params_set_is_bf16(params_handle, true);
+        params_handle->is_bf16 = true;
       }
       // Unless there's seqused_q, for the purpose of attn_combine, we can just
       // treat it as batch=1 and seqlen = total_q, and don't need to dispatch to
@@ -988,7 +942,7 @@ void FlashMaskV3BaseKernel(
       //     params.seqlen_q = total_q;
       // }
       // }
-      flashmaskv3_run_mha_fwd_combine(params_handle, stream,
+      run_mha_fwd_combine(*params_handle, stream,
                                       true /*enable_pdl*/);
     }
   } else if (total_q > 0 && num_heads_k > 0) {

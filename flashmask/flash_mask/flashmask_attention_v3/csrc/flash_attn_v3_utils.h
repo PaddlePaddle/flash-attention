@@ -16,13 +16,9 @@
 #pragma once
 
 #ifdef PADDLE_WITH_FLASHATTN_V3
-#include "../flash_api.h"
+#include "../flash.h"
 #include "paddle/extension.h"
 #include <cuda_runtime.h>
-
-FlashMask_fwd_params *get_flashmask_fwd_params_handle();
-
-FlashMask_bwd_params *get_flashmask_bwd_params_handle();
 
 inline int flashmaskv3_get_max_headdim() { return 256; }
 
@@ -41,7 +37,7 @@ inline int flashmaskv3_round_up_headdim(int head_size) {
 }
 
 void set_flashmaskv3_params_fprop(
-    FlashMask_fwd_params *params_handle,
+    Flash_fwd_params *params,
     // sizes
     const size_t b, const size_t seqlen_q, const size_t seqlen_k,
     const size_t seqlen_q_rounded, const size_t seqlen_k_rounded,
@@ -55,7 +51,7 @@ void set_flashmaskv3_params_fprop(
     const int sm_margin = 0);
 
 void set_flashmaskv3_params_dgrad(
-    FlashMask_bwd_params *params_handle,
+    Flash_bwd_params *params,
     // sizes
     const size_t b, const size_t seqlen_q, const size_t seqlen_k,
     const size_t seqlen_q_rounded, const size_t seqlen_k_rounded,

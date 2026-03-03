@@ -12,116 +12,220 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 整合 cmake 构建流程到 setup.py，pip install . 一步到位
-# 不再需要手动 mkdir build && cmake .. && make
+# Single-step build: compiles everything (CUDA kernels + Paddle custom ops)
+# into one flash_mask_pd_.so. No separate cmake / libflashmaskv3.so needed.
 #
-# 使用方法:
-#   pip install .                        # 标准安装（自动 cmake + 编译）
-#   pip install -e . --no-build-isolation  # 开发安装
-#
-# 环境变量:
-#   FLASH_MASK_SKIP_CMAKE=1    跳过 cmake（假设 libflashmaskv3.so 已存在）
-#   FLASH_MASK_FORCE_REBUILD=1 强制重新 cmake
-#   FLASH_MASK_CMAKE_ARGS      额外 cmake 参数（空格分隔）
-#   FLASH_MASK_LIB_DIR         手动指定 libflashmaskv2/v3.so 所在目录
+# Usage:
+#   python setup.py install
+#   pip install .
+#   pip install -e . --no-build-isolation
 
 import os
 import sys
 import subprocess
-import shutil
 
 from setuptools import find_packages
 from paddle.utils.cpp_extension import CUDAExtension, setup
 
 # ============================================================
-# 配置区
+# Config
 # ============================================================
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 FLASH_MASK_DIR = os.path.join(ROOT_DIR, 'flash_mask')
-BUILD_DIR = os.path.join(FLASH_MASK_DIR, 'build')
-# libflashmaskv3.so 安装到 flash_mask/lib/ 下，随 package_data 分发
-INSTALL_LIB_DIR = os.path.join(FLASH_MASK_DIR, 'lib')
+FA_V3_DIR = os.path.join(FLASH_MASK_DIR, 'flashmask_attention_v3')
+INST_DIR = os.path.join(FA_V3_DIR, 'instantiations')
 
-SKIP_CMAKE = os.environ.get('FLASH_MASK_SKIP_CMAKE', '0') == '1'
-FORCE_REBUILD = os.environ.get('FLASH_MASK_FORCE_REBUILD', '0') == '1'
-EXTRA_CMAKE_ARGS = os.environ.get('FLASH_MASK_CMAKE_ARGS', '').split()
-MANUAL_LIB_DIR = os.environ.get('FLASH_MASK_LIB_DIR', '')
-
-# ============================================================
-# Step 1: 构建 libflashmaskv3.so (底层 CUDA kernel 库)
-# ============================================================
-LIB_NAME = 'flashmaskv3'
-LIB_FILE = f'lib{LIB_NAME}.so'
-
-def find_or_build_lib():
-    """找到或构建 libflashmaskv3.so，返回 (lib_dir, lib_name)"""
-    global LIB_NAME
-
-    if MANUAL_LIB_DIR:
-        lib_dir = os.path.abspath(MANUAL_LIB_DIR)
-        if os.path.exists(os.path.join(lib_dir, 'libflashmaskv3.so')):
-            return lib_dir, 'flashmaskv3'
-        else:
-            print(f"[WARNING] No flashmask lib found in {lib_dir}")
-            return lib_dir, 'flashmaskv3'
-
-    if SKIP_CMAKE:
-        return BUILD_DIR, 'flashmaskv3'
-
-    # 自动 cmake 构建
-    lib_so_path = os.path.join(BUILD_DIR, LIB_FILE)
-    need_build = FORCE_REBUILD or not os.path.exists(lib_so_path)
-
-    if need_build:
-        print("=" * 60)
-        print(f"Building {LIB_FILE} via cmake...")
-        print("=" * 60)
-
-        os.makedirs(BUILD_DIR, exist_ok=True)
-        cmake_args = [
-            'cmake', '..',
-            '-DWITH_FLASHATTN_V3=ON',
-            '-DDISABLE_FLASHMASK_V3_BACKWARD=OFF',
-        ] + EXTRA_CMAKE_ARGS
-
-        print(f"  cmake args: {' '.join(cmake_args)}")
-        subprocess.check_call(cmake_args, cwd=BUILD_DIR)
-
-        nproc = os.cpu_count() or 4
-        print(f"  make -j{nproc}")
-        subprocess.check_call(['make', f'-j{nproc}'], cwd=BUILD_DIR)
-
-        if not os.path.exists(lib_so_path):
-            raise RuntimeError(f"cmake build completed but {LIB_FILE} not found at {lib_so_path}")
-        print(f"  {LIB_FILE} built successfully")
-    else:
-        print(f"  {LIB_FILE} already exists, skipping cmake (set FLASH_MASK_FORCE_REBUILD=1 to force)")
-
-    return BUILD_DIR, 'flashmaskv3'
-
-LIB_DIR, LIB_NAME = find_or_build_lib()
-LIB_DIR = os.path.abspath(LIB_DIR)
-LIB_FILE = f'lib{LIB_NAME}.so'
-
-# 将 libflashmaskv3.so 拷贝到 flash_mask/lib/ 下
-os.makedirs(INSTALL_LIB_DIR, exist_ok=True)
-src_lib = os.path.join(LIB_DIR, LIB_FILE)
-dst_lib = os.path.join(INSTALL_LIB_DIR, LIB_FILE)
-if os.path.exists(src_lib) and (not os.path.exists(dst_lib) or
-        os.path.getmtime(src_lib) > os.path.getmtime(dst_lib)):
-    shutil.copy2(src_lib, dst_lib)
-    print(f"  Copied {LIB_FILE} -> flash_mask/lib/")
+# Feature toggles (match CMakeLists.txt defaults)
+DISABLE_FP16      = os.environ.get('DISABLE_FLASHMASK_V3_FP16', '0') == '1'
+DISABLE_FP8       = os.environ.get('DISABLE_FLASHMASK_V3_FP8', '1') == '1'
+DISABLE_HDIM64    = os.environ.get('DISABLE_FLASHMASK_V3_HDIM64', '0') == '1'
+DISABLE_HDIM96    = os.environ.get('DISABLE_FLASHMASK_V3_HDIM96', '1') == '1'
+DISABLE_HDIM128   = os.environ.get('DISABLE_FLASHMASK_V3_HDIM128', '0') == '1'
+DISABLE_HDIM192   = os.environ.get('DISABLE_FLASHMASK_V3_HDIM192', '1') == '1'
+DISABLE_HDIM256   = os.environ.get('DISABLE_FLASHMASK_V3_HDIM256', '0') == '1'
+DISABLE_SPLIT     = os.environ.get('DISABLE_FLASHMASK_V3_SPLIT', '1') == '1'
+DISABLE_PAGEDKV   = os.environ.get('DISABLE_FLASHMASK_V3_PAGEDKV', '1') == '1'
+DISABLE_SOFTCAP   = os.environ.get('DISABLE_FLASHMASK_V3_SOFTCAP', '1') == '1'
+DISABLE_PACKGQA   = os.environ.get('DISABLE_FLASHMASK_V3_PACKGQA', '1') == '1'
+DISABLE_BACKWARD  = os.environ.get('DISABLE_FLASHMASK_V3_BACKWARD', '0') == '1'
+DISABLE_SM8X      = os.environ.get('DISABLE_FLASHMASK_V3_SM8X', '1') == '1'
 
 # ============================================================
-# Step 2: 构建自定义算子
+# Step 1: Ensure instantiation .cu files are generated
+# ============================================================
+if not os.path.isdir(INST_DIR) or len(os.listdir(INST_DIR)) == 0:
+    print("Generating kernel instantiation files...")
+    subprocess.check_call(
+        [sys.executable, os.path.join(FA_V3_DIR, 'generate_kernels.py'),
+         '-o', INST_DIR],
+        cwd=FLASH_MASK_DIR,
+    )
+
+# ============================================================
+# Step 2: Collect source files (matching CMakeLists.txt logic)
+# ============================================================
+
+# Enabled head dimensions
+hdims = []
+if not DISABLE_HDIM64:  hdims.append('64')
+if not DISABLE_HDIM96:  hdims.append('96')
+if not DISABLE_HDIM128: hdims.append('128')
+if not DISABLE_HDIM192: hdims.append('192')
+if not DISABLE_HDIM256: hdims.append('256')
+
+# --- Forward SM90 ---
+dtypes_fwd_sm90 = ['bf16']
+if not DISABLE_FP16: dtypes_fwd_sm90.append('fp16')
+if not DISABLE_FP8:  dtypes_fwd_sm90.append('e4m3')
+
+split_suffixes = ['']
+if not DISABLE_SPLIT: split_suffixes.append('_split')
+
+paged_suffixes = ['']
+if not DISABLE_PAGEDKV: paged_suffixes.append('_paged')
+
+softcap_fwd_suffixes = ['']
+if not DISABLE_SOFTCAP: softcap_fwd_suffixes.append('_softcap')
+
+# For softcap "all": if softcap disabled, use empty; if enabled, use _softcapall
+softcap_all_suffixes = [''] if DISABLE_SOFTCAP else ['_softcapall']
+
+packgqa_suffixes = ['']
+if not DISABLE_PACKGQA: packgqa_suffixes.append('_packgqa')
+
+instantiation_sources = []
+
+for hdim in hdims:
+    for dtype in dtypes_fwd_sm90:
+        for split in split_suffixes:
+            for paged in paged_suffixes:
+                for softcap in softcap_fwd_suffixes:
+                    for packgqa in packgqa_suffixes:
+                        # Only allow packgqa if not paged and not split (CMake logic)
+                        if packgqa == '_packgqa' and (paged != '' or split != ''):
+                            continue
+                        fname = f'flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu'
+                        fpath = os.path.join(INST_DIR, fname)
+                        if os.path.exists(fpath):
+                            instantiation_sources.append(fpath)
+
+# --- Forward SM80 ---
+if not DISABLE_SM8X:
+    dtypes_fwd_sm80 = ['bf16']
+    if not DISABLE_FP16: dtypes_fwd_sm80.append('fp16')
+    for hdim in hdims:
+        for dtype in dtypes_fwd_sm80:
+            for split in split_suffixes:
+                for paged in paged_suffixes:
+                    for softcap in softcap_all_suffixes:
+                        fname = f'flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}_sm80.cu'
+                        fpath = os.path.join(INST_DIR, fname)
+                        if os.path.exists(fpath):
+                            instantiation_sources.append(fpath)
+
+# --- Backward SM90 ---
+if not DISABLE_BACKWARD:
+    dtypes_bwd = ['bf16']
+    if not DISABLE_FP16: dtypes_bwd.append('fp16')
+
+    softcap_bwd_all = [''] if DISABLE_SOFTCAP else ['_softcapall']
+
+    for hdim in hdims:
+        for dtype in dtypes_bwd:
+            for causal in ['', '_causal']:
+                for determ in ['', '_determ']:
+                    for softcap in softcap_bwd_all:
+                        fname = f'flash_bwd_hdim{hdim}_{dtype}{causal}{determ}{softcap}_sm90.cu'
+                        fpath = os.path.join(INST_DIR, fname)
+                        if os.path.exists(fpath):
+                            instantiation_sources.append(fpath)
+
+# --- Backward SM80 ---
+if not DISABLE_BACKWARD and not DISABLE_SM8X:
+    softcap_bwd_sm80 = ['']
+    if not DISABLE_SOFTCAP: softcap_bwd_sm80.append('_softcap')
+
+    for hdim in hdims:
+        for dtype in dtypes_bwd:
+            for softcap in softcap_bwd_sm80:
+                fname = f'flash_bwd_hdim{hdim}_{dtype}{softcap}_sm80.cu'
+                fpath = os.path.join(INST_DIR, fname)
+                if os.path.exists(fpath):
+                    instantiation_sources.append(fpath)
+
+# Core CUDA sources
+core_sources = [
+    os.path.join(FA_V3_DIR, 'flash_api.cu'),
+    os.path.join(FA_V3_DIR, 'flash_prepare_scheduler.cu'),
+]
+if not DISABLE_SPLIT:
+    core_sources.append(os.path.join(FA_V3_DIR, 'flash_fwd_combine.cu'))
+
+# Paddle adapter sources
+adapter_sources = [
+    'flash_mask/flashmask_attention_v3/csrc/flashmask_v3.cpp',
+    'flash_mask/flashmask_attention_v3/csrc/flashmask_v3_kernel.cu',
+    'flash_mask/flashmask_attention_v3/csrc/flashmask_v3_grad_kernel.cu',
+    'flash_mask/flashmask_attention_v3/csrc/flash_attn_v3_utils.cu',
+]
+
+all_sources = adapter_sources + core_sources + instantiation_sources
+# Make paths relative to ROOT_DIR for consistency
+all_sources = [os.path.relpath(s, ROOT_DIR) if os.path.isabs(s) else s for s in all_sources]
+
+print(f"Total CUDA sources: {len(all_sources)} "
+      f"(adapter: {len(adapter_sources)}, core: {len(core_sources)}, "
+      f"instantiations: {len(instantiation_sources)})")
+
+# ============================================================
+# Step 3: Build compile flags
+# ============================================================
+disable_defines = []
+if DISABLE_FP16:     disable_defines.append('-DFLASHMASK_V3_DISABLE_FP16')
+if DISABLE_FP8:      disable_defines.append('-DFLASHMASK_V3_DISABLE_FP8')
+if DISABLE_HDIM64:   disable_defines.append('-DFLASHMASK_V3_DISABLE_HDIM64')
+if DISABLE_HDIM96:   disable_defines.append('-DFLASHMASK_V3_DISABLE_HDIM96')
+if DISABLE_HDIM128:  disable_defines.append('-DFLASHMASK_V3_DISABLE_HDIM128')
+if DISABLE_HDIM192:  disable_defines.append('-DFLASHMASK_V3_DISABLE_HDIM192')
+if DISABLE_HDIM256:  disable_defines.append('-DFLASHMASK_V3_DISABLE_HDIM256')
+if DISABLE_SPLIT:    disable_defines.append('-DFLASHMASK_V3_DISABLE_SPLIT')
+if DISABLE_PAGEDKV:  disable_defines.append('-DFLASHMASK_V3_DISABLE_PAGEDKV')
+if DISABLE_SOFTCAP:  disable_defines.append('-DFLASHMASK_V3_DISABLE_SOFTCAP')
+if DISABLE_PACKGQA:  disable_defines.append('-DFLASHMASK_V3_DISABLE_PACKGQA')
+if DISABLE_BACKWARD: disable_defines.append('-DFLASHMASK_V3_DISABLE_BACKWARD')
+if DISABLE_SM8X:     disable_defines.append('-DFLASHMASK_V3_DISABLE_SM8X')
+
+nvcc_flags = [
+    '-gencode', 'arch=compute_90a,code=sm_90a',
+    '-O3',
+    '-std=c++17',
+    '-DPADDLE_WITH_FLASHATTN_V3=1',
+    '-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED',
+    '-DCUTLASS_ENABLE_GDC_FOR_SM90',
+    '-DCUTLASS_DEBUG_TRACE_LEVEL=0',
+    '-DNDEBUG',
+    '--use_fast_math',
+    '--expt-relaxed-constexpr',
+    '-Xcompiler=-fPIC',
+    '-Xcompiler=-O3',
+    '--ftemplate-backtrace-limit=0',
+    '--resource-usage',
+    '-lineinfo',
+] + disable_defines
+
+cxx_flags = [
+    '-O3',
+    '-DPADDLE_WITH_FLASHATTN_V3=1',
+    '-std=c++17',
+] + disable_defines
+
+# ============================================================
+# Step 4: Build
 # ============================================================
 setup(
     name='flash_mask',
     version='4.0',
     packages=find_packages(),
-    package_data={
-        'flash_mask': ['lib/*.so'],
-    },
     author='PaddlePaddle',
     description='FlashMask: Efficient and Rich Mask Extension of FlashAttention',
     install_requires=[
@@ -132,37 +236,17 @@ setup(
     python_requires='>=3.10',
     ext_modules=[
         CUDAExtension(
-            name='flash_mask_package',
-            sources=[
-                'flash_mask/flashmask_attention_v3/csrc/flashmask_v3.cpp',
-                'flash_mask/flashmask_attention_v3/csrc/flashmask_v3_kernel.cu',
-                'flash_mask/flashmask_attention_v3/csrc/flashmask_v3_grad_kernel.cu',
-                'flash_mask/flashmask_attention_v3/csrc/flash_attn_v3_utils.cu',
-            ],
+            name='flash_mask',
+            sources=all_sources,
             include_dirs=[
                 'flash_mask/flashmask_attention_v3/csrc',
                 'flash_mask/flashmask_attention_v3',
+                'flash_mask/flashmask_attention_v3/cutlass/include',
             ],
-            library_dirs=[LIB_DIR, INSTALL_LIB_DIR],
-            libraries=[LIB_NAME],
             extra_compile_args={
-                'nvcc': [
-                    '-gencode', 'arch=compute_90,code=sm_90',
-                    '-O3',
-                    '-DPADDLE_WITH_FLASHATTN_V3=1',
-                    '-std=c++17',
-                ],
-                'cxx': [
-                    '-O3',
-                    '-DPADDLE_WITH_FLASHATTN_V3=1',
-                    '-std=c++17'],
+                'nvcc': nvcc_flags,
+                'cxx': cxx_flags,
             },
-            extra_link_args=[
-                '-Wl,-rpath,$ORIGIN/flash_mask/lib',
-                '-Wl,-rpath,$ORIGIN',
-                f'-Wl,-rpath,{INSTALL_LIB_DIR}',
-                f'-Wl,-rpath,{LIB_DIR}',
-            ],
         )
     ]
 )

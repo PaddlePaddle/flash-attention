@@ -19,6 +19,8 @@
 
 #ifdef PADDLE_WITH_FLASHATTN_V3
 
+#include "../flash.h"
+
 #define CHECK_DEVICE(x) PD_CHECK(x.is_gpu(), #x " must be on CUDA Device")
 
 #define CHECK_SHAPE(x, ...)                                                    \

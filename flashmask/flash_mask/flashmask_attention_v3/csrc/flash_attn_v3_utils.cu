@@ -14,38 +14,11 @@
  ******************************************************************************/
 
 #include "flash_attn_v3_utils.h"
-#include <memory>
 
 #ifdef PADDLE_WITH_FLASHATTN_V3
 
-static void
-destroy_flashmask_fwd_params_handle(Flash_fwd_params *params_handle) {
-  flashmaskv3_destroy_fwd_params_handle(params_handle);
-}
-
-static void
-destroy_flashmask_bwd_params_handle(Flash_bwd_params *params_handle) {
-  flashmaskv3_destroy_bwd_params_handle(params_handle);
-}
-
-FlashMask_fwd_params *get_flashmask_fwd_params_handle() {
-  static std::unique_ptr<Flash_fwd_params,
-                         decltype(&destroy_flashmask_fwd_params_handle)>
-      params_handle(flashmaskv3_create_fwd_params_handle(),
-                    &destroy_flashmask_fwd_params_handle);
-  return params_handle.get();
-}
-
-FlashMask_bwd_params *get_flashmask_bwd_params_handle() {
-  static std::unique_ptr<Flash_bwd_params,
-                         decltype(&destroy_flashmask_bwd_params_handle)>
-      params_handle(flashmaskv3_create_bwd_params_handle(),
-                    &destroy_flashmask_bwd_params_handle);
-  return params_handle.get();
-}
-
 void set_flashmaskv3_params_fprop(
-    Flash_fwd_params *params_handle,
+    Flash_fwd_params *params,
     // sizes
     const size_t b, const size_t seqlen_q, const size_t seqlen_k,
     const size_t seqlen_q_rounded, const size_t seqlen_k_rounded,
@@ -56,81 +29,62 @@ void set_flashmaskv3_params_fprop(
     void *seqused_q, void *seqused_k, void *softmax_lse_d, float p_dropout,
     float softmax_scale, int window_size_left, int window_size_right,
     const cudaDeviceProp &dprops, const float softcap, const int sm_margin) {
-  flashmaskv3_fwd_params_set_is_bf16(params_handle,
-                                     q.dtype() == paddle::DataType::BFLOAT16);
-  flashmaskv3_fwd_params_set_is_e4m3(
-      params_handle, q.dtype() == paddle::DataType::FLOAT8_E4M3FN);
+  params->is_bf16 = (q.dtype() == paddle::DataType::BFLOAT16);
+  params->is_e4m3 = (q.dtype() == paddle::DataType::FLOAT8_E4M3FN);
 
   // Set the pointers and strides.
-  flashmaskv3_fwd_params_set_q_ptr(params_handle, const_cast<void *>(q.data()));
-  flashmaskv3_fwd_params_set_k_ptr(params_handle, const_cast<void *>(k.data()));
-  flashmaskv3_fwd_params_set_v_ptr(params_handle, const_cast<void *>(v.data()));
+  params->q_ptr = const_cast<void *>(q.data());
+  params->k_ptr = const_cast<void *>(k.data());
+  params->v_ptr = const_cast<void *>(v.data());
   // All stride are in elements, not bytes.
-  flashmaskv3_fwd_params_set_q_row_stride(params_handle,
-                                          q.strides()[q.strides().size() - 3]);
-  flashmaskv3_fwd_params_set_k_row_stride(params_handle,
-                                          k.strides()[k.strides().size() - 3]);
-  flashmaskv3_fwd_params_set_v_row_stride(params_handle,
-                                          v.strides()[v.strides().size() - 3]);
-  flashmaskv3_fwd_params_set_q_head_stride(params_handle,
-                                           q.strides()[q.strides().size() - 2]);
-  flashmaskv3_fwd_params_set_k_head_stride(params_handle,
-                                           k.strides()[k.strides().size() - 2]);
-  flashmaskv3_fwd_params_set_v_head_stride(params_handle,
-                                           v.strides()[v.strides().size() - 2]);
-  flashmaskv3_fwd_params_set_v_dim_stride(params_handle,
-                                          v.strides()[v.strides().size() - 1]);
-  flashmaskv3_fwd_params_set_o_ptr(params_handle,
-                                   const_cast<void *>(out->data()));
-  flashmaskv3_fwd_params_set_o_row_stride(
-      params_handle, out->strides()[out->strides().size() - 3]);
-  flashmaskv3_fwd_params_set_o_head_stride(
-      params_handle, out->strides()[out->strides().size() - 2]);
+  params->q_row_stride = q.strides()[q.strides().size() - 3];
+  params->k_row_stride = k.strides()[k.strides().size() - 3];
+  params->v_row_stride = v.strides()[v.strides().size() - 3];
+  params->q_head_stride = q.strides()[q.strides().size() - 2];
+  params->k_head_stride = k.strides()[k.strides().size() - 2];
+  params->v_head_stride = v.strides()[v.strides().size() - 2];
+  params->v_dim_stride = v.strides()[v.strides().size() - 1];
+  params->o_ptr = const_cast<void *>(out->data());
+  params->o_row_stride = out->strides()[out->strides().size() - 3];
+  params->o_head_stride = out->strides()[out->strides().size() - 2];
 
   if (cu_seqlens_q_d == nullptr) {
-    flashmaskv3_fwd_params_set_q_batch_stride(params_handle, q.strides()[0]);
-    flashmaskv3_fwd_params_set_o_batch_stride(params_handle, out->strides()[0]);
+    params->q_batch_stride = q.strides()[0];
+    params->o_batch_stride = out->strides()[0];
   }
   if (cu_seqlens_k_d == nullptr) {
-    flashmaskv3_fwd_params_set_k_batch_stride(params_handle, k.strides()[0]);
-    flashmaskv3_fwd_params_set_v_batch_stride(params_handle, v.strides()[0]);
+    params->k_batch_stride = k.strides()[0];
+    params->v_batch_stride = v.strides()[0];
   }
 
-  flashmaskv3_fwd_params_set_cu_seqlens_q(params_handle,
-                                          static_cast<int *>(cu_seqlens_q_d));
-  flashmaskv3_fwd_params_set_cu_seqlens_k(params_handle,
-                                          static_cast<int *>(cu_seqlens_k_d));
-  flashmaskv3_fwd_params_set_seqused_q(params_handle,
-                                       static_cast<int *>(seqused_q));
-  flashmaskv3_fwd_params_set_seqused_k(params_handle,
-                                       static_cast<int *>(seqused_k));
+  params->cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
+  params->cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
+  params->seqused_q = static_cast<int *>(seqused_q);
+  params->seqused_k = static_cast<int *>(seqused_k);
 
   // Softmax sum
-  flashmaskv3_fwd_params_set_softmax_lse_ptr(params_handle, softmax_lse_d);
+  params->softmax_lse_ptr = softmax_lse_d;
 
   // Set the dimensions.
-  flashmaskv3_fwd_params_set_b(params_handle, b);
-  flashmaskv3_fwd_params_set_h(params_handle, h);
-  flashmaskv3_fwd_params_set_h_k(params_handle, h_k);
-  flashmaskv3_fwd_params_set_seqlen_q(params_handle, seqlen_q);
-  flashmaskv3_fwd_params_set_seqlen_k(params_handle, seqlen_k);
-  flashmaskv3_fwd_params_set_seqlen_q_rounded(params_handle, seqlen_q_rounded);
-  flashmaskv3_fwd_params_set_seqlen_k_rounded(params_handle, seqlen_k_rounded);
-  flashmaskv3_fwd_params_set_d(params_handle, d);
-  flashmaskv3_fwd_params_set_d_rounded(params_handle, d_rounded);
+  params->b = b;
+  params->h = h;
+  params->h_k = h_k;
+  params->seqlen_q = seqlen_q;
+  params->seqlen_k = seqlen_k;
+  params->seqlen_q_rounded = seqlen_q_rounded;
+  params->seqlen_k_rounded = seqlen_k_rounded;
+  params->d = d;
+  params->d_rounded = d_rounded;
 
   // Set the different scale values.
-  flashmaskv3_fwd_params_set_scale_softmax(params_handle, softmax_scale);
-  flashmaskv3_fwd_params_set_softcap(params_handle, softcap);
+  params->scale_softmax = softmax_scale;
+  params->softcap = softcap;
 
   // Set this to probability of keeping an element to simplify things.
-  flashmaskv3_fwd_params_set_p_dropout(params_handle, 1.f - p_dropout);
-  flashmaskv3_fwd_params_set_p_dropout_in_uint8_t(
-      params_handle,
-      uint8_t(std::floor(flashmaskv3_fwd_params_get_p_dropout(params_handle) *
-                         255.0)));
-  flashmaskv3_fwd_params_set_rp_dropout(
-      params_handle, 1.f / flashmaskv3_fwd_params_get_p_dropout(params_handle));
+  params->p_dropout = 1.f - p_dropout;
+  params->p_dropout_in_uint8_t =
+      uint8_t(std::floor(params->p_dropout * 255.0));
+  params->rp_dropout = 1.f / params->p_dropout;
   PADDLE_ENFORCE_LT(
       p_dropout, 1.f,
       common::errors::InvalidArgument("p_dropout must less than 1"));
@@ -143,11 +97,9 @@ void set_flashmaskv3_params_fprop(
   // Causal is the special case where window_size_right == 0 and
   // window_size_left < 0. Local is the more general case where
   // window_size_right >= 0 or window_size_left >= 0.
-  flashmaskv3_fwd_params_set_is_causal(
-      params_handle, window_size_left < 0 && window_size_right == 0);
-  flashmaskv3_fwd_params_set_is_local(
-      params_handle, (window_size_left >= 0 || window_size_right >= 0) &&
-                         !flashmaskv3_fwd_params_get_is_causal(params_handle));
+  params->is_causal = (window_size_left < 0 && window_size_right == 0);
+  params->is_local = ((window_size_left >= 0 || window_size_right >= 0) &&
+                      !params->is_causal);
 
   if (window_size_left < 0 && window_size_right >= 0) {
     window_size_left = seqlen_k - 1;
@@ -155,19 +107,18 @@ void set_flashmaskv3_params_fprop(
   if (window_size_left >= 0 && window_size_right < 0) {
     window_size_right = seqlen_q - 1;
   }
-  flashmaskv3_fwd_params_set_window_size_left(params_handle, window_size_left);
-  flashmaskv3_fwd_params_set_window_size_right(params_handle,
-                                               window_size_right);
+  params->window_size_left = window_size_left;
+  params->window_size_right = window_size_right;
 
   int arch = dprops.major * 10 + dprops.minor;
   int num_sm = dprops.multiProcessorCount - sm_margin;
 
-  flashmaskv3_fwd_params_set_arch(params_handle, arch);
-  flashmaskv3_fwd_params_set_num_sm(params_handle, num_sm);
+  params->arch = arch;
+  params->num_sm = num_sm;
 }
 
 void set_flashmaskv3_params_dgrad(
-    Flash_bwd_params *params_handle,
+    Flash_bwd_params *params,
     // sizes
     const size_t b, const size_t seqlen_q, const size_t seqlen_k,
     const size_t seqlen_q_rounded, const size_t seqlen_k_rounded,
@@ -181,51 +132,42 @@ void set_flashmaskv3_params_dgrad(
     void *dsoftmax_sum_d, float p_dropout, float softmax_scale,
     int window_size_left, int window_size_right, const cudaDeviceProp &dprops,
     const float softcap, bool deterministic, int const sm_margin) {
+  // Reuse fprop setup for the base Flash_fwd_params fields
   set_flashmaskv3_params_fprop(
-      flashmaskv3_cast_to_fwd_params_handle(params_handle), b, seqlen_q,
+      static_cast<Flash_fwd_params *>(params), b, seqlen_q,
       seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded, q, k,
       v, &out, cu_seqlens_q_d, cu_seqlens_k_d, seqused_q, seqused_k,
       softmax_lse_d, p_dropout, softmax_scale, window_size_left,
       window_size_right, dprops, softcap, sm_margin);
 
   // Set the pointers and strides.
-  flashmaskv3_bwd_params_set_do_ptr(params_handle,
-                                    const_cast<void *>(dout.data()));
-  flashmaskv3_bwd_params_set_do_row_stride(
-      params_handle, dout.strides()[dout.strides().size() - 3]);
-  flashmaskv3_bwd_params_set_do_head_stride(
-      params_handle, dout.strides()[dout.strides().size() - 2]);
-  flashmaskv3_bwd_params_set_dq_ptr(params_handle, dq->data());
-  flashmaskv3_bwd_params_set_dk_ptr(params_handle, dk->data());
-  flashmaskv3_bwd_params_set_dv_ptr(params_handle, dv->data());
-  flashmaskv3_bwd_params_set_dq_row_stride(
-      params_handle, dq->strides()[dq->strides().size() - 3]);
-  flashmaskv3_bwd_params_set_dk_row_stride(
-      params_handle, dk->strides()[dk->strides().size() - 3]);
-  flashmaskv3_bwd_params_set_dv_row_stride(
-      params_handle, dv->strides()[dv->strides().size() - 3]);
-  flashmaskv3_bwd_params_set_dq_head_stride(
-      params_handle, dq->strides()[dq->strides().size() - 2]);
-  flashmaskv3_bwd_params_set_dk_head_stride(
-      params_handle, dk->strides()[dk->strides().size() - 2]);
-  flashmaskv3_bwd_params_set_dv_head_stride(
-      params_handle, dv->strides()[dv->strides().size() - 2]);
+  params->do_ptr = const_cast<void *>(dout.data());
+  params->do_row_stride = dout.strides()[dout.strides().size() - 3];
+  params->do_head_stride = dout.strides()[dout.strides().size() - 2];
+  params->dq_ptr = dq->data();
+  params->dk_ptr = dk->data();
+  params->dv_ptr = dv->data();
+  params->dq_row_stride = dq->strides()[dq->strides().size() - 3];
+  params->dk_row_stride = dk->strides()[dk->strides().size() - 3];
+  params->dv_row_stride = dv->strides()[dv->strides().size() - 3];
+  params->dq_head_stride = dq->strides()[dq->strides().size() - 2];
+  params->dk_head_stride = dk->strides()[dk->strides().size() - 2];
+  params->dv_head_stride = dv->strides()[dv->strides().size() - 2];
 
   if (cu_seqlens_q_d == nullptr) {
-    flashmaskv3_bwd_params_set_do_batch_stride(params_handle,
-                                               dout.strides()[0]);
-    flashmaskv3_bwd_params_set_dq_batch_stride(params_handle, dq->strides()[0]);
-    flashmaskv3_bwd_params_set_dk_batch_stride(params_handle, dk->strides()[0]);
-    flashmaskv3_bwd_params_set_dv_batch_stride(params_handle, dv->strides()[0]);
+    params->do_batch_stride = dout.strides()[0];
+    params->dq_batch_stride = dq->strides()[0];
+    params->dk_batch_stride = dk->strides()[0];
+    params->dv_batch_stride = dv->strides()[0];
   }
 
-  flashmaskv3_bwd_params_set_dq_accum_ptr(params_handle, dq_accum_d);
-  flashmaskv3_bwd_params_set_dk_accum_ptr(params_handle, dk_accum_d);
-  flashmaskv3_bwd_params_set_dv_accum_ptr(params_handle, dv_accum_d);
+  params->dq_accum_ptr = dq_accum_d;
+  params->dk_accum_ptr = dk_accum_d;
+  params->dv_accum_ptr = dv_accum_d;
 
   // Softmax sum
-  flashmaskv3_bwd_params_set_dsoftmax_sum(params_handle, dsoftmax_sum_d);
+  params->dsoftmax_sum = dsoftmax_sum_d;
 
-  flashmaskv3_bwd_params_set_deterministic(params_handle, deterministic);
+  params->deterministic = deterministic;
 }
 #endif

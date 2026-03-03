@@ -13,19 +13,45 @@
 # limitations under the License.
 
 
-# [BQW_CHANGE] 在 import 前先加载 flash_mask_pd_.so 并注册自定义算子
-# Paddle CUDAExtension 生成 flash_mask_pd_.so，需要手动加载注册
+# [BQW_CHANGE] 在 import 前先加载 flash_mask.so 并注册自定义算子
+# Paddle CUDAExtension 生成 flash_mask.so，需要手动加载注册
 import os
 import paddle
 
-_curr_dir = os.path.dirname(os.path.abspath(__file__))
-_parent_dir = os.path.dirname(_curr_dir)
-_so_path = os.path.join(_parent_dir, "flash_mask_pd_.so")
+# 尝试加载编译好的 so 文件
+# 1. 首先尝试从 site-packages 加载（pip install 后）
+# 2. 然后尝试从本地 build 目录加载（python setup.py install 后）
+_so_loaded = False
 
-if os.path.exists(_so_path):
-    paddle.utils.cpp_extension.load_op_meta_info_and_register_op(_so_path)
-else:
-    print(f"[WARNING] flash_mask_pd_.so not found at {_so_path}, custom ops may not be available")
+# 尝试从已安装的模块中加载
+try:
+    import flash_mask as _flash_mask_module
+    _so_path = _flash_mask_module.__file__
+    if _so_path.endswith('.so'):
+        paddle.utils.cpp_extension.load_op_meta_info_and_register_op(_so_path)
+        _so_loaded = True
+except Exception:
+    pass
+
+# 如果还没加载，尝试从 build 目录加载
+if not _so_loaded:
+    _curr_dir = os.path.dirname(os.path.abspath(__file__))
+    _parent_dir = os.path.dirname(_curr_dir)
+
+    # 检查可能的 so 文件位置
+    _possible_paths = [
+        os.path.join(_parent_dir, "build", "flash_mask", "lib.linux-x86_64-cpython-310", "flash_mask.so"),
+        os.path.join(_parent_dir, "flash_mask.so"),
+    ]
+
+    for _so_path in _possible_paths:
+        if os.path.exists(_so_path):
+            paddle.utils.cpp_extension.load_op_meta_info_and_register_op(_so_path)
+            _so_loaded = True
+            break
+
+if not _so_loaded:
+    print("[WARNING] flash_mask.so not found, custom ops may not be available")
 
 from .flashmask_attention_v3.interface import flashmask_attention
 

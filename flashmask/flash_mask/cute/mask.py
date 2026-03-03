@@ -550,8 +550,14 @@ class AttentionMask:
                     for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                         lts = sStartEndRowIndices[tScS_t2r[i][COL], 0] - m_block * self.tile_m
                         lte = sStartEndRowIndices[tScS_t2r[i][COL], 1] - m_block * self.tile_m
-                        uts = startend_row_indices[fm_batch_idx, fm_head_idx, n_block * self.tile_n + tScS_t2r[i][COL], 2] - m_block * self.tile_m
-                        ute = startend_row_indices[fm_batch_idx, fm_head_idx, n_block * self.tile_n + tScS_t2r[i][COL], 3] - m_block * self.tile_m
+                        # Guard gmem access: when seqlen_k is not divisible by tile_n,
+                        # the last n_block may have out-of-bound columns.
+                        col_idx = n_block * self.tile_n + tScS_t2r[i][COL]
+                        uts = 0
+                        ute = 0
+                        if col_idx < self.seqlen_k:
+                            uts = startend_row_indices[fm_batch_idx, fm_head_idx, col_idx, 2] - m_block * self.tile_m
+                            ute = startend_row_indices[fm_batch_idx, fm_head_idx, col_idx, 3] - m_block * self.tile_m
                         acc_S[i] = (
                             -cutlass.Float32.inf
                             if (tScS_t2r[i][ROW] >= lts and tScS_t2r[i][ROW] < lte) or (tScS_t2r[i][ROW] >= uts and tScS_t2r[i][ROW] < ute)
@@ -602,21 +608,8 @@ class AttentionMask:
                     mask_r2p_transposed(acc_S, row_limit_top, num_rep)
 
                 if partially_masked:
-                    # FlashMask
-                    if const_expr(has_uts):
-                        # num_vec==4: (row >= LTS AND row < LTE) OR (row >= UTS AND row < UTE)
-                        # LTS, LTE from smem; UTS, UTE from gmem via startend_row_indices
-                        for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
-                            lts = sStartEndRowIndices[tScS_t2r[i][COL], 0] - m_block * self.tile_m
-                            lte = sStartEndRowIndices[tScS_t2r[i][COL], 1] - m_block * self.tile_m
-                            uts = startend_row_indices[fm_batch_idx, fm_head_idx, n_block * self.tile_n + tScS_t2r[i][COL], 2] - m_block * self.tile_m
-                            ute = startend_row_indices[fm_batch_idx, fm_head_idx, n_block * self.tile_n + tScS_t2r[i][COL], 3] - m_block * self.tile_m
-                            acc_S[i] = (
-                                -cutlass.Float32.inf
-                                if (tScS_t2r[i][ROW] >= lts and tScS_t2r[i][ROW] < lte) or (tScS_t2r[i][ROW] >= uts and tScS_t2r[i][ROW] < ute)
-                                else acc_S[i]
-                            )
-                    elif const_expr(has_lte):
+                    # FlashMask (causal: has_uts is never True since num_vec==4 is always non-causal)
+                    if const_expr(has_lte):
                         # num_vec==2, causal: row >= LTS AND row < LTE
                         for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                             lts = sStartEndRowIndices[tScS_t2r[i][COL], 0] - m_block * self.tile_m

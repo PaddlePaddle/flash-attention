@@ -1,5 +1,4 @@
 cmake_minimum_required(VERSION 3.9)
-
 find_package(CUDAToolkit REQUIRED)
 
 # Make sure add_subdirectory is called later than include(distributed/cmake/nvshmem), so that nvshmem external proj is visible
@@ -21,7 +20,7 @@ target_compile_options(flashmaskv2_distributed PRIVATE $<$<COMPILE_LANGUAGE:CUDA
     -Xcompiler="-O3"
     -std=c++17
     --use_fast_math
-    -arch=sm_90
+    -gencode arch=compute_90a,code=sm_90a
     -lineinfo
     -DNDEBUG
     --expt-relaxed-constexpr
@@ -33,9 +32,8 @@ target_include_directories(flashmaskv2_distributed PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_link_libraries(flashmaskv2_distributed PRIVATE 
-    CUDA::cudart 
-    CUDA::cuda_driver 
+target_link_libraries(flashmaskv2_distributed PRIVATE
+    CUDA::cudart
     nvshmem
     ${NVSHMEM_BOOTSTRAP_UID_LIB}        # using MPI_Init, mpi bootstrap
 )
@@ -52,4 +50,8 @@ set_target_properties(flashmaskv2_distributed PROPERTIES
     CXX_STANDARD 17
     CUDA_STANDARD 17
     CUDA_SEPARABLE_COMPILATION ON
+    # the following lines tries to prevent PTX JIT
+    # getting rid of the need for loading libnvidia-ptxjitcompiler.so
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    CUDA_ARCHITECTURES "90a"
 )

@@ -1,5 +1,7 @@
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
+#include <algorithm>
 #include "overlap_comm.cuh"
 #include "remote_get_kernel.cuh"
 #include "remote_put_kernel.cuh"
@@ -98,6 +100,15 @@ void init_distributed_environment(
     int& n_pes,
     const uint8_t* unique_id_ptr
 ) {
+    if (unique_id_ptr == nullptr) {
+        throw std::runtime_error("unique_id_ptr is null: NVSHMEM initialization requires a valid unique ID.");
+    }
+
+    bool all_zeros = std::all_of(unique_id_ptr, unique_id_ptr + 128, [](uint8_t x) { return x == 0; });
+    if (all_zeros) {
+        throw std::runtime_error("invalid unique_id: The provided NVSHMEM unique ID consists entirely of zeros.");
+    }
+
     WARN_PRINT("[FlashMask Overlap] Initializing NVSHMEM... Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
     std::vector<uint8_t> unique_id_val;
     WARN_PRINT("Extracting unique ID...");

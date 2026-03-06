@@ -340,8 +340,6 @@ struct CollectiveMainloopBwdSm90 {
         int32_t * __restrict__ const ut_start_ptr = nullptr;
         int32_t * __restrict__ const ut_end_ptr = nullptr;
 
-        int32_t * __restrict__ const flashmask_maxmin_ptr = nullptr;
-
         int32_t * __restrict__ const lt_start_nblockmax = nullptr;
         int32_t * __restrict__ const lt_start_nblockmin = nullptr;
 
@@ -356,6 +354,9 @@ struct CollectiveMainloopBwdSm90 {
 
         int m_block_dim,n_block_dim;
         int32_t * __restrict__ block_mask_ptr = nullptr;
+        const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
+        // the following is usually 1, only when bwd RS-overlap is ON will this get set to correct segment
+        int num_segments = 1;
     };
 
     // Device side kernel params
@@ -394,8 +395,6 @@ struct CollectiveMainloopBwdSm90 {
         int32_t * __restrict__ const ut_start_ptr = nullptr;
         int32_t * __restrict__ const ut_end_ptr = nullptr;
 
-        int32_t * __restrict__ const flashmask_maxmin_ptr = nullptr;
-
         int32_t * __restrict__ const lt_start_nblockmax = nullptr;
         int32_t * __restrict__ const lt_start_nblockmin = nullptr;
 
@@ -411,6 +410,9 @@ struct CollectiveMainloopBwdSm90 {
         int m_block_dim,n_block_dim;
         int m_factor, n_factor;
         int32_t * __restrict__ block_mask_ptr = nullptr;
+        const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
+        // the following is usually 1, only when bwd RS-overlap is ON will this get set to correct segment
+        int num_segments = 1;
     };
 
     static Params
@@ -472,14 +474,15 @@ struct CollectiveMainloopBwdSm90 {
                 args.h_flashmask, args.h_h_flashmask_ratio,
                 args.lt_start_ptr, args.lt_end_ptr,
                 args.ut_start_ptr, args.ut_end_ptr,
-                args.flashmask_maxmin_ptr,
                 args.lt_start_nblockmax, args.lt_start_nblockmin,
                 args.lt_end_nblockmax, args.lt_end_nblockmin,
                 args.ut_start_nblockmax, args.ut_start_nblockmin,
                 args.ut_end_nblockmax, args.ut_end_nblockmin,
                 args.m_block_dim,args.n_block_dim,
                 m_factor,n_factor,
-                args.block_mask_ptr};
+                args.block_mask_ptr,
+                args.write_ptr,
+                args.num_segments};
     }
 
      enum class FmBlockInfo {
@@ -516,7 +519,7 @@ struct CollectiveMainloopBwdSm90 {
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         int const bh_offset = bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio;
         int const n_block_seqlen = ((seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc;       // / 4 * 4
-        int const bh_offset_block = bh_offset * n_block_seqlen;
+        int const bh_offset_block = bh_offset * n_block_seqlen * params.num_segments;
 
 
         const int valid_block_nblock_seqlen = (seqlen_k + params.n_block_dim - 1) / params.n_block_dim;
@@ -550,7 +553,7 @@ struct CollectiveMainloopBwdSm90 {
             // int row_offset1 = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen + n_block * kBlockN;
             // printf("row_offset: %d",row_offset1);
         }
-        int const row_offset = bh_offset * seqlen_k + n_block * kBlockN;
+        int const row_offset = bh_offset * seqlen_k * params.num_segments + n_block * kBlockN;
         // if(thread_idx == 0 and n_block == 0) printf("row_offset: %d, bidb: %d,h_flashmask: %d, h_h_flashmask_ratio: %d\n",row_offset,bidb,params.h_flashmask,params.h_h_flashmask_ratio);
         const bool in_range = n_block * kBlockN + thread_idx < seqlen_k;
         // Note(xhy): kBlockN in fa3 is always less than 128
@@ -695,6 +698,27 @@ struct CollectiveMainloopBwdSm90 {
 
         if (lane_predicate) {
             shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
+
+            // Used in distributed overlap
+            if (params.write_ptr && bidh <= 1) {
+                // for example: 8K local, CP4, hd128 ---> 16K --> 128 blocks, Hopper has 132-144 SMs
+                // so by the time bidh increase from 1 to 2, 1-KV-head KV blocks are loaded
+                // so for bidh > 1, we don't need to wait for KV write ptr anymore
+                static constexpr int chunk_size = 8192;
+                const int nblock_id = (n_block + 1) * kBlockN;      // right bound of this block
+                // different behavior: when num_segments > 1 (RS-overlap), the first chunk is not skipped
+                // we therefore need to enter wptr wait code unconditionally, and set 0 as target offset
+                if (nblock_id > chunk_size || params.num_segments > 1) {
+                    const int seqlen_k_offset = params.num_segments > 1 ? 0 : chunk_size;
+                    const int target = bidb * (seqlen_info.seqlen_k - seqlen_k_offset) + nblock_id;
+                    do {
+                        int current_wptr = 0;
+                        asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(current_wptr) : "l"(params.write_ptr));
+                        if (current_wptr >= target) break;
+                    } while (true);
+                }
+            }
+
             copy(params.tma_load_K.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tKgK, tKsK);
             copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tVgV, tVsV);
 

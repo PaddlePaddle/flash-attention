@@ -23,6 +23,10 @@
 #include "epilogue_fwd.hpp"
 #include "flash_mask.hpp"
 
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+#include "distributed/overlap_comm.cuh"
+#endif
+
 using namespace cute;
 
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
@@ -86,6 +90,76 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
         flash::enable_sm80_to_sm89<flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
+    int overlap_sm_margin = 0;
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+    params.cp_size = params.nranks;
+    bool need_overlap_comm = false;
+    if (params.cp_size > 1) {
+        if constexpr (Varlen) {
+            throw std::runtime_error("Overlap Communicator currently does not support Varlen.");
+        }
+        if (flashmask::comm::is_singleton_null()) {
+            if (params.d != params.dv) {
+                throw std::runtime_error("Overlap Communicator currently does not support D != Dv. KV should have the same D.");
+            }
+            if (params.seqlen_k % kBlockN) {
+                throw std::runtime_error("AttnBlock size should perfectly divided seqlen_k. This constraint will be removed in the future.");
+            }
+            auto& comm_singleton = flashmask::comm::init_singleton_instance(
+                (const Element*) params.k_ptr,
+                (const Element*) params.v_ptr,
+                params.b,
+                params.seqlen_k,
+                params.h_k,
+                params.d,
+                params.rank,
+                params.nranks,
+                params.cp_size,
+                params.unique_id_ptr,
+                params.h_flashmask
+            );
+            // initial step does not need to wait for SR buffer's emptyness.
+            comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
+            comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
+        } else {
+            // do not update the SR buffer if other ranks did not finish using it
+            auto& comm_singleton = flashmask::comm::singleton();
+            comm_singleton.wait_sr_buffer_empty();
+            comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
+            comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
+        }
+        need_overlap_comm = true;
+    }
+
+    if constexpr (Arch >= 90) {
+        // setting scheduler tile_count_semaphore / zeroing write_ptr / record write_ptr ready event
+        overlap_sm_margin = need_overlap_comm ? flashmask::comm::singleton().overlap_sm_margin() : 0;
+        prepare_flashmask(params, stream, params.num_sm - overlap_sm_margin, Scheduler::pipelining, 
+            need_overlap_comm ? &flashmask::comm::singleton().wptr_init : nullptr,
+            need_overlap_comm ? flashmask::comm::singleton().get_block_cnt_semaphore() : nullptr);
+    }
+
+    if (need_overlap_comm) {
+        auto& comm_singleton = flashmask::comm::singleton();
+        comm_singleton.wait_wptr_init();        // wait until wptr is initialized
+        comm_singleton.run_overlap_ag_kernel(params.write_ptr, params.seqlen_k);
+        // Note(heqianyue): if we don't use a cudaStreamSync at the end of update_kv_buffer, for team_bar
+        // the comm_stream itself might get blocked so comp_stream will load all the CTAs on the SMs, causing a deadlock.
+        // This is also true for semaphore syncs: we cannot take the risks of SMs being fully occupied.
+        // So no matter what, in this circumstance we need to make sure comm kernels occupies part of the SMs first.
+        comm_singleton.wait_reset_stream_coordinator(stream);
+        params.k_batch_stride *= params.cp_size;
+        params.v_batch_stride *= params.cp_size;
+        // `run_overlap_ag_kernel` is async. Then, re-route the KV data to the nvshmem_alloc SR buffer.
+        // After `run_overlap_ag_kernel`, the seqlen_k & k_batch_stride & v_batch_stride is no longer local, but local_length * cp_size
+        params.k_ptr = comm_singleton.k_data();
+        params.v_ptr = comm_singleton.v_data();
+    }
+#else
+    if constexpr (Arch >= 90) {
+        prepare_flashmask(params, stream, params.num_sm, Scheduler::pipelining);
+    }
+#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 
     bool const is_varlen_q = params.cu_seqlens_q;
     bool const is_varlen_k = params.cu_seqlens_k;
@@ -98,9 +172,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             make_stride(params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0),
             make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
 
-    if constexpr (Is_flashmask) {
-        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream, true);
-    }
+    flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream, true);
 
     typename CollectiveMainloop::Arguments mainloop_args {
         static_cast<Element const*>(params.q_ptr),
@@ -151,7 +223,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.ut_start_nblockmax, params.ut_start_nblockmin,
         params.ut_end_nblockmax, params.ut_end_nblockmin,
         params.m_block_dim,params.n_block_dim,
-        params.block_mask_ptr
+        params.block_mask_ptr,
+        params.write_ptr
     };
 
     typename CollectiveEpilogue::Arguments epilogue_args {
@@ -167,10 +240,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.h_k,
         params.cu_seqlens_q, params.seqused_q
     };
-
-    if constexpr (Arch >= 90) {
-        prepare_preemptive_scheduler(params, stream, params.num_sm, Scheduler::pipelining);
-    }
 
     int qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q * qhead_per_khead, get<0>(TileShape_MNK{}));
@@ -193,16 +262,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     int device;
     CHECK_CUDA(cudaGetDevice(&device));
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
-        mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
+        mainloop_args, epilogue_args, {device, params.num_sm - overlap_sm_margin}, scheduler_args
     });
+    CHECK_CUDA(cudaGetLastError());
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();
     int smem_size = AttnKernel::SharedStorageSize;
-    // int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
-    // int smem_size_k = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k));
-    // int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
-    // printf("smem_size = %d, q = %d, k = %d, v = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v);
+
     // Get the ptr to kernel function.
     if constexpr (size(ClusterShape{}) > 1) {
         void const* kernel = (void const*) flash::cutlass_flashmask_kernel<AttnKernel>;
@@ -221,6 +288,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                            Arch >= 90 && Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);
     }
     CHECK_CUDA_KERNEL_LAUNCH();
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+    if (need_overlap_comm) flashmask::comm::singleton().set_sr_usable(stream);
+#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 }
 
 template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>

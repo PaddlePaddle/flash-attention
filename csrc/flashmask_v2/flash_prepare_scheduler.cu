@@ -13,6 +13,8 @@
 // fallback, in case that paddle end does not allocate valid GPU mem for semaphore
 static __device__ int semaphore_storage_fwd[1];
 static __device__ int semaphore_storage_bwd[1];
+// fallback, if overlap is good to go, we use int buffer allocated by Paddle
+static __device__ int overlap_comm_wptr[1];
 
 namespace flash {
 
@@ -110,12 +112,18 @@ __global__ void prepare_varlen_num_blocks_kernel(
     }
 }
 
-__global__ void prepare_preemptive_scheduler_kernel(
+__global__ void prepare_flashmask_kernel(
         int* const tile_count_semaphore,
+        int* const write_ptr,
+        int* const block_cnt_semaphore,
         int sm_count) {
     // There's only 1 block in the grid, so might as well start launching the main attn kernel
     cutlass::arch::launch_dependent_grids();
-    if (threadIdx.x == 0 && tile_count_semaphore) { *tile_count_semaphore = sm_count; }
+    if (threadIdx.x == 0) {
+        if (tile_count_semaphore) { *tile_count_semaphore = sm_count; }
+        if (write_ptr) { *write_ptr = 0; }
+        if (block_cnt_semaphore) { *block_cnt_semaphore = 1; }
+    }
 }
 
 } // flash
@@ -135,22 +143,34 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
         params.num_splits_dynamic_ptr, enable_pdl);
 }
 
-void prepare_preemptive_scheduler(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx) {
-    if (params.tile_count_semaphore == nullptr) {
+// TODO(heqianyue): maybe template-fy the following two functions to reduce code
+void prepare_flashmask(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx, cudaEvent_t* const comm_event, int* const block_cnt_semaphore) {
+    if (params.tile_count_semaphore == nullptr) {           // fallback, deprecate in the future
         CHECK_CUDA(cudaGetSymbolAddress((void**)&params.tile_count_semaphore, semaphore_storage_fwd));
     }
-    if (is_dual_pptx)
-        num_sm *= 2;        // double buffer PPTX will have 2 * num_sm static scheduling
-    flash::prepare_preemptive_scheduler_kernel<<<1 /*grid*/, 32 /*block*/, 0, stream>>>(
+    if (comm_event && params.write_ptr == nullptr) {        // fallback, deprecate in the future
+        CHECK_CUDA(cudaGetSymbolAddress((void**)&params.write_ptr, overlap_comm_wptr));
+    }
+    if (is_dual_pptx) num_sm = 0;        // the new double buffer PPTX is dynamic from the very beginning
+    flash::prepare_flashmask_kernel<<<1 /*grid*/, 32 /*block*/, 0, stream>>>(
         params.tile_count_semaphore,
+        params.write_ptr,
+        block_cnt_semaphore,
         num_sm);
+    if (comm_event) cudaEventRecord(*comm_event, stream);       // notify the overlap communicator: wptr is initialized
 }
 
-void prepare_preemptive_scheduler(Flash_bwd_params &params, cudaStream_t stream, int num_sm) {
-    if (params.tile_count_semaphore == nullptr) {
+void prepare_flashmask(Flash_bwd_params &params, cudaStream_t stream, int num_sm, cudaEvent_t* const comm_event, int* const block_cnt_semaphore) {
+    if (params.tile_count_semaphore == nullptr) {           // fallback, deprecate in the future
         CHECK_CUDA(cudaGetSymbolAddress((void**)&params.tile_count_semaphore, semaphore_storage_bwd));
     }
-    flash::prepare_preemptive_scheduler_kernel<<<1 /*grid*/, 32 /*block*/, 0, stream>>>(
+    if (comm_event && params.write_ptr == nullptr) {        // fallback, deprecate in the future
+        CHECK_CUDA(cudaGetSymbolAddress((void**)&params.write_ptr, overlap_comm_wptr));
+    }
+    flash::prepare_flashmask_kernel<<<1 /*grid*/, 32 /*block*/, 0, stream>>>(
         params.tile_count_semaphore,
+        params.write_ptr,
+        block_cnt_semaphore,
         num_sm);
+    if (comm_event) cudaEventRecord(*comm_event, stream);       // notify the overlap communicator: wptr is initialized
 }

@@ -10,6 +10,37 @@
 #include "tile_size.h"
 #include "heuristics.h"
 #include "cuda_check.h"
+#include <cstring>
+
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+
+#include <nvshmem.h>
+#include <nvshmemx.h>
+#include "distributed/cp_heuristic.cuh"
+
+// Generate unique ID (call with rank 0 and broadcast this object)
+std::vector<uint8_t> get_nvshmem_unique_id() {
+    nvshmemx_uniqueid_t unique_id;
+    nvshmemx_get_uniqueid(&unique_id);
+    std::vector<uint8_t> result(sizeof(nvshmemx_uniqueid_t));
+    std::memcpy(result.data(), &unique_id, sizeof(nvshmemx_uniqueid_t));
+    return result;
+}
+
+// Used only in the backward RS-overlap
+inline int get_segment_size_wrapper(int local_seqlen_k, int nranks, int kv_head) {
+    return flashmask::get_num_chunk_per_segment(local_seqlen_k, nranks, kv_head);
+}
+#else
+// Does nothing when we are not compiling with `WITH_DISTRIBUTED_OVERLAP`
+std::vector<uint8_t> get_nvshmem_unique_id() {
+    return {};
+}
+
+inline int get_segment_size_wrapper(int local_seqlen_k, int nranks, int kv_head) {
+    return 1;
+}
+#endif
 
 #define PADDLE_CHECK(__cond, message)                    \
       do {                                               \
@@ -340,6 +371,19 @@ void flashmaskv2_run_mha_fwd(Flash_fwd_params* params_handle, cudaStream_t strea
     run_mha_fwd(*params_handle, stream);
 }
 
+int flashmaskv2_get_segment_size(int local_seqlen_k, int nranks, int kv_head) {
+    return get_segment_size_wrapper(local_seqlen_k, nranks, kv_head);
+}
+
+bool flashmaskv2_get_nvshmem_unique_id(uint8_t * unique_id_ptr) {
+    std::vector<uint8_t> result = get_nvshmem_unique_id();
+    if (!result.empty()) {
+        std::memcpy(unique_id_ptr, result.data(), result.size());
+        return true;
+    }
+    return false;
+}
+
 void flashmaskv2_run_mha_bwd(Flash_bwd_params* params_handle, cudaStream_t stream) {
     // printf("point1\n");
     run_mha_bwd(*params_handle, stream);
@@ -543,6 +587,11 @@ DEFINE_GETTER_SETTER(int32_t *, ut_end_nblockmin)
 DEFINE_GETTER_SETTER(int, m_block_dim)
 DEFINE_GETTER_SETTER(int, n_block_dim)
 DEFINE_GETTER_SETTER(int32_t *, block_mask_ptr)
+DEFINE_GETTER_SETTER(int, rank)
+DEFINE_GETTER_SETTER(int, nranks)
+DEFINE_GETTER_SETTER(int, cp_size)
+DEFINE_GETTER_SETTER(int32_t *, write_ptr)
+DEFINE_GETTER_SETTER(uint8_t *, unique_id_ptr)
 
 #define DEFINE_BWD_GETTER_SETTER(type, member) \
 type flashmaskv2_bwd_params_get_##member(const Flash_bwd_params* params_handle) { return params_handle->member; } \

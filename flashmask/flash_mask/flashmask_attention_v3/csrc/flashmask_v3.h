@@ -17,6 +17,26 @@
 
 #include "paddle/extension.h"
 
+#include <cuda_runtime.h>
+#include <mutex>
+#include <unordered_map>
+
+// Cache cudaGetDeviceProperties to avoid repeated synchronous driver queries.
+// The raw cudaGetDeviceProperties call is synchronous and has highly variable
+// latency, which causes GPU pipeline stalls and performance instability.
+inline const cudaDeviceProp &GetCachedDeviceProperties(int device_id) {
+  static std::mutex mtx;
+  static std::unordered_map<int, cudaDeviceProp> cache;
+  std::lock_guard<std::mutex> lock(mtx);
+  auto it = cache.find(device_id);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  cudaDeviceProp &prop = cache[device_id];
+  cudaGetDeviceProperties(&prop, device_id);
+  return prop;
+}
+
 #ifdef PADDLE_WITH_FLASHATTN_V3
 
 #include "../flash.h"

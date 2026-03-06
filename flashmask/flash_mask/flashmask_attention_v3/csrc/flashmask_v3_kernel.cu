@@ -82,8 +82,7 @@ void FlashMaskV3BaseKernel(
 
   // TODO(umiswing): support ampere
   int device_id = place.GetDeviceId();
-  cudaDeviceProp dprops;
-  cudaGetDeviceProperties(&dprops, device_id);
+  const cudaDeviceProp &dprops = GetCachedDeviceProperties(device_id);
 
   const bool is_sm90 = dprops.major == 9 && dprops.minor == 0;
   PADDLE_ENFORCE_EQ(is_sm90, true,

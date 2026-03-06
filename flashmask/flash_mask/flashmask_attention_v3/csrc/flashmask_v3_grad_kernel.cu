@@ -46,8 +46,7 @@ void FlashMaskV3GradBaseKernel(
   auto place = q.place();
 
   int device_id = place.GetDeviceId();
-  cudaDeviceProp dprops;
-  cudaGetDeviceProperties(&dprops, device_id);
+  const cudaDeviceProp &dprops = GetCachedDeviceProperties(device_id);
 
   const bool is_sm90 = dprops.major == 9 && dprops.minor == 0;
   PADDLE_ENFORCE_EQ(is_sm90, true,
@@ -524,35 +523,26 @@ void FlashMaskV3GradBaseKernel(
   if (num_heads_k != num_heads) { // MQA / GQA
     if (!is_varlen) {
       if (dk_accum) {
-        *dk_accum = paddle::empty(
+        *dk_accum = paddle::full(
             {batch_size, num_heads_k, seqlen_k_rounded * head_size_rounded},
-            paddle::DataType::FLOAT32, place);
+            float{0}, paddle::DataType::FLOAT32, place);
       }
       if (dv_accum) {
-        *dv_accum = paddle::empty(
+        *dv_accum = paddle::full(
             {batch_size, num_heads_k, seqlen_k_rounded * head_size_rounded},
-            paddle::DataType::FLOAT32, place);
+            float{0}, paddle::DataType::FLOAT32, place);
       }
     } else {
       if (dk_accum) {
-        *dk_accum = paddle::empty(
+        *dk_accum = paddle::full(
             {num_heads_k, total_k_padded_rounded, head_size_rounded},
-            paddle::DataType::FLOAT32, place);
+            float{0}, paddle::DataType::FLOAT32, place);
       }
       if (dv_accum) {
-        *dv_accum = paddle::empty(
+        *dv_accum = paddle::full(
             {num_heads_k, total_k_padded_rounded, head_size_rounded},
-            paddle::DataType::FLOAT32, place);
+            float{0}, paddle::DataType::FLOAT32, place);
       }
-    }
-
-    if (dk_accum) {
-      *dk_accum = paddle::full(dk_accum->shape(), float{0},
-                               paddle::DataType::FLOAT32, place);
-    }
-    if (dv_accum) {
-      *dv_accum = paddle::full(dv_accum->shape(), float{0},
-                               paddle::DataType::FLOAT32, place);
     }
   }
 

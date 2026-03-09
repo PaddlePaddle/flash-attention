@@ -169,70 +169,79 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) DenseKVFewHead
     }
 }
 
-template <int S_chunk, int num_warps = 8, int row_per_warp = 32, bool bwd=false>
-__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityCheckKernel(
+// Supports mask_head >= 1. When mask_head > 1, AND-reduces across all mask heads
+// so that a chunk is skippable only when ALL heads agree it is fully masked.
+// When mask_head == 1, the head loop runs once with negligible overhead.
+template <int S_chunk, int num_warps = 8, int row_per_warp = 32, bool skip_local=false>
+__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityCheckSpecializedKernel(
     const int* const __restrict__ lt_start_ptr,
     const int* const __restrict__ ut_end_ptr,
     int* const __restrict__ copy_chunk_mask,
-    const int num_head,                         // note that this is not KV head, but mask head
+    const int num_head,                         // mask head count (H_mask)
     const int head_stride
 ) {
-    // each thread load 1 int4 from lt_start_ptr and 1 int4 from ut_end_ptr
     static_assert(num_warps == 16 || num_warps == 8 || num_warps == 4);
     static_assert(row_per_warp == 32 || row_per_warp == 64 || row_per_warp == 16);
-    // num_warp = 4 and row_per_warp = 16 can't be different
     static_assert(row_per_warp != 16 || (row_per_warp == 16 && num_warps == 4));
     static constexpr int rows_per_cta = row_per_warp * num_warps;
     __shared__ int warps_masked[num_warps];
-    __shared__ int temp_result[128 / row_per_warp];
-    // bwd valid mask starts from mask[S_chunk], while fwd starts from mask[0] due to different roll strategy
-    constexpr int mask_offset = bwd ? S_chunk : 0;
+    __shared__ int temp_result[4];              // cross-head AND-reduction buffer
+    // mask layout: (B, H_mask, S_k), batch stride = num_head * head_stride
     const int batch_offset = blockIdx.y * num_head * head_stride;
+    const int seq_offset = skip_local ? S_chunk : 0;
     const int load_index = blockIdx.x * num_warps * 32 + threadIdx.x;
-    const int* mask_lts = lt_start_ptr + mask_offset + batch_offset + load_index * 4;
-    const int* mask_ute = ut_end_ptr + mask_offset + batch_offset + load_index * 4;
-    for (int head_id = 0, head_offset = 0; head_id < num_head; head_id ++, head_offset += head_stride) {
+    const int* mask_lts = lt_start_ptr + batch_offset + seq_offset + load_index * 4;
+    const int* mask_ute = ut_end_ptr + batch_offset + seq_offset + load_index * 4;
+    for (int head_id = 0, head_offset = 0; head_id < num_head; head_id++, head_offset += head_stride) {
         const int4 lts = *(reinterpret_cast<const int4*>(mask_lts + head_offset));
         const int4 ute = *(reinterpret_cast<const int4*>(mask_ute + head_offset));
         int is_masked = (lts.x <= ute.x) && (lts.y <= ute.y) && (lts.z <= ute.z) && (lts.w <= ute.w);
-        // warp reduce to check whether all the 128 rows (32 * 4 = 128 rows) are masked 
         int current_warp_masked = __all_sync(0xffffffff, is_masked);
-        if ((threadIdx.x % 32) == 0) {      // first lane
+        if ((threadIdx.x % 32) == 0) {
             warps_masked[threadIdx.x / 32] = current_warp_masked;
         }
         __syncthreads();
-        // all of the LTS <= UTE, then the 4 rows are fully masked
         if (threadIdx.x == 0) {
-            // two warps will produce the masking result of one 256/512-row block
             const int4* smem_int4 = reinterpret_cast<const int4*>(warps_masked);
-            // TODO(heqianyue): #warp = 16 reduces result to int4 instead of int2 
-            if constexpr (rows_per_cta >= 512) {
+            if constexpr (rows_per_cta == 1024) {
                 int2 result;
                 int4 src = *smem_int4;
                 result.x = src.x & src.y & src.z & src.w;
                 src = *(smem_int4 + 1);
-                if constexpr (rows_per_cta == 1024) {
-                    result.x &= src.x & src.y & src.z & src.w;
-                    // reduce the second 2-int4s
+                result.x &= src.x & src.y & src.z & src.w;
+                src = *(smem_int4 + 2);
+                result.y = src.x & src.y & src.z & src.w;
+                src = *(smem_int4 + 3);
+                result.y &= src.x & src.y & src.z & src.w;
+                int2* const addr = reinterpret_cast<int2*>(temp_result);
+                if (head_id == 0) { *addr = result; }
+                else { int2 old = *addr; old.x &= result.x; old.y &= result.y; *addr = old; }
+            }
+            if constexpr (rows_per_cta == 512) {
+                int4 src = *smem_int4;
+                if constexpr (num_warps == 16) {
+                    int4 result;
+                    result.x = src.x & src.y & src.z & src.w;
+                    src = *(smem_int4 + 1);
+                    result.y = src.x & src.y & src.z & src.w;
                     src = *(smem_int4 + 2);
-                    result.y = src.x & src.y & src.z & src.w;
+                    result.z = src.x & src.y & src.z & src.w;
                     src = *(smem_int4 + 3);
-                    result.y &= src.x & src.y & src.z & src.w;
+                    result.w = src.x & src.y & src.z & src.w;
+                    int4* const addr = reinterpret_cast<int4*>(temp_result);
+                    if (head_id == 0) { *addr = result; }
+                    else { int4 old = *addr; old.x &= result.x; old.y &= result.y; old.z &= result.z; old.w &= result.w; *addr = old; }
                 } else {
+                    int2 result;
+                    result.x = src.x & src.y & src.z & src.w;
+                    src = *(smem_int4 + 1);
                     result.y = src.x & src.y & src.z & src.w;
-                }
-                int2* const reduction_addr = reinterpret_cast<int2*>(temp_result);
-                if (head_id == 0) {
-                    *reduction_addr = result;
-                } else {
-                    int2 old_result = *reduction_addr;
-                    // reduce over heads (the chunk can be skipped only when all-heads can be skipped)
-                    old_result.x &= result.x;
-                    old_result.y &= result.y;
-                    *reduction_addr = old_result;
+                    int2* const addr = reinterpret_cast<int2*>(temp_result);
+                    if (head_id == 0) { *addr = result; }
+                    else { int2 old = *addr; old.x &= result.x; old.y &= result.y; *addr = old; }
                 }
             }
-            if constexpr (rows_per_cta == 256) {        // reduce 2 int
+            if constexpr (rows_per_cta == 256) {
                 int4 result;
                 int4 src = *smem_int4;
                 result.x = src.x & src.y;
@@ -240,129 +249,34 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityC
                 src = *(smem_int4 + 1);
                 result.z = src.x & src.y;
                 result.w = src.z & src.w;
-                if (head_id == 0) {
-                    *(reinterpret_cast<int4*>(temp_result)) = result;
-                } else {
-                    int4 old_result = *(reinterpret_cast<int4*>(temp_result));
-                    // reduce over heads (the chunk can be skipped only when all-heads can be skipped)
-                    old_result.x &= result.x;
-                    old_result.y &= result.y;
-                    old_result.z &= result.z;
-                    old_result.w &= result.w;
-                    *(reinterpret_cast<int4*>(temp_result)) = old_result;
-                }
+                int4* const addr = reinterpret_cast<int4*>(temp_result);
+                if (head_id == 0) { *addr = result; }
+                else { int4 old = *addr; old.x &= result.x; old.y &= result.y; old.z &= result.z; old.w &= result.w; *addr = old; }
             }
-            if constexpr (rows_per_cta == 64) {         // no reduction
+            if constexpr (rows_per_cta == 64) {
                 int4 result = *smem_int4;
-                if (head_id == 0) {
-                    *(reinterpret_cast<int4*>(temp_result)) = result;
-                } else {
-                    int4 old_result = *(reinterpret_cast<int4*>(temp_result));
-                    // reduce over heads (the chunk can be skipped only when all-heads can be skipped)
-                    old_result.x &= result.x;
-                    old_result.y &= result.y;
-                    old_result.z &= result.z;
-                    old_result.w &= result.w;
-                    *(reinterpret_cast<int4*>(temp_result)) = old_result;
+                int4* const addr = reinterpret_cast<int4*>(temp_result);
+                if (head_id == 0) { *addr = result; }
+                else { 
+                    int4 old = *addr;
+                    old.x &= result.x;
+                    old.y &= result.y;
+                    old.z &= result.z;
+                    old.w &= result.w;
+                    *addr = old; 
                 }
             }
         }
+        // barrier before next head iteration so warps_masked is not overwritten prematurely
+        if (head_id < num_head - 1) __syncthreads();
     }
+    // write the AND-reduced result to global memory
     if (threadIdx.x == 0) {
-        int block_offset = blockIdx.y * gridDim.x + blockIdx.x;     // grid is: (num-chunks (int4), num_batch, 1)
-        if constexpr (rows_per_cta >= 512) {
+        const int block_offset = blockIdx.y * gridDim.x + blockIdx.x;
+        if constexpr (rows_per_cta == 1024 || (rows_per_cta == 512 && num_warps != 16)) {
             *(reinterpret_cast<int2*>(copy_chunk_mask) + block_offset) = *(reinterpret_cast<int2*>(temp_result));
         } else {
             *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = *(reinterpret_cast<int4*>(temp_result));
-        }
-    }
-}
-
-// Specialized kernel used only when (Mask Head = 1, meaning that multiple KV heads share the same mask)
-// When num_warp is 4. this kernel only has 128 threads per CTA and each CTA reduces 512 mask pos to an int4
-// Can be used when KV head > 1 to reduce comm workload per CTA (so that computation won't stall that long)
-template <int S_chunk, int num_warps = 8, int row_per_warp = 32, bool skip_local=false>
-__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityCheckSpecializedKernel(
-    const int* const __restrict__ lt_start_ptr,
-    const int* const __restrict__ ut_end_ptr,
-    int* const __restrict__ copy_chunk_mask,
-    const int __attribute__((unused)) num_head,
-    const int head_stride
-) {
-    // each thread load 1 int4 from lt_start_ptr and 1 int4 from ut_end_ptr
-    static_assert(num_warps == 16 || num_warps == 8 || num_warps == 4);
-    static_assert(row_per_warp == 32 || row_per_warp == 64 || row_per_warp == 16);
-    // num_warp = 4 and row_per_warp = 16 can't be different
-    static_assert(row_per_warp != 16 || (row_per_warp == 16 && num_warps == 4));
-    static constexpr int rows_per_cta = row_per_warp * num_warps;
-    __shared__ int warps_masked[num_warps];
-    // bwd valid mask starts from mask[S_chunk], while fwd starts from mask[0] due to different roll strategy
-    const int batch_offset = blockIdx.y * head_stride;
-    const int mask_offset = (skip_local ? S_chunk : 0) + batch_offset;
-    const int load_index = blockIdx.x * num_warps * 32 + threadIdx.x;
-    const int4 lts = *(reinterpret_cast<const int4*>(lt_start_ptr + mask_offset) + load_index);
-    const int4 ute = *(reinterpret_cast<const int4*>(ut_end_ptr + mask_offset) + load_index);
-    // all of the LTS <= UTE, then the 4 rows are fully masked
-    int is_masked = (lts.x <= ute.x) && (lts.y <= ute.y) && (lts.z <= ute.z) && (lts.w <= ute.w);
-    // warp reduce to check whether all the 128 rows (32 * 4 = 128 rows) are masked 
-    int current_warp_masked = __all_sync(0xffffffff, is_masked);
-    if ((threadIdx.x % 32) == 0) {      // first lane
-        warps_masked[threadIdx.x / 32] = current_warp_masked;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        // grid is: (num-chunks (# 1024-row chunks), num_batch, 1)
-        const int block_offset = blockIdx.y * gridDim.x + blockIdx.x;
-        // two warps will produce the masking result of one 256/512-row block
-        const int4* smem_int4 = reinterpret_cast<const int4*>(warps_masked);
-        if constexpr (rows_per_cta == 1024) {       // reduce 8 int
-            // happens only when num_warps == 16 and rows_per_warp = 64
-            // we reduce to 16ints, each int represents 128 rows. So
-            // we need to further reduce two int4 into a single int value
-            int2 result;
-            int4 src = *smem_int4;
-            result.x = src.x & src.y & src.z & src.w;
-            src = *(smem_int4 + 1);
-            result.x &= src.x & src.y & src.z & src.w;
-            // reduce the second 2-int4s
-            src = *(smem_int4 + 2);
-            result.y = src.x & src.y & src.z & src.w;
-            src = *(smem_int4 + 3);
-            result.y &= src.x & src.y & src.z & src.w;
-            *(reinterpret_cast<int2*>(copy_chunk_mask) + block_offset) = result;
-        }
-        if constexpr (rows_per_cta == 512) {        // reduce 4 int
-            int4 src = *smem_int4;
-            if constexpr (num_warps == 16) {
-                int4 result;
-                result.x = src.x & src.y & src.z & src.w;
-                src = *(smem_int4 + 1);
-                result.y = src.x & src.y & src.z & src.w;
-                src = *(smem_int4 + 2);
-                result.z = src.x & src.y & src.z & src.w;
-                src = *(smem_int4 + 3);
-                result.w = src.x & src.y & src.z & src.w;
-                *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = result;
-            } else {
-                int2 result;
-                result.x = src.x & src.y & src.z & src.w;
-                src = *(smem_int4 + 1);
-                result.y = src.x & src.y & src.z & src.w;
-                *(reinterpret_cast<int2*>(copy_chunk_mask) + block_offset) = result;
-            }
-        }
-        if constexpr (rows_per_cta == 256) {        // reduce 2 int
-            int4 result;
-            int4 src = *(smem_int4);
-            result.x = src.x & src.y;
-            result.y = src.z & src.w;
-            src = *(smem_int4 + 1);
-            result.z = src.x & src.y;
-            result.w = src.z & src.w;
-            *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = result;
-        }
-        if constexpr (rows_per_cta == 64) {        // no reduction
-            *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = *smem_int4;
         }
     }
 }

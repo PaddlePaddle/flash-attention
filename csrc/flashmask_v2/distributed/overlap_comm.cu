@@ -389,10 +389,6 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
         throw std::invalid_argument("Full seqlen must be 32K or 128K"); \
     }
 
-// can be adjust to use non-specialized version
-#define BlockChunkKernelTrait Specialized
-#define EXPAND_MACRO(MACRO, ...) MACRO(__VA_ARGS__)
-
 template <typename KVType>
 void OverlapCommunicator<KVType>::compute_chunk_mask(
     const int* const lt_start_ptr,
@@ -414,23 +410,23 @@ void OverlapCommunicator<KVType>::compute_chunk_mask(
         constexpr int num_reduce_warp = RDMA_ROW_PER_WARP == 16 ? 4 : num_warps;
         const int head_stride = S_local * _cp_size;
         const int valid_seqlen_k = head_stride - S_chunk;
-#define CallBlockSparsityKernel(grid, skip_local, Trait)                                                      \
-    BlockSparsityCheck##Trait##Kernel<S_chunk, num_reduce_warp, RDMA_ROW_PER_WARP, skip_local>    \
+#define CallBlockSparsityKernel(grid, skip_local)                                                    \
+    BlockSparsityCheckSpecializedKernel<S_chunk, num_reduce_warp, RDMA_ROW_PER_WARP, skip_local>     \
                 <<< grid, num_reduce_warp * 32, 0, stream >>>(lt_start_ptr, ut_end_ptr, copy_chunk_mask, H_mask, head_stride)
 
         if (fwd) {
             // note that * 32 (threads per warp) * 4 (vectorization factor, we use int4 load)
             dim3 grids = dim3(valid_seqlen_k / (num_reduce_warp * 32 * 4), B, 1);
-            EXPAND_MACRO(CallBlockSparsityKernel, grids, false, BlockChunkKernelTrait);
+            CallBlockSparsityKernel(grids, false);
         } else {
             WARN_PRINT("(%d) Before compute_chunk_mask (bwd).\n", _my_pe);
             // RS overlap: for bwd AG overlap, the splitted remote_put requires not to skip the local chunk
             if (dkv_buffer) {
                 dim3 grids = dim3((valid_seqlen_k + S_chunk) / (num_reduce_warp * 32 * 4), B, 1);
-                EXPAND_MACRO(CallBlockSparsityKernel, grids, false, BlockChunkKernelTrait);
+                CallBlockSparsityKernel(grids, false);
             } else {
                 dim3 grids = dim3(valid_seqlen_k / (num_reduce_warp * 32 * 4), B, 1);
-                EXPAND_MACRO(CallBlockSparsityKernel, grids, true, BlockChunkKernelTrait);
+                CallBlockSparsityKernel(grids, true);
             }
             WARN_PRINT_SYNC(stream, "(%d) After compute_chunk_mask (bwd).\n", _my_pe);
         }

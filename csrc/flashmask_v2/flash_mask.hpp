@@ -160,15 +160,16 @@ namespace flashmask {
   }
 
   template <int kBlockN>
-  void prepare_block_maxmin(Flash_fwd_params &params, cudaStream_t stream, bool is_forward = false) {
+  void prepare_block_maxmin(Flash_fwd_params &params, cudaStream_t stream, bool is_forward = false, int seqlen_scale = 1) {
     if (params.lt_start_ptr == nullptr &&
         params.ut_end_ptr == nullptr) {
       return;
     }
     int *nblock_smask = params.flashmask_maxmin_ptr;
+    const int seqlen_k = seqlen_scale * params.seqlen_k;
 
     // only used in forward pass and SM90 (FlashMaskV3)
-    const int nblock_seqlen = ((params.seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc; // umiswing: padding for int4 load
+    const int nblock_seqlen = ((seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc; // umiswing: padding for int4 load
     int nblock_masklen = 0;
 
     const bool use_aligned_chunk = params.arch == 90 && is_forward; 
@@ -194,7 +195,7 @@ namespace flashmask {
       scanMaxMinGpu<kBlockN>(
           params.lt_start_ptr,
           params.b * params.h_flashmask,
-          params.seqlen_k,
+          seqlen_k,
           params.lt_start_nblockmax,
           params.lt_start_nblockmin,
           stream,
@@ -207,7 +208,7 @@ namespace flashmask {
       scanMaxMinGpu<kBlockN>(
                     params.ut_end_ptr,
                     params.b * params.h_flashmask,
-                    params.seqlen_k,
+                    seqlen_k,
                     params.ut_end_nblockmax,
                     params.ut_end_nblockmin,
                     stream,
@@ -220,7 +221,7 @@ namespace flashmask {
       scanMaxMinGpu<kBlockN>(
           params.lt_end_ptr,
           params.b * params.h_flashmask,
-          params.seqlen_k,
+          seqlen_k,
           params.lt_end_nblockmax,
           params.lt_end_nblockmin,
           stream,
@@ -233,7 +234,7 @@ namespace flashmask {
       scanMaxMinGpu<kBlockN>(
           params.ut_start_ptr,
           params.b * params.h_flashmask,
-          params.seqlen_k,
+          seqlen_k,
           params.ut_start_nblockmax,
           params.ut_start_nblockmin,
           stream,
@@ -243,5 +244,61 @@ namespace flashmask {
       params.ut_start_nblockmin = nullptr;
     }
   }
+
+/**
+ * This class updates the lt/ut_start/end_ptr
+ * as well as the lt/ut_start/end_nblock min/max ptr, so that if we do
+ * splitting (for example, FMV3 bwd RS-overlap, split 128K bwd to 4 * 32K),
+ * then we can use this updater to offset the mask pointer (move long seqlen-axis)
+ * 
+ * The updater is state-less, so MAKE SURE this updater is called correctly
+ * in accordance with the splitted bwd loop
+*/
+template <int kBlockN>
+class MaskPtrUpdater {
+public:
+  MaskPtrUpdater(
+    Flash_bwd_params &params, 
+    int chunk_size, 
+    int chunks_per_seg
+  ): _params(params), 
+      seqlen_offset(chunk_size * chunks_per_seg),
+      nblock_seqlen(((seqlen_offset + kBlockN - 1) / kBlockN + 3) & 0xfffffffc) {
+    if (kBlockN & (kBlockN - 1)) {    // not the power of 2
+      std::cerr << "[RS-Overlap Error] MaskPtrUpater currently supports block size being the power of 2. Got: " 
+                << kBlockN << std::endl;
+      throw std::runtime_error("Unsupported kBlockN for RS overlap.");
+    }
+  }
+
+  void inplace_update() {
+    // TODO(heqianyue): assert kBlockN to be the power of 2
+    if (_params.lt_start_ptr != nullptr) {
+      _params.lt_start_ptr += seqlen_offset;
+      _params.lt_start_nblockmax += nblock_seqlen;
+      _params.lt_start_nblockmin += nblock_seqlen;
+    }
+    if (_params.lt_end_ptr != nullptr) {
+      _params.lt_end_ptr += seqlen_offset;
+      _params.lt_end_nblockmax += nblock_seqlen;
+      _params.lt_end_nblockmin += nblock_seqlen;
+    }
+    if (_params.ut_start_ptr != nullptr) {
+      _params.ut_start_ptr += seqlen_offset;
+      _params.ut_start_nblockmax += nblock_seqlen;
+      _params.ut_start_nblockmin += nblock_seqlen;
+    }
+    if (_params.ut_end_ptr != nullptr) {
+      _params.ut_end_ptr += seqlen_offset;
+      _params.ut_end_nblockmax += nblock_seqlen;
+      _params.ut_end_nblockmin += nblock_seqlen;
+    }
+  }
+
+private:
+  Flash_bwd_params& _params;
+  const int seqlen_offset;    // seqlen offset per segment
+  const int nblock_seqlen;    // block-column mask offset per segment
+};
 } // namespace flashmask
 } // namespace flash

@@ -20,6 +20,8 @@ void flashmaskv2_destroy_fwd_params_handle(Flash_fwd_params* params_handle);
 void flashmaskv2_destroy_bwd_params_handle(Flash_bwd_params* params_handle);
 void flashmaskv2_run_mha_fwd_combine(Flash_fwd_params* params_handle, cudaStream_t stream, bool enable_pdl=false);
 void flashmaskv2_run_mha_fwd(Flash_fwd_params* params_handle, cudaStream_t stream);
+bool flashmaskv2_get_nvshmem_unique_id(uint8_t* unique_id_ptr);
+int flashmaskv2_get_segment_size(int local_seqlen_k, int nranks, int kv_head);
 bool flashmaskv2_get_pagedkv_tma(Flash_fwd_params* params_handle);
 bool flashmaskv2_get_pack_gqa(Flash_fwd_params* params_handle);
 int flashmaskv2_get_num_splits(Flash_fwd_params* params_handle);
@@ -202,6 +204,12 @@ DECLARE_GETTER_SETTER(int32_t *, flashmask_maxmin_ptr)
 DECLARE_GETTER_SETTER(int, m_block_dim)
 DECLARE_GETTER_SETTER(int, n_block_dim)
 DECLARE_GETTER_SETTER(int32_t *, block_mask_ptr)
+
+DECLARE_GETTER_SETTER(int, rank)
+DECLARE_GETTER_SETTER(int, nranks)
+DECLARE_GETTER_SETTER(int, cp_size)
+DECLARE_GETTER_SETTER(int32_t *, write_ptr)
+DECLARE_GETTER_SETTER(uint8_t *, unique_id_ptr)
 
 #define DECLARE_BWD_GETTER_SETTER(type, member) \
 type flashmaskv2_bwd_params_get_##member(const Flash_bwd_params* params_handle); \

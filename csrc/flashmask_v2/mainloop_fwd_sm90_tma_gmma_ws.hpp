@@ -451,6 +451,8 @@ struct CollectiveMainloopFwdSm90 {
 
         int m_block_dim,n_block_dim;
         int32_t * __restrict__ block_mask_ptr = nullptr;
+
+        const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
     };
 
     // Device side kernel params
@@ -534,6 +536,8 @@ struct CollectiveMainloopFwdSm90 {
         // int m_block_dim,n_block_dim;
         int32_t * __restrict__ block_mask_ptr = nullptr;
         // int m_factor = 0, n_factor = 0;
+
+        const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
     };
 
     static Params
@@ -660,7 +664,8 @@ struct CollectiveMainloopFwdSm90 {
                 args.ut_end_nblockmax, args.ut_end_nblockmin,
                 // args.m_block_dim,args.n_block_dim,
                 // m_factor,n_factor,
-                args.block_mask_ptr};
+                args.block_mask_ptr,
+                args.write_ptr};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1132,6 +1137,26 @@ struct CollectiveMainloopFwdSm90 {
             }
         }
 
+        int old_wptr_val = 0;
+        // the following function stalls to wait for write_ptr. Can use static dispatch to optimize
+        auto wait_for_write_ptr = [&](int const n_block) {
+            if (params.write_ptr == nullptr) return;
+            static constexpr int chunk_size = 8192;
+            const int reverse_blockN_id = seqlen_info.seqlen_k - n_block * kBlockN - chunk_size;
+            if (reverse_blockN_id >= 0) {
+                const int target = bidb * (seqlen_info.seqlen_k - chunk_size) + reverse_blockN_id;
+                if (old_wptr_val >= target) return; // use the cached value to avoid frequent load from GMEM
+                // TODO(heqianyue): this should be made more generalized
+                // if num_head > 4: (bidb * num_head + bidh) / 2 * ..., divide by 2: overlap_comm copy 2 heads at once 
+
+                // TODO(heqianyue): timeout mechanism should be added for debugging purposes (`trap()`)
+                do {
+                    asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(old_wptr_val) : "l"(params.write_ptr));
+                    if (old_wptr_val >= target) return;
+                } while (true);
+            }
+        };
+
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
             pipeline_k.producer_acquire(smem_pipe_write);
             if constexpr (!PagedKVNonTMA) {
@@ -1286,6 +1311,7 @@ struct CollectiveMainloopFwdSm90 {
             } else {
                 paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
             }
+            wait_for_write_ptr(n_block);
             if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
             load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
         }
@@ -1353,6 +1379,7 @@ struct CollectiveMainloopFwdSm90 {
                 } else {
                     paged_kv_manager.load_page_table_TMA(n_block);
                 }
+                wait_for_write_ptr(n_block);
                 if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
                 load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
                 if constexpr (!Transpose_V) {
@@ -1384,7 +1411,8 @@ struct CollectiveMainloopFwdSm90 {
         pipeline_n_block.consumer_release(n_block_pipe_read);
         ++n_block_pipe_read;
 
-        if constexpr (!Transpose_V && IntraWGOverlap) {
+        if constexpr (!Transpose_V) {
+            wait_for_write_ptr(n_block);
             if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
         if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }

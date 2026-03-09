@@ -417,6 +417,7 @@ if(NOT SKIP_BUILD_FA)
     option(DISABLE_FLASHMASK_V2_PACKGQA "Disable PackGQA for flashmask_v2" ON)
     option(DISABLE_FLASHMASK_V2_BACKWARD "Disable Backward for flashmask_v2" OFF)
     option(DISABLE_FLASHMASK_V2_SM8X "Disable SM8x for flashmask_v2" ON)
+    option(WITH_DISTRIBUTED_OVERLAP "Enable distributed communication overlap" OFF)
 
     if(DISABLE_FLASHMASK_V2_FP16)
       add_compile_definitions(FLASHMASK_V2_DISABLE_FP16)
@@ -624,6 +625,40 @@ if(NOT SKIP_BUILD_FA)
     list(APPEND FLASHMASKV2_SOURCES_CU_SOURCES "flashmask_v2/flash_prepare_scheduler.cu")
     message(STATUS "Auto generated CUDA source files for flashmask_v2: ${FLASHMASKV2_SOURCES_CU_SOURCES}")
 
+    if(WITH_DISTRIBUTED_OVERLAP)
+        message(STATUS "Enabling NVSHMEM for distributed overlap support. NVSHMEM: ${NVSHMEM_INSTALL_DIR}")
+        
+        if(NVSHMEM_INSTALL_DIR)
+            message(STATUS "Reusing external NVSHMEM from: ${NVSHMEM_INSTALL_DIR}")
+            set(NVSHMEM_INCLUDE_DIR "${NVSHMEM_INSTALL_DIR}/include" CACHE PATH "" FORCE)
+            set(NVSHMEM_LIB "${NVSHMEM_INSTALL_DIR}/lib/libnvshmem.a")
+            set(NVSHMEM_BOOTSTRAP_MPI_LIB
+                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_bootstrap_mpi.so.3)
+            set(NVSHMEM_BOOTSTRAP_UID_LIB
+                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_bootstrap_uid.so.3)
+            set(NVSHMEM_BOOTSTRAP_PMI_LIB
+                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_bootstrap_pmi.so.3)
+            set(NVSHMEM_BOOTSTRAP_PMI2_LIB
+                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_bootstrap_pmi2.so.3)
+            set(NVSHMEM_TRANSPORT_IBRC_LIB
+                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_transport_ibrc.so.3)
+            set(NVSHMEM_TRANSPORT_IBGDA_LIB
+                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_transport_ibgda.so.3)
+            
+            add_library(nvshmem STATIC IMPORTED GLOBAL)
+            set_property(TARGET nvshmem PROPERTY IMPORTED_LOCATION ${NVSHMEM_LIB})
+            # No need for add_dependencies(nvshmem extern_nvshmem), since paddle end made sure of this
+        else()
+            # We still support standalone compilation with self downloaded NVSHMEM package
+            # This is used when the FA repo is built independently
+            message(STATUS "Standalone FlashMask builting with NVSHMEM support (distributed overlap)")
+            include(${CMAKE_CURRENT_SOURCE_DIR}/flashmask_v2/distributed/cmake/nvshmem.cmake)
+        endif()
+        
+        add_subdirectory(flashmask_v2/distributed)
+        add_compile_definitions(NVSHMEM_DISTRIBUTED_OVERLAP)
+    endif()
+
     # 3. 添加动态库
     add_library(flashmaskv2 SHARED
         ${FLASHMASKV2_SOURCES_CU_SOURCES}
@@ -649,6 +684,17 @@ if(NOT SKIP_BUILD_FA)
       -gencode arch=compute_90a,code=sm_90a
       --expt-relaxed-constexpr
       >)
+
+    if(WITH_DISTRIBUTED_OVERLAP)
+        target_include_directories(flashmaskv2 PRIVATE ${NVSHMEM_INCLUDE_DIR})
+        target_link_libraries(flashmaskv2 PRIVATE flashmaskv2_distributed)
+        add_dependencies(flashmaskv2 flashmaskv2_distributed)
+        set_target_properties(flashmaskv2 PROPERTIES
+            BUILD_RPATH "$ORIGIN"
+            INSTALL_RPATH "$ORIGIN"
+            BUILD_WITH_INSTALL_RPATH ON
+        )
+    endif()
 
     INSTALL(TARGETS flashmaskv2 LIBRARY DESTINATION "lib")
 

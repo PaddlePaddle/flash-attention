@@ -1696,7 +1696,6 @@ def flashmask_attention(
     if (
         paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"] == 4
         and query.shape[-1] <= 128 and key.shape[-1] <= 128 and value.shape[-1] <= 128
-        and (startend_row_indices is None or startend_row_indices.shape[-1] != 4)
     ):
         assert dropout == 0.0, (
             "flashmask v4 does not support dropout"

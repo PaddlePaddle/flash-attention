@@ -194,7 +194,7 @@ SEGMENT_LOOP_START:
         // reset grad semaphores, otherwise the program will hang
         size_t total_q_bytes = (seqlen_q + kBlockM - 1) / kBlockM * params.b * params.h * sizeof(int);
         cudaMemsetAsync(params.dq_semaphore, 0, total_q_bytes, stream);
-        if constexpr (Deterministic) {
+        if constexpr (Deterministic && GQA) {
             size_t total_kv_bytes = (params.seqlen_k + kBlockN - 1) / kBlockN * params.b * params.h_k * sizeof(int);
             cudaMemsetAsync(params.dk_semaphore, 0, total_kv_bytes, stream);
             cudaMemsetAsync(params.dv_semaphore, 0, total_kv_bytes, stream);
@@ -271,8 +271,28 @@ SEGMENT_LOOP_START:
                 params.seqused_q, params.seqused_k};
             }();        
     // The case work with GQA is ugly but idk how to fix it.
+    // For non-GQA + overlap_rs: redirect epilogue output to dk/dv_send buffer
+    void* dk_epilogue_out = params.dk_ptr;
+    void* dv_epilogue_out = params.dv_ptr;
+    int dk_epilogue_batch_stride = params.dk_batch_stride;
+    int dv_epilogue_batch_stride = params.dv_batch_stride;
+#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+    if constexpr (!GQA) {
+        if (overlap_rs) {
+            auto& comm = flashmask::comm::singleton();
+            if (segment_idx >= comm.dkv_buffer_stage()) {
+                comm.dkv_buffer->wait_buffer(segment_idx, stream);
+            }
+            dk_epilogue_out = comm.dk_send(segment_idx);
+            dv_epilogue_out = comm.dv_send(segment_idx);
+            // send buffer batch stride: (B, S_scaled, H, D) contiguous
+            dk_epilogue_batch_stride = params.d * seqlen_k * params.h;
+            dv_epilogue_batch_stride = dk_epilogue_batch_stride;
+        }
+    }
+#endif
     typename CollectiveEpilogue::Arguments epilogue_args {
-        static_cast<typename CollectiveEpilogue::Element*>(!GQA ? params.dk_ptr : params.dk_accum_ptr),
+        static_cast<typename CollectiveEpilogue::Element*>(!GQA ? dk_epilogue_out : params.dk_accum_ptr),
         [&] {
             if constexpr (!GQA) {
                 return typename CollectiveEpilogue::ShapedKV {seqlen_k, params.d, params.h, batch_k};  // shape_dK
@@ -282,15 +302,15 @@ SEGMENT_LOOP_START:
         }(),
         [&] {
             if constexpr (!GQA) {
-                return typename CollectiveEpilogue::StridedKV {params.dk_row_stride, _1{}, params.dk_head_stride, !is_varlen_k ? params.dk_batch_stride : 0};  // stride_dK
+                return typename CollectiveEpilogue::StridedKV {params.dk_row_stride, _1{}, params.dk_head_stride, !is_varlen_k ? dk_epilogue_batch_stride : 0};  // stride_dK
             } else {
                 return typename CollectiveEpilogue::StridedKV {_1{}, params.d_rounded * seqlen_k_rounded, !is_varlen_k ? params.h_k * params.d_rounded * params.seqlen_k_rounded : 0};  // stride_dKaccum
             }
         }(),
-        static_cast<typename CollectiveEpilogue::Element*>(!GQA ? params.dv_ptr : params.dv_accum_ptr),
+        static_cast<typename CollectiveEpilogue::Element*>(!GQA ? dv_epilogue_out : params.dv_accum_ptr),
         [&] {
             if constexpr (!GQA) {
-                return typename CollectiveEpilogue::StridedKV {params.dv_row_stride, _1{}, params.dv_head_stride, !is_varlen_k ? params.dv_batch_stride : 0};  // stride_dV
+                return typename CollectiveEpilogue::StridedKV {params.dv_row_stride, _1{}, params.dv_head_stride, !is_varlen_k ? dv_epilogue_batch_stride : 0};  // stride_dV
             } else {
                 return typename CollectiveEpilogue::StridedKV {_1{}, params.d_rounded * seqlen_k_rounded, !is_varlen_k ? params.h_k * params.d_rounded * params.seqlen_k_rounded : 0};  // stride_dVaccum
             }
@@ -467,8 +487,6 @@ SEGMENT_LOOP_START:
         CHECK_CUDA_KERNEL_LAUNCH();
     }
 #ifdef NVSHMEM_DISTRIBUTED_OVERLAP
-    // TODO(heqianyue): we don't need to constrain the function with 'GQA', but
-    // for simplicity of output pointer, GQA is required for now
     if (overlap_rs) {
         auto& comm_singleton = flashmask::comm::singleton();
         // dk_ptr and dv_ptr is the output
@@ -480,15 +498,15 @@ SEGMENT_LOOP_START:
         );
         segment_idx ++;
         if (segment_idx < segment_cnt) {
-            // Note(heqianyue): this is so damned, be extra careful here: for GQA, epilogue
-            // does not set blocks to zero if they are masked. So we need to manually set zero
             if constexpr (GQA) {
-                // need to set dk/v_accum to zero, so that the dK, dV from previous segments won't 
-                // contaminate the later computation (GQA epilgue store_zero does nothing) 
+                // need to set dk/v_accum to zero, so that the dK, dV from previous segments won't
+                // contaminate the later computation (GQA epilgue store_zero does nothing)
                 size_t accum_bytes = params.b * params.seqlen_k_rounded * params.h_k * params.d_rounded * sizeof(float);
                 cudaMemsetAsync(params.dk_accum_ptr, 0, accum_bytes, stream);
                 cudaMemsetAsync(params.dv_accum_ptr, 0, accum_bytes, stream);
             }
+            // non-GQA: store_zero in the epilogue properly zeros masked blocks,
+            // so dk/dv_send will be fully written by the attention kernel — no manual zeroing needed.
             mask_ptr_updater->inplace_update();
             goto SEGMENT_LOOP_START;
         }

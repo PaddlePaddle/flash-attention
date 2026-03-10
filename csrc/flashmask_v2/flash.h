@@ -189,7 +189,6 @@ struct Flash_fwd_params : public Qkv_params {
     // FlashMask Distributed Overlap
     int rank = 0;
     int nranks = 1;
-    int cp_size = 0;        // means no CP, not used in distributed env
     int * __restrict__ write_ptr = nullptr;
     // NVSHMEM should be initialized with unique ID, generated
     // with PHI exported python API, broadcast in the CP group

@@ -127,7 +127,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     use_overlap = params.nranks > 1 && (!flashmask::comm::is_singleton_null());
     std::unique_ptr<flash::flashmask::MaskPtrUpdater<kBlockN>> mask_ptr_updater = nullptr;
 
-    // in bwd, we don't need to set rank, cp_size for params, since overlap_comm instance already knew these in fwd
+    // in bwd, we don't need to set rank, nranks for params, since overlap_comm instance already knew these in fwd
     // also, when nranks == 1, overlap mode is not used
     if (use_overlap) {
         auto& comm_singleton = flashmask::comm::singleton();
@@ -144,7 +144,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         comm_singleton.wait_sr_buffer_empty();
         comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr, false /*fwd*/);     // copy new KV data
 
-        // seqlen_scale: when use_rs is true, this is chunks_per_seg (4 if CP16), otherwise this is cp_size
+        // seqlen_scale: when use_rs is true, this is chunks_per_seg (4 if CP16), otherwise this is nranks
         params.seqlen_k *= comm_singleton.seqlen_scale();
         seqlen_k *= comm_singleton.seqlen_scale();
         params.k_batch_stride *= comm_singleton.seqlen_scale();

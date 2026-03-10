@@ -92,9 +92,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     >;
     int overlap_sm_margin = 0;
 #ifdef NVSHMEM_DISTRIBUTED_OVERLAP
-    params.cp_size = params.nranks;
     bool need_overlap_comm = false;
-    if (params.cp_size > 1) {
+    if (params.nranks > 1) {
         if constexpr (Varlen) {
             throw std::runtime_error("Overlap Communicator currently does not support Varlen.");
         }
@@ -114,7 +113,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                 params.d,
                 params.rank,
                 params.nranks,
-                params.cp_size,
+                params.nranks,
                 params.unique_id_ptr,
                 params.h_flashmask
             );
@@ -148,10 +147,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         // This is also true for semaphore syncs: we cannot take the risks of SMs being fully occupied.
         // So no matter what, in this circumstance we need to make sure comm kernels occupies part of the SMs first.
         comm_singleton.wait_reset_stream_coordinator(stream);
-        params.k_batch_stride *= params.cp_size;
-        params.v_batch_stride *= params.cp_size;
+        params.k_batch_stride *= params.nranks;
+        params.v_batch_stride *= params.nranks;
         // `run_overlap_ag_kernel` is async. Then, re-route the KV data to the nvshmem_alloc SR buffer.
-        // After `run_overlap_ag_kernel`, the seqlen_k & k_batch_stride & v_batch_stride is no longer local, but local_length * cp_size
+        // After `run_overlap_ag_kernel`, the seqlen_k & k_batch_stride & v_batch_stride is no longer local, but local_length * nranks
         params.k_ptr = comm_singleton.k_data();
         params.v_ptr = comm_singleton.v_data();
     }

@@ -589,7 +589,6 @@ DEFINE_GETTER_SETTER(int, n_block_dim)
 DEFINE_GETTER_SETTER(int32_t *, block_mask_ptr)
 DEFINE_GETTER_SETTER(int, rank)
 DEFINE_GETTER_SETTER(int, nranks)
-DEFINE_GETTER_SETTER(int, cp_size)
 DEFINE_GETTER_SETTER(int32_t *, write_ptr)
 DEFINE_GETTER_SETTER(uint8_t *, unique_id_ptr)
 

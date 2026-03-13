@@ -701,6 +701,41 @@ if(NOT SKIP_BUILD_FA)
             INSTALL_RPATH "$ORIGIN"
             BUILD_WITH_INSTALL_RPATH ON
         )
+
+        # Plugin isolation: copy NVSHMEM plugin .so files with flashmask-specific names.
+        # dlopen uses realpath to deduplicate; different filenames = independent instances
+        # with independent static variables. This prevents the bootstrap/transport plugin
+        # shared-state hang when coexisting with DeepEP (which loads the original plugins).
+        set(_FM_PLUGIN_DIR "${NVSHMEM_INSTALL_DIR}/lib")
+        set(_FM_PLUGINS
+            "nvshmem_bootstrap_uid.so.3:flashmask_nvshmem_bootstrap_uid.so.3"
+            "nvshmem_transport_ibrc.so.3:flashmask_nvshmem_transport_ibrc.so.3"
+        )
+        if(NVSHMEM_IBGDA_SUPPORT OR EXISTS "${_FM_PLUGIN_DIR}/nvshmem_transport_ibgda.so.3")
+            list(APPEND _FM_PLUGINS
+                "nvshmem_transport_ibgda.so.3:flashmask_nvshmem_transport_ibgda.so.3"
+            )
+        endif()
+        foreach(_plugin_pair ${_FM_PLUGINS})
+            string(REPLACE ":" ";" _pair_list "${_plugin_pair}")
+            list(GET _pair_list 0 _src_name)
+            list(GET _pair_list 1 _dst_name)
+            set(_src_path "${_FM_PLUGIN_DIR}/${_src_name}")
+            if(EXISTS "${_src_path}")
+                add_custom_command(TARGET flashmaskv2 POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_src_path}"
+                        "$<TARGET_FILE_DIR:flashmaskv2>/${_dst_name}"
+                    COMMENT "Copying ${_src_name} -> ${_dst_name} for plugin isolation"
+                )
+                install(FILES "${_src_path}"
+                    DESTINATION "lib"
+                    RENAME "${_dst_name}"
+                )
+            else()
+                message(WARNING "NVSHMEM plugin not found: ${_src_path}, skipping copy")
+            endif()
+        endforeach()
     endif()
 
     INSTALL(TARGETS flashmaskv2 LIBRARY DESTINATION "lib")

@@ -1,0 +1,39 @@
+Allow overriding transport plugin path via environment variable.
+
+NVSHMEM transport plugin filenames (nvshmem_transport_ibrc.so.3, etc.) are
+hardcoded. When multiple libraries in the same process each statically link
+libnvshmem.a, dlopen returns the same plugin handle (same path = same loaded
+instance), causing shared static state and hangs.
+
+This adds env var overrides: NVSHMEM_TRANSPORT_IBRC_PLUGIN and
+NVSHMEM_TRANSPORT_IBGDA_PLUGIN, paralleling the existing
+NVSHMEM_BOOTSTRAP_UID_PLUGIN for bootstrap.
+
+See: https://github.com/NVIDIA/nvshmem/issues/68
+
+--- a/src/host/transport/transport.cpp
++++ b/src/host/transport/transport.cpp
+@@ -100,6 +100,11 @@
+     } else {
+         status = snprintf(transport_object_file, transport_object_file_len,
+                           "nvshmem_transport_ibrc.so.%d", NVSHMEM_TRANSPORT_PLUGIN_MAJOR_VERSION);
++        { /* Plugin isolation: allow env var override for multi-lib coexistence */
++            const char *ov = getenv("NVSHMEM_TRANSPORT_IBRC_PLUGIN");
++            if (ov && ov[0] != '\0')
++                snprintf(transport_object_file, transport_object_file_len, "%s", ov);
++        }
+         if (status > 0 && status < transport_object_file_len) {
+             transport_selected = true;
+             goto transport_init;
+@@ -225,6 +230,11 @@
+     if (nvshmemi_options.IB_ENABLE_IBGDA) {
+         status = snprintf(transport_object_file, transport_object_file_len,
+                           "nvshmem_transport_ibgda.so.%d", NVSHMEM_TRANSPORT_PLUGIN_MAJOR_VERSION);
++        { /* Plugin isolation: allow env var override for multi-lib coexistence */
++            const char *ov = getenv("NVSHMEM_TRANSPORT_IBGDA_PLUGIN");
++            if (ov && ov[0] != '\0')
++                snprintf(transport_object_file, transport_object_file_len, "%s", ov);
++        }
+         if (status < 0 || status > transport_object_file_len) {
+             WARN("Unable to open the %s transport. %s\n", transport_object_file, dlerror());
+             goto out;

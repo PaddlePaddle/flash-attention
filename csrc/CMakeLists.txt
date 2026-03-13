@@ -689,6 +689,13 @@ if(NOT SKIP_BUILD_FA)
         target_include_directories(flashmaskv2 PRIVATE ${NVSHMEM_INCLUDE_DIR})
         target_link_libraries(flashmaskv2 PRIVATE flashmaskv2_distributed)
         add_dependencies(flashmaskv2 flashmaskv2_distributed)
+        # Symbol isolation: hide statically-linked nvshmem internals to prevent
+        # interposition with libpaddle.so (DeepEP) causing hang/crash.
+        target_link_options(flashmaskv2 PRIVATE
+            -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/flashmask_v2/flashmaskv2.map
+            -Wl,-Bsymbolic
+            -Wl,--exclude-libs,ALL
+        )
         set_target_properties(flashmaskv2 PROPERTIES
             BUILD_RPATH "$ORIGIN"
             INSTALL_RPATH "$ORIGIN"

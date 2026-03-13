@@ -1,0 +1,13 @@
+/* Version script for libflashmaskv2.so
+ *
+ * Only export flashmaskv2_* public API symbols.
+ * Hide all statically-linked nvshmem internals to prevent
+ * symbol interposition with libpaddle.so (DeepEP) when both
+ * .so files coexist in the same process.
+ */
+{
+    global:
+        flashmaskv2_*;
+    local:
+        *;
+};

@@ -246,7 +246,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         );
         // zero initialize the dkv semaphores
         dkv_buffer->reset_semaphores();
-        printf("[FlashMask Overlap] Using RS-Overlap, buffer capacity: %d, num_chunks: %d\n", RS_BUFFER_CAPACITY, num_chunks);
+        WARN_PRINT("[FlashMask Overlap] Using RS-Overlap, buffer capacity: %d, num_chunks: %d\n", RS_BUFFER_CAPACITY, num_chunks);
     }
     kv_buffer->team_bar();
     // Initialize configuration tracking
@@ -261,7 +261,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     }
     // copy to the last position of the SR buffer
     WARN_PRINT("SR buffer valid: %d, B, S, H, D: %d, %d, %d, %d, cp_size: %d, stride: %d\n", int(kv_buffer->is_valid()), B, S_local, H, D, cp_size, _cp_stride);
-    printf("[FlashMask Overlap] constructor rank: %d, nranks: %d\n", rank, nranks);
+    WARN_PRINT("[FlashMask Overlap] constructor rank: %d, nranks: %d\n", rank, nranks);
 }
 
 template <typename KVType>

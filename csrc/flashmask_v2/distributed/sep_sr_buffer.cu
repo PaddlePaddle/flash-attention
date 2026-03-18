@@ -22,11 +22,13 @@ SepSRBuffer<KVType>::SepSRBuffer(
     int chunks_per_seg,
     int buffer_capacity,
     nvshmem_team_t team
-) : 
-    _dk_data(nullptr), _dv_data(nullptr), _semaphores(nullptr), 
-    _allocated(false), _idx_mask(buffer_capacity - 1), _team(team), 
-    _buf_offset(2 * chunks_per_seg * single_k_numel), 
-    _semaphore_size(semaphore_size)
+) :
+    _dk_data(nullptr), _dv_data(nullptr), _semaphores(nullptr),
+    _allocated(false), _idx_mask(buffer_capacity - 1), _team(team),
+    _buf_offset(2 * chunks_per_seg * single_k_numel),
+    _semaphore_size(semaphore_size),
+    _single_k_numel(single_k_numel),
+    _chunks_per_seg(chunks_per_seg)
 {
     if (single_k_numel & 31) {
         throw std::invalid_argument("SepSRBuffer: numel should be the positive multiple of 32");
@@ -70,6 +72,27 @@ void SepSRBuffer<KVType>::release() {
         _team = NVSHMEM_TEAM_INVALID;
         _buf_offset = 0;
         _semaphore_size = 0;
+        _single_k_numel = 0;
+        _chunks_per_seg = 0;
+    }
+}
+
+template <typename KVType>
+void SepSRBuffer<KVType>::release_for_realloc() {
+    if (_allocated && _dk_data) {
+        nvshmem_free(_dk_data);
+        for (int i = 0; i < _idx_mask + 1; i++) {
+            CUDA_DEBUG_CHECK(cudaEventDestroy(_empty_states[i]));
+        }
+        _dk_data = nullptr;
+        _dv_data = nullptr;
+        _semaphores = nullptr;
+        _allocated = false;
+        _team = NVSHMEM_TEAM_INVALID;
+        _buf_offset = 0;
+        _semaphore_size = 0;
+        _single_k_numel = 0;
+        _chunks_per_seg = 0;
     }
 }
 

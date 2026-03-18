@@ -127,10 +127,25 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     use_overlap = params.nranks > 1 && (!flashmask::comm::is_singleton_null());
     std::unique_ptr<flash::flashmask::MaskPtrUpdater<kBlockN>> mask_ptr_updater = nullptr;
 
-    // in bwd, we don't need to set rank, nranks for params, since overlap_comm instance already knew these in fwd
-    // also, when nranks == 1, overlap mode is not used
+    // BWD also needs to reconfigure the singleton, since in multi-config training
+    // (e.g., text/image/audio), all FWDs run first, then all BWDs run in reverse.
+    // The singleton config after all FWDs reflects the last FWD's params, which
+    // may differ from the current BWD's params. So BWD must call init_singleton_instance
+    // to ensure the singleton is correctly configured for its own params.
     if (use_overlap) {
-        auto& comm_singleton = flashmask::comm::singleton();
+        auto& comm_singleton = flashmask::comm::init_singleton_instance(
+            (const Element*) params.k_ptr,
+            (const Element*) params.v_ptr,
+            params.b,
+            params.seqlen_k,
+            params.h_k,
+            params.d,
+            params.rank,
+            params.nranks,
+            params.nranks,
+            params.unique_id_ptr,
+            params.h_flashmask
+        );
         segment_cnt = comm_singleton.num_segments();
         overlap_rs = segment_cnt > 1;
         overlap_sm_margin = comm_singleton.overlap_sm_margin();
@@ -145,18 +160,18 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr, false /*fwd*/);     // copy new KV data
 
         // seqlen_scale: when use_rs is true, this is chunks_per_seg (4 if CP16), otherwise this is nranks
+        const int original_seqlen_k = params.seqlen_k;  // capture before scaling for MaskPtrUpdater
         params.seqlen_k *= comm_singleton.seqlen_scale();
         seqlen_k *= comm_singleton.seqlen_scale();
         params.k_batch_stride *= comm_singleton.seqlen_scale();
         params.v_batch_stride *= comm_singleton.seqlen_scale();
-        
+
         // Re-route the KV data to the nvshmem_alloc SR buffer.
         params.k_ptr = comm_singleton.k_data();
         params.v_ptr = comm_singleton.v_data();
         // prepare mask_ptr mask_ptr_updater and set params.num_segments to enable correct mask access in bwd kernel
         if (overlap_rs) {
-            static constexpr int cp_chunk_size = 8192;
-            mask_ptr_updater = std::make_unique<flash::flashmask::MaskPtrUpdater<kBlockN>>(params, cp_chunk_size, comm_singleton.chunk_per_seg());
+            mask_ptr_updater = std::make_unique<flash::flashmask::MaskPtrUpdater<kBlockN>>(params, original_seqlen_k, comm_singleton.chunk_per_seg());
         }
     } else if (params.nranks > 1) {
         throw std::runtime_error("Overlap singleton instance is null but we try using overlap mechanism. This should be buggy.");

@@ -97,36 +97,35 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         if constexpr (Varlen) {
             throw std::runtime_error("Overlap Communicator currently does not support Varlen.");
         }
-        if (flashmask::comm::is_singleton_null()) {
-            if (params.d != params.dv) {
-                throw std::runtime_error("Overlap Communicator currently does not support D != Dv. KV should have the same D.");
-            }
-            if (params.seqlen_k % kBlockN) {
-                throw std::runtime_error("AttnBlock size should perfectly divided seqlen_k. This constraint will be removed in the future.");
-            }
-            auto& comm_singleton = flashmask::comm::init_singleton_instance(
-                (const Element*) params.k_ptr,
-                (const Element*) params.v_ptr,
-                params.b,
-                params.seqlen_k,
-                params.h_k,
-                params.d,
-                params.rank,
-                params.nranks,
-                params.nranks,
-                params.unique_id_ptr,
-                params.h_flashmask
-            );
-            // initial step does not need to wait for SR buffer's emptyness.
-            comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
-            comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
-        } else {
-            // do not update the SR buffer if other ranks did not finish using it
-            auto& comm_singleton = flashmask::comm::singleton();
-            comm_singleton.wait_sr_buffer_empty();
-            comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
-            comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
+        if (params.d != params.dv) {
+            throw std::runtime_error("Overlap Communicator currently does not support D != Dv. KV should have the same D.");
         }
+        if (params.seqlen_k % kBlockN) {
+            throw std::runtime_error("AttnBlock size should perfectly divided seqlen_k. This constraint will be removed in the future.");
+        }
+
+        bool is_first_init = flashmask::comm::is_singleton_null();
+        // init_singleton_instance handles both first-time creation and dynamic reconfiguration
+        auto& comm_singleton = flashmask::comm::init_singleton_instance(
+            (const Element*) params.k_ptr,
+            (const Element*) params.v_ptr,
+            params.b,
+            params.seqlen_k,
+            params.h_k,
+            params.d,
+            params.rank,
+            params.nranks,
+            params.nranks,
+            params.unique_id_ptr,
+            params.h_flashmask
+        );
+
+        if (!is_first_init) {
+            // Non-first call: wait for SR buffer to be released by previous computation
+            comm_singleton.wait_sr_buffer_empty();
+        }
+        comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
+        comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
         need_overlap_comm = true;
     }
 

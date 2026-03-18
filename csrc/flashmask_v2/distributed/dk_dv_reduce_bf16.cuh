@@ -108,7 +108,7 @@ void ReducedKdVKernel(
  *  dk_accum and dv_accum.
 */
 void launch_dk_dv_reduce(
-    const bf16* dk_recv, 
+    const bf16* dk_recv,
     const bf16* dv_recv,
     bf16* dk_accum, bf16* dv_accum,
     int B, int S_chunk, int H, int D,
@@ -116,22 +116,37 @@ void launch_dk_dv_reduce(
 ) {
     // 128 threads, each reduces 4 bf16
     static constexpr int elem_per_block = 512;
-    static constexpr int S_chunk_exp = 8192;        // expected S_chunk
-    if (S_chunk != S_chunk_exp) {
-        throw std::runtime_error("Chunk seqlen should be 8192.");
-    }
     int elem_per_chunk = S_chunk * H * D;
     // a typical value: 8192 * 8 * 128 / 512 = 16384
     int num_tasks_per_chunk = elem_per_chunk / elem_per_block;
 
     // typically, B = 1, so we have 2048 CTAs --> 16 CTAs per SM = 128 SMs
     // the reduce speed shouldn't be a bottleneck, so it's OK to allocate more SMs
-    dim3 grid(std::max(2048 / B, 128), B); 
-    if (is_first) {
-        ChunkDipatchKernelLaunch(num_chunks, true);
-    } else {
-        ChunkDipatchKernelLaunch(num_chunks, false);
+    dim3 grid(std::max(2048 / B, 128), B);
+
+#define ReduceDispatchBody(_S_chunk_val)                                            \
+    do {                                                                             \
+        static constexpr int S_chunk_exp = _S_chunk_val;                            \
+        if (is_first) {                                                              \
+            ChunkDipatchKernelLaunch(num_chunks, true);                              \
+        } else {                                                                     \
+            ChunkDipatchKernelLaunch(num_chunks, false);                              \
+        }                                                                            \
+    } while(0)
+
+    switch (S_chunk) {
+        case 4096:   { ReduceDispatchBody(4096);   break; }
+        case 8192:   { ReduceDispatchBody(8192);   break; }
+        case 16384:  { ReduceDispatchBody(16384);  break; }
+        case 32768:  { ReduceDispatchBody(32768);  break; }
+        case 65536:  { ReduceDispatchBody(65536);  break; }
+        case 131072: { ReduceDispatchBody(131072); break; }
+    default:
+        throw std::invalid_argument(
+            "[FlashMask Overlap] S_chunk must be one of {4096, 8192, 16384, 32768, 65536, 131072}, got: "
+            + std::to_string(S_chunk));
     }
+#undef ReduceDispatchBody
 }
 
 #undef ChunkDipatchKernelLaunch

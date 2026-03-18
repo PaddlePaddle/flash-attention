@@ -28,6 +28,8 @@ private:
     // offset to the recv buffer (2 * chunks_per_seg * k_numel)
     size_t _buf_offset;
     int _semaphore_size;
+    size_t _single_k_numel;    // allocated capacity per-K (B * S_local * H * D)
+    int _chunks_per_seg;       // chunks per segment (layout-defining)
 
     const int _idx_mask;
     std::array<cudaEvent_t, 2> _empty_states; 
@@ -56,6 +58,11 @@ public:
 
     void release();
 
+    // Unconditionally free NVSHMEM memory for runtime reallocation.
+    // Unlike release() which is gated by MANUAL_CLEANUP, this always calls nvshmem_free.
+    // Must be called with all PEs synchronized.
+    void release_for_realloc();
+
     ~SepSRBuffer();
 
     // [K_send, V_send] --> buf_offset size, therefore 2 * buf_offset is the double buffer offset
@@ -79,6 +86,14 @@ public:
 
     inline bool is_valid() const noexcept {
         return _allocated && _dk_data && _dv_data && _semaphores && _team != NVSHMEM_TEAM_INVALID;
+    }
+
+    size_t capacity() const noexcept {
+        return _single_k_numel;
+    }
+
+    int get_chunks_per_seg() const noexcept {
+        return _chunks_per_seg;
     }
 
     nvshmem_team_t team() const noexcept {

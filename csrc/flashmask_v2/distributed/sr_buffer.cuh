@@ -28,13 +28,14 @@ private:
     SemaphoreType* _semaphores;
     bool _allocated;
     nvshmem_team_t _team;
+    size_t _numel;  // allocated capacity in numel (for one of K or V)
 
     // no copy, move-only object
     SRBuffer(const SRBuffer&) = delete;
     SRBuffer& operator=(const SRBuffer&) = delete;
 public:
-    explicit SRBuffer(size_t numel, nvshmem_team_t team = NVSHMEM_TEAM_WORLD, int semaphore_size = 0) : 
-        _k_sr(nullptr), _v_sr(nullptr), _semaphores(nullptr), _allocated(false), _team(team) 
+    explicit SRBuffer(size_t numel, nvshmem_team_t team = NVSHMEM_TEAM_WORLD, int semaphore_size = 0) :
+        _k_sr(nullptr), _v_sr(nullptr), _semaphores(nullptr), _allocated(false), _team(team), _numel(0)
     {
         if (numel == 0) {
             throw std::invalid_argument("SRBuffer: numel must be positive");
@@ -53,6 +54,7 @@ public:
         _v_sr = _k_sr + numel;
         _semaphores = reinterpret_cast<SemaphoreType*>(_v_sr + numel);
         _allocated = true;
+        _numel = numel;
     }
 
     void team_bar() const {
@@ -64,16 +66,18 @@ public:
     }
 
     SRBuffer(SRBuffer&& other) noexcept
-        : _k_sr(other._k_sr), 
-          _v_sr(other._v_sr), 
+        : _k_sr(other._k_sr),
+          _v_sr(other._v_sr),
           _allocated(other._allocated),
-          _team(other._team)
+          _team(other._team),
+          _numel(other._numel)
     {
         other._k_sr = nullptr;
         other._v_sr = nullptr;
         other._semaphores = nullptr;
         other._team = NVSHMEM_TEAM_INVALID;
         other._allocated = false;
+        other._numel = 0;
     }
 
     SRBuffer& operator=(SRBuffer&& other) noexcept {
@@ -88,11 +92,14 @@ public:
             _allocated = other._allocated;
             _team = other._team;
             
+            _numel = other._numel;
+
             other._k_sr = nullptr;
             other._v_sr = nullptr;
             other._semaphores = nullptr;
             other._allocated = false;
             other._team = NVSHMEM_TEAM_INVALID;
+            other._numel = 0;
         }
         return *this;
     }
@@ -107,6 +114,22 @@ public:
             _semaphores = nullptr;
             _allocated = false;
             _team = NVSHMEM_TEAM_INVALID;
+            _numel = 0;
+        }
+    }
+
+    // Unconditionally free NVSHMEM memory for runtime reallocation.
+    // Unlike release() which is gated by MANUAL_CLEANUP (for safe process-exit),
+    // this method always calls nvshmem_free. Must be called with all PEs synchronized.
+    void release_for_realloc() {
+        if (_allocated && _k_sr) {
+            nvshmem_free(_k_sr);
+            _k_sr = nullptr;
+            _v_sr = nullptr;
+            _semaphores = nullptr;
+            _allocated = false;
+            _team = NVSHMEM_TEAM_INVALID;
+            _numel = 0;
         }
     }
 
@@ -130,6 +153,10 @@ public:
         return _allocated && _k_sr && _v_sr && _semaphores && _team != NVSHMEM_TEAM_INVALID;
     }
 
+    size_t capacity() const noexcept {
+        return _numel;
+    }
+
     nvshmem_team_t team() const noexcept {
         return _team;
     }
@@ -140,6 +167,7 @@ public:
         std::swap(_semaphores, other._semaphores);
         std::swap(_allocated, other._allocated);
         std::swap(_team, other._team);
+        std::swap(_numel, other._numel);
     }
 };
 

@@ -53,33 +53,16 @@ else()
 endif()
 
 set(NVSHMEM_PATCH_PATH "${NVSHMEM_CMAKE_DIR}/${NVSHMEM_PATCH_NAME}")
-set(NVSHMEM_PLUGIN_ISOLATION_PATCH "${NVSHMEM_CMAKE_DIR}/nvshmem_plugin_isolation.patch")
 
 if(EXISTS "${NVSHMEM_PATCH_PATH}")
   message(STATUS "Found NVSHMEM patch: ${NVSHMEM_PATCH_PATH}")
-  set(NVSHMEM_PATCH_COMMAND
+  
+  set(NVSHMEM_PATCH_COMMAND 
       patch -p1 < "${NVSHMEM_PATCH_PATH}" || echo "Patch applied or already applied"
   )
 else()
   message(STATUS "NVSHMEM patch not found at ${NVSHMEM_PATCH_PATH}, skipping patching")
-  set(NVSHMEM_PATCH_COMMAND "")
-endif()
-
-if(EXISTS "${NVSHMEM_PLUGIN_ISOLATION_PATCH}")
-  message(STATUS "Found NVSHMEM plugin isolation patch: ${NVSHMEM_PLUGIN_ISOLATION_PATCH}")
-  if(NVSHMEM_PATCH_COMMAND)
-    set(NVSHMEM_PATCH_COMMAND
-        ${NVSHMEM_PATCH_COMMAND} && patch --forward -p1 < "${NVSHMEM_PLUGIN_ISOLATION_PATCH}" || echo "Plugin isolation patch applied or already applied"
-    )
-  else()
-    set(NVSHMEM_PATCH_COMMAND
-        patch --forward -p1 < "${NVSHMEM_PLUGIN_ISOLATION_PATCH}" || echo "Plugin isolation patch applied or already applied"
-    )
-  endif()
-endif()
-
-if(NOT NVSHMEM_PATCH_COMMAND)
-  set(NVSHMEM_PATCH_COMMAND "")
+  set(NVSHMEM_PATCH_COMMAND "")     # empty command, nothing is executed
 endif()
 
 set(NVSHMEM_LIB ${NVSHMEM_INSTALL_DIR}/lib/libnvshmem.a)

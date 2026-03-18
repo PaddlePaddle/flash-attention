@@ -101,17 +101,6 @@ void get_nvshmem_info(int& my_pe, int& n_pes) {
     n_pes = nvshmem_n_pes();
 }
 
-// Direct NVSHMEM plugin .so files to FlashMask's own renamed copies.
-// This ensures that when both FlashMask and DeepEP statically link libnvshmem.a,
-// each side dlopen()s a distinct plugin file (different realpath = independent
-// loaded instance), so the plugin's internal static variables are not shared.
-// See: https://github.com/NVIDIA/nvshmem/issues/68
-static void set_flashmask_nvshmem_plugin_env() {
-    setenv("NVSHMEM_BOOTSTRAP_UID_PLUGIN", "flashmask_nvshmem_bootstrap_uid.so.3", 0);
-    setenv("NVSHMEM_TRANSPORT_IBRC_PLUGIN", "flashmask_nvshmem_transport_ibrc.so.3", 0);
-    setenv("NVSHMEM_TRANSPORT_IBGDA_PLUGIN", "flashmask_nvshmem_transport_ibgda.so.3", 0);
-}
-
 void init_with_unique_id(
     std::vector<uint8_t>&& root_unique_id_val,
     int rank,
@@ -124,7 +113,6 @@ void init_with_unique_id(
     WARN_PRINT("Start to set unique ID args...\n");
     nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr);
     WARN_PRINT("Start to set init attr...\n");
-    set_flashmask_nvshmem_plugin_env();
     nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
     // TODO(heqianyue): Do we need to bar here?
     WARN_PRINT("%d / %d bars before completing the init.\n", rank, num_ranks);

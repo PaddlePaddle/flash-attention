@@ -28,7 +28,7 @@ std::vector<uint8_t> get_nvshmem_unique_id() {
 }
 
 // Used only in the backward RS-overlap
-inline int get_segment_size_wrapper(int local_seqlen_k, int nranks, int kv_head) {
+inline int get_num_chunks_per_stage(int local_seqlen_k, int nranks, int kv_head) {
     return flashmask::get_num_chunk_per_segment(local_seqlen_k, nranks, kv_head);
 }
 #else
@@ -37,8 +37,8 @@ std::vector<uint8_t> get_nvshmem_unique_id() {
     return {};
 }
 
-inline int get_segment_size_wrapper(int local_seqlen_k, int nranks, int kv_head) {
-    return 1;
+inline int get_num_chunks_per_stage(int local_seqlen_k, int nranks, int kv_head) {
+    return 0;
 }
 #endif
 
@@ -371,8 +371,8 @@ void flashmaskv2_run_mha_fwd(Flash_fwd_params* params_handle, cudaStream_t strea
     run_mha_fwd(*params_handle, stream);
 }
 
-int flashmaskv2_get_segment_size(int local_seqlen_k, int nranks, int kv_head) {
-    return get_segment_size_wrapper(local_seqlen_k, nranks, kv_head);
+int flashmaskv2_get_num_chunks_per_stage(int local_seqlen_k, int nranks, int kv_head) {
+    return get_num_chunks_per_stage(local_seqlen_k, nranks, kv_head);
 }
 
 bool flashmaskv2_get_nvshmem_unique_id(uint8_t * unique_id_ptr) {

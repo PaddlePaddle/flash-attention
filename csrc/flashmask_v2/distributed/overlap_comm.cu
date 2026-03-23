@@ -553,9 +553,9 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
 #undef DenseFewHeadKernel
 #undef SparseLargeChunkKernel
 
-#define SparseLargeChunkSplittedKernel(num_chunk, start_rank, seg_idx, num_segs, smem_bytes)\
+#define SparseLargeChunkSplittedKernel(num_chunk, _has_local, start_rank, seg_idx, num_segs, smem_bytes)\
     SparseLargeKVChunkSplittedRemoteGetKernel<KVType, S_chunk,                              \
-        num_warps, RDMA_ROW_PER_WARP, num_chunk, USE_STREAM_COORD, USE_SEMAPHORES>          \
+        num_warps, RDMA_ROW_PER_WARP, num_chunk, _has_local, USE_STREAM_COORD, USE_SEMAPHORES> \
         <<<num_blocks, num_warps * 32, smem_bytes, comm_stream>>>(                          \
                         kv_buffer->k_data(),                                                \
                         kv_buffer->v_data(),                                                \
@@ -575,16 +575,16 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
                         kv_buffer->semaphores()                                             \
                     )
 
-#define NumChunkDispatchSplitted(MACRO_FUNC, num_chunk, ...)    \
-    switch (num_chunk) {                                        \
-        case 4: { MACRO_FUNC(4, __VA_ARGS__); break; }          \
-        case 2: { MACRO_FUNC(2, __VA_ARGS__); break; }          \
-        case 3: { MACRO_FUNC(3, __VA_ARGS__); break; }          \
-        case 1: { MACRO_FUNC(1, __VA_ARGS__); break; }          \
-        case 8: { MACRO_FUNC(8, __VA_ARGS__); break; }          \
-        case 7: { MACRO_FUNC(7, __VA_ARGS__); break; }          \
-    default:                                                    \
-        throw std::invalid_argument("Num chunk per segment must be in [2, 4, 8]. [1, 3, 7] cases considers local chunk skipping. Other segment size is not supported."); \
+#define NumChunkDispatchSplitted(MACRO_FUNC, num_chunk, _has_local, ...)  \
+    switch (num_chunk) {                                                  \
+        case 4: { MACRO_FUNC(4, _has_local, __VA_ARGS__); break; }        \
+        case 2: { MACRO_FUNC(2, _has_local, __VA_ARGS__); break; }        \
+        case 8: { MACRO_FUNC(8, _has_local, __VA_ARGS__); break; }        \
+        case 1: { MACRO_FUNC(1, _has_local, __VA_ARGS__); break; }        \
+    default:                                                              \
+        throw std::invalid_argument(                                      \
+            "[FlashMask Overlap] Num chunk per segment must be one of "   \
+            "{1, 2, 4, 8}, got: " + std::to_string(num_chunk));           \
     }
 
 template <typename KVType>
@@ -606,12 +606,12 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
         const int mask_smem_bytes = B * sizeof(int) * num_chunks * S_chunk / (num_warps * RDMA_ROW_PER_WARP); \
         if (segment_idx) {                                                                              \
             cudaMemsetAsync(block_work_ids, 0, sizeof(int) * num_blocks, comm_stream);                  \
-            NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks,                         \
+            NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks, false,                  \
                 start_pe, segment_idx, num_segs, mask_smem_bytes);                                      \
         } else {                                                                                        \
             constexpr int work_to_skip = S_chunk / (num_warps * RDMA_ROW_PER_WARP);                     \
             sema::rs::SetValueKernel<<<1, num_blocks, 0, comm_stream>>>(block_work_ids, work_to_skip);  \
-            NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks - 1,                     \
+            NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks, true,                   \
                 start_pe, segment_idx, num_segs, mask_smem_bytes);                                      \
         }                                                                                               \
     } while(0)
@@ -636,9 +636,9 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
 #undef SparseLargeChunkSplittedKernel
 #undef SeqlenCase
 
-#define SegmentIdxPutKernelDispatch(_num_chunks, seg_idx)                   \
+#define SegmentIdxPutKernelDispatch(_num_chunks, _has_local, seg_idx)       \
 SparseLargeKVChunkRemotePutKernel<KVType, S_chunk, num_warps,               \
-            RDMA_ROW_PER_WARP, _num_chunks>                                 \
+            RDMA_ROW_PER_WARP, _num_chunks, _has_local>                     \
             <<<num_blocks, num_warps * 32, dynamic_smem, aux_p_stream>>>(   \
         dkv_buffer->k_send(seg_idx),                                        \
         dkv_buffer->v_send(seg_idx),                                        \
@@ -695,7 +695,7 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         constexpr int S_chunk = _S_chunk;                                                               \
         const int dynamic_smem = B * sizeof(int) * S_chunk * num_chunks / (num_warps * RDMA_ROW_PER_WARP); \
         if (segment_idx) {                                                                              \
-            NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks, segment_idx);              \
+            NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks, false, segment_idx);       \
         } else {                                                                                        \
             const int S_stride = H * D;                                                                 \
             const int batch_stride = num_chunks * S_chunk * S_stride;                                   \
@@ -709,7 +709,7 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
             }                                                                                           \
             cudaEventRecord(local_moved, aux_p_stream);                                                 \
             cudaStreamWaitEvent(aux_c_stream, local_moved);                                             \
-            NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks - 1, segment_idx);          \
+            NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks, true, segment_idx);        \
         }                                                                                               \
         dkv_buffer->release_buffer(segment_idx, aux_p_stream);                                          \
         nvshmemx_quiet_on_stream(aux_p_stream);                                                         \
@@ -984,11 +984,11 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     const uint8_t* unique_id_ptr,
     int mask_head
 ) {
-    // RS-overlap requires H_k >= 4, nranks > 1, AND num_chunks > 1.
-    // When num_chunks=1 (S_local >= 32768, or cp_size=2), the splitted AG/RS dispatch
-    // has no valid code path for the degenerate single-chunk case. Fall back to AG-only overlap.
+    // RS-overlap requires H_k >= rs_overlap_min_h_k AND nranks > 1.
+    // num_chunks=1 (CP2 or S_local >= 32768) is now supported by the splitted kernels:
+    // segment 0's local-only chunk triggers early return, and segment 1 processes the single remote chunk.
     int num_chunks_preview = get_num_chunk_per_segment(s_kv, nranks, h_kv);
-    bool new_overlap_rs = (h_kv >= rs_overlap_min_h_k && nranks > 1 && num_chunks_preview > 1);
+    bool new_overlap_rs = (h_kv >= rs_overlap_min_h_k && nranks > 1);
 
     // Validate S_local is in the supported dispatch set (applies to both first-time and reconfigure)
     if (s_kv != 4096 && s_kv != 8192 && s_kv != 16384

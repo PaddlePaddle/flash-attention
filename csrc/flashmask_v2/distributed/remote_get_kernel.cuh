@@ -432,7 +432,10 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 // the local read ptr is exceeded by the write ptr and load KV can procede if true. Therefore, we can choose to
 // start the AG-overlap kernel (non-splitted version) just once at the beginning of the BWD kernel. We only need to
 // inform the bwd kernel one more thing: what is the current segment ID? For now, use the splitted version.
-template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunks=4, bool use_stream_coord=false, bool use_semaphore=false>
+//
+// @param num_chunks  total chunks per segment (always the real count, e.g. 4 for CP16)
+// @param has_local_chunk  true iff segment 0 (the first chunk is local and should be skipped)
+template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunks=4, bool has_local_chunk=false, bool use_stream_coord=false, bool use_semaphore=false>
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkSplittedRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
@@ -455,11 +458,14 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         // notify computation stream that one of the CTAs for communication kernel is running
         if (threadIdx.x == 0) atomicOr(stream_coordinator, 1 << blockIdx.x);
     }
-    constexpr bool has_local = (num_chunks & 1) > 0;
+    // segment has only a local chunk, nothing to remote-get.
+    if constexpr (has_local_chunk && num_chunks == 1) {
+        if (threadIdx.x == 0) atomicMax(wptr, INT_MAX);
+        return;
+    }
+    constexpr bool has_local = has_local_chunk;
     constexpr int row_per_block = num_warps * row_per_warp;
-    // round the num_chunks to include the local chunk
-    constexpr int rounded_num_chunks = has_local ? (num_chunks + 1) : num_chunks;
-    constexpr int S = S_chunk * rounded_num_chunks;         // seqlen of this segment
+    constexpr int S = S_chunk * num_chunks;                  // seqlen of this segment (num_chunks is already the real total)
     constexpr int work_per_seg = S / row_per_block;
     // for each segment, get the number of work we can skip (due to being local). Note that
     // if work_to_skip is not 0, there will be some skippable works for **each batch**

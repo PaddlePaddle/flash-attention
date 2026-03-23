@@ -96,8 +96,12 @@ void ReducedKdVKernel(
             dk_recv, dv_recv, dk_accum, dv_accum, num_tasks_per_chunk); break; }        \
         case 8: { ReducedKdVKernel<S_chunk_exp, 8, is_first><<<grid, 128, 0, stream>>>( \
             dk_recv, dv_recv, dk_accum, dv_accum, num_tasks_per_chunk); break; }        \
+        case 1: { ReducedKdVKernel<S_chunk_exp, 1, is_first><<<grid, 128, 0, stream>>>( \
+            dk_recv, dv_recv, dk_accum, dv_accum, num_tasks_per_chunk); break; }        \
     default:                                                                            \
-        throw std::invalid_argument("Num chunk per segment must be 2 or 4. Other segment size is not supported."); \
+        throw std::invalid_argument(                                                    \
+            "[FlashMask Overlap] num_chunks must be one of {1, 2, 4, 8}, got: "         \
+            + std::to_string(num_chunk));                                               \
     }
 
 /**

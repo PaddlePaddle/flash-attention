@@ -8,23 +8,16 @@
 namespace flashmask {
 
 /**
- * @brief usage of this function: if the actual num of chunks is N (for example, 4).
- *  The first call: num_chunk = N - 1 to enable local_chunk skipping
- *  The follow-up calls: num_chunk = N, to put the chunks to all the remote ranks that need them 
- * 
- * @param num_chunk number of chunk per segment. @note Let's take CP16, N4 segment as an example:
- * 
- * the first chunk of the first segment is local. We should skip it. So, for the first segment
- * we should call: num_chunk = 3! The function will check whether num_chunk is odd: if odd, we
- * the send_recv buffer will be offseted by 1 chunk (to skip the first chunk).
- * 
- * The follow-up call of this function should set num_chunk = 4 to correctly put all the non-local chunk
- * 
+ * @brief Splitted remote put kernel for RS-overlap.
+ *
+ * @param num_chunk  total chunks per segment (always the real count, e.g. 4 for CP16)
+ * @param has_local_chunk  true iff segment 0 (the first chunk is local and should be skipped)
+ *
  * @param x_send & x_recv: SepSRBuffer separates send and recv into two buffers, since this is
  * actually an all-gather op implemented by an A2A op, the buffer cannot be reused the same way as the
- * all-gather overlap.  
+ * all-gather overlap.
 */
-template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunk=4>
+template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunk=4, bool has_local_chunk=false>
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkRemotePutKernel(
     const T* const __restrict__ k_send,                 // K src addr (local)
     const T* const __restrict__ v_send,                 // V src addr (local)
@@ -46,28 +39,32 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
        DEBUG_PRINT("Remote put starts, blockIdx: %d, self rank: %d, segment_idx: %d / %d\n", blockIdx.x, my_pe, segment_idx, num_segments);
     }
 #endif  // NVSHMEM_DEBUG
-    static constexpr bool has_local = (num_chunk & 0x01) > 0;
+    // segment has only a local chunk, nothing to remote-put. Return immediately.
+    if constexpr (has_local_chunk && num_chunk == 1) {
+        return;
+    }
+    static constexpr bool has_local = has_local_chunk;
     // skip the local chunk by using 1 as offset
     static constexpr int chunk_offset = has_local ? 1 : 0;
-    static constexpr int r2_num_chunk = has_local ? (num_chunk + 1) : num_chunk;  // round-even num chunk
+    static constexpr int remote_chunks = num_chunk - chunk_offset > 0 ? num_chunk - chunk_offset : 1;  // clamp to 1 to suppress div-by-zero warning; total_works=0 guards runtime
     static constexpr int row_per_block = num_warps * row_per_warp;     // 256 or 512 row per block (32 or 64 per warp)
     static constexpr int work_per_chunk = S_chunk / row_per_block;
-    static constexpr int work_per_seg = work_per_chunk * num_chunk;
+    static constexpr int work_per_seg = work_per_chunk * remote_chunks;
 
     const int total_works = num_batch * work_per_seg;
-    const int batch_stride = S_chunk * r2_num_chunk * S_stride;         // use rounded chunk to compute batch_stride
+    const int batch_stride = S_chunk * num_chunk * S_stride;         // num_chunk is the real total
 
     extern __shared__ int smem_chunk_mask[];
-    __shared__ int cached_empty[r2_num_chunk];
+    __shared__ int cached_empty[num_chunk];
     __shared__ int next_work_id;
 
     if (threadIdx.x < total_works) {
         const int batch_id = threadIdx.x / work_per_seg;
         const int seqlen_id = threadIdx.x % work_per_seg;
         constexpr int start_offset = chunk_offset * work_per_chunk;
-        auto* src_ptr = copy_chunk_mask + (segment_idx + batch_id * num_segments) * r2_num_chunk * work_per_chunk + seqlen_id;
+        auto* src_ptr = copy_chunk_mask + (segment_idx + batch_id * num_segments) * num_chunk * work_per_chunk + seqlen_id;
         smem_chunk_mask[start_offset + threadIdx.x] = *(src_ptr + start_offset);
-        if (threadIdx.x < r2_num_chunk) {
+        if (threadIdx.x < num_chunk) {
             cached_empty[threadIdx.x] = 0;
         }
     }
@@ -81,7 +78,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             int _work_id = atomicAdd(block_cnt_semaphore, 1);
             next_work_id = _work_id;
             // chunk ID changes first: chunk [0, 1, 2, 3, 0, 1, 2, 3, ...]
-            int chunk_id = (_work_id % num_chunk) + chunk_offset;
+            int chunk_id = (_work_id % remote_chunks) + chunk_offset;
             int target_pe = (start_rank + chunk_id) % cp_size;
             // the current CTA might be scheduled to send things to different ranks
             // so each CTA should keep track of whether the target rank is empty
@@ -95,9 +92,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     };
 
     for (int work_id = update_work_id_sync(); work_id < total_works;) {
-        const int chunk_work_id = work_id / num_chunk;         // the work_id within the chunk
+        const int chunk_work_id = work_id / remote_chunks;         // the work_id within the chunk
         // seg_chunk_id is also the offset to the start_rank
-        const int seg_chunk_id = (work_id % num_chunk) + chunk_offset;         // which chunk the work_id falls into
+        const int seg_chunk_id = (work_id % remote_chunks) + chunk_offset;         // which chunk the work_id falls into
         const int target_rank = (seg_chunk_id + start_rank) % cp_size;
 
         // within segment seqlen work_id
@@ -106,7 +103,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 
         // Note(heqianyue): this copy_chunk_mask is computed without sharding. Therefore we need to compute
         // the correct index, considering the stride of the full seqlen_k
-        int mask_index = seq_work_id + work_per_chunk * (seg_chunk_id + num_chunk * batch_id);
+        int mask_index = seq_work_id + work_per_chunk * (seg_chunk_id + remote_chunks * batch_id);
 
         if (smem_chunk_mask[mask_index]) {
             // __syncthreads() here is necessary: in case some of the warp haven't updated

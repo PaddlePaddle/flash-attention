@@ -56,7 +56,8 @@ struct OverlapConfig {
  * `reconfigure_if_needed()` will detect the change and reallocate buffers as needed.
  * cp_size change is a fatal error (NVSHMEM bootstrap persists).
  * S_local is dispatched at compile time: supported values are {4096, 8192, 16384, 32768, 65536, 131072}.
- * RS-overlap is automatically disabled when num_chunks=1 (S_local >= 32768 or cp_size=2).
+ * RS-overlap is automatically enabled when H_k >= rs_overlap_min_h_k and nranks > 1.
+ * num_chunks=1 (S_local >= 32768 or cp_size=2) is supported via early-return in splitted kernels.
 */
 template <typename KVType>
 class OverlapCommunicator {

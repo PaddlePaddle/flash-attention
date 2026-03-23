@@ -1123,8 +1123,6 @@ struct CollectiveMainloopBwdSm90 {
         );
         // int32_t flashmask_mem_[8]s;
         // load_n_block_info(n_block, flashmask_mem_, params);
-
-        int m_block = m_block_min;
         // if(thread_idx == 0) printf("m_block:%d",m_block);
         // get_next_m_block(n_block,m_block,partially_masked,m_block_max - 1,params);
 
@@ -1330,76 +1328,75 @@ struct CollectiveMainloopBwdSm90 {
         // this helps quite a bit to not have to do causal masking for most of the iterations.
 
         auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-        int loop_end = m_block_max;
-        if constexpr(!Is_causal){
-            if constexpr (Has_ut_start) {
-                loop_end = std::min(flashmask_mem_[5]/*ut_start_nblockmin*/, m_block_max);
-                CUTLASS_PRAGMA_NO_UNROLL
-                for (; m_block < loop_end; m_block++) {
-                    if constexpr (Is_blockmask){
-                        if(!blockmask_smem_[m_block / params.m_factor]) continue;
-                    }
-                    // if(threadIdx.x == 128) printf("consumer0 m_block,n_block: %d, %d\n", m_block,n_block);
-                    bwd_step(m_block, mask_fn, false, flashmask_index_smem_);
-                }
-                loop_end = flashmask_mem_[4]/*ut_start_nblockmax*/;
-                CUTLASS_PRAGMA_NO_UNROLL
-                for (; m_block <= loop_end; ++m_block) {
-                    if constexpr (Is_blockmask){
-                        if(!blockmask_smem_[m_block / params.m_factor]) continue;
-                    }
-                    // if(threadIdx.x == 128) printf("consumer0 m_block,n_block: %d, %d\n", m_block,n_block);
-                    bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
-                }
-            }
-            m_block = std::max(m_block, flashmask_mem_[7]/*ut_end_nblockmin*/); 
-            loop_end = std::min(flashmask_mem_[6]/*ut_end_nblockmax*/, m_block_max - 1);
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block <= loop_end; m_block++) {
-                if constexpr (Is_blockmask){
-                    if(!blockmask_smem_[m_block / params.m_factor]) continue;
-                }
-                // if(threadIdx.x == 128) printf("consumer-u-2 m_block,n_block,m_block_max,flashmask_mem_[2]: %d, %d, %d,%d\n", m_block,n_block,m_block_max,flashmask_mem_[6]);
-                bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
-            }
-        } 
-       loop_end = std::min(flashmask_mem_[1]/*lt_start_nblockmin*/, m_block_max);
+
+        // Note(heqianyue): this is a state machine version for compacting multiple for-loops into one
+        // For the original separate loops impl, check `store_dq` and `load`. These two impls
+        // are kept, since they are not in MMA consumer and does not affect MMA registers. State machine 
+        // tries getting rid of multiple loops that might consume more registers than expected, possibly
+        // caused by the inlining of lambda functions (umiswing). For global
+        // swin mask, multiple for-loops related register spilling problem stops us from using bigger
+        // block sizes. Once a bigger block size can be applied with low cost, the speed can be boosted. 
+        // state -----------------> 0 1 (2 3) 4 5 (6 7) 8
+        // state & 0x3 -----------> 0 1 (2 3) 0 1 (2 3) 0
+        // mask triangle ---------> U U ( U ) L L ( L ) L
+        // is partially masked ---> F T ( T ) F T ( T ) F
+        // smem_pos = state ^ 5 --> 5 4 (7 6) 1 0 (3 2) [13 --- not used]
+        // (...) brackets means that the two states are combined into one (stride 2)
+        // Combined states (2,3)/(6,7): smem_index gives nblockmin (skip target),
+        //   smem_index - 1 gives nblockmax (loop_end). NOT +1, since XOR mapping
+        //   puts max at the lower index.
+        // State 0/4: use fm[smem_index] - 1 as loop_end to match original strict < semantics,
+        //   so the boundary block is processed by state 1/5 with partially_masked=true.
+
+        int loop_end = m_block_min - 1; // m_block_min > m_block_min-1 triggers first state transition
+        // starts with actual_state - 1 (since we have `++ state` at the very first step)
         CUTLASS_PRAGMA_NO_UNROLL
-        for (; m_block < loop_end; m_block++) {
-            if constexpr (Is_blockmask){
-                if(!blockmask_smem_[m_block / params.m_factor]) continue;
-            }
-            // if(threadIdx.x == 128) printf("consumer-l-0 m_block,n_block: %d, %d\n", m_block,n_block);
-            bwd_step(m_block, mask_fn, false, flashmask_index_smem_);
-        }
-        //partial_maskloop_end
-        loop_end = std::min(m_block_max - 1, flashmask_mem_[0]/*lt_start_nblockmax*/);
-        CUTLASS_PRAGMA_NO_UNROLL
-        for (; m_block <= loop_end; m_block++) {
-            if constexpr (Is_blockmask){
-                if(!blockmask_smem_[m_block / params.m_factor]) continue;
-            }
-            // if(threadIdx.x == 128) printf("consumer-l-1 m_block,n_block, flashmask_mem_[0]: %d, %d, %d\n", m_block,n_block,flashmask_mem_[0]);
-            bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
-        }
-        if constexpr (Has_lt_end) {
-            m_block = std::max(m_block, flashmask_mem_[3]/*lt_end_nblockmin*/);  
-            //partial_maskloop_end
-            loop_end = std::min(flashmask_mem_[2]/*lt_end_nblockmax*/, m_block_max - 1);
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block <= loop_end; m_block++) {
-                if constexpr (Is_blockmask){
-                    if(!blockmask_smem_[m_block / params.m_factor]) continue;
+        for (int state = Is_causal ? 3 : (Has_ut_start ? -1 : 1), 
+                 m_block = m_block_min; 
+                 /* loops forever, exit according to state */;
+                 m_block ++
+        ) {
+            // update the state machine
+            // compile time (static dispatch) state skipping
+            // 1. Is_causal, state starts from 4 (lt only)
+            // 2. Has_lt_end == false, state 6, 7 and 8 can be skipped
+            // 3. !Is_causal and:
+            //      Has_ut_start: all the states are kept
+            //      otherwise: state starts from 2
+            // Use `while` + strict `>` instead of `if` + `>=`:
+            //   `>` (not `>=`): when m_block == loop_end, current block still needs processing
+            //     before transitioning. `>=` would transition prematurely, skipping it.
+            //   `while` (not `if`): when a state's region is empty (loop_end < m_block),
+            //     keep advancing state without m_block++. With `if`, the for-loop's m_block++
+            //     fires once per empty state, drifting m_block ahead of load()'s producer → hang.
+            while (m_block > loop_end) {
+                ++ state;
+                if (state >= (Has_lt_end ? 9 : 6)) break;
+                const int smem_index = state ^ 0x5;
+                if (state < 8) {
+                    if ((state & 0x03) == 0x02) {   // state 2, 6: skip to nblockmin, loop_end = nblockmax (smem_index - 1)
+                        m_block = std::max(flashmask_mem_[smem_index], m_block);
+                        loop_end = std::min(flashmask_mem_[smem_index - 1], m_block_max - 1);
+                        ++ state;                   // one more ++, so that state = 3 and 7 are skipped
+                    } else {
+                        // state 1, 5: inclusive <= boundary (do not need to minus 1)
+                        // state 0, 4: strict < boundary (fm[x]-1 to exclude boundary block, minus 1 is needed)
+                        loop_end = std::min(flashmask_mem_[smem_index] - !(state & 0x03), m_block_max - 1);
+                    }
+                } else {                            // Has_lt_end, and state = 8 (loop till m_block_max)
+                    loop_end = m_block_max - 1;
                 }
-                // if(threadIdx.x == 128) printf("consumer2 m_block,n_block,m_block_max,flashmask_mem_[2]: %d, %d, %d,%d\n", m_block,n_block,m_block_max,flashmask_mem_[2]);
-                bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
             }
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block < m_block_max; m_block++) {
-                if constexpr (Is_blockmask){
-                    if(!blockmask_smem_[m_block / params.m_factor]) continue;
+            if (state >= (Has_lt_end ? 9 : 6)) break;
+            // m_block <= loop_end is guaranteed here (while exits when condition is false),
+            // so no need to check. Saves 1 branch + 1 predicate register per iteration.
+            if constexpr (Is_blockmask) {
+                if (blockmask_smem_[m_block / params.m_factor]) {
+                    bwd_step(m_block, mask_fn, (state & 0x3) > 0, flashmask_index_smem_);
                 }
-                bwd_step(m_block, mask_fn, false, flashmask_index_smem_);
+            } else {
+                // state 0, 4 and 8 is fully masked (false), otherwise partially masked
+                bwd_step(m_block, mask_fn, (state & 0x3) > 0, flashmask_index_smem_);
             }
         }
 

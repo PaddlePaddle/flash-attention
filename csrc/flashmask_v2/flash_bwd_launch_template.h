@@ -52,6 +52,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     int seqlen_k_rounded = !is_varlen_k ? params.seqlen_k_rounded : total_k_padded_rounded;
     int batch_q = !is_varlen_q ? params.b : 1;
     int batch_k = !is_varlen_k ? params.b : 1;
+    int const local_seqlen_k = seqlen_k;
     // printf("params.dv_ptr:%p\n",params.dv_ptr);
     // printf("seqlen_q_rounded:%d\n",seqlen_q_rounded);
     // printf("d_rounded:%d\n",params.d_rounded);
@@ -255,7 +256,8 @@ SEGMENT_LOOP_START:
                 params.m_block_dim, params.n_block_dim,
                 params.block_mask_ptr,
                 params.write_ptr,
-                segment_cnt
+                segment_cnt,
+                local_seqlen_k
             };
         else
             return typename CollectiveMainloop::Arguments {

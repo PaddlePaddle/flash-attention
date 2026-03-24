@@ -356,7 +356,8 @@ struct CollectiveMainloopBwdSm90 {
         int32_t * __restrict__ block_mask_ptr = nullptr;
         const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
         // the following is usually 1, only when bwd RS-overlap is ON will this get set to correct segment
-        int num_segments = 1;
+        const int num_segments = 1;
+        const int kv_chunk_size = 8192;
     };
 
     // Device side kernel params
@@ -412,7 +413,8 @@ struct CollectiveMainloopBwdSm90 {
         int32_t * __restrict__ block_mask_ptr = nullptr;
         const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
         // the following is usually 1, only when bwd RS-overlap is ON will this get set to correct segment
-        int num_segments = 1;
+        const int num_segments = 1;
+        const int kv_chunk_size = 8192;
     };
 
     static Params
@@ -482,7 +484,8 @@ struct CollectiveMainloopBwdSm90 {
                 m_factor,n_factor,
                 args.block_mask_ptr,
                 args.write_ptr,
-                args.num_segments};
+                args.num_segments,
+                args.kv_chunk_size};
     }
 
      enum class FmBlockInfo {
@@ -700,16 +703,16 @@ struct CollectiveMainloopBwdSm90 {
             shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
 
             // Used in distributed overlap
-            if (params.write_ptr && bidh <= 1) {
-                // for example: 8K local, CP4, hd128 ---> 16K --> 128 blocks, Hopper has 132-144 SMs
-                // so by the time bidh increase from 1 to 2, 1-KV-head KV blocks are loaded
-                // so for bidh > 1, we don't need to wait for KV write ptr anymore
-                static constexpr int chunk_size = 8192;
+            if (params.write_ptr && bidh <= 3) {
+                // large heads does not need to wait for write_ptr, since we will be scheduling S, then H
+                // for example, if local seqlen is 8K, kBlockN = 128, we will have 64 blocks per head
+                // Hopper GPUs have 132-144 SMs, so 4heads * 64 = 256 > 144, already covers! Greater seqlen_k
+                // can even lower the bidh <= 3 constraint 
                 const int nblock_id = (n_block + 1) * kBlockN;      // right bound of this block
                 // different behavior: when num_segments > 1 (RS-overlap), the first chunk is not skipped
                 // we therefore need to enter wptr wait code unconditionally, and set 0 as target offset
-                if (nblock_id > chunk_size || params.num_segments > 1) {
-                    const int seqlen_k_offset = params.num_segments > 1 ? 0 : chunk_size;
+                if (nblock_id > params.kv_chunk_size || params.num_segments > 1) {
+                    const int seqlen_k_offset = params.num_segments > 1 ? 0 : params.kv_chunk_size;
                     const int target = bidb * (seqlen_info.seqlen_k - seqlen_k_offset) + nblock_id;
                     do {
                         int current_wptr = 0;

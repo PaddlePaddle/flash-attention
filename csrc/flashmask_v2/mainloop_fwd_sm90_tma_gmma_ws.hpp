@@ -453,6 +453,7 @@ struct CollectiveMainloopFwdSm90 {
         int32_t * __restrict__ block_mask_ptr = nullptr;
 
         const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
+        const int kv_chunk_size = 8192;                   // local KV chunk size for distributed overlap
     };
 
     // Device side kernel params
@@ -538,6 +539,7 @@ struct CollectiveMainloopFwdSm90 {
         // int m_factor = 0, n_factor = 0;
 
         const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
+        const int kv_chunk_size = 8192;                   // local KV chunk size for distributed overlap
     };
 
     static Params
@@ -665,7 +667,8 @@ struct CollectiveMainloopFwdSm90 {
                 // args.m_block_dim,args.n_block_dim,
                 // m_factor,n_factor,
                 args.block_mask_ptr,
-                args.write_ptr};
+                args.write_ptr,
+                args.kv_chunk_size};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1141,10 +1144,9 @@ struct CollectiveMainloopFwdSm90 {
         // the following function stalls to wait for write_ptr. Can use static dispatch to optimize
         auto wait_for_write_ptr = [&](int const n_block) {
             if (params.write_ptr == nullptr) return;
-            static constexpr int chunk_size = 8192;
-            const int reverse_blockN_id = seqlen_info.seqlen_k - n_block * kBlockN - chunk_size;
+            const int reverse_blockN_id = seqlen_info.seqlen_k - n_block * kBlockN - params.kv_chunk_size;
             if (reverse_blockN_id >= 0) {
-                const int target = bidb * (seqlen_info.seqlen_k - chunk_size) + reverse_blockN_id;
+                const int target = bidb * (seqlen_info.seqlen_k - params.kv_chunk_size) + reverse_blockN_id;
                 if (old_wptr_val >= target) return; // use the cached value to avoid frequent load from GMEM
                 // TODO(heqianyue): this should be made more generalized
                 // if num_head > 4: (bidb * num_head + bidh) / 2 * ..., divide by 2: overlap_comm copy 2 heads at once 

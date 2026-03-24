@@ -90,6 +90,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
         flash::enable_sm80_to_sm89<flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
+    int const local_seqlen_k = params.seqlen_k;
     int overlap_sm_margin = 0;
 #ifdef NVSHMEM_DISTRIBUTED_OVERLAP
     bool need_overlap_comm = false;
@@ -222,7 +223,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.ut_end_nblockmax, params.ut_end_nblockmin,
         params.m_block_dim,params.n_block_dim,
         params.block_mask_ptr,
-        params.write_ptr
+        params.write_ptr,
+        local_seqlen_k
     };
 
     typename CollectiveEpilogue::Arguments epilogue_args {

@@ -335,8 +335,6 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     const int local_offset = fwd ? (_cp_chunk_size * (_cp_size - 1)) : 0;
     // for bwd RS-overlap splitted AG, the batch stride is num_chunks * S_local * S_stride
     int batch_stride = _cp_chunk_size * _cp_size;
-    // FIXME(heqianyue): Note that for RS-overlap, batch size > 1 is currently not correct!
-    // there is a mismatch between RS-overlap stride and SR buffer stride.
     if (fwd == false && dkv_buffer) {
         batch_stride = _cp_chunk_size * num_chunks;
         const size_t copy_bytes = B * _cp_chunk_size * sizeof(KVType);

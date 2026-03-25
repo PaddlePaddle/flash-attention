@@ -47,12 +47,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     bool const is_varlen_q = params.cu_seqlens_q;
     bool const is_varlen_k = params.cu_seqlens_k;
     int seqlen_q = !is_varlen_q ? params.seqlen_q : params.total_q;
-    int seqlen_k = !is_varlen_k ? params.seqlen_k : params.total_k;
     int seqlen_q_rounded = !is_varlen_q ? params.seqlen_q_rounded : total_q_padded_rounded;
     int seqlen_k_rounded = !is_varlen_k ? params.seqlen_k_rounded : total_k_padded_rounded;
     int batch_q = !is_varlen_q ? params.b : 1;
     int batch_k = !is_varlen_k ? params.b : 1;
-    int const local_seqlen_k = seqlen_k;
     // printf("params.dv_ptr:%p\n",params.dv_ptr);
     // printf("seqlen_q_rounded:%d\n",seqlen_q_rounded);
     // printf("d_rounded:%d\n",params.d_rounded);
@@ -124,6 +122,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 
     bool use_overlap = false, overlap_rs = false;
     int segment_idx = 0, segment_cnt = 1, overlap_sm_margin = 0;
+    int scaled_seqlen_k = params.seqlen_k;
 #ifdef NVSHMEM_DISTRIBUTED_OVERLAP
     use_overlap = params.nranks > 1 && (!flashmask::comm::is_singleton_null());
     std::unique_ptr<flash::flashmask::MaskPtrUpdater<kBlockN>> mask_ptr_updater = nullptr;
@@ -143,7 +142,6 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             params.d,
             params.rank,
             params.nranks,
-            params.nranks,
             params.unique_id_ptr,
             params.h_flashmask
         );
@@ -160,10 +158,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         comm_singleton.wait_sr_buffer_empty();
         comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr, false /*fwd*/);     // copy new KV data
 
-        // seqlen_scale: when use_rs is true, this is chunks_per_seg (4 if CP16), otherwise this is nranks
-        const int original_seqlen_k = params.seqlen_k;  // capture before scaling for MaskPtrUpdater
-        params.seqlen_k *= comm_singleton.seqlen_scale();
-        seqlen_k *= comm_singleton.seqlen_scale();
+        // seqlen_scale: when use_rs is true, this is chunks_per_seg, otherwise this is nranks
+        scaled_seqlen_k = params.seqlen_k * comm_singleton.seqlen_scale();
         params.k_batch_stride *= comm_singleton.seqlen_scale();
         params.v_batch_stride *= comm_singleton.seqlen_scale();
 
@@ -172,7 +168,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.v_ptr = comm_singleton.v_data();
         // prepare mask_ptr mask_ptr_updater and set params.num_segments to enable correct mask access in bwd kernel
         if (overlap_rs) {
-            mask_ptr_updater = std::make_unique<flash::flashmask::MaskPtrUpdater<kBlockN>>(params, original_seqlen_k, comm_singleton.chunk_per_seg());
+            mask_ptr_updater = std::make_unique<flash::flashmask::MaskPtrUpdater<kBlockN>>(params, params.seqlen_k, comm_singleton.chunk_per_seg());
         }
     } else if (params.nranks > 1) {
         throw std::runtime_error("Overlap singleton instance is null but we try using overlap mechanism. This should be buggy.");
@@ -190,10 +186,10 @@ SEGMENT_LOOP_START:
         // Note(heqianyue): for RS-overlap, before the last computation kernel, communication kernel won't start
         comm_singleton.wait_wptr_init();        // wait until wptr is initialized
         if (overlap_rs) {  // RS-overlap splits the AG and attn kernel
-            comm_singleton.run_overlap_splitted_ag_kernel(params.write_ptr, params.seqlen_k, segment_idx);
+            comm_singleton.run_overlap_splitted_ag_kernel(params.write_ptr, segment_idx);
             // make sure computation kernels are scheduled with SMs later than communication kernels
         } else {
-            comm_singleton.run_overlap_ag_kernel(params.write_ptr, params.seqlen_k, false /*fwd*/);
+            comm_singleton.run_overlap_ag_kernel(params.write_ptr, scaled_seqlen_k, false /*fwd*/);
         }
         comm_singleton.wait_reset_stream_coordinator(stream);
     }
@@ -204,14 +200,15 @@ SEGMENT_LOOP_START:
 #endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 
     if (segment_idx == 0) {
-        // scanMinMax is called only once
-        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream, false /* is_forward */, segment_cnt);
+        // scanMinMax is called only once, using full seqlen_k to calculate 
+        flash::flashmask::prepare_block_maxmin<kBlockN>(params, 
+            scaled_seqlen_k * segment_cnt, stream, false /* is_forward */);
     } else {
         // reset grad semaphores, otherwise the program will hang
         size_t total_q_bytes = (seqlen_q + kBlockM - 1) / kBlockM * params.b * params.h * sizeof(int);
         cudaMemsetAsync(params.dq_semaphore, 0, total_q_bytes, stream);
         if constexpr (Deterministic && GQA) {
-            size_t total_kv_bytes = (params.seqlen_k + kBlockN - 1) / kBlockN * params.b * params.h_k * sizeof(int);
+            size_t total_kv_bytes = (scaled_seqlen_k + kBlockN - 1) / kBlockN * params.b * params.h_k * sizeof(int);
             cudaMemsetAsync(params.dk_semaphore, 0, total_kv_bytes, stream);
             cudaMemsetAsync(params.dv_semaphore, 0, total_kv_bytes, stream);
         }
@@ -224,7 +221,7 @@ SEGMENT_LOOP_START:
                 {seqlen_q, params.d, params.h, batch_q},  // shape_Q
                 {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},  // stride_Q
                 static_cast<Element const*>(params.k_ptr),
-                {seqlen_k, params.d, params.h_k, batch_k},  // shape_K
+                {scaled_seqlen_k, params.d, params.h_k, batch_k},  // shape_K
                 {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},  // stride_K
                 static_cast<Element const*>(params.v_ptr),
                 {params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0},  // stride_V
@@ -257,7 +254,7 @@ SEGMENT_LOOP_START:
                 params.block_mask_ptr,
                 params.write_ptr,
                 segment_cnt,
-                local_seqlen_k
+                params.seqlen_k
             };
         else
             return typename CollectiveMainloop::Arguments {
@@ -265,7 +262,7 @@ SEGMENT_LOOP_START:
                 {seqlen_q, params.d, params.h, batch_q},  // shape_Q
                 {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},  // stride_Q
                 static_cast<Element const*>(params.k_ptr),
-                {seqlen_k, params.d, params.h_k, batch_k},  // shape_K
+                {scaled_seqlen_k, params.d, params.h_k, batch_k},  // shape_K
                 {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},  // stride_K
                 static_cast<Element const*>(params.v_ptr),
                 {params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0},  // stride_V
@@ -303,7 +300,7 @@ SEGMENT_LOOP_START:
             dk_epilogue_out = comm.dk_send(segment_idx);
             dv_epilogue_out = comm.dv_send(segment_idx);
             // send buffer batch stride: (B, S_scaled, H, D) contiguous
-            dk_epilogue_batch_stride = params.d * seqlen_k * params.h;
+            dk_epilogue_batch_stride = params.d * scaled_seqlen_k * params.h;
             dv_epilogue_batch_stride = dk_epilogue_batch_stride;
         }
     }
@@ -312,7 +309,7 @@ SEGMENT_LOOP_START:
         static_cast<typename CollectiveEpilogue::Element*>(!GQA ? dk_epilogue_out : params.dk_accum_ptr),
         [&] {
             if constexpr (!GQA) {
-                return typename CollectiveEpilogue::ShapedKV {seqlen_k, params.d, params.h, batch_k};  // shape_dK
+                return typename CollectiveEpilogue::ShapedKV {scaled_seqlen_k, params.d, params.h, batch_k};  // shape_dK
             } else {
                 return typename CollectiveEpilogue::ShapedKV {seqlen_k_rounded * params.d_rounded, params.h_k, batch_k};  // shape_dKaccum
             }
@@ -339,12 +336,12 @@ SEGMENT_LOOP_START:
         params.seqused_k,
     };
 
-    int num_blocks_n = cutlass::ceil_div(params.seqlen_k, get<1>(TileShape_MNK{}));
+    int num_blocks_n = cutlass::ceil_div(scaled_seqlen_k, get<1>(TileShape_MNK{}));
     num_blocks_n = cutlass::round_up(num_blocks_n, size<1>(ClusterShape{}));
     typename flash::TileSchedulerArguments scheduler_args {
         num_blocks_n, params.h, params.b, 1 /*num_splits*/,
         params.h / params.h_k,
-        params.seqlen_k,
+        scaled_seqlen_k,
         params.seqlen_q, params.d, params.dv, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_k, params.seqused_k
     };
@@ -463,7 +460,7 @@ SEGMENT_LOOP_START:
             {seqlen_k_rounded * params.d_rounded, params.h_k, batch_k},  // shape_dKaccum
             {_1{}, seqlen_k_rounded * params.d_rounded, !is_varlen_k ? batch_stride_dkv : 0},  // stride_dKaccum
             dk_buffer,
-            {seqlen_k, params.d, params.h_k, batch_k},  // shape_dK
+            {scaled_seqlen_k, params.d, params.h_k, batch_k},  // shape_dK
             {params.dk_row_stride, _1{}, params.dk_head_stride, overlap_rs ? batch_stride_dkv : params.dk_batch_stride},  // stride_dK
             1.f,
             params.cu_seqlens_k,
@@ -475,14 +472,14 @@ SEGMENT_LOOP_START:
             {seqlen_k_rounded * params.d_rounded, params.h_k, batch_k},  // shape_dVaccum
             {_1{}, seqlen_k_rounded * params.d_rounded, !is_varlen_k ? batch_stride_dkv : 0},  // stride_dVaccum
             dv_buffer,
-            {seqlen_k, params.d, params.h_k, batch_k},  // shape_dV
+            {scaled_seqlen_k, params.d, params.h_k, batch_k},  // shape_dV
             {params.dv_row_stride, _1{}, params.dv_head_stride, overlap_rs ? batch_stride_dkv : params.dv_batch_stride},  // stride_dV
             1.f,
             params.cu_seqlens_k,
             params.seqused_k
         };
         typename PostprocessKerneldKV::Params postprocess_dV_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dV_args);
-        int num_n_block_postprocess = cute::ceil_div(params.seqlen_k, get<0>(TileShape_NK{}));
+        int num_n_block_postprocess = cute::ceil_div(scaled_seqlen_k, get<0>(TileShape_NK{}));
         dim3 grid_n_postprocess(num_n_block_postprocess, params.h_k, params.b);
         int smem_size_postprocess = PostprocessKerneldKV::SharedStorageSize;
         if (smem_size_postprocess >= 48 * 1024) {
@@ -525,6 +522,7 @@ SEGMENT_LOOP_START:
             // non-GQA: store_zero in the epilogue properly zeros masked blocks,
             // so dk/dv_send will be fully written by the attention kernel — no manual zeroing needed.
             mask_ptr_updater->inplace_update();
+            // jump back to stage starting point if this is not the last stage
             goto SEGMENT_LOOP_START;
         }
         // consumer (dKdV reduce) stream will record event for compute stream to wait for

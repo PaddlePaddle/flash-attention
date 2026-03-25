@@ -25,10 +25,10 @@ __global__ void SetValueKernel(
 __global__ void ProducerNotifyFull(
     int64_t* const __restrict__ semaphores,
     int remote_consumer_start_rank,
-    int cp_size,
+    int nranks,
     int self_rank
 ) {
-    const int target_rank = (remote_consumer_start_rank + threadIdx.x) % cp_size;
+    const int target_rank = (remote_consumer_start_rank + threadIdx.x) % nranks;
     // quiet make sure the previous put/get on this stream is done, then we can clear bit
     if (self_rank == target_rank) return;
     semaphores[target_rank] = 0;        // clear the local status (set by the remote target)
@@ -43,22 +43,22 @@ __global__ void ProducerNotifyFull(
 __global__ void FusedConsumerNotifyEmpty(
     int64_t* const __restrict__ semaphores,
     int remote_producer_end_rank,
-    int cp_size,
+    int nranks,
     int value,
     int self_rank
 ) {
     // for example: rank 3 local consumer needs the data from [12, 15] (remote producer) for seg 1
-    // remote_producer_end_rank will be 15 (computed by mod_cp_size(3 - 4 * seg_idx) --> (-1 % 16) --> 15)
+    // remote_producer_end_rank will be 15 (computed by mod_nranks(3 - 4 * seg_idx) --> (-1 % 16) --> 15)
     if (threadIdx.x == 0) {
         semaphores[self_rank] = value;
         DEBUG_PRINT("Consumer %d fused, sets self empty value: %d, \
-            cp_size: %d, end_rank: %d\n", self_rank, value, cp_size, remote_producer_end_rank);
+            nranks: %d, end_rank: %d\n", self_rank, value, nranks, remote_producer_end_rank);
     }
     // the following fence makes sure semaphore setting is visible across all CP ranks 
     __threadfence();
     __syncwarp();
     int target_rank = remote_producer_end_rank - threadIdx.x;
-    target_rank = target_rank >= 0 ? target_rank : target_rank + cp_size;
+    target_rank = target_rank >= 0 ? target_rank : target_rank + nranks;
     if (target_rank == self_rank) return;
     nvshmem_int64_p(semaphores + self_rank, 1, target_rank);
     DEBUG_PRINT("Consumer %d notifies remote %d empty, end_rank: %d\n", self_rank, target_rank, remote_producer_end_rank);
@@ -86,14 +86,14 @@ void notify_consumer_empty(
     int64_t* const semaphores,
     int remote_producer_end_rank,
     int seg_size,
-    int cp_size,
+    int nranks,
     int self_rank,
     cudaStream_t comm_stream
 ) {
     int local_flag = 0;
     for (int i = 0; i < seg_size; i++) {
         int target_rank = remote_producer_end_rank - i;
-        target_rank = target_rank >= 0 ? target_rank : target_rank + cp_size;
+        target_rank = target_rank >= 0 ? target_rank : target_rank + nranks;
         local_flag |= target_rank == self_rank ? 0 : (1 << target_rank);
     }
     // Fused step 1 & 2 in one kernel. Should the following gets buggy, you can revert to 1540b3438fb8 for testing
@@ -103,7 +103,7 @@ void notify_consumer_empty(
     // set remote empty state can not start before we set the local state
     // otherwise there will be corrupted read-write
     FusedConsumerNotifyEmpty<<<1, seg_size, 0, comm_stream>>>(semaphores,
-                    remote_producer_end_rank, cp_size, local_flag, self_rank);
+                    remote_producer_end_rank, nranks, local_flag, self_rank);
 }
 
 // self rank notifies all remote consumers that needs dK, dV data 
@@ -112,13 +112,13 @@ void notify_consumer_empty(
 void producer_commit_all(
     int64_t* const semaphores,
     int remote_consumer_start_rank,
-    int cp_size,
+    int nranks,
     int self_rank,
     int chunks_per_seg,
     cudaStream_t comm_stream
 ) {
     ProducerNotifyFull<<<1, chunks_per_seg, 0, comm_stream>>>(
-        semaphores, remote_consumer_start_rank, cp_size, self_rank);
+        semaphores, remote_consumer_start_rank, nranks, self_rank);
 }
 
 /**

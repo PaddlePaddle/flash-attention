@@ -27,7 +27,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int* const __restrict__ copy_chunk_mask,
     const int my_pe,
     const int start_rank,               // start rank is chunk 0
-    const int cp_size,
+    const int nranks,
     const int segment_idx,
     const int num_batch,                // B
     const int S_stride,                 // H * D
@@ -79,7 +79,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             next_work_id = _work_id;
             // chunk ID changes first: chunk [0, 1, 2, 3, 0, 1, 2, 3, ...]
             int chunk_id = (_work_id % remote_chunks) + chunk_offset;
-            int target_pe = (start_rank + chunk_id) % cp_size;
+            int target_pe = (start_rank + chunk_id) % nranks;
             // the current CTA might be scheduled to send things to different ranks
             // so each CTA should keep track of whether the target rank is empty
             if (cached_empty[chunk_id] == 0) {
@@ -95,7 +95,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         const int chunk_work_id = work_id / remote_chunks;         // the work_id within the chunk
         // seg_chunk_id is also the offset to the start_rank
         const int seg_chunk_id = (work_id % remote_chunks) + chunk_offset;         // which chunk the work_id falls into
-        const int target_rank = (seg_chunk_id + start_rank) % cp_size;
+        const int target_rank = (seg_chunk_id + start_rank) % nranks;
 
         // within segment seqlen work_id
         const int batch_id = chunk_work_id / work_per_chunk;

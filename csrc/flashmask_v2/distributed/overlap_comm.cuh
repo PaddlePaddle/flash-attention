@@ -15,19 +15,19 @@ struct OverlapConfig {
     int H = 0;
     int H_mask = 0;
     int D = 0;
-    int cp_size = 0;        // NVSHMEM-unsafe to change; kept for validation
+    int nranks = 0;        // NVSHMEM-unsafe to change; kept for validation
     bool overlap_rs = false;
 
     bool operator==(const OverlapConfig& other) const {
         return B == other.B && S_local == other.S_local && H == other.H
-            && H_mask == other.H_mask && D == other.D && cp_size == other.cp_size
+            && H_mask == other.H_mask && D == other.D && nranks == other.nranks
             && overlap_rs == other.overlap_rs;
     }
     bool operator!=(const OverlapConfig& other) const { return !(*this == other); }
 
-    // Compute the SRBuffer numel for one of K or V (= B * S_local * H * D * cp_size)
+    // Compute the SRBuffer numel for one of K or V (= B * S_local * H * D * nranks)
     size_t sr_buffer_numel() const {
-        return static_cast<size_t>(S_local) * H * D * B * cp_size;
+        return static_cast<size_t>(S_local) * H * D * B * nranks;
     }
 
     // Compute the per-chunk size (= S_local * H * D)
@@ -38,7 +38,7 @@ struct OverlapConfig {
     std::string to_string() const {
         return "B=" + std::to_string(B) + ", S_local=" + std::to_string(S_local)
             + ", H=" + std::to_string(H) + ", H_mask=" + std::to_string(H_mask)
-            + ", D=" + std::to_string(D) + ", cp_size=" + std::to_string(cp_size)
+            + ", D=" + std::to_string(D) + ", nranks=" + std::to_string(nranks)
             + ", overlap_rs=" + std::to_string(int(overlap_rs));
     }
 };
@@ -54,10 +54,8 @@ struct OverlapConfig {
  *
  * Dynamic reconfiguration: when B/H/D/mask_head/S_local change between calls,
  * `reconfigure_if_needed()` will detect the change and reallocate buffers as needed.
- * cp_size change is a fatal error (NVSHMEM bootstrap persists).
  * S_local is dispatched at compile time: supported values are {4096, 8192, 16384, 32768, 65536, 131072}.
  * RS-overlap is automatically enabled when H_k >= rs_overlap_min_h_k and nranks > 1.
- * num_chunks=1 (S_local >= 32768 or cp_size=2) is supported via early-return in splitted kernels.
 */
 template <typename KVType>
 class OverlapCommunicator {
@@ -71,7 +69,6 @@ public:
         int d_kv,
         int rank,
         int nranks,
-        int cp_size,
         const uint8_t* unique_id_ptr = nullptr,
         int mask_head = 0,
         bool overlap_rs = false
@@ -82,7 +79,6 @@ public:
     /**
      * Check if reconfiguration is needed given new params, and perform it if so.
      * Returns true if reconfiguration happened.
-     * Throws if cp_size changed (NVSHMEM-unsafe).
      * S_local must be one of {4096, 8192, 16384, 32768, 65536, 131072}.
     */
     bool reconfigure_if_needed(
@@ -96,7 +92,7 @@ public:
     /**
      * run the overlap kernel asynchronously
      * @param S the seqlen of local K (for example, 32K full length, CP=4, local S=8K)
-     *      After the execution of this function, S will be set to `S * cp_size`
+     *      After the execution of this function, S will be set to `S * nranks`
      * TODO(heqianyue): extend to more mask types!
     */
     void run_overlap_ag_kernel(
@@ -108,7 +104,6 @@ public:
     // only used when use_rs_overlap and in the bwd
     void run_overlap_splitted_ag_kernel(
         int* const write_ptr,
-        int& S,
         int segment_idx
     );
 
@@ -168,8 +163,8 @@ public:
         return block_cnt_semaphore;
     }
 
-    int cp_size() const {
-        return _cp_size;
+    int nranks() const {
+        return _total_n_pes;
     }
 
     int s_local() const {
@@ -212,10 +207,10 @@ private:
      *
     */
     inline KVType* local_k_data() const {
-        return kv_buffer->k_data() + _total_numel - B * _cp_chunk_size;
+        return kv_buffer->k_data() + _total_numel - B * _local_batch_stride;
     }
     inline KVType* local_v_data() const {
-        return kv_buffer->v_data() + _total_numel - B * _cp_chunk_size;
+        return kv_buffer->v_data() + _total_numel - B * _local_batch_stride;
     }
 
     // Helper to (re)allocate block_work_ids and derived pointers
@@ -235,13 +230,11 @@ private:
     int H;
     int H_mask;             // mask head
     int D;
-    const int _cp_size;     // CONST: cp_size cannot change after NVSHMEM init
     int num_chunks;
 
     int _my_pe;
     int _total_n_pes;
-    int _cp_stride;
-    size_t _cp_chunk_size;
+    size_t _local_batch_stride;
     size_t _total_numel;
 
     // Configuration tracking for dynamic reconfiguration
@@ -274,7 +267,6 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     int d_kv,
     int rank,
     int nranks,
-    int cp_size,
     const uint8_t* unique_id_ptr,
     int mask_head = 1
 );
@@ -288,7 +280,7 @@ bool is_singleton_null();
 // Destroy the singleton for topology refresh.
 // After calling this, the next init_singleton_instance() will re-create from scratch.
 // IMPORTANT: per NVSHMEM bootstrap persistence, finalize + re-init is only safe when
-// rank/nranks (cp_size) remain the same. This function is intended for refreshing
+// rank/nranks remain the same. This function is intended for refreshing
 // transport-level resources (e.g., after node migration), not for changing topology.
 void destroy_singleton();
 

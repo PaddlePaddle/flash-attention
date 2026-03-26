@@ -1123,8 +1123,6 @@ struct CollectiveMainloopBwdSm90 {
         );
         // int32_t flashmask_mem_[8]s;
         // load_n_block_info(n_block, flashmask_mem_, params);
-
-        int m_block = m_block_min;
         // if(thread_idx == 0) printf("m_block:%d",m_block);
         // get_next_m_block(n_block,m_block,partially_masked,m_block_max - 1,params);
 
@@ -1330,76 +1328,111 @@ struct CollectiveMainloopBwdSm90 {
         // this helps quite a bit to not have to do causal masking for most of the iterations.
 
         auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-        int loop_end = m_block_max;
-        if constexpr(!Is_causal){
-            if constexpr (Has_ut_start) {
-                loop_end = std::min(flashmask_mem_[5]/*ut_start_nblockmin*/, m_block_max);
-                CUTLASS_PRAGMA_NO_UNROLL
-                for (; m_block < loop_end; m_block++) {
-                    if constexpr (Is_blockmask){
-                        if(!blockmask_smem_[m_block / params.m_factor]) continue;
+
+        // State machine reduces bwd_step call sites from 7 to 1, lowering register pressure.
+        // Only beneficial when all 9 states are active (!Is_causal && Has_ut_start && Has_lt_end).
+        // Other cases use the original multi-for-loop (fewer call sites, compiler can optimize each loop).
+        if constexpr (!Is_causal && Has_ut_start && Has_lt_end) {
+            // State machine version: single bwd_step call site for all 9 states.
+            // state -----------------> 0 1 (2 3) 4 5 (6 7) 8
+            // is partially masked ---> F T ( T ) F T ( T ) F
+            // smem_pos = state ^ 5 --> 5 4 (7 6) 1 0 (3 2) N/A
+            // Combined states (2,3)/(6,7): smem_index = nblockmin, smem_index-1 = nblockmax.
+            // State 0/4: fm[x]-1 as loop_end for strict < semantics.
+            int loop_end = m_block_min - 1;
+            CUTLASS_PRAGMA_NO_UNROLL
+            for (int state = -1, m_block = m_block_min; ; m_block++) {
+                while (m_block > loop_end) {
+                    ++ state;
+                    if (state >= 9) break;
+                    const int smem_index = state ^ 0x5;
+                    if (state < 8) {
+                        if ((state & 0x03) == 0x02) {
+                            m_block = std::max(flashmask_mem_[smem_index], m_block);
+                            loop_end = std::min(flashmask_mem_[smem_index - 1], m_block_max - 1);
+                            ++ state;
+                        } else {
+                            loop_end = std::min(flashmask_mem_[smem_index] - !(state & 0x03), m_block_max - 1);
+                        }
+                    } else {
+                        loop_end = m_block_max - 1;
                     }
-                    // if(threadIdx.x == 128) printf("consumer0 m_block,n_block: %d, %d\n", m_block,n_block);
-                    bwd_step(m_block, mask_fn, false, flashmask_index_smem_);
                 }
-                loop_end = flashmask_mem_[4]/*ut_start_nblockmax*/;
+                if (state >= 9) break;
+                if constexpr (Is_blockmask) {
+                    if (blockmask_smem_[m_block / params.m_factor]) {
+                        bwd_step(m_block, mask_fn, (state & 0x3) > 0, flashmask_index_smem_);
+                    }
+                } else {
+                    bwd_step(m_block, mask_fn, (state & 0x3) > 0, flashmask_index_smem_);
+                }
+            }
+        } else {
+            // Original multi-for-loop version.
+            int m_block = m_block_min;
+            int loop_end = m_block_max;
+            if constexpr(!Is_causal){
+                if constexpr (Has_ut_start) {
+                    loop_end = std::min(flashmask_mem_[5]/*ut_start_nblockmin*/, m_block_max);
+                    CUTLASS_PRAGMA_NO_UNROLL
+                    for (; m_block < loop_end; m_block++) {
+                        if constexpr (Is_blockmask){
+                            if(!blockmask_smem_[m_block / params.m_factor]) continue;
+                        }
+                        bwd_step(m_block, mask_fn, false, flashmask_index_smem_);
+                    }
+                    loop_end = flashmask_mem_[4]/*ut_start_nblockmax*/;
+                    CUTLASS_PRAGMA_NO_UNROLL
+                    for (; m_block <= loop_end; ++m_block) {
+                        if constexpr (Is_blockmask){
+                            if(!blockmask_smem_[m_block / params.m_factor]) continue;
+                        }
+                        bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
+                    }
+                }
+                m_block = std::max(m_block, flashmask_mem_[7]/*ut_end_nblockmin*/);
+                loop_end = std::min(flashmask_mem_[6]/*ut_end_nblockmax*/, m_block_max - 1);
                 CUTLASS_PRAGMA_NO_UNROLL
-                for (; m_block <= loop_end; ++m_block) {
+                for (; m_block <= loop_end; m_block++) {
                     if constexpr (Is_blockmask){
                         if(!blockmask_smem_[m_block / params.m_factor]) continue;
                     }
-                    // if(threadIdx.x == 128) printf("consumer0 m_block,n_block: %d, %d\n", m_block,n_block);
                     bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
                 }
             }
-            m_block = std::max(m_block, flashmask_mem_[7]/*ut_end_nblockmin*/); 
-            loop_end = std::min(flashmask_mem_[6]/*ut_end_nblockmax*/, m_block_max - 1);
+            loop_end = std::min(flashmask_mem_[1]/*lt_start_nblockmin*/, m_block_max);
             CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block <= loop_end; m_block++) {
-                if constexpr (Is_blockmask){
-                    if(!blockmask_smem_[m_block / params.m_factor]) continue;
-                }
-                // if(threadIdx.x == 128) printf("consumer-u-2 m_block,n_block,m_block_max,flashmask_mem_[2]: %d, %d, %d,%d\n", m_block,n_block,m_block_max,flashmask_mem_[6]);
-                bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
-            }
-        } 
-       loop_end = std::min(flashmask_mem_[1]/*lt_start_nblockmin*/, m_block_max);
-        CUTLASS_PRAGMA_NO_UNROLL
-        for (; m_block < loop_end; m_block++) {
-            if constexpr (Is_blockmask){
-                if(!blockmask_smem_[m_block / params.m_factor]) continue;
-            }
-            // if(threadIdx.x == 128) printf("consumer-l-0 m_block,n_block: %d, %d\n", m_block,n_block);
-            bwd_step(m_block, mask_fn, false, flashmask_index_smem_);
-        }
-        //partial_maskloop_end
-        loop_end = std::min(m_block_max - 1, flashmask_mem_[0]/*lt_start_nblockmax*/);
-        CUTLASS_PRAGMA_NO_UNROLL
-        for (; m_block <= loop_end; m_block++) {
-            if constexpr (Is_blockmask){
-                if(!blockmask_smem_[m_block / params.m_factor]) continue;
-            }
-            // if(threadIdx.x == 128) printf("consumer-l-1 m_block,n_block, flashmask_mem_[0]: %d, %d, %d\n", m_block,n_block,flashmask_mem_[0]);
-            bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
-        }
-        if constexpr (Has_lt_end) {
-            m_block = std::max(m_block, flashmask_mem_[3]/*lt_end_nblockmin*/);  
-            //partial_maskloop_end
-            loop_end = std::min(flashmask_mem_[2]/*lt_end_nblockmax*/, m_block_max - 1);
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block <= loop_end; m_block++) {
-                if constexpr (Is_blockmask){
-                    if(!blockmask_smem_[m_block / params.m_factor]) continue;
-                }
-                // if(threadIdx.x == 128) printf("consumer2 m_block,n_block,m_block_max,flashmask_mem_[2]: %d, %d, %d,%d\n", m_block,n_block,m_block_max,flashmask_mem_[2]);
-                bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
-            }
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block < m_block_max; m_block++) {
+            for (; m_block < loop_end; m_block++) {
                 if constexpr (Is_blockmask){
                     if(!blockmask_smem_[m_block / params.m_factor]) continue;
                 }
                 bwd_step(m_block, mask_fn, false, flashmask_index_smem_);
+            }
+            loop_end = std::min(m_block_max - 1, flashmask_mem_[0]/*lt_start_nblockmax*/);
+            CUTLASS_PRAGMA_NO_UNROLL
+            for (; m_block <= loop_end; m_block++) {
+                if constexpr (Is_blockmask){
+                    if(!blockmask_smem_[m_block / params.m_factor]) continue;
+                }
+                bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
+            }
+            if constexpr (Has_lt_end) {
+                m_block = std::max(m_block, flashmask_mem_[3]/*lt_end_nblockmin*/);
+                loop_end = std::min(flashmask_mem_[2]/*lt_end_nblockmax*/, m_block_max - 1);
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (; m_block <= loop_end; m_block++) {
+                    if constexpr (Is_blockmask){
+                        if(!blockmask_smem_[m_block / params.m_factor]) continue;
+                    }
+                    bwd_step(m_block, mask_fn, true, flashmask_index_smem_);
+                }
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (; m_block < m_block_max; m_block++) {
+                    if constexpr (Is_blockmask){
+                        if(!blockmask_smem_[m_block / params.m_factor]) continue;
+                    }
+                    bwd_step(m_block, mask_fn, false, flashmask_index_smem_);
+                }
             }
         }
 

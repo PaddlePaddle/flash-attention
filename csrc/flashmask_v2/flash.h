@@ -183,8 +183,17 @@ struct Flash_fwd_params : public Qkv_params {
     int32_t * __restrict__ ut_end_nblockmax = nullptr;
     int32_t * __restrict__ ut_end_nblockmin = nullptr;
 
-    int m_block_dim,n_block_dim;
+    int m_block_dim, n_block_dim;
     int32_t * __restrict__ block_mask_ptr = nullptr;
+
+    // FlashMask Distributed Overlap
+    int rank = 0;
+    int nranks = 1;
+    int * __restrict__ write_ptr = nullptr;
+    // NVSHMEM should be initialized with unique ID, generated
+    // with PHI exported python API, broadcast in the CP group
+    // so that all ranks in the same group can use the ID from rank 0
+    uint8_t * __restrict__ unique_id_ptr = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -242,5 +251,6 @@ template <int Arch, typename T, int kHeadDim, bool Has_softcap, bool Is_causal, 
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
 template <typename T, typename Tpartial, int kBlockK>
 void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl);
-void prepare_preemptive_scheduler(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx = false);
-void prepare_preemptive_scheduler(Flash_bwd_params &params, cudaStream_t stream, int num_sm);
+void prepare_flashmask(Flash_fwd_params &params, cudaStream_t stream, int num_sm, bool is_dual_pptx = false, cudaEvent_t* const comm_event = nullptr, int* const block_cnt_semaphore = nullptr);
+void prepare_flashmask(Flash_bwd_params &params, cudaStream_t stream, int num_sm, cudaEvent_t* const comm_event = nullptr, int* const block_cnt_semaphore = nullptr);
+std::vector<uint8_t> get_nvshmem_unique_id();

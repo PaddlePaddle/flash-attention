@@ -355,7 +355,8 @@ class FlashAttentionBackwardSm100:
         else:
             self.sdKV_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
 
-        # TODO(GuoxiaWang): 2 means only support flashmask startend_row_indices.shape[-1] <= 2
+        # 2 columns: [LTS, LTE or UTE] loaded into smem.
+        # For num_vec==4, UTS and UTE are read directly from gmem (smem budget is full).
         self.sStartEndRowIndices_layout = cute.make_layout(
             shape=(self.tile_n, 2),
             stride=(1, self.tile_n),
@@ -402,6 +403,9 @@ class FlashAttentionBackwardSm100:
         self.ds_dtype = self.q_dtype
 
         self.enable_flashmask = cutlass.const_expr(flashmask_info is not None)
+        self.has_lte = const_expr(flashmask_info is not None and flashmask_info.LTE_nblock_max is not None)
+        self.has_uts = const_expr(flashmask_info is not None and flashmask_info.UTS_nblock_max is not None)
+        self.has_ute = const_expr(flashmask_info is not None and flashmask_info.UTE_nblock_max is not None)
 
         if const_expr(self.qhead_per_kvhead > 1):
             assert self.dk_dtype.width == 32, "Must accumulate dK in float precision for GQA"
@@ -714,9 +718,9 @@ class FlashAttentionBackwardSm100:
                 cute.struct.MemRange[self.startend_row_indices_dtype, cute.cosize(self.sStartEndRowIndices_layout)],
                 64,
             ]
-            # sStartEndRowIndices_layout (128,4):(1,128)
-            # 128 * 4 = 512 * 4 = 2048
-            # 234496
+            # sStartEndRowIndices_layout (128,2):(1,128)
+            # 128 * 2 = 256 * 4 = 1024
+            # 233472
 
         self.shared_storage = SharedStorage
         #print("self.shared_storage.size_in_bytes()", self.shared_storage.size_in_bytes())
@@ -1216,6 +1220,7 @@ class FlashAttentionBackwardSm100:
                 sStartEndRowIndices,
                 sFM_max_min,
                 flashmask_loaded_mbar_ptr,
+                mQ.shape[2],
             )
             cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
@@ -1461,7 +1466,8 @@ class FlashAttentionBackwardSm100:
                                 if tidx == 0 and self.debug_print:
                                     cute.printf('n_block: %d, after load_step 0 ~ UTS: %d', n_block, m_block)
                             # Subtract 1 beforehand to use loop_start + 1 uniformly in the for loop.
-                            loop_start = sFM_max_min[7] - 1
+                            # Use max to advance past UTS region, avoiding double-loading when UTE_min <= UTS_max
+                            loop_start = max(sFM_max_min[4], sFM_max_min[7] - 1)
                         else:
                             loop_start = sFM_max_min[7]
 
@@ -1667,22 +1673,38 @@ class FlashAttentionBackwardSm100:
                 sFM_max_min[6] = (UTE_nblock_max[n_block] - 1) // self.tile_m
                 sFM_max_min[7] = UTE_nblock_min[n_block] // self.tile_m
 
+        # sStartEndRowIndices layout is (tile_n, 2).
+        # For num_vec==4 (has_uts), UTS and UTE are read from gmem by the compute warp
+        # because smem budget is at the 228KB limit and cannot fit 4 columns.
+        #
+        # Possible masking conditions depending on num_vec:
+        #   num_vec==1, causal:     row >= LTS
+        #   num_vec==2, causal:     row >= LTS AND row < LTE
+        #   num_vec==2, non-causal: row >= LTS OR  row < UTE
+        #   num_vec==4:             (row >= LTS AND row < LTE) OR (row >= UTS AND row < UTE)
+        #
+        # smem column mapping:
+        #   [:, 0] = LTS (all cases)
+        #   [:, 1] = LTE (num_vec==2 causal or num_vec==4) or UTE (num_vec==2 non-causal)
+        #
+        # Default values ensure no masking when the bound is not supplied or column is OOB:
+        #   [:, 0] = Int32.max (LTS default): "row >= Int32.max" is always false.
+        #   [:, 1] = 0         (LTE/UTE default): "row < 0" is always false.
         for i in cutlass.range_constexpr(ntimes_copy):
             copy_offset = i * num_load_threads + tidx
-            sStartEndRowIndices[copy_offset, 0] = 2147483647
-            sStartEndRowIndices[copy_offset, 1] = 2147483647
+            sStartEndRowIndices[copy_offset, 0] = Int32.max  # LTS default
+            sStartEndRowIndices[copy_offset, 1] = 0          # LTE/UTE default
             if (copy_offset < self.tile_n and n_block * self.tile_n + copy_offset < seqlen_k):
                 LTS = flashmask_info.startend_row_indices[fm_batch_idx, fm_head_idx, None, 0]
                 sStartEndRowIndices[copy_offset, 0] = LTS[n_block * self.tile_n + copy_offset]
-                #assert const_expr(num_vec <= 2), "only support num_vec == 2 now"
                 if const_expr(flashmask_info.LTE_nblock_max is not None):
+                    # num_vec==2 causal or num_vec==4: LTE at source index 1
                     LTE = flashmask_info.startend_row_indices[fm_batch_idx, fm_head_idx, None, 1]
                     sStartEndRowIndices[copy_offset, 1] = LTE[n_block * self.tile_n + copy_offset]
-                if const_expr(flashmask_info.UTE_nblock_max is not None):
+                elif const_expr(flashmask_info.UTE_nblock_max is not None):
+                    # num_vec==2, non-causal: UTE at source index 1
                     UTE = flashmask_info.startend_row_indices[fm_batch_idx, fm_head_idx, None, 1]
                     sStartEndRowIndices[copy_offset, 1] = UTE[n_block * self.tile_n + copy_offset]
-                #cute.printf("%d, %d", copy_offset, sStartEndRowIndices[copy_offset, 0])
-                #cute.print_tensor(LTS)
         cute.arch.sync_warp()
 
     @cute.jit
@@ -1832,7 +1854,10 @@ class FlashAttentionBackwardSm100:
                         num_blocks = num_blocks + max(0, (loop_end - loop_start))
                         if tidx == 0 and self.debug_print:
                             cute.printf('after uts mma: n_block: %d, %d', n_block, num_blocks)
-                    loop_start = sFM_max_min[7]
+                        # Advance past UTS region to avoid double-counting when UTE_min <= UTS_max
+                        loop_start = max(sFM_max_min[4] + 1, sFM_max_min[7])
+                    else:
+                        loop_start = sFM_max_min[7]
 
                 # UTE ~ LTS
                 #loop_end = m_block_max if m_block_max < sFM_max_min[0] + 1 else sFM_max_min[0] + 1
@@ -2089,6 +2114,7 @@ class FlashAttentionBackwardSm100:
         sStartEndRowIndices: cute.Tensor,
         sFM_max_min: cute.Tensor,
         flashmask_loaded_mbar_ptr: cute.Pointer,
+        num_heads: Int32,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -2204,6 +2230,14 @@ class FlashAttentionBackwardSm100:
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
+            # For num_vec==4, compute fm_batch_idx/fm_head_idx for direct gmem access
+            # to UTS/UTE (not loaded into smem because 228KB smem budget is full).
+            fm_batch_idx_compute = Int32(0)
+            fm_head_idx_compute = Int32(0)
+            if const_expr(self.has_uts):
+                bsz, fm_heads, seqlen_k_fm, num_vec = flashmask_info.startend_row_indices.shape
+                fm_batch_idx_compute = batch_idx if bsz > 1 else 0
+                fm_head_idx_compute = head_idx // (num_heads // fm_heads)
             # TODO: condition mask_seqlen
             mask_fn = partial(
                 mask.apply_mask_sm100_transposed,
@@ -2214,6 +2248,12 @@ class FlashAttentionBackwardSm100:
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
                 sStartEndRowIndices=sStartEndRowIndices,
+                startend_row_indices=flashmask_info.startend_row_indices if const_expr(self.has_uts) else None,
+                fm_batch_idx=fm_batch_idx_compute,
+                fm_head_idx=fm_head_idx_compute,
+                has_lte=self.has_lte,
+                has_uts=self.has_uts,
+                has_ute=self.has_ute,
             )
 
             # prefetch_LSE = not self.is_causal
@@ -2291,6 +2331,9 @@ class FlashAttentionBackwardSm100:
                             )
                             if tidx == 0 and self.debug_print:
                                 cute.printf('n_block: %d, after compute_step UTS_min ~ UTS_max: %d', n_block, m_block)
+
+                        # Advance past UTS region to avoid double-processing when UTE_min <= UTS_max
+                        loop_start = sFM_max_min[4] + 1  # UTS_max + 1
 
                     loop_start = max(loop_start, sFM_max_min[7]) # UTE_min
                     loop_end = min(sFM_max_min[6] + 1, m_block_max) # UTE_max

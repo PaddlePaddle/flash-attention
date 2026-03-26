@@ -942,22 +942,26 @@ struct CollectiveMainloopFwdSm90 {
         }
 
         cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
-        
-        // Currently, we use only 3 warps, so (warp_id_ <= 2) is always true, we can remove it from the predicate 
-        if(warp_id_ >= 1) {
-            prefix_sum += s_prefix_sum[0];
-            if (warp_id_ == 2) {
-                prefix_sum += s_prefix_sum[1];
-                if (lane_id_ == 31) s_prefix_sum[2] = prefix_sum;
-            }
-        }
 
-        // if not fully masked or not partially masked: unmasked, useless (no need to compute)
-        if(!fully_masked)
-          mask_encode_n_block_smem_[valid_n_block_num + prefix_sum - 1] = partially_masked ? n_block : (-n_block - 1);
-        cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
-        valid_n_block_num += s_prefix_sum[2];
-        cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
+        // Optimization: skip inter-warp prefix-sum, smem write, and 2 syncs when all blocks are fully masked.
+        // s_prefix_sum[warp_id_] at lane 31 is the total valid count for that warp; if all are 0, nothing to do.
+        if (s_prefix_sum[0] | s_prefix_sum[1] | s_prefix_sum[2]) {
+            // Currently, we use only 3 warps, so (warp_id_ <= 2) is always true, we can remove it from the predicate
+            if(warp_id_ >= 1) {
+                prefix_sum += s_prefix_sum[0];
+                if (warp_id_ == 2) {
+                    prefix_sum += s_prefix_sum[1];
+                    if (lane_id_ == 31) s_prefix_sum[2] = prefix_sum;
+                }
+            }
+
+            // if not fully masked or not partially masked: unmasked, useless (no need to compute)
+            if(!fully_masked)
+              mask_encode_n_block_smem_[valid_n_block_num + prefix_sum - 1] = partially_masked ? n_block : (-n_block - 1);
+            cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
+            valid_n_block_num += s_prefix_sum[2];
+            cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
+        }
       }
       // Do not allocate buffer length that is not the multiple of 32 (otherwise there will be global excessive sectors)
       if (valid_n_block_num < Flashmask_n_block_buffer_valid_length)

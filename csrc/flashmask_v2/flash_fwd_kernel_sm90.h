@@ -308,6 +308,18 @@ public:
               // for padding 32 and padding 4: the num_chunk (pad_32) >= num_chunk (pad_4) is always true
               const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc; // umiswing: padding for int4 load
               const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_valid_length - 1) / CollectiveMainloop::Flashmask_n_block_buffer_valid_length;
+              // Optimization: skip chunks entirely beyond the causal diagonal.
+              // reverse_chunk_idx=0 covers the rightmost (highest-indexed) n_blocks.
+              // For causal/local attention, chunks where all n_blocks >= n_block_max are fully masked.
+              int reverse_chunk_start = 0;
+              if constexpr (Is_causal || Is_local) {
+                  if (n_block_max > 0) {
+                      const int chunk_containing_max = (n_block_max - 1) / CollectiveMainloop::Flashmask_n_block_buffer_valid_length;
+                      reverse_chunk_start = num_chunk - 1 - chunk_containing_max;
+                  } else {
+                      reverse_chunk_start = num_chunk; // skip all chunks
+                  }
+              }
               // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
               bool valid_chunk = true;
               const int cppl_stage = scheduler.template stage<true>();      // coarse pipeline stage (offset, 0 or 2)
@@ -325,7 +337,7 @@ public:
                             blockmask_smem_ + CollectiveMainloop::Blockmask_n_block_buffer_valid_length * (n_block_pipe_write.index() + cppl_stage))              
                             
 
-              for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
+              for(int reverse_chunk_idx = reverse_chunk_start; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
                 if (valid_chunk)
                     pipeline_n_block.producer_acquire(n_block_pipe_write);
                 if (Is_blockmask) {

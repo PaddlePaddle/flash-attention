@@ -15,6 +15,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
+from functools import partial
 
 # cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default
 fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)

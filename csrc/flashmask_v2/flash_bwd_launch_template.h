@@ -155,7 +155,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         // chunk_mask and update_kv_buffer can actually be called only once. AG and RS overlap are called 4 (num_segs) times.
         comm_singleton.prepare_dkv_buffer(stream);        // RS-overlap: reset dK, dV semaphores to all 0
         comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr, stream, false /* fwd */);
-        comm_singleton.wait_sr_buffer_empty();
+        comm_singleton.wait_sr_buffer_empty(stream);
         comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr, false /*fwd*/);     // copy new KV data
 
         // seqlen_scale: when use_rs is true, this is chunks_per_seg, otherwise this is nranks
@@ -394,13 +394,6 @@ SEGMENT_LOOP_START:
         flash::flashmask_kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/);
     }
     CHECK_CUDA_KERNEL_LAUNCH();
-#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
-    // only seg 0: local chunk is computed in segment 0, 
-    // so once seg 0 is done using, we can reuse SR buffer. 
-    if (use_overlap && segment_idx == 0) {
-        flashmask::comm::singleton().set_sr_usable(stream);
-    }
-#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 
     using PostprocessKernel = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_MK, Element, ElementAccum, ArchTag,
         AttnKernel::CollectiveMainloop::NumMmaThreads,

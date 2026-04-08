@@ -120,10 +120,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             params.h_flashmask
         );
 
-        if (!is_first_init) {
-            // Non-first call: wait for SR buffer to be released by previous computation
-            comm_singleton.wait_sr_buffer_empty();
-        }
+        comm_singleton.wait_sr_buffer_empty(stream);
         comm_singleton.compute_chunk_mask(params.lt_start_ptr, params.lt_end_ptr, params.ut_start_ptr, params.ut_end_ptr, stream, true /* fwd */);
         comm_singleton.update_kv_buffer((const Element*) params.k_ptr, (const Element*) params.v_ptr);     // copy new KV data
         need_overlap_comm = true;
@@ -287,9 +284,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                            Arch >= 90 && Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);
     }
     CHECK_CUDA_KERNEL_LAUNCH();
-#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
-    if (need_overlap_comm) flashmask::comm::singleton().set_sr_usable(stream);
-#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
 }
 
 template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>

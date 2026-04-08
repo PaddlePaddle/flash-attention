@@ -128,10 +128,6 @@ public:
     // computation stream wait the comm_stream kernel to be scheduled with SMs
     void wait_reset_stream_coordinator(cudaStream_t stream);
 
-    void set_sr_usable(cudaStream_t stream) {
-        cudaEventRecord(sr_usable, stream);
-    }
-
     void update_kv_buffer(
         const KVType* const new_k_data,
         const KVType* const new_v_data,
@@ -157,7 +153,7 @@ public:
     // in `USE_SEMAPHORES` mode, call this function before calling `updayte_kv_buffer`
     // to make sure other PEs have finished reading the local KV data in our SR buffer
     // also, barriers the remote_get `comm_kernel`
-    void wait_sr_buffer_empty();
+    void wait_sr_buffer_empty(cudaStream_t stream);
 
     int* get_block_cnt_semaphore() const {
         return block_cnt_semaphore;

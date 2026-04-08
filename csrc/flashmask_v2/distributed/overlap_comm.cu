@@ -298,12 +298,13 @@ void OverlapCommunicator<KVType>::wait_reset_stream_coordinator(cudaStream_t str
 }
 
 template <typename KVType>
-void OverlapCommunicator<KVType>::wait_sr_buffer_empty() {
+void OverlapCommunicator<KVType>::wait_sr_buffer_empty(cudaStream_t stream) {
     // TBH, since there is enough time between two attention call,
     // for an unsafe impl, we actually don't need to wait.
     // This would save some time, but not entirely safe if
     // the attention's workload is too too small. Yet currently
     // we haven't trigger unsafe problems even once
+    cudaEventRecord(sr_usable, stream);             // in-case there is previously unfinished comp stream ops
     cudaStreamWaitEvent(comm_stream, sr_usable);
     if constexpr (USE_SEMAPHORES) {
         WARN_PRINT("Before wait_self_empty\n");

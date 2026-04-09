@@ -76,7 +76,8 @@ VERSION = _get_version()
 # ============================================================
 # Packages: exclude modules not being built
 # ============================================================
-exclude_packages = ['build', 'build.*', 'tests', 'tests.*']
+exclude_packages = ['build', 'build.*', 'tests', 'tests.*',
+                     'flash_mask.cp_balance.csrc', 'flash_mask.cp_balance.csrc.*']
 if not BUILD_FA3:
     exclude_packages += [
         'flash_mask.flashmask_attention_v3',
@@ -393,3 +394,25 @@ if BUILD_FA3:
     paddle_setup(**setup_kwargs, ext_modules=ext_modules)
 else:
     setuptools_setup(**setup_kwargs)
+
+# ============================================================
+# CP Balance: CUDA extension (built via its own setup.py after main setup)
+# Paddle's cpp_extension.setup only supports 1 Extension per call,
+# so we invoke cp_balance's setup.py as a subprocess.
+# ============================================================
+if BUILD_FA3:
+    cp_balance_csrc_dir = os.path.join(FLASH_MASK_DIR, 'cp_balance', 'csrc')
+    print("[flashmask] Building CP Balance CUDA extension...")
+    result = subprocess.run(
+        [sys.executable, 'setup.py', 'install'],
+        cwd=cp_balance_csrc_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"[flashmask] CP Balance build STDERR:\n{result.stderr}")
+        raise RuntimeError(
+            f"Failed to build CP Balance CUDA extension.\n"
+            f"You can build it manually: cd {cp_balance_csrc_dir} && python setup.py install"
+        )
+    print("[flashmask] CP Balance CUDA extension built successfully.")

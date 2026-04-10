@@ -663,7 +663,7 @@ def _flash_attn_bwd(
         dKV_swapAB = False
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
-        cluster_size = 2 if head_dim == 192 else 1
+        cluster_size = 2 if head_dim >= 128 else 1
         use_2cta_instrs = cluster_size == 2
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
         maybe_contiguous(t)

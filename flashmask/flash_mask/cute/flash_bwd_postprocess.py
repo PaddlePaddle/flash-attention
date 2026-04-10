@@ -54,13 +54,13 @@ class FlashAttentionBackwardPostprocess:
         )
         self.arch = arch
         # padding head_dim to a multiple of 64 for SM100 (32 for others) to match head_dim_rounded
-        hdim_multiple_of = 64 if arch == 100 else 32
+        hdim_multiple_of = 64 if arch // 10 == 10 else 32
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.num_threads = num_threads
         self.AtomLayoutMdQ = AtomLayoutMdQ
         self.dQ_swapAB = dQ_swapAB
-        self.use_2cta_instrs = use_2cta_instrs and arch == 100 and head_dim != 64
+        self.use_2cta_instrs = use_2cta_instrs and arch // 10 == 10 and head_dim != 64
         self.cluster_size = cluster_size
 
     @staticmethod
@@ -368,7 +368,7 @@ class FlashAttentionBackwardPostprocess:
             seqlen_q = seqlen.seqlen_q
             seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
 
-            if const_expr(self.arch == 100 and self.use_2cta_instrs):
+            if const_expr(self.arch // 10 == 10 and self.use_2cta_instrs):
                 # 2-CTA: remap dQaccum layout into TMEM view before writing sdQ
                 num_reduce_threads = self.num_threads
                 thr_mma_dsk = tiled_mma.get_slice(tidx)

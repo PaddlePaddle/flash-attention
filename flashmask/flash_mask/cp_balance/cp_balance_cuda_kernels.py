@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import flashmask_cpbalance_cudaops as cp_balance_ops
-    
+from . import flashmask_cpbalance_cudaops as cp_balance_ops
+
 def scanMaxMinChunkedKernel(input_tensor, Bc, B, H, S):
     maxo,mino = cp_balance_ops.scan_max_min(
         input_tensor,
@@ -41,12 +41,12 @@ def reduce_workload(start_row_maxmin_indice_list, B, H, Tr, Tc, Br, S):
         UTEndMax,
         UTEndMin,
     ) = start_row_maxmin_indice_list
-    
+
     workload = cp_balance_ops.reduce_workload(
         LTStartMax, LTStartMin, LTEndMax, LTEndMin, UTStartMax, UTStartMin, UTEndMax, UTEndMin,
         B, H, Tr, Tc, S, Br, False, 128
     )
-    
+
     return workload
 
 def indices_to_chunks_cuda(startend_row_indices, bucket_idx, chunksize=2048):

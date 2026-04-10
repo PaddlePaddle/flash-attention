@@ -17,24 +17,7 @@ import paddle
 import numpy as np
 from .cp_balance_cuda_kernels import scanMaxMinChunkedKernel, reduce_workload, indices_to_chunks_cuda, indices_rerank_cuda
 import paddle.distributed as dist
-import hashlib
 from typing import List, Tuple, Dict, Optional
-
-# --- 调试辅助函数 ---
-
-def save_tensor(x: paddle.Tensor, name: str):
-    """将 Paddle Tensor 保存为 txt 文件，用于调试。"""
-    x_np = x.numpy()
-    np.savetxt(f'{name}.txt', x_np.reshape(-1, x_np.shape[-1]), fmt='%d')
-
-def tensor_md5(tensor: paddle.Tensor) -> str:
-    """计算 Paddle Tensor 的 MD5 哈希值，用于验证数据一致性。"""
-    x_bytes = tensor.numpy().tobytes()
-    md5_hash = hashlib.md5(x_bytes).hexdigest()
-    print(f"Tensor MD5: {md5_hash}")
-    return md5_hash
-
-# --- 核心工作负载计算与分配 ---
 
 def get_q_workload(
     start_row_indices: paddle.Tensor,

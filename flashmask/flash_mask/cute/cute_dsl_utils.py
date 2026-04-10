@@ -122,3 +122,21 @@ def cute_compile_patched(*args, **kwargs):
             sass = extract(cubin_path, None)
             pathlib.Path(cubin_path).with_suffix(".annotated.sass").write_text(sass)
     return output
+
+
+def assume_strides_aligned(t):
+    """Assume all strides except the last are divisible by 128 bits.
+
+    Python int strides (e.g., stride=0 from GQA expand) are kept as-is
+    since they're static and don't need alignment assumptions.
+    """
+    divby = 128 // t.element_type.width
+    strides = tuple(s if isinstance(s, int) else cute.assume(s, divby=divby) for s in t.stride[:-1])
+    return (*strides, t.stride[-1])
+
+
+def assume_tensor_aligned(t):
+    """Rebuild a tensor with 128-bit aligned stride assumptions. Passes through None."""
+    if t is None:
+        return None
+    return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t)))

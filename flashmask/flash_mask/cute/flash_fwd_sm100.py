@@ -233,7 +233,13 @@ class FlashAttentionForwardSm100:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
 
-        self.kv_stage = 4 if self.q_dtype.width == 8 else 3
+        if self.head_dim_padded == 192 and self.head_dim_v_padded == 128:
+            self.kv_stage = 2
+        elif self.q_dtype.width == 8 or self.q_stage == 1:
+            self.kv_stage = 4
+        else:
+            self.kv_stage = 3
+
         self.acc_stage = 1
         self.epi_stage = 2
         self.generate_block_stage = 2

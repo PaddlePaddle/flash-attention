@@ -15,7 +15,7 @@
 import heapq
 import paddle
 import numpy as np
-from .cp_balance_cuda_kernels import scanMaxMinChunkedKernel, reduce_workload, indices_to_chunks_cuda, indices_rerank_cuda
+from .cp_balance_cuda_kernels import scanMaxMinChunkedKernel, reduce_workload, indices_to_chunks_cuda, indices_rerank_cuda, cp_balance_ipo_solve
 import paddle.distributed as dist
 from typing import List, Tuple, Dict, Optional
 
@@ -184,6 +184,56 @@ def assign_tasks_heap(
     return buckets, bucket_weights, cuts
 
 
+def assign_tasks_ipo(
+    tasks: np.ndarray,
+    num_buckets: int
+) -> Tuple[List[List[Tuple[int, int]]], List[int], int]:
+    """
+    使用 IPO (Iterative Pairwise/Triple Optimal) 最优求解器分配任务。
+    接口与 assign_tasks_heap 完全一致。
+
+    当 N > 512 或 N % num_buckets != 0 时自动 fallback 到 assign_tasks_heap。
+
+    Args:
+        tasks (np.ndarray): 形状为 (N, 2) 的任务数组，每行是 [weight, index]。
+        num_buckets (int): 桶的数量。
+
+    Returns:
+        与 assign_tasks_heap 相同的三元组 (buckets, bucket_weights, cuts)。
+    """
+    n = len(tasks)
+    if n == 0 or n > 512 or n % num_buckets != 0:
+        return assign_tasks_heap(tasks, num_buckets)
+
+    K = n // num_buckets
+    weights = np.array([t[0] for t in tasks], dtype=np.int32)
+
+    # 调用 C++ IPO solver
+    # assign_matrix: (num_buckets, K)，每个元素是 item index (0..N-1)
+    assign_matrix, _ = cp_balance_ipo_solve(weights, num_buckets)
+
+    buckets = []
+    bucket_weights = []
+    for j in range(num_buckets):
+        bucket = []
+        bw = 0
+        for t in range(K):
+            idx = int(assign_matrix[j, t])
+            w = int(tasks[idx][0])
+            chunk_idx = int(tasks[idx][1])
+            bucket.append((w, chunk_idx))
+            bw += w
+        bucket.sort(key=lambda x: x[1])
+        buckets.append(bucket)
+        bucket_weights.append(bw)
+
+    # 统计切分次数
+    all_idx = sorted([idx for b in buckets for _, idx in b])
+    cuts = sum(1 for i in range(1, len(all_idx)) if all_idx[i] != all_idx[i - 1] + 1)
+
+    return buckets, bucket_weights, cuts
+
+
 # --- 数据通信与重排辅助函数 ---
 
 def get_send_dict(buckets: List[List[Tuple[int, int]]], cp_size: int, rank: int) -> Dict[int, List[int]]:
@@ -317,7 +367,8 @@ def balance_flashmask_input(
     cp_rank: int,
     balance_chunk_size: int = 2048,
     q_block_size: int = 128,
-    k_block_size: int = 128
+    k_block_size: int = 128,
+    use_ipo: bool = False
 ) -> Tuple[paddle.Tensor, List[List[Tuple[int, int]]]]:
     """
     FlashMask 输入数据的负载均衡主流程。
@@ -330,6 +381,8 @@ def balance_flashmask_input(
         balance_chunk_size (int): 用于负载均衡分析和数据移动的块大小。
         q_block_size (int): FlashAttention kernel 的 query 块大小。
         k_block_size (int): FlashAttention kernel 的 key 块大小。
+        use_ipo (bool): 是否使用 IPO 最优求解器替代 LPT 贪心。
+                        N > 512 或 N % cp_size != 0 时自动 fallback 到 LPT。
 
     Returns:
         Tuple:
@@ -343,11 +396,14 @@ def balance_flashmask_input(
     workload = get_q_workload(startend_row_indices, balance_chunk_size, q_block_size, k_block_size)
     paddle.base.core.nvprof_nvtx_pop()
 
-    # 步骤 2: 使用堆贪心算法在 CPU 上进行任务分配
-    paddle.base.core.nvprof_nvtx_push("assign_tasks_heap")
-    # 将 workload tensor 转换成 numpy 数组以用于 heapq
+    # 步骤 2: 任务分配（IPO 最优求解 或 LPT 贪心）
+    paddle.base.core.nvprof_nvtx_push("assign_tasks")
+    # 将 workload tensor 转换成 numpy 数组
     tasks_np = workload.reshape([-1, 2]).cpu().numpy()
-    buckets, _, _ = assign_tasks_heap(tasks_np, cp_size)
+    if use_ipo:
+        buckets, _, _ = assign_tasks_ipo(tasks_np, cp_size)
+    else:
+        buckets, _, _ = assign_tasks_heap(tasks_np, cp_size)
     paddle.base.core.nvprof_nvtx_pop()
 
     # 步骤 5: 根据全局分配方案 `buckets`，对原始索引张量进行重排 (Gather)

@@ -103,9 +103,10 @@ def setup_ops_extension():
 
     ext_module = CUDAExtension(
         sources=[
-            # cpp files
             # cuda files
             "./cp_balance_utils.cu",
+            # cpp files (compiled by host compiler, not nvcc)
+            "./cp_balance_ipo_op.cpp",
         ],
         include_dirs=[
             os.path.join(os.getcwd(), "./"),

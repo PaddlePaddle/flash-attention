@@ -16,16 +16,16 @@
 #include "cp_balance_fast.hpp"
 
 std::vector<paddle::Tensor> CpBalanceIpoKernel(
-    const paddle::Tensor& weights, int64_t M) {
+    const paddle::Tensor& weights, int M) {
     int N = static_cast<int>(weights.shape()[0]);
-    int K = N / static_cast<int>(M);
+    int K = N / M;
 
     auto assign_out = paddle::empty(
         {static_cast<int64_t>(M), static_cast<int64_t>(K)},
         paddle::DataType::INT32, paddle::CPUPlace());
 
     int max_load = CpBalanceSolver::solve_to(
-        weights.data<int>(), N, static_cast<int>(M), assign_out.data<int>());
+        weights.data<int>(), N, M, assign_out.data<int>());
 
     auto ml_out = paddle::full({1}, max_load, paddle::DataType::INT32);
     return {assign_out, ml_out};

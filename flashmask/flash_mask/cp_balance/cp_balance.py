@@ -201,12 +201,16 @@ def assign_tasks_ipo(
     Returns:
         与 assign_tasks_heap 相同的三元组 (buckets, bucket_weights, cuts)。
     """
+    # 兼容 Paddle tensor 输入（与 assign_tasks_heap 行为对齐）
+    if not isinstance(tasks, np.ndarray):
+        tasks = tasks.cpu().numpy() if hasattr(tasks, 'cpu') else np.asarray(tasks)
+
     n = len(tasks)
     if n == 0 or n > 512 or n % num_buckets != 0:
         return assign_tasks_heap(tasks, num_buckets)
 
     K = n // num_buckets
-    weights = np.array([t[0] for t in tasks], dtype=np.int32)
+    weights = tasks[:, 0].astype(np.int32)
 
     # 调用 C++ IPO solver
     # assign_matrix: (num_buckets, K)，每个元素是 item index (0..N-1)

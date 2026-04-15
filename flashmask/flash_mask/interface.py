@@ -30,6 +30,7 @@ No environment variable is needed (or checked) at runtime.
 
 import importlib
 import paddle
+from .cute.interface import flashmask_attention as _cute_flashmask_attention
 
 __all__ = [
     "flash_attn_func",
@@ -241,7 +242,7 @@ def flashmask_attention(
         else:
             return out
     else:
-        return cute.interface.flashmask_attention(
+        return _cute_flashmask_attention(
             query=query,
             key=key,
             value=value,

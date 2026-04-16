@@ -40,6 +40,8 @@ from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+from cutlass.base_dsl.arch import Arch
+from cutlass.cutlass_dsl import BaseDSL
 
 from flash_mask.cute.paged_kv import PagedKVManager
 import flash_mask.cute.utils as utils
@@ -118,6 +120,8 @@ class FlashAttentionForwardSm100:
         self.n_block_size = n_block_size
         self.q_stage = 2
         assert self.q_stage in [1, 2]
+        self.arch = BaseDSL._get_dsl().get_arch_enum()
+        assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f, "Only SM 10.x and 11.x are supported"
 
         # 2 Q tile per CTA
         self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.head_dim_padded)
@@ -149,6 +153,7 @@ class FlashAttentionForwardSm100:
             self.vec_size: cutlass.Constexpr = 2
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
+        self.enable_e2e = self.head_dim_padded <= 128 and not (self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f)
         self.s0_s1_barrier = False
 
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
@@ -199,21 +204,27 @@ class FlashAttentionForwardSm100:
         self.tmem_vec_offset = self.tmem_s_offset
 
         if self.head_dim_padded < 96:
-            self.num_regs_softmax = 200
+            self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
             self.num_regs_correction = 64
-            self.num_regs_other = 48
+            self.num_regs_other = 48 if not paged_kv_non_tma else 80
         else:
-            # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
-            self.num_regs_softmax = 200
+            if not self.enable_e2e:
+                self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
+            else:
+                # self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
+                self.num_regs_softmax = 192 if not paged_kv_non_tma else 184
             # self.num_regs_softmax = 176
             # self.num_regs_correction = 96
-            # self.num_regs_correction = 80
             # self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
-            self.num_regs_correction = 64
+            if not self.enable_e2e:
+                self.num_regs_correction = 80
+            else:
+                # self.num_regs_correction = 64
+                self.num_regs_correction = 80
             # self.num_regs_other = 32
             # self.num_regs_other = 64
             # self.num_regs_other = 80
-            self.num_regs_other = 48
+            self.num_regs_other = 48 if not paged_kv_non_tma else 80
             # self.num_regs_other = 96 if self.is_causal or self.is_local else 80
             # self.num_regs_other = 64 if self.is_causal or self.is_local else 80
         self.num_regs_empty = 24
@@ -358,7 +369,7 @@ class FlashAttentionForwardSm100:
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
-        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
+        self.use_tma_O = self.arch >= Arch.sm_90 and mCuSeqlensQ is None and mSeqUsedQ is None
         # This can be tuned
         self.e2e_freq = 16
         if const_expr(

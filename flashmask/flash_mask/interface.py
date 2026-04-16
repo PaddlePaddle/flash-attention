@@ -212,8 +212,13 @@ def flashmask_attention(
     use_varlen: bool = False,
 ):
     if use_varlen:
+        assert (
+            paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"] == 4
+        ), (
+            "use_varlen only support fa4"
+        )
         batch_size, seqlen_q, nheads, _ = query.shape
-        dv = value.shape
+        dv = value.shape[-1]
         varlen_args = convert_to_varlen(
             query=query,
             key=key,

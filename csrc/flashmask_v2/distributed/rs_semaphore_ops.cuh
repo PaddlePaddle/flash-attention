@@ -32,11 +32,12 @@ __global__ void ProducerNotifyFull(
     // quiet make sure the previous put/get on this stream is done, then we can clear bit
     if (self_rank == target_rank) return;
     semaphores[target_rank] = 0;        // clear the local status (set by the remote target)
+    const int64_t clear_mask = -(1LL << self_rank);
 #ifdef NVSHMEM_DEBUG
-    auto fetched = nvshmem_long_atomic_fetch_add(semaphores + target_rank, -(1 << self_rank), target_rank);
+    auto fetched = nvshmem_long_atomic_add(semaphores + target_rank, clear_mask, target_rank);
     DEBUG_PRINT("Producer %d notifies remote %d full, fetched: %ld\n", self_rank, target_rank, fetched);
 #else
-    nvshmem_long_atomic_add(semaphores + target_rank, -(1 << self_rank), target_rank);
+    nvshmem_long_atomic_add(semaphores + target_rank, clear_mask, target_rank);
 #endif  // NVSHMEM_DEBUG
 }
 
@@ -44,7 +45,7 @@ __global__ void FusedConsumerNotifyEmpty(
     int64_t* const __restrict__ semaphores,
     int remote_producer_end_rank,
     int nranks,
-    int value,
+    int64_t value,
     int self_rank
 ) {
     // for example: rank 3 local consumer needs the data from [12, 15] (remote producer) for seg 1
@@ -56,7 +57,7 @@ __global__ void FusedConsumerNotifyEmpty(
     }
     // the following fence makes sure semaphore setting is visible across all CP ranks 
     __threadfence();
-    __syncwarp();
+    __syncthreads();
     int target_rank = remote_producer_end_rank - threadIdx.x;
     target_rank = target_rank >= 0 ? target_rank : target_rank + nranks;
     if (target_rank == self_rank) return;
@@ -90,11 +91,11 @@ void notify_consumer_empty(
     int self_rank,
     cudaStream_t comm_stream
 ) {
-    int local_flag = 0;
+    int64_t local_flag = 0;
     for (int i = 0; i < seg_size; i++) {
         int target_rank = remote_producer_end_rank - i;
         target_rank = target_rank >= 0 ? target_rank : target_rank + nranks;
-        local_flag |= target_rank == self_rank ? 0 : (1 << target_rank);
+        local_flag |= target_rank == self_rank ? 0 : (1LL << target_rank);
     }
     // Fused step 1 & 2 in one kernel. Should the following gets buggy, you can revert to 1540b3438fb8 for testing
     // step 1. set self (inform reduce kernel that we haven't got data from other ranks, so we wait)

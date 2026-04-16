@@ -41,8 +41,7 @@ __global__ void NotifySemaphoreEmptyKernel(
         // Note(heqianyue): bitwise op is generally safer than add, if we are using only 1 node
         // we can opt for the following atomic_and approach
         // clear bit representing the current PE on the all other target PE
-        // nvshmem_int64_atomic_and(semaphores + threadIdx.x, ~(1 << my_pe), threadIdx.x);
-        nvshmem_long_atomic_add(semaphores + threadIdx.x, -(1 << my_pe), threadIdx.x);
+        nvshmem_long_atomic_add(semaphores + threadIdx.x, -(1LL << my_pe), threadIdx.x);
     }
 }
 
@@ -59,7 +58,7 @@ __global__ void NotifySegmentSemaphoreEmptyKernel(
         // the other PE will not notify us before we reset
         wait_full(semaphores, target_rank);
         semaphores[target_rank] = 0;
-        nvshmem_long_atomic_add(semaphores + target_rank, -(1 << my_pe), target_rank);
+        nvshmem_long_atomic_add(semaphores + target_rank, -(1LL << my_pe), target_rank);
     }
 }
 
@@ -92,14 +91,14 @@ __global__ void DebugWaitOnStreamLocalKernel(
 
 __global__ void SetFullKernel(
     int64_t* const __restrict__ semaphores,
-    int value,
+    int64_t value,
     int self_rank
 ) {
     if (threadIdx.x == 0) {
-        semaphores[self_rank] = int64_t(value);
+        semaphores[self_rank] = value;
     }
     __threadfence();
-    __syncwarp();
+    __syncthreads();
     if (threadIdx.x == self_rank) return;
     // set the semaphores[self_rank] = 1 for all remote ranks
     nvshmem_int64_p(semaphores + self_rank, 1, threadIdx.x);
@@ -185,7 +184,7 @@ void notify_full(
     nvshmem_team_t team,
     cudaStream_t stream
 ) {
-    int bit_val = (1 << total_pes) - (1 << my_pe) - 1;
+    int64_t bit_val = (1LL << total_pes) - (1LL << my_pe) - 1;
     // make sure local store is visible to other ranks and notify other PE that data is ready (full) 
     SetFullKernel<<<1, total_pes, 0, stream>>>(semaphores, bit_val, my_pe);
 }

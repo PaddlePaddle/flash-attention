@@ -34,6 +34,8 @@
 import os
 import sys
 import subprocess
+import shutil
+import glob
 
 from setuptools import setup as setuptools_setup, find_packages
 
@@ -98,7 +100,8 @@ VERSION = _get_version()
 # ============================================================
 # Packages: exclude modules not being built
 # ============================================================
-exclude_packages = ['build', 'build.*', 'tests', 'tests.*']
+exclude_packages = ['build', 'build.*', 'tests', 'tests.*',
+                     'flash_mask.cp_balance.csrc', 'flash_mask.cp_balance.csrc.*']
 if not BUILD_FA3:
     exclude_packages += [
         'flash_mask.flashmask_attention_v3',
@@ -399,12 +402,113 @@ if BUILD_FA3:
     )
 
 # ============================================================
+# CUDA submodule builder
+# ============================================================
+# Some submodules need different nvcc flags than the main FA3 extension
+# (e.g., cp_balance needs sm_80/sm_90a/sm_100 while FA3 targets sm_90a only).
+# Paddle's CUDAExtension applies the same flags to ALL sources, so these
+# submodules must be compiled independently. This function handles:
+#   1. Run the submodule's own setup.py build_ext
+#   2. Copy the resulting .so into the Python package directory
+#   3. Return the package name for package_data (so the .so ships in the wheel)
+#
+# To add a new submodule, just call _build_cuda_submodule() and append
+# the returned package name to _submodule_package_data.
+
+def _build_cuda_submodule(name, csrc_dir, pkg_dir):
+    """Build a CUDA submodule and copy outputs into its package directory.
+
+    Paddle's build_ext produces in build/:
+      - {module_name}.so   — compiled CUDA binary (no _pd_ suffix)
+      - {module_name}.py   — Python wrapper that loads {module_name}_pd_.so
+    The wrapper hardcodes the _pd_ filename, so we rename the .so when copying.
+
+    Args:
+        name: Human-readable name for log messages.
+        csrc_dir: Directory containing the submodule's setup.py.
+        pkg_dir: Python package directory to copy outputs into.
+
+    Returns:
+        Package name (dot-separated) for package_data, or None if skipped.
+    """
+    if not os.path.isdir(csrc_dir):
+        print(f"[flashmask] {name}: csrc directory not found, skipping.")
+        return None
+
+    print(f"[flashmask] Building {name} CUDA extension...")
+    result = subprocess.run(
+        [sys.executable, 'setup.py', 'build_ext'],
+        cwd=csrc_dir, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"[flashmask] {name} build STDERR:\n{result.stderr}")
+        raise RuntimeError(
+            f"Failed to build {name} CUDA extension.\n"
+            f"Build manually: cd {csrc_dir} && python setup.py build_ext"
+        )
+
+    # Find the .so and wrapper .py in build/
+    so_files = glob.glob(os.path.join(csrc_dir, 'build', '**', '*.so'), recursive=True)
+    if not so_files:
+        raise RuntimeError(
+            f"{name} build_ext succeeded but no .so found under "
+            f"{os.path.join(csrc_dir, 'build')}/"
+        )
+    so_path = so_files[0]
+    module_name = os.path.basename(so_path).replace('.so', '')
+    wrapper_path = os.path.join(os.path.dirname(so_path), f'{module_name}.py')
+    if not os.path.exists(wrapper_path):
+        raise RuntimeError(
+            f"{name}: Paddle-generated wrapper {module_name}.py not found "
+            f"alongside {so_path}"
+        )
+
+    # Copy to pkg_dir. Rename .so to add _pd_ suffix (wrapper hardcodes this name).
+    shutil.copy2(so_path, os.path.join(pkg_dir, f'{module_name}_pd_.so'))
+    shutil.copy2(wrapper_path, pkg_dir)
+    print(f"[flashmask] {name} built: {module_name}_pd_.so + {module_name}.py")
+
+    # Clean up build artifacts from csrc_dir
+    for _d in glob.glob(os.path.join(csrc_dir, 'build')) + \
+              glob.glob(os.path.join(csrc_dir, '*.egg-info')):
+        shutil.rmtree(_d, ignore_errors=True)
+    # Also clean any _pd_.so / wrapper .py that Paddle may leave in csrc_dir
+    for _f in glob.glob(os.path.join(csrc_dir, '*_pd_.so')) + \
+              glob.glob(os.path.join(csrc_dir, f'{module_name}.py')):
+        os.remove(_f)
+
+    # Derive package name from pkg_dir relative to ROOT_DIR
+    # e.g. flash_mask/cp_balance -> flash_mask.cp_balance
+    return os.path.relpath(pkg_dir, ROOT_DIR).replace(os.sep, '.')
+
+
+# ============================================================
+# Build CUDA submodules
+# ============================================================
+_submodule_package_data = {}
+
+# --- cp_balance: needs sm_80/sm_90a/sm_100 (multi-arch) ---
+_pkg = _build_cuda_submodule(
+    'CP Balance',
+    csrc_dir=os.path.join(FLASH_MASK_DIR, 'cp_balance', 'csrc'),
+    pkg_dir=os.path.join(FLASH_MASK_DIR, 'cp_balance'),
+)
+if _pkg:
+    _submodule_package_data[_pkg] = ['*.so']
+
+# To add future submodules, just repeat:
+#   _pkg = _build_cuda_submodule('Name', csrc_dir=..., pkg_dir=...)
+#   if _pkg:
+#       _submodule_package_data[_pkg] = ['*.so']
+
+# ============================================================
 # Build: use paddle's setup when building FA3, plain setuptools otherwise
 # ============================================================
 setup_kwargs = dict(
     name='flash_mask',
     version=VERSION,
     packages=packages,
+    package_data=_submodule_package_data,
     author='PaddlePaddle',
     description='FlashMask: Efficient and Rich Mask Extension of FlashAttention',
     install_requires=install_requires,

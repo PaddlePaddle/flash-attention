@@ -199,8 +199,15 @@ def flashmask_attention(
         ), (
             "use_varlen only support fa4"
         )
-        batch_size, seqlen_q, nheads, _ = query.shape
+        batch_size, seqlen_q, nheads, d = query.shape
         dv = value.shape[-1]
+
+        if (d == 256 or dv == 256):
+            assert not return_softmax_lse, (
+                "SM100 backward with head_dim=256 does not support dlse, ",
+                "please set return_softmax_lse to False"
+            )
+
         varlen_args = convert_to_varlen(
             query=query,
             key=key,

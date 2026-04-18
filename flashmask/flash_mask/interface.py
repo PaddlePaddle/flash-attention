@@ -29,6 +29,9 @@ No environment variable is needed (or checked) at runtime.
 """
 
 import importlib
+import numpy as np
+import paddle
+from .cute.interface import flashmask_attention as _cute_flashmask_attention
 
 __all__ = [
     "flash_attn_func",
@@ -72,13 +75,174 @@ flash_attn_func        = _mod.flash_attn_func
 flash_attn_varlen_func = _mod.flash_attn_varlen_func
 flash_attn_combine     = _mod.flash_attn_combine
 
-# ---------------------------------------------------------------------------
-# Paddle-only high-level interfaces — sourced from flash_mask.cute.interface.
-# These are not dispatched through the backend mechanism (no torch equivalent).
-# Only imported when paddle backend is active.
-# ---------------------------------------------------------------------------
-if _backend_name == 'paddle':
-    try:
-        from flash_mask.cute.interface import flash_attention, flashmask_attention
-    except ImportError:
-        pass
+def convert_to_varlen(
+    query: paddle.Tensor,
+    key: paddle.Tensor,
+    value: paddle.Tensor,
+    startend_row_indices: paddle.Tensor,
+    causal: bool,
+):
+    b, sq, hq, d = query.shape
+    _, skv, hkv, dv = value.shape
+    assert sq == skv
+
+    _, hfm, _, bound_num = startend_row_indices.shape
+    assert hfm == 1
+    assert bound_num == 1 or bound_num == 2
+
+    # ── Move startend_row_indices to numpy (single GPU→CPU transfer) ──
+    sri_np = startend_row_indices.numpy()  # (batch, hfm, seqlen_k, bound_num)
+    s_np = sri_np[:, 0, :, 0]  # (batch, seqlen_k)
+
+    # ── Vectorised boundary detection in numpy ──
+    # Compare consecutive elements per batch: (b, skv-1)
+    diffs = s_np[:, 1:] != s_np[:, :-1]
+
+    # Real ends per batch
+    real_ends_np = s_np.max(axis=1)  # (b,)
+    real_ends = real_ends_np.tolist()
+    needs_padding_fixup = bool(np.any(real_ends_np < skv))
+
+    # Per-batch boundary extraction (b is typically 1-2, loop is trivial)
+    cu_seqlens_list = []
+    max_doc_len = 0
+    for bi in range(b):
+        change_idx = np.nonzero(diffs[bi])[0].astype(np.int32) + 1
+        boundaries = np.concatenate([
+            np.zeros(1, dtype=np.int32),
+            change_idx,
+            np.array([skv], dtype=np.int32),
+        ])
+        doc_lens = boundaries[1:] - boundaries[:-1]
+        max_doc_len = max(max_doc_len, int(doc_lens.max()))
+        cu_seqlens_list.append(boundaries[:-1] + np.int32(bi * skv))
+
+    # Build cu_seqlens: one numpy concat, one paddle tensor creation
+    cu_seqlens_np = np.concatenate(
+        cu_seqlens_list + [np.array([b * skv], dtype=np.int32)]
+    )
+    cu_seqlens = paddle.to_tensor(cu_seqlens_np)
+
+    # ── Flatten q, k, v: (batch, seqlen, heads, dim) -> (total, heads, dim)
+    q_varlen = query.reshape([b * sq, hq, d])
+    k_varlen = key.reshape([b * skv, hkv, d])
+    v_varlen = value.reshape([b * skv, hkv, dv])
+
+    # ── Detect simulated causal masks (numpy) ────────────────────────
+    varlen_causal = causal
+    if not causal and bound_num == 2:
+        lts_all = s_np  # (b, skv), already extracted
+        ute_all = sri_np[:, 0, :, 1]  # (b, skv)
+        arange_ref = np.arange(skv, dtype=np.int32).reshape(1, skv)
+        expected_causal_ute = np.minimum(arange_ref, lts_all)
+        if np.array_equal(ute_all, expected_causal_ute):
+            varlen_causal = True
+
+    result = {
+        "q": q_varlen,
+        "k": k_varlen,
+        "v": v_varlen,
+        "cu_seqlens_q": cu_seqlens,
+        "cu_seqlens_k": cu_seqlens,
+        "max_seqlen_q": max_doc_len,
+        "max_seqlen_k": max_doc_len,
+        "causal": varlen_causal,
+    }
+
+    # For non-causal masks with trailing padding: padding rows attend to
+    # nothing in flashmask (zero output), but varlen computes non-zero
+    # output for them.  Zero out padding rows per batch to match flashmask.
+    # Note: real_end can differ across batch items.
+    if needs_padding_fixup:
+        _b, _sq = b, sq
+        _real_ends = real_ends
+
+        def output_to_padded(out_varlen_pt):
+            nh = out_varlen_pt.shape[1]
+            dv_out = out_varlen_pt.shape[2]
+            out_padded = out_varlen_pt.reshape(_b, _sq, nh, dv_out)
+            # Vectorised per-batch zeroing
+            row_idx = paddle.arange(_sq)
+            real_end_t = paddle.to_tensor(
+                _real_ends, dtype=paddle.int64,
+            ).unsqueeze(1)
+            padding_mask = row_idx.unsqueeze(0) >= real_end_t  # (b, sq)
+            out_padded[padding_mask] = 0
+            return out_padded
+
+        result["output_to_padded"] = output_to_padded
+
+    return result
+
+def flashmask_attention(
+    query: paddle.Tensor,
+    key: paddle.Tensor,
+    value: paddle.Tensor,
+    startend_row_indices: paddle.Tensor | None = None,
+    *,
+    dropout: float = 0.0,
+    causal: bool = False,
+    window_size: int | tuple | None = None,
+    return_softmax_lse: bool = False,
+    return_seed_offset: bool = False,
+    fixed_seed_offset: paddle.Tensor | None = None,
+    rng_name: str = "",
+    training: bool = True,
+    name: str | None = None,
+    softmax_scale: float | None = None,
+    block_mask: paddle.Tensor | None = None,
+    use_varlen: bool = False,
+):
+    if use_varlen:
+        assert (
+            paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"] == 4
+        ), (
+            "use_varlen only support fa4"
+        )
+        batch_size, seqlen_q, nheads, _ = query.shape
+        dv = value.shape[-1]
+        varlen_args = convert_to_varlen(
+            query=query,
+            key=key,
+            value=value,
+            startend_row_indices=startend_row_indices,
+            causal=causal)
+        out, lse = flash_attn_varlen_func(
+            q=varlen_args["q"],
+            k=varlen_args["k"],
+            v=varlen_args["v"],
+            cu_seqlens_q=varlen_args["cu_seqlens_q"],
+            cu_seqlens_k=varlen_args["cu_seqlens_k"],
+            max_seqlen_q=varlen_args["max_seqlen_q"],
+            max_seqlen_k=varlen_args["max_seqlen_k"],
+            causal=varlen_args["causal"],
+            return_lse=return_softmax_lse,
+        )
+
+        if "output_to_padded" in varlen_args:
+            out = varlen_args["output_to_padded"](out)
+        else:
+            out = out.reshape([batch_size, seqlen_q, nheads, dv])
+
+        if return_softmax_lse:
+            return [out, lse]
+        else:
+            return out
+    else:
+        return _cute_flashmask_attention(
+            query=query,
+            key=key,
+            value=value,
+            startend_row_indices=startend_row_indices,
+            dropout=dropout,
+            causal=causal,
+            window_size=window_size,
+            return_softmax_lse=return_softmax_lse,
+            return_seed_offset=return_seed_offset,
+            fixed_seed_offset=fixed_seed_offset,
+            rng_name=rng_name,
+            training=training,
+            name=name,
+            softmax_scale=softmax_scale,
+            block_mask=block_mask,
+        )

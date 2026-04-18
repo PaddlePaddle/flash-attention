@@ -75,8 +75,10 @@ except ImportError:
 _fa4_available = False
 if _backend_name == 'paddle':
     try:
-        from .cute import flash_attention, flashmask_attention
-        __all__ += ["flash_attention", "flashmask_attention"]
+        from .cute import flash_attention
+        __all__ += ["flash_attention"]
+        from .interface import flashmask_attention
+        __all__ += ["flashmask_attention"]
         _fa4_available = True
     except ImportError:
         pass  # cute module not installed or dependencies missing

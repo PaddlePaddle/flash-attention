@@ -29,6 +29,7 @@ No environment variable is needed (or checked) at runtime.
 """
 
 import importlib
+import numpy as np
 import paddle
 from .cute.interface import flashmask_attention as _cute_flashmask_attention
 
@@ -89,71 +90,52 @@ def convert_to_varlen(
     assert hfm == 1
     assert bound_num == 1 or bound_num == 2
 
-    # ── Extract document boundaries PER BATCH from startend_row_indices ──
-    # startend_row_indices shape: (batch, nheads_fm, seqlen_k, bound_num)
-    # Column 0 encodes the "end of document" boundary for each key position.
-    # Tokens within the same document share the same value; boundaries are
-    # where this value changes.  Different batch items may have different
-    # document layouts, so we extract boundaries for each batch independently.
-    s = startend_row_indices[:, 0, :, 0]  # (batch, seqlen_k)
+    # ── Move startend_row_indices to numpy (single GPU→CPU transfer) ──
+    sri_np = startend_row_indices.numpy()  # (batch, hfm, seqlen_k, bound_num)
+    s_np = sri_np[:, 0, :, 0]  # (batch, seqlen_k)
 
-    cu_seqlens_parts = []
+    # ── Vectorised boundary detection in numpy ──
+    # Compare consecutive elements per batch: (b, skv-1)
+    diffs = s_np[:, 1:] != s_np[:, :-1]
+
+    # Real ends per batch
+    real_ends_np = s_np.max(axis=1)  # (b,)
+    real_ends = real_ends_np.tolist()
+    needs_padding_fixup = bool(np.any(real_ends_np < skv))
+
+    # Per-batch boundary extraction (b is typically 1-2, loop is trivial)
+    cu_seqlens_list = []
     max_doc_len = 0
-    needs_padding_fixup = False
-    real_ends = []
-
     for bi in range(b):
-        s_bi = s[bi]  # (seqlen_k,)
-
-        # Find change positions -> document boundaries
-        diff_bi = paddle.not_equal(s_bi[1:], s_bi[:-1])
-        change_idx_bi = paddle.nonzero(diff_bi).flatten().cast(paddle.int32) + 1
-
-        # Real end of documents (max value in column 0)
-        real_end_bi = int(s_bi.max().item())
-        real_ends.append(real_end_bi)
-        if real_end_bi < skv:
-            needs_padding_fixup = True
-
-        # Boundaries: [0, change_1, ..., seqlen_k]
-        # Always use seqlen_k as last boundary so padding KV (visible to
-        # the last doc's rows in flashmask) is included in the last doc.
-        boundaries_bi = paddle.concat([
-            paddle.zeros([1], dtype=paddle.int32),
-            change_idx_bi,
-            paddle.to_tensor([skv], dtype=paddle.int32),
+        change_idx = np.nonzero(diffs[bi])[0].astype(np.int32) + 1
+        boundaries = np.concatenate([
+            np.zeros(1, dtype=np.int32),
+            change_idx,
+            np.array([skv], dtype=np.int32),
         ])
+        doc_lens = boundaries[1:] - boundaries[:-1]
+        max_doc_len = max(max_doc_len, int(doc_lens.max()))
+        cu_seqlens_list.append(boundaries[:-1] + np.int32(bi * skv))
 
-        # Track max document length across all batches
-        doc_lens_bi = boundaries_bi[1:] - boundaries_bi[:-1]
-        max_doc_len = max(max_doc_len, int(doc_lens_bi.max().item()))
-
-        # Collect document start positions with batch offset
-        cu_seqlens_parts.append(boundaries_bi[:-1] + bi * skv)
-
-    # Build cu_seqlens: concat per-batch starts + final endpoint
-    cu_seqlens = paddle.concat(
-        cu_seqlens_parts + [paddle.to_tensor([b * skv], dtype=paddle.int32)]
+    # Build cu_seqlens: one numpy concat, one paddle tensor creation
+    cu_seqlens_np = np.concatenate(
+        cu_seqlens_list + [np.array([b * skv], dtype=np.int32)]
     )
+    cu_seqlens = paddle.to_tensor(cu_seqlens_np)
 
     # ── Flatten q, k, v: (batch, seqlen, heads, dim) -> (total, heads, dim)
     q_varlen = query.reshape([b * sq, hq, d])
     k_varlen = key.reshape([b * skv, hkv, d])
     v_varlen = value.reshape([b * skv, hkv, dv])
 
-    # ── Detect simulated causal masks ──────────────────────────────────
-    # A causal document mask can be encoded as causal=False with bound_num=2
-    # (LTS + UTE) where UTE[j] = min(j, LTS[j]) reproduces the causal
-    # diagonal.  For true non-causal masks, UTE is constant within each
-    # document (= document start), which differs from min(j, LTS[j]).
+    # ── Detect simulated causal masks (numpy) ────────────────────────
     varlen_causal = causal
-    bound_num = startend_row_indices.shape[-1]
     if not causal and bound_num == 2:
-        lts_all = startend_row_indices[:, 0, :, 0]  # (b, skv)
-        ute_all = startend_row_indices[:, 0, :, 1]  # (b, skv)
-        arange_ref = paddle.arange(skv, dtype=paddle.int32).unsqueeze(0)  # (1, skv)
-        expected_causal_ute = paddle.minimum(arange_ref, lts_all)  # (b, skv)
-        if paddle.equal_all(ute_all, expected_causal_ute).item():
+        lts_all = s_np  # (b, skv), already extracted
+        ute_all = sri_np[:, 0, :, 1]  # (b, skv)
+        arange_ref = np.arange(skv, dtype=np.int32).reshape(1, skv)
+        expected_causal_ute = np.minimum(arange_ref, lts_all)
+        if np.array_equal(ute_all, expected_causal_ute):
             varlen_causal = True
 
     result = {

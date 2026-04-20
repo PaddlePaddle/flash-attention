@@ -140,7 +140,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int total_n_pes,
     const int num_batch,                // B
     const int S_stride,                 // H * D
-    const int64_t* const __restrict__ semaphores = nullptr
+    int64_t* const __restrict__ semaphores = nullptr,
+    int* const __restrict__ rank_empty_counters = nullptr
 ) {
     // Degenerate case: S == S_chunk means nranks=1, nothing to remote-get.
     // This template instantiation is unreachable at runtime (overlap requires nranks > 1)
@@ -161,7 +162,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     constexpr int row_per_block = num_warps * row_per_warp;     // 256 or 512 row per block (32 or 64 per warp)
     constexpr int seqlen_offset = bwd ? 0 : (S - S_chunk);
     constexpr int chunk_per_batch = (S - S_chunk) / row_per_block;
-    const int total_chunks = num_batch * chunk_per_batch;     // 8192 chunk: 32 blocks --> 96 blocks
+    constexpr int work_per_chunk = S_chunk / row_per_block;
+    const int total_chunks = num_batch * chunk_per_batch;
+    const int works_per_rank = num_batch * work_per_chunk;
     const int batch_stride = S * S_stride;
     __shared__ int cached_semaphores[16];
     __shared__ int next_work_id;
@@ -192,6 +195,24 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         return next_work_id;
     };
 
+    // P2P empty notify: when all works for a source PE are done, notify it immediately.
+    // wait_full ensures the producer has set its bitmask before we send the atomic_add.
+    auto try_release_rank = [&](int remote_pe) {
+        if constexpr (use_semaphore) {
+            if (threadIdx.x == 0) {
+                int prev = atomicAdd(&rank_empty_counters[remote_pe], 1);
+                if (prev + 1 == works_per_rank) {
+                    if (cached_semaphores[remote_pe] == 0) {
+                        sema::ag::wait_full(semaphores, remote_pe);
+                    }
+                    semaphores[remote_pe] = 0;
+                    nvshmem_long_atomic_add(
+                        semaphores + remote_pe, -(1LL << my_pe), remote_pe);
+                }
+            }
+        }
+    };
+
     if constexpr (use_semaphore) {
         if (threadIdx.x < total_n_pes) {
             cached_semaphores[threadIdx.x] = 0;
@@ -208,15 +229,6 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         const int batch_id = work_id_m1 / chunk_per_batch;
         const int seq_work_id = (work_id_m1 % chunk_per_batch) + 1;     // this is in range [1, chunk_per_batch]
         int mask_index = bwd ? (work_id - 1) : (chunk_per_batch * (batch_id + 1) - seq_work_id);
-        if (copy_chunk_mask[mask_index]) {
-            // does not need copying since the current KV block is masked. skip directly
-            // __syncthreads() here is necessary: in case some of the warp haven't updated
-            // the work_id and warp 0 overwrites next_work_id first, which will be bad.
-            __syncthreads();
-            work_id = update_wptr_and_work_id_sync(work_id);
-            continue;
-        }
-        // calculate seqlen offset via work_id
         int seqlen_id = 0, remote_pe = 0;
         if constexpr (bwd) {        // bwd is forward traversal
             seqlen_id = S_chunk + (seq_work_id - 1) * row_per_block;
@@ -228,11 +240,18 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             remote_pe = my_pe - cp_chunk_id;
             remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes; 
         }
+
+        if (copy_chunk_mask[mask_index]) {
+            // Masked: no get needed, but still counts toward rank release
+            try_release_rank(remote_pe);
+            __syncthreads();
+            work_id = update_wptr_and_work_id_sync(work_id);
+            continue;
+        }
         if constexpr (use_semaphore) {
             if (threadIdx.x == 0 && cached_semaphores[remote_pe] == 0) {
                 sema::ag::wait_full(semaphores, remote_pe);
                 cached_semaphores[remote_pe] = 1;
-                // no need to sync, since `two_buffers_getmem_<scope>` will sync 
             }
         }
         // copy upto 4 heads (S_stride = H * D), and row_per_block rows (seqlen axis) per CTA
@@ -248,6 +267,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         // buffer getmem_block will call syncthreads(), so next_work_id will not be updated
         // therefore, next_work_id's update is visible to all threads and won't be overwritten
         // before some threads reading it. Safe!
+        try_release_rank(remote_pe);
         work_id = update_wptr_and_work_id_sync(work_id);
     }
 }
@@ -272,13 +292,15 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     int* const __restrict__ block_cnt_semaphore,      // for dynamic scheduling
     int* const __restrict__ stream_coordinator,
     const int* const __restrict__ copy_chunk_mask,
+    const int my_pe,
     const int start_rank,               // first call is my_pe + 1
     const int segment_idx,
     const int total_n_pes,
     const int num_batch,                // B
     const int S_stride,                 // H * D
     const int num_segments = 4,
-    const int64_t* const __restrict__ semaphores = nullptr
+    int64_t* const __restrict__ semaphores = nullptr,
+    int* const __restrict__ rank_empty_counters = nullptr
 ) {
     if constexpr (use_stream_coord) {
         // notify computation stream that one of the CTAs for communication kernel is running
@@ -293,12 +315,15 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     constexpr int row_per_block = num_warps * row_per_warp;
     constexpr int S = S_chunk * num_chunks;                  // seqlen of this segment (num_chunks is already the real total)
     constexpr int work_per_seg = S / row_per_block;
+    constexpr int work_per_chunk = S_chunk / row_per_block;
     // for each segment, get the number of work we can skip (due to being local). Note that
     // if work_to_skip is not 0, there will be some skippable works for **each batch**
     constexpr int work_to_skip = has_local ? (S_chunk / row_per_block) : 0;
+    constexpr int chunk_offset = has_local ? 1 : 0;
     // though the actual skippable work is `num_batch * (work_per_seg - work_to_skip)`
     // for batch_idx > 0, those skippable local works cannot be skipped **directly**.
     const int total_works = num_batch * work_per_seg;
+    const int works_per_rank = num_batch * work_per_chunk;
     // this batch_stride is the segment batch stride, not full (num_segs * segment_size) batch stride
     const int batch_stride = S * S_stride;
     const int local_batch_stride = S_chunk * S_stride;
@@ -350,15 +375,47 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     //     atomicMax(wptr, INT_MAX);
     // }
 
+    // P2P empty notify: when all works for a source PE (chunk) are done, notify it immediately.
+    // Counter indexed by chunk_id - chunk_offset (same scheme as remote_put's try_commit_rank).
+    // wait_full ensures the producer has set its bitmask before we send the atomic_add.
+    auto try_release_rank = [&](int chunk_id) {
+        if constexpr (use_semaphore) {
+            if (threadIdx.x == 0) {
+                int counter_idx = chunk_id - chunk_offset;
+                int prev = atomicAdd(&rank_empty_counters[counter_idx], 1);
+                if (prev + 1 == works_per_rank) {
+                    int target_rank = (start_rank + chunk_id) % total_n_pes;
+                    if (cached_semaphores[target_rank] == 0) {
+                        sema::ag::wait_full(semaphores, target_rank);
+                    }
+                    semaphores[target_rank] = 0;
+                    nvshmem_long_atomic_add(
+                        semaphores + target_rank,
+                        -(1LL << my_pe), target_rank);
+                }
+            }
+        }
+    };
+
     // Note(heqianyue): the simple way to skip the first chunk: offset the initial work_cnt
     // and the atomicAdd result (semaphore fetch result)
     for (int work_id = update_wptr_and_work_id_sync(work_to_skip); work_id <= total_works;) {
         const int work_id_m1 = work_id - 1;
         const int batch_id = work_id_m1 / work_per_seg;
         const int seq_work_id = work_id_m1 % work_per_seg;
-        // if there is local_chunk and B > 1, we might have some of the 
-        // work to be skipped (due to being local) directly.
-        if (seq_work_id < work_to_skip || smem_chunk_mask[work_id_m1]) {
+
+        // Local chunk works: skip, no release needed
+        if (seq_work_id < work_to_skip) {
+            __syncthreads();
+            work_id = update_wptr_and_work_id_sync(work_id);
+            continue;
+        }
+
+        int chunk_id = seq_work_id / work_per_chunk;
+
+        if (smem_chunk_mask[work_id_m1]) {
+            // Masked remote: no get needed, but still counts toward rank release
+            try_release_rank(chunk_id);
             __syncthreads();
             work_id = update_wptr_and_work_id_sync(work_id);
             continue;
@@ -372,7 +429,6 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             if (threadIdx.x == 0 && cached_semaphores[remote_pe] == 0) {
                 sema::ag::wait_full(semaphores, remote_pe);
                 cached_semaphores[remote_pe] = 1;
-                // no need to sync, since `two_buffers_getmem_<scope>` will sync 
             }
         }
 
@@ -389,6 +445,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         // buffer getmem_block will call syncthreads(), so next_work_id will not be updated.
         // therefore, next_work_id's update is visible to all threads and won't be overwritten
         // before some threads reading it. Safe!
+        try_release_rank(chunk_id);
         work_id = update_wptr_and_work_id_sync(work_id);
     }
 }

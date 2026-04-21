@@ -805,8 +805,10 @@ struct CollectiveMainloopFwdSm90 {
         const int valid_block_mblock_seqlen = (seqlen_info.seqlen_q + m_block_dim - 1) / m_block_dim;
         int blockmask_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * valid_block_nblock_seqlen * valid_block_mblock_seqlen; // row_offset
         blockmask_offset += m_block * valid_block_nblock_seqlen / m_factor;
-        blockmask_offset += std::max((chunks_size - (reverse_chunk_idx + 1) * Blockmask_n_block_buffer_valid_length), 0);
-        int blockmask_length = Blockmask_n_block_buffer_valid_length < valid_block_nblock_seqlen ? Blockmask_n_block_buffer_valid_length : valid_block_nblock_seqlen;
+        int chunk_col_start = std::max((chunks_size - (reverse_chunk_idx + 1) * Blockmask_n_block_buffer_valid_length), 0);
+        blockmask_offset += chunk_col_start;
+        int remaining = valid_block_nblock_seqlen - chunk_col_start;
+        int blockmask_length = remaining < Blockmask_n_block_buffer_valid_length ? remaining : Blockmask_n_block_buffer_valid_length;
 
         //xhy: blockmask ptr maybe not 16-aligned, since load_blockmask is called before load_max_min, sync can be shared with load_max_min
         for(int64_t idx = thread_idx; idx < blockmask_length && (offset + idx >= 0); idx += ProducerThreadNum) {

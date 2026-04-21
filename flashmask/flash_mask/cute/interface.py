@@ -1678,6 +1678,7 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
             dout,
             lse,
             flashmask_info,
+            softmax_scale=ctx.softmax_scale,
             causal=ctx.causal,
             deterministic=paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"],
         )

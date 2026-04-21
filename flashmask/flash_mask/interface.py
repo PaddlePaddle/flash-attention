@@ -204,6 +204,15 @@ def flashmask_attention(
         ), (
             "use_varlen does not support deterministic"
         )
+        assert dropout == 0, (
+            "use_varlen does not support dropout"
+        )
+        assert window_size is None, (
+            "use_varlen does not support setting window_size"
+        )
+        assert block_mask is None, (
+            "use_varlen does not support block_mask"
+        )
         batch_size, seqlen_q, nheads, d = query.shape
         dv = value.shape[-1]
 
@@ -227,6 +236,7 @@ def flashmask_attention(
             cu_seqlens_k=varlen_args["cu_seqlens_k"],
             max_seqlen_q=varlen_args["max_seqlen_q"],
             max_seqlen_k=varlen_args["max_seqlen_k"],
+            softmax_scale=softmax_scale,
             causal=varlen_args["causal"],
             return_lse=return_softmax_lse,
         )

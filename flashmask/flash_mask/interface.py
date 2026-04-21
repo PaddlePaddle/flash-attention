@@ -213,7 +213,14 @@ def flashmask_attention(
         assert block_mask is None, (
             "use_varlen does not support block_mask"
         )
+
         batch_size, seqlen_q, nheads, d = query.shape
+        seqlen_k = key.shape[1]
+        assert seqlen_q == seqlen_k, (
+            f"use_varlen requires seqlen_q == seqlen_k, ",
+            f"currently seqlen_q={seqlen_q}, seqlen_k={seqlen_k}",
+        )
+
         dv = value.shape[-1]
 
         if (d == 256 or dv == 256):

@@ -8,7 +8,7 @@
 namespace flashmask {
 
 /**
- * @brief Splitted remote put kernel for RS-overlap.
+ * @brief Splitted remote put kernel for RS-overlap with P2P commit.
  *
  * @param num_chunk  total chunks per segment (always the real count, e.g. 4 for CP16)
  * @param has_local_chunk  true iff segment 0 (the first chunk is local and should be skipped)
@@ -16,6 +16,9 @@ namespace flashmask {
  * @param x_send & x_recv: SepSRBuffer separates send and recv into two buffers, since this is
  * actually an all-gather op implemented by an A2A op, the buffer cannot be reused the same way as the
  * all-gather overlap.
+ *
+ * P2P commit: when the last CTA finishes all puts to a given rank, it calls nvshmem_fence() + signal
+ * to notify that specific remote consumer immediately — no blocking quiet or group commit needed.
 */
 template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunk=4, bool has_local_chunk=false>
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkRemotePutKernel(
@@ -24,6 +27,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     T* const __restrict__ k_recv,                       // K dst addr (remote)
     T* const __restrict__ v_recv,                       // V dst addr (remote)
     int* const __restrict__ block_cnt_semaphore,        // for dynamic scheduling
+    int* const __restrict__ rank_commit_counters,       // per-chunk completion counters [num_chunk]
     const int* const __restrict__ copy_chunk_mask,
     const int my_pe,
     const int start_rank,               // start rank is chunk 0
@@ -31,7 +35,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int segment_idx,
     const int num_batch,                // B
     const int S_stride,                 // H * D
-    const int64_t* const __restrict__ semaphores,
+    int64_t* const __restrict__ semaphores,
     const int num_segments = 4
 ) {
 #ifdef NVSHMEM_DEBUG
@@ -52,6 +56,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     static constexpr int work_per_seg = work_per_chunk * remote_chunks;
 
     const int total_works = num_batch * work_per_seg;
+    const int works_per_rank = num_batch * work_per_chunk;  // total put operations per target rank
     const int batch_stride = S_chunk * num_chunk * S_stride;         // num_chunk is the real total
 
     extern __shared__ int smem_chunk_mask[];
@@ -77,18 +82,43 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             // Note: block_cnt_semaphore for remote_put starts from 0 (for remote get, starts from 1)
             int _work_id = atomicAdd(block_cnt_semaphore, 1);
             next_work_id = _work_id;
-            // chunk ID changes first: chunk [0, 1, 2, 3, 0, 1, 2, 3, ...]
-            int chunk_id = (_work_id % remote_chunks) + chunk_offset;
-            int target_pe = (start_rank + chunk_id) % nranks;
-            // the current CTA might be scheduled to send things to different ranks
-            // so each CTA should keep track of whether the target rank is empty
-            if (cached_empty[chunk_id] == 0) {
-                sema::rs::producer_wait_empty(semaphores, target_pe);
-                cached_empty[chunk_id] = 1;
+            // Guard: only wait for consumer "empty" signal for valid works.
+            // Invalid work_ids (>= total_works) must NOT call producer_wait_empty,
+            // because try_commit_rank may have already cleared semaphores[target] = 0.
+            if (_work_id < total_works) {
+                // chunk ID changes first: chunk [0, 1, 2, 3, 0, 1, 2, 3, ...]
+                int chunk_id = (_work_id % remote_chunks) + chunk_offset;
+                int target_pe = (start_rank + chunk_id) % nranks;
+                // the current CTA might be scheduled to send things to different ranks
+                // so each CTA should keep track of whether the target rank is empty
+                if (cached_empty[chunk_id] == 0) {
+                    sema::rs::producer_wait_empty(semaphores, target_pe);
+                    cached_empty[chunk_id] = 1;
+                }
             }
         }
         __syncthreads();
         return next_work_id;
+    };
+
+    // P2P commit: after completing a work, check if all works for that rank are done.
+    // If so, fence + signal that specific consumer rank.
+    auto try_commit_rank = [&](int seg_chunk_id) {
+        if (threadIdx.x == 0) {
+            // chunk_offset maps seg_chunk_id back to the counter index for remote chunks
+            int counter_idx = seg_chunk_id - chunk_offset;
+            int prev = atomicAdd(&rank_commit_counters[counter_idx], 1);
+            if (prev + 1 == works_per_rank) {
+                // Last CTA to finish work for this rank.
+                // nvshmem_fence() is PE-level: ensures ALL prior puts from this GPU
+                // are delivered to their targets before the subsequent signal.
+                nvshmem_fence();
+                int target_rank = (seg_chunk_id + start_rank) % nranks;
+                // P2P notify: same semantics as ProducerNotifyFull but for one rank only
+                semaphores[target_rank] = 0;
+                nvshmem_long_atomic_add(semaphores + target_rank, -(1LL << my_pe), target_rank);
+            }
+        }
     };
 
     for (int work_id = update_work_id_sync(); work_id < total_works;) {
@@ -106,13 +136,13 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         int mask_index = seq_work_id + work_per_chunk * (seg_chunk_id + remote_chunks * batch_id);
 
         if (smem_chunk_mask[mask_index]) {
-            // __syncthreads() here is necessary: in case some of the warp haven't updated
-            // the work_id and warp 0 overwrites next_work_id first, which will be bad.
+            // Masked work: no put needed, but still counts toward rank completion
+            try_commit_rank(seg_chunk_id);
             __syncthreads();
             work_id = update_work_id_sync();
             continue;
         }
-        
+
         // batch_offset + chunk_offset + work_offset, the src and dst in the buffer is the same
         const int addr = batch_id * batch_stride + (seg_chunk_id * S_chunk + seq_work_id * row_per_block) * S_stride;
 
@@ -126,6 +156,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         // buffer putmem_block will call syncthreads(), so next_work_id will not be updated
         // therefore, next_work_id's update is visible to all threads and won't be overwritten
         // before some threads reading it. Safe!
+        try_commit_rank(seg_chunk_id);
         work_id = update_work_id_sync();
     }
 #ifdef NVSHMEM_DEBUG

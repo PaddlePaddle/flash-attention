@@ -244,6 +244,7 @@ private:
     int* block_cnt_semaphore;
     int* copy_chunk_mask;
     int* stream_coordinator;        // make sure comm kernel is scheduled to GPU before computation kernel
+    int* rank_commit_counters;      // per-rank put completion counters for P2P RS commit
 };
 
 namespace comm {

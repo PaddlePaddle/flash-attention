@@ -641,8 +641,6 @@ def _flash_attn_bwd(
         cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
         num_flashmask_tensors = 2 * flashmask_info.startend_row_indices.shape[-1]
 
-    num_head, head_dim = q.shape[-2:]
-
     if compute_capability == 9:
         m_block_size = 80 if not causal else 64
         n_block_size = 128
@@ -663,16 +661,13 @@ def _flash_attn_bwd(
         dKV_swapAB = False
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
-
-        need_large_cluster = (head_dim > 128) or (head_dim == 128 and flashmask_info is None)
-        cluster_size = 2 if need_large_cluster else 1
-        use_2cta_instrs = cluster_size == 2
-
+        # TODO: support cluster size 2
+        cluster_size = 1
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
         maybe_contiguous(t)
         for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
-
+    num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
         total_q = batch_size * seqlen_q
@@ -829,7 +824,7 @@ def _flash_attn_bwd(
     ]
     if deterministic:
         dQ_semaphore = paddle.zeros(
-            shape=[batch_size, num_head, seqlen_q_rounded // m_block_size, cluster_size], dtype=paddle.int32
+            shape=[batch_size, num_head, seqlen_q_rounded // m_block_size, 1], dtype=paddle.int32
         )
     else:
         dQ_semaphore = None
@@ -863,11 +858,10 @@ def _flash_attn_bwd(
     current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
-    compile_key_pre = (compute_capability, dtype, head_dim, head_dim_v, head_dim_rounded, m_block_size, num_threads)
+    compile_key_pre = (compute_capability, dtype, head_dim_v, head_dim_rounded, m_block_size, num_threads)
     if compile_key_pre not in _flash_attn_bwd.compile_cache_pre:
         fa_bwd_pre = FlashAttentionBackwardPreprocess(
             dtype,
-            head_dim,
             head_dim_v,
             m_block_size,
             num_threads=num_threads,
@@ -992,7 +986,7 @@ def _flash_attn_bwd(
                 # tile_m=m_block_size,
                 # tile_n=n_block_size,
                 cluster_size=cluster_size,
-                use_2cta_instrs=use_2cta_instrs,
+                # cluster_size=1,
                 deterministic=deterministic,
             )
         # TODO: check @can_implement
@@ -1043,11 +1037,10 @@ def _flash_attn_bwd(
     num_threads = 256 if compute_capability == 9 else 128
     arch = compute_capability * 10
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
-    compile_key_post = (dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB, use_2cta_instrs)
+    compile_key_post = (dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
         fa_bwd_post = FlashAttentionBackwardPostprocess(
-            dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB,
-            use_2cta_instrs=use_2cta_instrs,
+            dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1073,8 +1066,7 @@ def _flash_attn_bwd(
         compile_key_post = (dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB,
-                cluster_size=cluster_size,
+                dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1105,8 +1097,7 @@ def _flash_attn_bwd(
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim_v, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB,
-                cluster_size=cluster_size,
+                dtype, head_dim_v, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1705,11 +1696,7 @@ def flashmask_attention(
 ):
     if (
         paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"] == 4
-        and (
-            (query.shape[-1] <= 128 and key.shape[-1] <= 128 and value.shape[-1] <= 128)
-            or
-            (query.shape[-1] == 192 and key.shape[-1] == 192 and value.shape[-1] == 128)
-        )
+        and query.shape[-1] <= 128 and key.shape[-1] <= 128 and value.shape[-1] <= 128
         and (startend_row_indices is None or startend_row_indices.shape[-1] != 4)
     ):
         assert dropout == 0.0, (
@@ -1845,11 +1832,7 @@ def flash_attention(
 ):
     if (
         paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"] == 4
-        and (
-            (query.shape[-1] <= 128 and key.shape[-1] <= 128 and value.shape[-1] <= 128)
-            or
-            (query.shape[-1] == 192 and key.shape[-1] == 192 and value.shape[-1] == 128)
-        )
+        and query.shape[-1] <= 128 and key.shape[-1] <= 128 and value.shape[-1] <= 128
     ):
         assert dropout == 0.0, (
             "flash attention 4 does not support dropout"

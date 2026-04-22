@@ -18,8 +18,9 @@ static constexpr bool USE_SEMAPHORES = true;
 // whether to use stream coordinator to make sure the scheduling order of comm & comp kernels
 // Note(heqianyue): If we can make sure CUDA_DEVICE_MAX_CONNECTION=1, stream_coord is actually not required
 static constexpr bool USE_STREAM_COORD = true;
-// whether to use double buffer for dK, dV SepSRBuffer, either 1 (single) or 2 (double buffer)
-// Note(heqianyue): double buffering might be deprecated in the future
+// (experimental): if true, the RS buffer capacity is the same as CP-size
+static constexpr bool USE_DYNAMIC_CAPACITY = true;
+// whether to use multiple buffers, this can be set up to CP-size
 static constexpr int RS_BUFFER_CAPACITY = 1;
 // SM_MARGIN works for 128K CP16, but for 32K CP4, the performance is a bit degraded.
 static constexpr int OVERLAP_SM_MARGIN = 0;
@@ -216,16 +217,18 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         cudaEventCreateWithFlags(&bwd_done, cudaEventDisableTiming);
         cudaEventCreateWithFlags(&reduce_done, cudaEventDisableTiming);
         cudaEventCreateWithFlags(&local_moved, cudaEventDisableTiming);
+        const int num_stages = _total_n_pes / num_chunks;
         dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
             _local_batch_stride * b_kv,      // single chunk K numel (B * S_local * H * D)
             _total_n_pes,
             num_chunks,
-            RS_BUFFER_CAPACITY,
+            USE_DYNAMIC_CAPACITY ? num_stages : RS_BUFFER_CAPACITY,
             cp_team
         );
-        // zero initialize the dkv semaphores
-        dkv_buffer->reset_semaphores();
-        WARN_PRINT("[FlashMask Overlap] Using RS-Overlap, buffer capacity: %d, num_chunks: %d\n", RS_BUFFER_CAPACITY, num_chunks);
+        dkv_buffer->initialize_buffer(_my_pe, USE_DYNAMIC_CAPACITY);
+
+        printf("[FlashMask Overlap] Using RS-Overlap, buffer capacity: %d, num_chunks: %d\n", 
+                USE_DYNAMIC_CAPACITY ? num_stages : RS_BUFFER_CAPACITY, num_chunks);
     }
     kv_buffer->team_bar();
     // Initialize configuration tracking
@@ -616,23 +619,27 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
     cudaStreamWaitEvent(aux_p_stream, bwd_done);
     cudaStreamWaitEvent(aux_c_stream, bwd_done);
 
-    // Note(heqianyue): remote_producer: who is putting data to us. remote_consumer: who should we put data to.
-    // for remote producer, it is easier to compute the last rank.
-    const int remote_producer_end_rank = (_my_pe - num_chunks * segment_idx) % _total_n_pes;
     const int remote_consumer_start_rank = (_my_pe + num_chunks * segment_idx) % _total_n_pes;
+    const int remote_producer_end_rank = (_my_pe - num_chunks * segment_idx) % _total_n_pes;
 
-    // local consumer clears recv buffer so that places where remote_put kernel does not put data to are clean
-    // set local state: local consumer needs data (this prevents dk_dv reducer starts before other remote ranks
-    // put their data). Also, notify remote producer after setting local state, so that they won't change our local
-    // state before we've set it, which might cause deadlock hang). After the following function call:
-    // local consumer (recv_buffer and reduce kernel) is ready to wait for the buffer to be full
-    if (segment_idx) dkv_buffer->zero_recv_buf(segment_idx, aux_c_stream);
-    sema::rs::notify_consumer_empty(
-        dkv_buffer->semaphores(segment_idx),
-        remote_producer_end_rank,
-        num_chunks, _total_n_pes, _my_pe,
-        aux_c_stream
-    );                          // local consumer
+    // When capacity >= num_segments, each segment owns a dedicated buffer slot.
+    // notify_consumer_empty is deferred to post-reduce, so that producer_wait_empty latency
+    // is hidden by the full inter-BWD interval. constructor handles the first init.
+
+    // When capacity < num_segments, slots are reused within a BWD pass.
+    // Post-reduce notify would let a fast remote rank overwrite a reused slot's live data.
+    // Must use the original pre-notify path: notify at stage start, before the put kernel.
+    const bool post_reduce_notify = dkv_buffer_stage() == num_segments();
+
+    if (!post_reduce_notify) {
+        if (segment_idx) dkv_buffer->zero_recv_buf(segment_idx, aux_c_stream);
+        sema::rs::notify_consumer_empty(
+            dkv_buffer->semaphores(segment_idx),
+            remote_producer_end_rank,
+            num_chunks, _total_n_pes, _my_pe,
+            aux_c_stream
+        );
+    }
 
     // step 2. local producer (put) wait empty (in the kernel) and start remote_put
 #define RsKernelBody(_S_chunk)                                                                              \
@@ -657,13 +664,11 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
             NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks, true, segment_idx);       \
         }                                                                                               \
         dkv_buffer->release_buffer(segment_idx, aux_p_stream);                                          \
-        /* step 3. local producer notifies remote consumer: put done. Can start reduce. */              \
-        /* step 4. the local rank consumer (reduce) wait full */                                        \
+        /* consumer wait full + reduce */                                                               \
         sema::rs::consumer_wait_full(                                                                   \
             dkv_buffer->semaphores(segment_idx),                                                        \
             _my_pe, aux_c_stream                                                                        \
         );                                                                                              \
-        /* step 5. zero-copy reduce */                                                                  \
         launch_dk_dv_reduce(                                                                            \
             dkv_buffer->k_recv(segment_idx),                                                            \
             dkv_buffer->v_recv(segment_idx),                                                            \
@@ -672,15 +677,23 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
             segment_idx == 0,                                                                           \
             aux_c_stream                                                                                \
         );                                                                                              \
+        /* post-reduce notify: only when each segment has its own slot (capacity >= num_segments). */   \
+        /* Zero the recv buffer first, then signal remote producers — safe because reduce already */    \
+        /* consumed the data, and no other segment will touch this slot within this BWD pass. */        \
+        if (post_reduce_notify) {                                                                       \
+            dkv_buffer->zero_recv_buf(segment_idx, aux_c_stream);                                       \
+            sema::rs::notify_consumer_empty(                                                            \
+                dkv_buffer->semaphores(segment_idx),                                                    \
+                remote_producer_end_rank, num_chunks, _total_n_pes, _my_pe,                             \
+                aux_c_stream                                                                            \
+            );                                                                                          \
+        }                                                                                               \
     } while(0)
 
     SChunkDispatch(RsKernelBody, S_local);
 #undef RsKernelBody
 
-    // the end state should be: semaphore is all zero
-    WARN_PRINT_SYNC(aux_c_stream, "(%d) After run_overlap_rs_kernel.\n", _my_pe);
-    // the next post process should wait for the current reduce to be done
-    // otherwise, the local dk/v_send will risk being overwritten by the next post-process
+    WARN_PRINT_SYNC(aux_c_stream, "(%d) After run_overlap_rs_kernel, segment: %d\n", _my_pe, segment_idx);
 }
 
 #undef SegmentIdxPutKernelDispatch
@@ -688,7 +701,7 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
 
 template <typename KVType>
 int OverlapCommunicator<KVType>::dkv_buffer_stage() const {
-    return RS_BUFFER_CAPACITY;
+    return USE_DYNAMIC_CAPACITY ? num_segments() : RS_BUFFER_CAPACITY;
 }
 
 template <typename KVType>
@@ -717,9 +730,14 @@ int OverlapCommunicator<KVType>::overlap_sm_margin() const {
 template <typename KVType>
 void OverlapCommunicator<KVType>::prepare_dkv_buffer(cudaStream_t stream) {
     if (!dkv_buffer) return;
-    // we need to use compute stream to zero the recv buffer
-    // to make sure the buffer is zero-ed before producer/consumer starts
-    dkv_buffer->zero_recv_buf(0, stream);
+
+    const bool pre_reduce_notify = dkv_buffer_stage() < num_segments();
+    if (pre_reduce_notify) {
+        // capacity < num_segments: slots are reused within a BWD pass.
+        // Only zero seg 0's recv buffer on comp_stream (original behavior).
+        // notify_consumer_empty is done at stage start in run_overlap_rs_kernel.
+        dkv_buffer->zero_recv_buf(0, stream);
+    }
 }
 
 // ====== Dynamic Reconfiguration ======
@@ -766,9 +784,9 @@ void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, nvshmem_team_t 
 
         size_t alloc_numel = alloc_with_headroom(new_single_k_numel);
         dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
-            alloc_numel, _total_n_pes, num_chunks, RS_BUFFER_CAPACITY, cp_team
+            alloc_numel, _total_n_pes, num_chunks, USE_DYNAMIC_CAPACITY ? _total_n_pes / num_chunks : RS_BUFFER_CAPACITY, cp_team
         );
-        dkv_buffer->reset_semaphores();
+        dkv_buffer->initialize_buffer(_my_pe, USE_DYNAMIC_CAPACITY);
         _dkv_single_k_numel_capacity = alloc_numel;
         _dkv_num_chunks = num_chunks;
         WARN_PRINT("[FlashMask Overlap] Reconfigure: created dkv_buffer, chunks: %d\n", num_chunks);
@@ -781,9 +799,9 @@ void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, nvshmem_team_t 
             size_t alloc_numel = alloc_with_headroom(new_single_k_numel);
             dkv_buffer->release_for_realloc();
             dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
-                alloc_numel, _total_n_pes, num_chunks, RS_BUFFER_CAPACITY, cp_team
+                alloc_numel, _total_n_pes, num_chunks, USE_DYNAMIC_CAPACITY ? _total_n_pes / num_chunks : RS_BUFFER_CAPACITY, cp_team
             );
-            dkv_buffer->reset_semaphores();
+            dkv_buffer->initialize_buffer(_my_pe, USE_DYNAMIC_CAPACITY);
             _dkv_single_k_numel_capacity = alloc_numel;
             _dkv_num_chunks = num_chunks;
             WARN_PRINT("[FlashMask Overlap] Reconfigure: recreated dkv_buffer, chunks: %d\n", num_chunks);

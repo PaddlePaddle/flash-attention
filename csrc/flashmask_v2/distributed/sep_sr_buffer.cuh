@@ -7,13 +7,13 @@
 #include <nvshmemx.h>
 #include <stdexcept>
 #include <cstring>
-#include <array>
+#include <vector>
 
 namespace flashmask {
 
 // RAII object of separate send/recv buffer
 
-#define CLAMP_IDX(idx) (idx & _idx_mask)
+#define CLAMP_IDX(idx) (idx % _capacity)
 template <typename KVType>
 class SepSRBuffer {
 using SemaphoreType = int64_t;
@@ -31,8 +31,8 @@ private:
     size_t _single_k_numel;    // allocated capacity per-K (B * S_local * H * D)
     int _chunks_per_seg;       // chunks per segment (layout-defining)
 
-    const int _idx_mask;
-    std::array<cudaEvent_t, 2> _empty_states; 
+    const int _capacity;
+    std::vector<cudaEvent_t> _empty_states; 
 
     // this object cannot be moved or copied
     SepSRBuffer(const SepSRBuffer&) = delete;
@@ -72,6 +72,10 @@ public:
     inline KVType* v_recv(int seg_idx) const { return _dv_data + (CLAMP_IDX(seg_idx) * 2 + 1) * _buf_offset; }
     inline SemaphoreType* semaphores(int seg_idx) const { return _semaphores + CLAMP_IDX(seg_idx) * _semaphore_size; }
 
+    // initialize multi-buffer for post-notify latency hiding setup
+    // or using fixed capacity without post-notify
+    void initialize_buffer(int self_rank, bool dynamic_capacity = false);
+
     void wait_buffer(int seg_idx, cudaStream_t stream) {
         cudaStreamWaitEvent(stream, _empty_states[CLAMP_IDX(seg_idx)]);
     }
@@ -80,7 +84,6 @@ public:
         cudaEventRecord(_empty_states[CLAMP_IDX(seg_idx)], stream);
     }
 
-    void reset_semaphores();
     // clear recv buffer (so that reduce won't op on dirty data)
     void zero_recv_buf(int seg_idx, cudaStream_t comm_stream);
 

@@ -166,7 +166,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int total_chunks = num_batch * chunk_per_batch;
     const int works_per_rank = num_batch * work_per_chunk;
     const int batch_stride = S * S_stride;
-    __shared__ int cached_semaphores[16];
+    __shared__ int cached_semaphores[64];
     __shared__ int next_work_id;
     // note that block_cnt_semaphore starts from 1. dyn-scheduling from the beginning.
 
@@ -329,7 +329,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int local_batch_stride = S_chunk * S_stride;
 
     extern __shared__ int smem_chunk_mask[];
-    __shared__ int cached_semaphores[16];
+    __shared__ int cached_semaphores[64];
     __shared__ int next_work_id;
 
     if (threadIdx.x < total_works) {

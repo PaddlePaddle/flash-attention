@@ -52,8 +52,8 @@ __global__ void FusedConsumerNotifyEmpty(
     // remote_producer_end_rank will be 15 (computed by mod_nranks(3 - 4 * seg_idx) --> (-1 % 16) --> 15)
     if (threadIdx.x == 0) {
         semaphores[self_rank] = value;
-        DEBUG_PRINT("Consumer %d fused, sets self empty value: %d, \
-            nranks: %d, end_rank: %d\n", self_rank, value, nranks, remote_producer_end_rank);
+        DEBUG_PRINT("Consumer %d fused, sets self empty value: %lx, nranks: %d, end_rank: %d\n", 
+            self_rank, value, nranks, remote_producer_end_rank);
     }
     // the following fence makes sure semaphore setting is visible across all CP ranks 
     __threadfence();
@@ -133,12 +133,14 @@ void consumer_wait_full(
     int my_pe,
     cudaStream_t comm_stream
 ) {
+    WARN_PRINT("Consumer wait full ...\n");
     nvshmemx_int64_wait_until_on_stream(
         semaphores + my_pe,
         NVSHMEM_CMP_EQ,
         0,
         comm_stream
     );
+    WARN_PRINT_SYNC(comm_stream, "Consumer wait full succeeded.\n");
 }
 
 __device__ void producer_wait_empty(

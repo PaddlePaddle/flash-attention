@@ -512,17 +512,31 @@ class AttentionMask:
         mask_local: cutlass.Constexpr,
         sStartEndRowIndices: cute.Tensor,
         partially_masked: bool,
+        startend_row_indices: Optional[cute.Tensor] = None,
+        fm_batch_idx: cutlass.Int32 = 0,
+        fm_head_idx: cutlass.Int32 = 0,
+        has_lte: cutlass.Constexpr[bool] = False,
+        has_uts: cutlass.Constexpr[bool] = False,
+        has_ute: cutlass.Constexpr[bool] = False,
     ) -> None:
         """
         Backward pass: mask S = K @ Q.T where n_block tiles seqlen_k and m_block tiles seqlen_q.
+        sStartEndRowIndices layout: (tile_n, 2).
+          [:, 0] = LTS (all cases)
+          [:, 1] = LTE (num_vec==2 causal or num_vec==4) or UTE (num_vec==2 non-causal)
+        For num_vec==4 (has_uts), UTS and UTE are read from gmem via startend_row_indices
+        because smem cannot fit 4 columns at the 228KB limit.
+        FlashMask masking conditions:
+          num_vec==1, causal:     row >= LTS
+          num_vec==2, causal:     row >= LTS AND row < LTE
+          num_vec==2, non-causal: row >= LTS OR  row < UTE
+          num_vec==4:             (row >= LTS AND row < LTE) OR (row >= UTS AND row < UTE)
         """
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
         thr_col_offset = tScS_t2r[0][COL]
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
-        #cute.printf('seqlenk_col_limit: %d, thr_col_offset: %d, t0ScS_t2r[0][COL]: %d, %d', seqlenk_col_limit, thr_col_offset, t0ScS_t2r[0][COL], t0ScS_t2r[32][COL])
-        #cute.print_tensor(t0ScS_t2r)
         if const_expr(not mask_causal and not mask_local):
             if const_expr(mask_seqlen):
                 if t0ScS_t2r[0][COL] >= seqlenk_col_limit:
@@ -530,15 +544,44 @@ class AttentionMask:
                         acc_S[i] = -cutlass.Float32.inf
             # FlashMask
             if partially_masked:
-                for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
-                    lts = sStartEndRowIndices[tScS_t2r[i][COL], 0] - m_block * self.tile_m 
-                    ute = sStartEndRowIndices[tScS_t2r[i][COL], 1] - m_block * self.tile_m
-                    acc_S[i] = (
-                        -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts else acc_S[i]
-                    )
-                    acc_S[i] = (
-                        -cutlass.Float32.inf if tScS_t2r[i][ROW] < ute else acc_S[i]
-                    )
+                if const_expr(has_uts):
+                    # num_vec==4: (row >= LTS AND row < LTE) OR (row >= UTS AND row < UTE)
+                    # LTS, LTE from smem; UTS, UTE from gmem via startend_row_indices
+                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                        lts = sStartEndRowIndices[tScS_t2r[i][COL], 0] - m_block * self.tile_m
+                        lte = sStartEndRowIndices[tScS_t2r[i][COL], 1] - m_block * self.tile_m
+                        # Guard gmem access: when seqlen_k is not divisible by tile_n,
+                        # the last n_block may have out-of-bound columns.
+                        col_idx = n_block * self.tile_n + tScS_t2r[i][COL]
+                        uts = 0
+                        ute = 0
+                        if col_idx < self.seqlen_k:
+                            uts = startend_row_indices[fm_batch_idx, fm_head_idx, col_idx, 2] - m_block * self.tile_m
+                            ute = startend_row_indices[fm_batch_idx, fm_head_idx, col_idx, 3] - m_block * self.tile_m
+                        acc_S[i] = (
+                            -cutlass.Float32.inf
+                            if (tScS_t2r[i][ROW] >= lts and tScS_t2r[i][ROW] < lte) or (tScS_t2r[i][ROW] >= uts and tScS_t2r[i][ROW] < ute)
+                            else acc_S[i]
+                        )
+                elif const_expr(has_ute):
+                    # num_vec==2, non-causal: row >= LTS OR row < UTE
+                    # UTE stored in smem [:, 1]
+                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                        lts = sStartEndRowIndices[tScS_t2r[i][COL], 0] - m_block * self.tile_m
+                        ute = sStartEndRowIndices[tScS_t2r[i][COL], 1] - m_block * self.tile_m
+                        acc_S[i] = (
+                            -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts else acc_S[i]
+                        )
+                        acc_S[i] = (
+                            -cutlass.Float32.inf if tScS_t2r[i][ROW] < ute else acc_S[i]
+                        )
+                else:
+                    # num_vec==1: row >= LTS
+                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                        lts = sStartEndRowIndices[tScS_t2r[i][COL], 0] - m_block * self.tile_m
+                        acc_S[i] = (
+                            -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts else acc_S[i]
+                        )
 
         else:  # Causal or local
             thr_row_offset = tScS_t2r[0][ROW]
@@ -548,9 +591,6 @@ class AttentionMask:
             if const_expr(mask_causal):
                 col0 = t0ScS_t2r[0][COL]
                 row_limit_top = col0 - causal_row_offset
-                # tidx = cute.arch.thread_idx()[0] % 256
-                # if tidx < 32:
-                #     cute.printf("tidx = {}, {} {}, {} {}, col0 = {}", tidx, tScS_t2r[0][0], tScS_t2r[0][1], tScS_t2r[1][0], tScS_t2r[1][1], col0)
                 if const_expr(mask_seqlen):
                     # If col is beyond the column limit, we want to mask out the entire
                     # column, by setting row limit to be self.tile_m.
@@ -568,12 +608,21 @@ class AttentionMask:
                     mask_r2p_transposed(acc_S, row_limit_top, num_rep)
 
                 if partially_masked:
-                    # FlashMask
-                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
-                        lts = sStartEndRowIndices[tScS_t2r[i][COL], 0] - m_block * self.tile_m 
-                        lte = sStartEndRowIndices[tScS_t2r[i][COL], 1] - m_block * self.tile_m
-                        acc_S[i] = (
-                            -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts and tScS_t2r[i][ROW] < lte else acc_S[i]
-                        )
+                    # FlashMask (causal: has_uts is never True since num_vec==4 is always non-causal)
+                    if const_expr(has_lte):
+                        # num_vec==2, causal: row >= LTS AND row < LTE
+                        for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                            lts = sStartEndRowIndices[tScS_t2r[i][COL], 0] - m_block * self.tile_m
+                            lte = sStartEndRowIndices[tScS_t2r[i][COL], 1] - m_block * self.tile_m
+                            acc_S[i] = (
+                                -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts and tScS_t2r[i][ROW] < lte else acc_S[i]
+                            )
+                    else:
+                        # num_vec==1: row >= LTS
+                        for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                            lts = sStartEndRowIndices[tScS_t2r[i][COL], 0] - m_block * self.tile_m
+                            acc_S[i] = (
+                                -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts else acc_S[i]
+                            )
             else:
                 assert False, "Local masking isn't supported yet"

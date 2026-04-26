@@ -122,24 +122,53 @@ void producer_commit_all(
         semaphores, remote_consumer_start_rank, nranks, self_rank);
 }
 
+static __global__ void SpinWaitAndReplaceKernel(int64_t* ptr, int64_t target) {
+    if (threadIdx.x > 0) return;
+    while (true) {
+        int64_t val;
+        asm volatile("ld.global.cg.s64 %0, [%1];" 
+            : "=l"(val) 
+            : "l"(ptr) 
+            : "memory"
+        );
+
+        if (val == target) {
+            if (atomicCAS(reinterpret_cast<unsigned long long int*>(ptr), 
+                          static_cast<unsigned long long int>(target), 
+                          0ULL) == static_cast<unsigned long long int>(target)) {
+                break;
+            }
+        }
+        __nanosleep(16); 
+    }
+}
+
 /**
  * @brief CPU wait until the semaphores[my_pe] reached 0
  * @param semaphores int semaphores allocated by nvshmem: size is total_n_pes
  * @param my_pe the id of semaphore to wait for
  * @param stream waiting stream. This API is therefore async on stream (if non-blocking)
 */
+template <bool use_per_stage_buffer = false>
 void consumer_wait_full(
     int64_t* const __restrict__ semaphores,
     int my_pe,
+    int wait_value,
     cudaStream_t comm_stream
 ) {
     WARN_PRINT("Consumer wait full ...\n");
-    nvshmemx_int64_wait_until_on_stream(
-        semaphores + my_pe,
-        NVSHMEM_CMP_EQ,
-        0,
-        comm_stream
-    );
+    if constexpr (use_per_stage_buffer) {
+        SpinWaitAndReplaceKernel<<<1, 1, 0, comm_stream>>>(
+            semaphores + my_pe, wait_value
+        );
+    } else {
+        nvshmemx_int64_wait_until_on_stream(
+            semaphores + my_pe,
+            NVSHMEM_CMP_EQ,
+            0,
+            comm_stream
+        );
+    }
     WARN_PRINT_SYNC(comm_stream, "Consumer wait full succeeded.\n");
 }
 

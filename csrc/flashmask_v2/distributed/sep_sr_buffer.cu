@@ -107,47 +107,18 @@ void SepSRBuffer<KVType>::zero_recv_buf(int seg_idx, cudaStream_t comm_stream) {
     cudaMemsetAsync(_dk_data + _buf_offset * (1 + 2 * (seg_idx % _capacity)), 0, sizeof(KVType) * _buf_offset, comm_stream);
 }
 
-static __global__ void ConsumerNotifyEmpty(
-    int64_t* const __restrict__ semaphores,
-    int remote_producer_end_rank,
-    int nranks,
-    int64_t value,
-    int self_rank
-) {
-    if (threadIdx.x == 0) {
-        semaphores[self_rank] = value;
-    }
-    __threadfence();
-    __syncthreads();
-    int target_rank = remote_producer_end_rank - threadIdx.x;
-    target_rank = target_rank >= 0 ? target_rank : target_rank + nranks;
-    if (target_rank == self_rank) return;
-    nvshmem_int64_p(semaphores + self_rank, 1, target_rank);
-}
-
 template <typename KVType>
-void SepSRBuffer<KVType>::initialize_buffer(int self_rank, bool dynamic_capacity) {
-    if (dynamic_capacity) {
+void SepSRBuffer<KVType>::initialize_buffer(int self_rank, bool per_stage_buffer) {
+    if (per_stage_buffer) {
         // all the GPU ops uses the default blocking stream, since this is only called during initialization (one-off)
         size_t recv_buffer_sz = sizeof(KVType) * _buf_offset;
-        cudaStream_t default_stream = 0;
         for (int stage = 0; stage < _capacity; stage++) {
             cudaMemset(_dk_data + _buf_offset * (1 + 2 * (stage % _capacity)), 0, recv_buffer_sz);
-            int64_t local_flag = 0, remote_end_rank = self_rank - stage * _chunks_per_seg;
-            remote_end_rank = remote_end_rank >= 0 ? remote_end_rank : remote_end_rank + _semaphore_size;
-            for (int i = 0; i < _chunks_per_seg; i++) {
-                int target_rank = remote_end_rank - i;
-                target_rank = target_rank >= 0 ? target_rank : target_rank + _semaphore_size;
-                local_flag |= target_rank == self_rank ? 0 : (1LL << target_rank);
-            }
-            ConsumerNotifyEmpty<<<1, _chunks_per_seg>>>(semaphores(stage), remote_end_rank, _semaphore_size, local_flag, self_rank);
-            cudaEventRecord(_empty_states[stage], default_stream);
         }
-    } else {
-        size_t semaphore_bytes = _semaphore_size * sizeof(SemaphoreType);
-        // set recv buffer and semaphores to be 0 all at once
-        cudaMemset(_semaphores, 0, semaphore_bytes * _capacity);
     }
+    size_t semaphore_bytes = _semaphore_size * sizeof(SemaphoreType);
+    // set recv buffer and semaphores to be 0 all at once
+    cudaMemset(_semaphores, 0, semaphore_bytes * _capacity);
 }
 
 template class SepSRBuffer<cutlass::bfloat16_t>;

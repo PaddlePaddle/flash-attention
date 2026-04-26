@@ -246,6 +246,12 @@ private:
     int* stream_coordinator;        // make sure comm kernel is scheduled to GPU before computation kernel
     int* rank_commit_counters;      // per-rank put completion counters for P2P RS commit
     int* rank_empty_counters;       // per-rank get completion counters for P2P AG empty notify
+
+    // RS multi-stream: per-segment producer resources (USE_DYNAMIC_CAPACITY only)
+    cudaStream_t* put_streams;      // [num_segments], nullptr if single-stream
+    cudaEvent_t* bwd_done_events;   // [num_segments], nullptr if single-stream
+    int* rs_block_cnt;              // device memory [num_segments], nullptr if single-stream
+    int _num_put_streams;           // 0 = single-stream mode
 };
 
 namespace comm {

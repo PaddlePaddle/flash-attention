@@ -74,7 +74,7 @@ public:
 
     // initialize multi-buffer for post-notify latency hiding setup
     // or using fixed capacity without post-notify
-    void initialize_buffer(int self_rank, bool dynamic_capacity = false);
+    void initialize_buffer(int self_rank, bool per_stage_buffer = false);
 
     void wait_buffer(int seg_idx, cudaStream_t stream) {
         cudaStreamWaitEvent(stream, _empty_states[CLAMP_IDX(seg_idx)]);

@@ -20,7 +20,8 @@ namespace flashmask {
  * P2P commit: when the last CTA finishes all puts to a given rank, it calls nvshmem_fence() + signal
  * to notify that specific remote consumer immediately — no blocking quiet or group commit needed.
 */
-template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunk=4, bool has_local_chunk=false>
+template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, 
+    int num_chunk=4, bool has_local_chunk=false, bool per_stage_buffer=false>
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkRemotePutKernel(
     const T* const __restrict__ k_send,                 // K src addr (local)
     const T* const __restrict__ v_send,                 // V src addr (local)
@@ -82,18 +83,20 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             // Note: block_cnt_semaphore for remote_put starts from 0 (for remote get, starts from 1)
             int _work_id = atomicAdd(block_cnt_semaphore, 1);
             next_work_id = _work_id;
-            // Guard: only wait for consumer "empty" signal for valid works.
-            // Invalid work_ids (>= total_works) must NOT call producer_wait_empty,
-            // because try_commit_rank may have already cleared semaphores[target] = 0.
-            if (_work_id < total_works) {
-                // chunk ID changes first: chunk [0, 1, 2, 3, 0, 1, 2, 3, ...]
-                int chunk_id = (_work_id % remote_chunks) + chunk_offset;
-                int target_pe = (start_rank + chunk_id) % nranks;
-                // the current CTA might be scheduled to send things to different ranks
-                // so each CTA should keep track of whether the target rank is empty
-                if (cached_empty[chunk_id] == 0) {
-                    sema::rs::producer_wait_empty(semaphores, target_pe);
-                    cached_empty[chunk_id] = 1;
+            if constexpr (per_stage_buffer == false) {
+                // Guard: only wait for consumer "empty" signal for valid works.
+                // Invalid work_ids (>= total_works) must NOT call producer_wait_empty,
+                // because try_commit_rank may have already cleared semaphores[target] = 0.
+                if (_work_id < total_works) {
+                    // chunk ID changes first: chunk [0, 1, 2, 3, 0, 1, 2, 3, ...]
+                    int chunk_id = (_work_id % remote_chunks) + chunk_offset;
+                    int target_pe = (start_rank + chunk_id) % nranks;
+                    // the current CTA might be scheduled to send things to different ranks
+                    // so each CTA should keep track of whether the target rank is empty
+                    if (cached_empty[chunk_id] == 0) {
+                        sema::rs::producer_wait_empty(semaphores, target_pe);
+                        cached_empty[chunk_id] = 1;
+                    }
                 }
             }
         }
@@ -115,8 +118,12 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                 nvshmem_fence();
                 int target_rank = (seg_chunk_id + start_rank) % nranks;
                 // P2P notify: same semantics as ProducerNotifyFull but for one rank only
-                semaphores[target_rank] = 0;
-                nvshmem_long_atomic_add(semaphores + target_rank, -(1LL << my_pe), target_rank);
+                if constexpr (per_stage_buffer) {
+                    nvshmem_long_atomic_add(semaphores + target_rank, 1, target_rank);
+                } else {
+                    semaphores[target_rank] = 0;
+                    nvshmem_long_atomic_add(semaphores + target_rank, -(1LL << my_pe), target_rank);
+                }
             }
         }
     };

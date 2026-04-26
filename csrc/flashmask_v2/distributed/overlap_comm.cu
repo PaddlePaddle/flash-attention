@@ -19,7 +19,7 @@ static constexpr bool USE_SEMAPHORES = true;
 // Note(heqianyue): If we can make sure CUDA_DEVICE_MAX_CONNECTION=1, stream_coord is actually not required
 static constexpr bool USE_STREAM_COORD = true;
 // (experimental): if true, the RS buffer capacity is the same as CP-size
-static constexpr bool USE_DYNAMIC_CAPACITY = true;
+static constexpr bool PER_STAGE_BUFFER = false;
 // whether to use multiple buffers, this can be set up to CP-size
 static constexpr int RS_BUFFER_CAPACITY = 1;
 // SM_MARGIN works for 128K CP16, but for 32K CP4, the performance is a bit degraded.
@@ -173,7 +173,11 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
    num_chunks(get_num_chunk_per_segment(s_kv, nranks, h_kv)),
    block_work_ids(nullptr),
    block_cnt_semaphore(nullptr),
-   copy_chunk_mask(nullptr)
+   copy_chunk_mask(nullptr),
+   put_streams(nullptr),
+   bwd_done_events(nullptr),
+   rs_block_cnt(nullptr),
+   _num_put_streams(0)
 {
     if constexpr (SHOULD_MANAGE_NVSHMEM) {
         init_distributed_environment(rank, nranks, _my_pe, _total_n_pes, unique_id_ptr);
@@ -222,13 +226,26 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
             _local_batch_stride * b_kv,      // single chunk K numel (B * S_local * H * D)
             _total_n_pes,
             num_chunks,
-            USE_DYNAMIC_CAPACITY ? num_stages : RS_BUFFER_CAPACITY,
+            PER_STAGE_BUFFER ? num_stages : RS_BUFFER_CAPACITY,
             cp_team
         );
-        dkv_buffer->initialize_buffer(_my_pe, USE_DYNAMIC_CAPACITY);
+        dkv_buffer->initialize_buffer(_my_pe, PER_STAGE_BUFFER);
 
-        printf("[FlashMask Overlap] Using RS-Overlap, buffer capacity: %d, num_chunks: %d\n", 
-                USE_DYNAMIC_CAPACITY ? num_stages : RS_BUFFER_CAPACITY, num_chunks);
+        // Per-segment producer streams for parallel put (PER_STAGE_BUFFER only)
+        if constexpr (PER_STAGE_BUFFER) {
+            _num_put_streams = num_stages;
+            put_streams = new cudaStream_t[num_stages];
+            bwd_done_events = new cudaEvent_t[num_stages];
+            for (int i = 0; i < num_stages; i++) {
+                cudaStreamCreateWithPriority(&put_streams[i], cudaStreamNonBlocking,
+                    std::min(greatest_priority + 1, least_priority));
+                cudaEventCreateWithFlags(&bwd_done_events[i], cudaEventDisableTiming);
+            }
+            CUDA_DEBUG_CHECK(cudaMalloc(&rs_block_cnt, sizeof(int) * num_stages));
+        }
+
+        printf("[FlashMask Overlap] Using RS-Overlap, buffer capacity: %d, num_chunks: %d\n",
+                PER_STAGE_BUFFER ? num_stages : RS_BUFFER_CAPACITY, num_chunks);
     }
     kv_buffer->team_bar();
     // Initialize configuration tracking
@@ -257,6 +274,19 @@ OverlapCommunicator<KVType>::~OverlapCommunicator() {
         CUDA_DEBUG_CHECK(cudaEventDestroy(local_moved));
         CUDA_DEBUG_CHECK(cudaStreamDestroy(aux_p_stream));
         CUDA_DEBUG_CHECK(cudaStreamDestroy(aux_c_stream));
+        if (_num_put_streams > 0) {
+            for (int i = 0; i < _num_put_streams; i++) {
+                CUDA_DEBUG_CHECK(cudaStreamDestroy(put_streams[i]));
+                CUDA_DEBUG_CHECK(cudaEventDestroy(bwd_done_events[i]));
+            }
+            delete[] put_streams;
+            delete[] bwd_done_events;
+            CUDA_DEBUG_CHECK(cudaFree(rs_block_cnt));
+            put_streams = nullptr;
+            bwd_done_events = nullptr;
+            rs_block_cnt = nullptr;
+            _num_put_streams = 0;
+        }
         dkv_buffer->release();
     }
     if constexpr (SHOULD_MANAGE_NVSHMEM && MANUAL_CLEANUP) {
@@ -464,8 +494,6 @@ void OverlapCommunicator<KVType>::compute_chunk_mask(
 
 template <typename KVType>
 int OverlapCommunicator<KVType>::chunk_per_seg() const {
-    // TODO(heqianyue): this is fixed for now, we can make this
-    // dynamic in the future (for example, for 32K CP4, chunk might be 2)
     return num_chunks;
 }
 
@@ -584,14 +612,14 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
 
 #define SegmentIdxPutKernelDispatch(_num_chunks, _has_local, seg_idx)       \
 SparseLargeKVChunkRemotePutKernel<KVType, S_chunk, num_warps,               \
-            RDMA_ROW_PER_WARP, _num_chunks, _has_local>                     \
-            <<<num_blocks, num_warps * 32, dynamic_smem, aux_p_stream>>>(   \
+            RDMA_ROW_PER_WARP, _num_chunks, _has_local, PER_STAGE_BUFFER>   \
+            <<<num_blocks, num_warps * 32, dynamic_smem, p_stream>>>(       \
         dkv_buffer->k_send(seg_idx),                                        \
         dkv_buffer->v_send(seg_idx),                                        \
         dkv_buffer->k_recv(seg_idx),                                        \
         dkv_buffer->v_recv(seg_idx),                                        \
-        block_cnt_semaphore + 1,                                            \
-        rank_commit_counters,                                               \
+        rs_cnt,                                                             \
+        commit_counters,                                                    \
         copy_chunk_mask,                                                    \
         _my_pe,                                                             \
         remote_consumer_start_rank,                                         \
@@ -611,13 +639,20 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
     cudaStream_t comp_stream
 ) {
     WARN_PRINT("(%d) Before run_overlap_rs_kernel, seg: %d\n", _my_pe, segment_idx);
-    // step 1 (pre-process and prepare) comp_stream should notify aux_p_stream, post-process is done.
+    // Per-segment resource selection: multi-stream when available, else single-stream fallback
+    cudaStream_t p_stream = PER_STAGE_BUFFER ? put_streams[segment_idx] : aux_p_stream;
+    int* const rs_cnt = PER_STAGE_BUFFER ? (rs_block_cnt + segment_idx) : (block_cnt_semaphore + 1);
+    int* const commit_counters = PER_STAGE_BUFFER
+        ? (rank_commit_counters + segment_idx * num_chunks) : rank_commit_counters;
+    cudaEvent_t done_event = PER_STAGE_BUFFER ? bwd_done_events[segment_idx] : bwd_done;
+
+    // step 1 (pre-process and prepare) comp_stream should notify p_stream, post-process is done.
     // also, reset the block_cnt_semaphore for remote_put dynamic scheduling
-    cudaMemsetAsync(block_cnt_semaphore + 1, 0, sizeof(int), aux_p_stream);
-    cudaMemsetAsync(rank_commit_counters, 0, sizeof(int) * num_chunks, aux_p_stream);
-    cudaEventRecord(bwd_done, comp_stream);
-    cudaStreamWaitEvent(aux_p_stream, bwd_done);
-    cudaStreamWaitEvent(aux_c_stream, bwd_done);
+    cudaMemsetAsync(rs_cnt, 0, sizeof(int), p_stream);
+    cudaMemsetAsync(commit_counters, 0, sizeof(int) * num_chunks, p_stream);
+    cudaEventRecord(done_event, comp_stream);
+    cudaStreamWaitEvent(p_stream, done_event);
+    cudaStreamWaitEvent(aux_c_stream, done_event);
 
     const int remote_consumer_start_rank = (_my_pe + num_chunks * segment_idx) % _total_n_pes;
     const int remote_producer_end_rank = (_my_pe - num_chunks * segment_idx) % _total_n_pes;
@@ -655,19 +690,19 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
             const KVType* const dk_src = dkv_buffer->k_send(0), *const dv_src = dkv_buffer->v_send(0);  \
             for (int batch_offset = 0, bid = 0; bid < B; bid ++, batch_offset += batch_stride) {        \
                 cudaMemcpyAsync(dk_dst + batch_offset, dk_src + batch_offset,                           \
-                    sizeof(KVType) * S_chunk * S_stride, cudaMemcpyDeviceToDevice, aux_p_stream);       \
+                    sizeof(KVType) * S_chunk * S_stride, cudaMemcpyDeviceToDevice, p_stream);           \
                 cudaMemcpyAsync(dv_dst + batch_offset, dv_src + batch_offset,                           \
-                    sizeof(KVType) * S_chunk * S_stride, cudaMemcpyDeviceToDevice, aux_p_stream);       \
+                    sizeof(KVType) * S_chunk * S_stride, cudaMemcpyDeviceToDevice, p_stream);           \
             }                                                                                           \
-            cudaEventRecord(local_moved, aux_p_stream);                                                 \
+            cudaEventRecord(local_moved, p_stream);                                                     \
             cudaStreamWaitEvent(aux_c_stream, local_moved);                                             \
             NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks, true, segment_idx);       \
         }                                                                                               \
-        dkv_buffer->release_buffer(segment_idx, aux_p_stream);                                          \
+        dkv_buffer->release_buffer(segment_idx, p_stream);                                              \
         /* consumer wait full + reduce */                                                               \
-        sema::rs::consumer_wait_full(                                                                   \
+        sema::rs::consumer_wait_full<PER_STAGE_BUFFER>(                                                 \
             dkv_buffer->semaphores(segment_idx),                                                        \
-            _my_pe, aux_c_stream                                                                        \
+            _my_pe, segment_idx == 0 ? (num_chunks - 1) : num_chunks, aux_c_stream                      \
         );                                                                                              \
         launch_dk_dv_reduce(                                                                            \
             dkv_buffer->k_recv(segment_idx),                                                            \
@@ -682,11 +717,13 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         /* consumed the data, and no other segment will touch this slot within this BWD pass. */        \
         if (post_reduce_notify) {                                                                       \
             dkv_buffer->zero_recv_buf(segment_idx, aux_c_stream);                                       \
-            sema::rs::notify_consumer_empty(                                                            \
-                dkv_buffer->semaphores(segment_idx),                                                    \
-                remote_producer_end_rank, num_chunks, _total_n_pes, _my_pe,                             \
-                aux_c_stream                                                                            \
-            );                                                                                          \
+            if constexpr (PER_STAGE_BUFFER == false) {                                                  \
+                sema::rs::notify_consumer_empty(                                                        \
+                    dkv_buffer->semaphores(segment_idx),                                                \
+                    remote_producer_end_rank, num_chunks, _total_n_pes, _my_pe,                         \
+                    aux_c_stream                                                                        \
+                );                                                                                      \
+            }                                                                                           \
         }                                                                                               \
     } while(0)
 
@@ -701,7 +738,7 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
 
 template <typename KVType>
 int OverlapCommunicator<KVType>::dkv_buffer_stage() const {
-    return USE_DYNAMIC_CAPACITY ? num_segments() : RS_BUFFER_CAPACITY;
+    return PER_STAGE_BUFFER ? num_segments() : RS_BUFFER_CAPACITY;
 }
 
 template <typename KVType>
@@ -784,11 +821,26 @@ void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, nvshmem_team_t 
 
         size_t alloc_numel = alloc_with_headroom(new_single_k_numel);
         dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
-            alloc_numel, _total_n_pes, num_chunks, USE_DYNAMIC_CAPACITY ? _total_n_pes / num_chunks : RS_BUFFER_CAPACITY, cp_team
+            alloc_numel, _total_n_pes, num_chunks, PER_STAGE_BUFFER ? _total_n_pes / num_chunks : RS_BUFFER_CAPACITY, cp_team
         );
-        dkv_buffer->initialize_buffer(_my_pe, USE_DYNAMIC_CAPACITY);
+        dkv_buffer->initialize_buffer(_my_pe, PER_STAGE_BUFFER);
         _dkv_single_k_numel_capacity = alloc_numel;
         _dkv_num_chunks = num_chunks;
+
+        // Per-segment producer streams (PER_STAGE_BUFFER only)
+        if constexpr (PER_STAGE_BUFFER) {
+            const int ns = _total_n_pes / num_chunks;
+            _num_put_streams = ns;
+            put_streams = new cudaStream_t[ns];
+            bwd_done_events = new cudaEvent_t[ns];
+            for (int i = 0; i < ns; i++) {
+                cudaStreamCreateWithPriority(&put_streams[i], cudaStreamNonBlocking,
+                    std::min(greatest_priority + 1, least_priority));
+                cudaEventCreateWithFlags(&bwd_done_events[i], cudaEventDisableTiming);
+            }
+            CUDA_DEBUG_CHECK(cudaMalloc(&rs_block_cnt, sizeof(int) * ns));
+        }
+
         WARN_PRINT("[FlashMask Overlap] Reconfigure: created dkv_buffer, chunks: %d\n", num_chunks);
 
     } else if (need_rs && dkv_buffer) {
@@ -799,16 +851,57 @@ void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, nvshmem_team_t 
             size_t alloc_numel = alloc_with_headroom(new_single_k_numel);
             dkv_buffer->release_for_realloc();
             dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
-                alloc_numel, _total_n_pes, num_chunks, USE_DYNAMIC_CAPACITY ? _total_n_pes / num_chunks : RS_BUFFER_CAPACITY, cp_team
+                alloc_numel, _total_n_pes, num_chunks, PER_STAGE_BUFFER ? _total_n_pes / num_chunks : RS_BUFFER_CAPACITY, cp_team
             );
-            dkv_buffer->initialize_buffer(_my_pe, USE_DYNAMIC_CAPACITY);
+            dkv_buffer->initialize_buffer(_my_pe, PER_STAGE_BUFFER);
             _dkv_single_k_numel_capacity = alloc_numel;
             _dkv_num_chunks = num_chunks;
+
+            // Recreate multi-stream resources if num_segments changed
+            if constexpr (PER_STAGE_BUFFER) {
+                const int ns = _total_n_pes / num_chunks;
+                if (ns != _num_put_streams) {
+                    // Destroy old
+                    for (int i = 0; i < _num_put_streams; i++) {
+                        cudaStreamDestroy(put_streams[i]);
+                        cudaEventDestroy(bwd_done_events[i]);
+                    }
+                    delete[] put_streams;
+                    delete[] bwd_done_events;
+                    CUDA_DEBUG_CHECK(cudaFree(rs_block_cnt));
+                    // Create new
+                    _num_put_streams = ns;
+                    put_streams = new cudaStream_t[ns];
+                    bwd_done_events = new cudaEvent_t[ns];
+                    int lp, gp;
+                    cudaDeviceGetStreamPriorityRange(&lp, &gp);
+                    for (int i = 0; i < ns; i++) {
+                        cudaStreamCreateWithPriority(&put_streams[i], cudaStreamNonBlocking,
+                            std::min(gp + 1, lp));
+                        cudaEventCreateWithFlags(&bwd_done_events[i], cudaEventDisableTiming);
+                    }
+                    CUDA_DEBUG_CHECK(cudaMalloc(&rs_block_cnt, sizeof(int) * ns));
+                }
+            }
+
             WARN_PRINT("[FlashMask Overlap] Reconfigure: recreated dkv_buffer, chunks: %d\n", num_chunks);
         }
 
     } else if (!need_rs && dkv_buffer) {
         // RS-overlap disabled: release dkv_buffer and aux resources
+        if (_num_put_streams > 0) {
+            for (int i = 0; i < _num_put_streams; i++) {
+                cudaStreamDestroy(put_streams[i]);
+                cudaEventDestroy(bwd_done_events[i]);
+            }
+            delete[] put_streams;
+            delete[] bwd_done_events;
+            CUDA_DEBUG_CHECK(cudaFree(rs_block_cnt));
+            put_streams = nullptr;
+            bwd_done_events = nullptr;
+            rs_block_cnt = nullptr;
+            _num_put_streams = 0;
+        }
         CUDA_DEBUG_CHECK(cudaEventDestroy(bwd_done));
         CUDA_DEBUG_CHECK(cudaEventDestroy(reduce_done));
         CUDA_DEBUG_CHECK(cudaEventDestroy(local_moved));

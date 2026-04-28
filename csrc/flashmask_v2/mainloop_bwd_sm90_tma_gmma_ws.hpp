@@ -358,6 +358,9 @@ struct CollectiveMainloopBwdSm90 {
         // the following is usually 1, only when bwd RS-overlap is ON will this get set to correct segment
         const int num_segments = 1;
         const int kv_chunk_size = 8192;
+        // Per-work ready flag mode for BWD: when > 0, write_ptr points to work_done[] array
+        // and comm_rpb = row_per_block (num_warps * RDMA_ROW_PER_WARP). 0 = contiguous wptr mode.
+        const int comm_rpb = 0;
     };
 
     // Device side kernel params
@@ -415,6 +418,7 @@ struct CollectiveMainloopBwdSm90 {
         // the following is usually 1, only when bwd RS-overlap is ON will this get set to correct segment
         const int num_segments = 1;
         const int kv_chunk_size = 8192;
+        const int comm_rpb = 0;
     };
 
     static Params
@@ -485,7 +489,8 @@ struct CollectiveMainloopBwdSm90 {
                 args.block_mask_ptr,
                 args.write_ptr,
                 args.num_segments,
-                args.kv_chunk_size};
+                args.kv_chunk_size,
+                args.comm_rpb};
     }
 
      enum class FmBlockInfo {
@@ -713,23 +718,22 @@ struct CollectiveMainloopBwdSm90 {
             shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
 
             // Used in distributed overlap
-            if (params.write_ptr && bidh <= 3) {
+            if (params.write_ptr) {
                 // large heads does not need to wait for write_ptr, since we will be scheduling S, then H
                 // for example, if local seqlen is 8K, kBlockN = 128, we will have 64 blocks per head
                 // Hopper GPUs have 132-144 SMs, so 4heads * 64 = 256 > 144, already covers! Greater seqlen_k
                 // can even lower the bidh <= 3 constraint 
                 const int nblock_id = (n_block + 1) * kBlockN;      // right bound of this block
-                // different behavior: when num_segments > 1 (RS-overlap), the first chunk is not skipped
-                // we therefore need to enter wptr wait code unconditionally, and set 0 as target offset
-                if (nblock_id > params.kv_chunk_size || params.num_segments > 1) {
-                    const int seqlen_k_offset = params.num_segments > 1 ? 0 : params.kv_chunk_size;
-                    const int target = bidb * (seqlen_info.seqlen_k - seqlen_k_offset) + nblock_id;
-                    do {
-                        int current_wptr = 0;
-                        asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(current_wptr) : "l"(params.write_ptr));
-                        if (current_wptr >= target) break;
-                    } while (true);
-                }
+                // Per-work ready flag mode: write_ptr points to work_done[] array.
+                // Each work covers comm_rpb rows. Map nblock_id to work_id and check directly.
+                // work_id is 1-based: work 1 covers rows [0, rpb), work 2 covers [rpb, 2*rpb), ...
+                // For batch > 0, add batch offset: batch_id * work_per_seg.
+                const int work_per_seg = seqlen_info.seqlen_k / params.comm_rpb;
+                const int work_id = bidb * work_per_seg + (nblock_id - 1) / params.comm_rpb + 1;
+                int flag = 0;
+                do {
+                    asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(flag) : "l"(params.write_ptr + work_id));
+                } while (flag == 0);
             }
 
             copy(params.tma_load_K.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tKgK, tKsK);

@@ -6,6 +6,18 @@
 #include "debug_logger.cuh"
 
 namespace flashmask {
+
+__device__ __forceinline__ int load_global_cg(const int* __restrict__ ptr) {
+    int value;
+    asm volatile ("ld.global.cg.s32 %0, [%1];" : "=r"(value) : "l"(ptr) : "memory");
+    return value;
+}
+
+__global__ void InitBitmapForLocalSkip(int* const __restrict__ work_done) {
+    int tid = threadIdx.x + 1;  // work_done is 1-based
+    work_done[tid] = 1;
+}
+
 // Supports mask_head >= 1. When mask_head > 1, AND-reduces across all mask heads
 // so that a chunk is skippable only when ALL heads agree it is fully masked.
 // When mask_head == 1, the head loop runs once with negligible overhead.
@@ -184,7 +196,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             // make sure atomicExch happen before load from block_work_idx[threadIdx.x],
             // so that if one block finished atomicExch first, other blocks will know
             __syncwarp();
-            wid = threadIdx.x != blockIdx.x ? block_work_idx[threadIdx.x] : wid;
+            wid = threadIdx.x != blockIdx.x ? load_global_cg(block_work_idx + threadIdx.x) : wid;
             wid = __reduce_min_sync(0xffffffff, wid);
             if (threadIdx.x == blockIdx.x) {
                 __threadfence();                // prevent the change on L2 visibility order (make sure previous stores are done) 
@@ -346,25 +358,20 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         }
     }
 
-    // block_cnt_semaphore starts from 1, and we can offset it
+    // bitmap pointers (compute kernel reads work_done[work_id] directly — per-work ready flag)
+    int* const work_done = block_work_idx;
+
+    // Per-work ready flag update (thread-0 only):
+    //   Mark:  work_done[wid]=1 + __threadfence()  (makes flag visible to compute kernel)
+    //   Next:  atomicAdd to grab the next work item
+    // No scan or wptr update needed — compute kernel checks work_done[] directly.
     auto update_wptr_and_work_id_sync = [&](int wid) {
-        if (threadIdx.x < 32) {
-            if (threadIdx.x == blockIdx.x) {
-                int next_wid = atomicAdd(block_cnt_semaphore, 1) + work_to_skip;       // fetch and check the next work ID
-                // if there is no more work to do: set the wid for the current block to be INT_MAX
-                wid = next_wid <= total_works ? wid : INT_MAX;
-                next_work_id = next_wid;
-                atomicExch(&block_work_idx[blockIdx.x], wid);
+        if (threadIdx.x == 0) {
+            if (wid > work_to_skip) {
+                __threadfence();
+                atomicExch(&work_done[wid], 1);
             }
-            // make sure atomicExch happen before load from block_work_idx[threadIdx.x],
-            // so that if one block finished atomicExch first, other blocks will know
-            __syncwarp();
-            wid = threadIdx.x != blockIdx.x ? block_work_idx[threadIdx.x] : wid;
-            wid = __reduce_min_sync(0xffffffff, wid);
-            if (threadIdx.x == blockIdx.x) {
-                __threadfence();            // prevent the change on L2 visibility order (make sure previous stores are done) 
-                atomicMax(wptr, wid == INT_MAX ? INT_MAX : (wid * row_per_block));     // 256 or 512 * wid, or INT_MAX
-            }
+            next_work_id = atomicAdd(block_cnt_semaphore, 1) + work_to_skip;
         }
         __syncthreads();
         return next_work_id;

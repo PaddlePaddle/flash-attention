@@ -159,6 +159,16 @@ public:
         return block_cnt_semaphore;
     }
 
+    // Per-work ready flag accessors for BWD compute kernel.
+    // work_done array = block_work_ids (bitmap region, 1-based indexing).
+    int* get_work_done_ptr() const {
+        return block_work_ids;
+    }
+
+    // row_per_block used by comm kernel = num_warps * RDMA_ROW_PER_WARP.
+    // Returns 0 if per-work mode should not be used.
+    int get_comm_rpb() const;
+
     int nranks() const {
         return _total_n_pes;
     }
@@ -239,6 +249,7 @@ private:
     size_t _dkv_single_k_numel_capacity;    // allocated SepSRBuffer single_k_numel capacity
     int _dkv_num_chunks;                    // SepSRBuffer's chunks_per_seg (layout-defining)
     int _num_copy_chunks;                   // block_work_ids array size tracking
+    int _bitmap_region_size;                // bitmap region size (work_done + frontier)
 
     int* block_work_ids;
     int* block_cnt_semaphore;

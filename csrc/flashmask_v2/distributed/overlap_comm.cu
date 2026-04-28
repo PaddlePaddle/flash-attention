@@ -203,9 +203,13 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         cudaMemset(kv_buffer->semaphores(), 0, sizeof(int64_t) * _total_n_pes);
     }
     const int num_copy_chunks = b_kv * s_kv * nranks / (RDMA_ROW_PER_WARP * num_warps);
+    // FWD uses num_blocks slots (reduce-based wptr). BWD uses work_done[0..N] bitmap (per-work flag).
+    // Allocate max of both so the same buffer serves both paths.
+    _bitmap_region_size = ((num_copy_chunks + 1) + 3) & ~3;
+    const int head_region_size = std::max(num_blocks, _bitmap_region_size);
     // block_cnt_semaphore (AG overlap only requires only 1 extra int, 2 is for RS overlap, 2 more for padding)
-    CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (num_blocks + num_copy_chunks + 4 + 2 * nranks), comm_stream));
-    copy_chunk_mask = block_work_ids + num_blocks;
+    CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (head_region_size + num_copy_chunks + 4 + 2 * nranks), comm_stream));
+    copy_chunk_mask = block_work_ids + head_region_size;
     block_cnt_semaphore = copy_chunk_mask + num_copy_chunks;
     stream_coordinator = block_cnt_semaphore + STREAM_COORD_OFFSET;
     rank_commit_counters = block_cnt_semaphore + 4;
@@ -588,13 +592,13 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
         if constexpr (USE_SEMAPHORES) {                                                                       \
             cudaMemsetAsync(rank_empty_counters, 0, sizeof(int) * num_chunks, comm_stream);                   \
         }                                                                                                     \
+        cudaMemsetAsync(block_work_ids, 0, sizeof(int) * _bitmap_region_size, comm_stream);                   \
         if (segment_idx) {                                                                                    \
-            cudaMemsetAsync(block_work_ids, 0, sizeof(int) * num_blocks, comm_stream);                        \
             NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks, false,                       \
                 start_pe, segment_idx, num_segs, mask_smem_bytes);                                            \
         } else {                                                                                              \
             constexpr int work_to_skip = S_chunk / (num_warps * RDMA_ROW_PER_WARP);                           \
-            sema::rs::SetValueKernel<<<1, num_blocks, 0, comm_stream>>>(block_work_ids, work_to_skip);        \
+            InitBitmapForLocalSkip<<<1, std::max(work_to_skip, 1), 0, comm_stream>>>(block_work_ids);         \
             NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks, true,                        \
                 start_pe, segment_idx, num_segs, mask_smem_bytes);                                            \
         }                                                                                                     \
@@ -765,6 +769,11 @@ int OverlapCommunicator<KVType>::overlap_sm_margin() const {
 }
 
 template <typename KVType>
+int OverlapCommunicator<KVType>::get_comm_rpb() const {
+    return num_warps * RDMA_ROW_PER_WARP;
+}
+
+template <typename KVType>
 void OverlapCommunicator<KVType>::prepare_dkv_buffer(cudaStream_t stream) {
     if (!dkv_buffer) return;
 
@@ -786,8 +795,10 @@ void OverlapCommunicator<KVType>::reallocate_block_work_ids() {
     CUDA_DEBUG_CHECK(cudaStreamSynchronize(comm_stream));
 
     _num_copy_chunks = B * S_local * _total_n_pes / (RDMA_ROW_PER_WARP * num_warps);
-    CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (num_blocks + _num_copy_chunks + 4 + 2 * _total_n_pes), comm_stream));
-    copy_chunk_mask = block_work_ids + num_blocks;
+    _bitmap_region_size = ((_num_copy_chunks + 1) + 3) & ~3;
+    const int head_region_size = std::max(num_blocks, _bitmap_region_size);
+    CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (head_region_size + _num_copy_chunks + 4 + 2 * _total_n_pes), comm_stream));
+    copy_chunk_mask = block_work_ids + head_region_size;
     block_cnt_semaphore = copy_chunk_mask + _num_copy_chunks;
     stream_coordinator = block_cnt_semaphore + STREAM_COORD_OFFSET;
     rank_commit_counters = block_cnt_semaphore + 4;

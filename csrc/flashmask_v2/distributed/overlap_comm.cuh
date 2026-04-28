@@ -3,6 +3,7 @@
 #include <string>
 #include "sr_buffer.cuh"
 #include "sep_sr_buffer.cuh"
+#include "hierarchical_rank_map.cuh"
 #include "cutlass/bfloat16.h"
 
 namespace flashmask {
@@ -177,6 +178,19 @@ public:
         return S_local;
     }
 
+    int gpus_per_node() const {
+        return _gpus_per_node;
+    }
+    int my_pe_node() const {
+        return _my_pe_node;
+    }
+    int num_nodes() const {
+        return _num_nodes;
+    }
+    bool use_hierarchical() const {
+        return _use_hierarchical;
+    }
+
     // this function is only called in the bwd
     int seqlen_scale() const;
     int num_segments() const;
@@ -242,6 +256,12 @@ private:
     int _total_n_pes;
     size_t _local_batch_stride;
     size_t _total_numel;
+
+    // Hierarchical overlap topology
+    int _gpus_per_node;     // Number of GPUs per node (from nvshmem_n_pes_node)
+    int _my_pe_node;        // This PE's index within its node (from nvshmem_team_my_pe)
+    int _num_nodes;         // Number of nodes (= _total_n_pes / _gpus_per_node)
+    bool _use_hierarchical; // Whether to use hierarchical overlap (from USE_HIERARCHICAL_OVERLAP env)
 
     // Configuration tracking for dynamic reconfiguration
     OverlapConfig _config;

@@ -185,6 +185,26 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         get_nvshmem_info(_my_pe, _total_n_pes);     // get info if nvshmem is already avaliable
     }
 
+    // Hierarchical overlap topology discovery
+    _gpus_per_node = nvshmem_team_n_pes(NVSHMEMX_TEAM_NODE); 
+    _my_pe_node = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
+    _num_nodes = _total_n_pes / _gpus_per_node;
+    const char* hier_env = std::getenv("USE_HIERARCHICAL_OVERLAP");
+    _use_hierarchical = (hier_env != nullptr && (std::string(hier_env) == "1" || std::string(hier_env) == "true"));
+    if (_use_hierarchical && !hier::hier_is_effective(_total_n_pes, _gpus_per_node)) {
+        WARN_PRINT("[FlashMask Overlap] USE_HIERARCHICAL_OVERLAP=true but single node (%d PEs, %d per node). "
+                   "Hierarchical mode has no effect, falling back to circular shift.\n",
+                   _total_n_pes, _gpus_per_node);
+        _use_hierarchical = false;
+    }
+    if (_use_hierarchical) {
+        WARN_PRINT("[FlashMask Overlap] Hierarchical overlap enabled: %d nodes × %d GPUs/node, "
+                   "local pe_node=%d, Phase1 chunks=%d, Phase2 chunks=%d\n",
+                   _num_nodes, _gpus_per_node, _my_pe_node,
+                   hier::hier_phase1_chunk_count(_total_n_pes, _gpus_per_node),
+                   hier::hier_phase2_chunk_count(_total_n_pes, _gpus_per_node));
+    }
+
     int least_priority, greatest_priority;
     cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
     cudaStreamCreateWithPriority(&comm_stream, 
@@ -383,11 +403,20 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     }
     if constexpr (USE_SEMAPHORES) {
         // notify all other PEs that the local data is ready (1. set self to be `total_pes - 1`. 2. broadcast to other PEs)
-        sema::ag::notify_full(
-            kv_buffer->semaphores(),
-            _my_pe, _total_n_pes, 
-            kv_buffer->team(), comm_stream
-        );
+        if (_use_hierarchical) {
+            sema::ag::notify_full_hier(
+                kv_buffer->semaphores(),
+                _my_pe, _total_n_pes,
+                _gpus_per_node, _num_nodes,
+                comm_stream
+            );
+        } else {
+            sema::ag::notify_full(
+                kv_buffer->semaphores(),
+                _my_pe, _total_n_pes,
+                kv_buffer->team(), comm_stream
+            );
+        }
     } else {
         // bar, so that comm_stream will finish transfering data before starting to get data from remote
         // this can be slow if the pace difference of PEs is large  
@@ -406,25 +435,34 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
 // These are unreachable at runtime (overlap requires nranks >= 2, so S_full >= 2*S_chunk).
 // Eliminating them saves ~40% of kernel binary from combinatorial expansion.
 
+#define LaunchSparseKernel(_S, bwd, _hier)                                            \
+    SparseLargeKVChunkRemoteGetKernel<KVType, _S, S_chunk,                            \
+        num_warps, RDMA_ROW_PER_WARP, USE_STREAM_COORD, USE_SEMAPHORES, bwd,          \
+        _hier>                                                                        \
+        <<<num_blocks, num_warps * 32, 0, comm_stream>>>(                             \
+                        kv_buffer->k_data(),                                          \
+                        kv_buffer->v_data(),                                          \
+                        write_ptr,                                                    \
+                        block_work_ids,                                               \
+                        block_cnt_semaphore,                                          \
+                        stream_coordinator,                                           \
+                        copy_chunk_mask,                                              \
+                        _my_pe,                                                       \
+                        _total_n_pes,                                                 \
+                        B,                                                            \
+                        H * D,                                                        \
+                        kv_buffer->semaphores(),                                      \
+                        rank_empty_counters,                                          \
+                        _gpus_per_node                                                \
+                    )
+
 #define SparseLargeChunkKernel(_S, bwd)                                             \
     if constexpr ((_S) > S_chunk) {                                                 \
-        SparseLargeKVChunkRemoteGetKernel<KVType, _S, S_chunk,                      \
-            num_warps, RDMA_ROW_PER_WARP, USE_STREAM_COORD, USE_SEMAPHORES, bwd>    \
-            <<<num_blocks, num_warps * 32, 0, comm_stream>>>(                       \
-                            kv_buffer->k_data(),                                    \
-                            kv_buffer->v_data(),                                    \
-                            write_ptr,                                              \
-                            block_work_ids,                                         \
-                            block_cnt_semaphore,                                    \
-                            stream_coordinator,                                     \
-                            copy_chunk_mask,                                        \
-                            _my_pe,                                                 \
-                            _total_n_pes,                                           \
-                            B,                                                      \
-                            H * D,                                                  \
-                            kv_buffer->semaphores(),                                \
-                            rank_empty_counters                                     \
-                        );                                                          \
+        if (_use_hierarchical) {                                                    \
+            LaunchSparseKernel(_S, bwd, true);                                      \
+        } else {                                                                    \
+            LaunchSparseKernel(_S, bwd, false);                                     \
+        }                                                                           \
     }
 
 #define SeqlenCase(MACRO_FUNC, _S, KernelTraits, ...)       \

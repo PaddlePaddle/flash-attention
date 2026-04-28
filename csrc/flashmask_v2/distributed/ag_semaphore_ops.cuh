@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <nvshmem.h>
 #include <nvshmemx.h>
+#include "hierarchical_rank_map.cuh"
 
 namespace flashmask {
 namespace sema {
@@ -177,6 +178,96 @@ void notify_segment_empty(
  * @param my_pe local rank of the semaphore
  * @param stream waiting stream. This API is therefore async on stream (if non-blocking)
 */
+/**
+ * Hierarchical notify_full: sets reference count and broadcasts to congruence partners + same-node ranks.
+ *
+ * Semaphore protocol:
+ *   semaphores[my_pe] on producer = (num_nodes - 1) + (gpus_per_node - 1)
+ *     = Phase 1 consumers (congruence partners) + Phase 2 consumers (same-node ranks reading local chunk)
+ *   semaphores[my_pe] on congruence partner = 1  (signal: local data ready for Phase 1)
+ *   semaphores[my_pe] on same-node rank = 1      (signal: local chunk ready for Phase 2 direct read)
+ *
+ * Note: same-node ranks reading congruence partner data from src_pe's buffer
+ *       wait on semaphores[partner_rank], which is set by congruence_notify, NOT by this function.
+ *
+ * Thread layout: thread 0 sets local semaphore; threads 1..num_notify-1 broadcast to targets.
+ *   Targets: congruence partners (num_nodes - 1) then same-node ranks (gpus_per_node - 1).
+ */
+__global__ void HierSetFullKernel(
+    int64_t* const __restrict__ semaphores,
+    int64_t refcount,
+    int self_rank,
+    int my_pe_node,
+    int my_node_id,
+    int num_nodes,
+    int gpus_per_node,
+    int total_n_pes
+) {
+    if (threadIdx.x == 0) {
+        semaphores[self_rank] = refcount;
+    }
+    __threadfence();
+    __syncthreads();
+
+    int tid = threadIdx.x;
+    if (tid == 0) return;
+
+    const int congruence_count = num_nodes - 1;
+    int target_rank = -1;
+
+    if (tid <= congruence_count) {
+        // Congruence partner: same node-local index, different node
+        int node_offset = tid;  // 1..num_nodes-1
+        target_rank = my_pe_node + ((my_node_id + node_offset) % num_nodes) * gpus_per_node;
+    } else if (tid <= congruence_count + gpus_per_node - 1) {
+        // Same-node rank: different node-local index, same node
+        int slot = tid - congruence_count;  // 1..gpus_per_node-1
+        int base = (my_pe_node + slot) % gpus_per_node;
+        target_rank = base + my_node_id * gpus_per_node;
+    } else {
+        return;  // excess thread
+    }
+
+    if (target_rank != self_rank) {
+        nvshmem_int64_p(semaphores + self_rank, 1, target_rank);
+    }
+}
+
+/**
+ * Congruence notify: after src_pe completes Phase 1 fetch for a congruence partner,
+ * it signals same-node ranks that the partner's data is now available in src_pe's SR buffer.
+ *
+ * Sets semaphores[partner] = congruence_refcount on src_pe's local copy,
+ * then broadcasts 1 to each same-node rank's semaphores[partner].
+ *
+ * Thread layout: thread 0 sets local semaphore; threads 1..gpus_per_node-1 broadcast to same-node ranks.
+ */
+__global__ void CongruenceNotifyKernel(
+    int64_t* const __restrict__ semaphores,
+    int64_t refcount,
+    int partner_rank,
+    int my_pe,
+    int my_pe_node,
+    int gpus_per_node
+) {
+    if (threadIdx.x == 0) {
+        semaphores[partner_rank] = refcount;
+    }
+    __threadfence();
+    __syncthreads();
+
+    // Threads 1..gpus_per_node-1 notify same-node ranks
+    int tid = threadIdx.x;
+    if (tid == 0 || tid >= gpus_per_node) return;
+
+    // Same-node rank: different node-local index, same node
+    int base = (my_pe_node + tid) % gpus_per_node;
+    int target_rank = base + (my_pe / gpus_per_node) * gpus_per_node;
+    if (target_rank != my_pe) {
+        nvshmem_int64_p(semaphores + partner_rank, 1, target_rank);
+    }
+}
+
 void notify_full(
     int64_t* const __restrict__ semaphores,
     int my_pe,
@@ -185,8 +276,53 @@ void notify_full(
     cudaStream_t stream
 ) {
     int64_t bit_val = (1LL << total_pes) - (1LL << my_pe) - 1;
-    // make sure local store is visible to other ranks and notify other PE that data is ready (full) 
+    // make sure local store is visible to other ranks and notify other PE that data is ready (full)
     SetFullKernel<<<1, total_pes, 0, stream>>>(semaphores, bit_val, my_pe);
+}
+
+/**
+ * Hierarchical notify_full: sets reference count = (num_nodes - 1) + (gpus_per_node - 1).
+ * Broadcasts to congruence partners (Phase 1 consumers) AND same-node ranks (Phase 2 local chunk consumers).
+ * Same-node ranks reading congruence partner data get signaled later via congruence_notify.
+ */
+void notify_full_hier(
+    int64_t* const __restrict__ semaphores,
+    int my_pe,
+    int total_pes,
+    int gpus_per_node,
+    int num_nodes,
+    cudaStream_t stream
+) {
+    const int my_pe_node = my_pe % gpus_per_node;
+    const int my_node_id = my_pe / gpus_per_node;
+    // Phase 1 consumers (num_nodes - 1) + Phase 2 consumers reading local chunk (gpus_per_node - 1)
+    const int64_t refcount = hier::hier_local_refcount(total_pes, gpus_per_node);
+    // Thread count: 1 (self) + congruence partners + same-node ranks
+    const int num_notify = 1 + refcount;
+    HierSetFullKernel<<<1, num_notify, 0, stream>>>(
+        semaphores, refcount, my_pe, my_pe_node, my_node_id, num_nodes, gpus_per_node, total_pes);
+}
+
+/**
+ * Congruence notify: src_pe signals same-node ranks that partner's data is available.
+ * Called after src_pe completes all Phase 1 works for a congruence partner.
+ *
+ * @param partner_rank  The congruence partner whose data src_pe has fetched
+ * @param gpus_per_node Number of GPUs per node
+ */
+void congruence_notify(
+    int64_t* const __restrict__ semaphores,
+    int my_pe,
+    int partner_rank,
+    int gpus_per_node,
+    cudaStream_t stream
+) {
+    const int my_pe_node = my_pe % gpus_per_node;
+    // Phase 2 consumers: gpus_per_node - 1 same-node ranks
+    const int64_t refcount = hier::hier_congruence_refcount(gpus_per_node);
+    // Thread count: 1 (self, sets local value) + gpus_per_node - 1 (same-node ranks)
+    CongruenceNotifyKernel<<<1, gpus_per_node, 0, stream>>>(
+        semaphores, refcount, partner_rank, my_pe, my_pe_node, gpus_per_node);
 }
 
 }   // namespace ag

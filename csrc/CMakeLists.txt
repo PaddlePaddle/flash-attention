@@ -257,7 +257,19 @@ if(NOT SKIP_BUILD_FA)
         list(APPEND HEAD_DIMENSIONS_BWD 256)
     endif()
 
-    set(HEAD_DIMENSIONS_FWD "all" "diff")
+    # CUDA 13.2 ptxas can ICE when all SM90 forward head dimensions are batched
+    # into the generated hdimall/hdimdiff translation units. Compile them as
+    # individual instantiation files on CUDA 13+ to keep each PTX module smaller.
+    set(FA3_SPLIT_SM90_FWD_BY_HDIM OFF)
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
+        set(FA3_SPLIT_SM90_FWD_BY_HDIM ON)
+    endif()
+
+    if(FA3_SPLIT_SM90_FWD_BY_HDIM)
+        set(HEAD_DIMENSIONS_FWD ${HEAD_DIMENSIONS_BWD})
+    else()
+        set(HEAD_DIMENSIONS_FWD "all" "diff")
+    endif()
     set(HEAD_DIMENSIONS_FWD_SM80 ${HEAD_DIMENSIONS_BWD})
 
     set(SPLIT "__EMPTY__")
@@ -303,6 +315,7 @@ if(NOT SKIP_BUILD_FA)
     endforeach()
 
     set(sources_fwd_sm90)
+    set(fa3_sm90_fwd_ptxas_o0_sources)
     foreach(hdim ${HEAD_DIMENSIONS_FWD})
         foreach(dtype ${DTYPE_FWD_SM90})
             foreach(split ${SPLIT})
@@ -320,6 +333,36 @@ if(NOT SKIP_BUILD_FA)
             endforeach()
         endforeach()
     endforeach()
+
+    if(FA3_SPLIT_SM90_FWD_BY_HDIM)
+        foreach(dtype ${DTYPE_FWD_SM90})
+            foreach(split ${SPLIT})
+                foreach(paged ${PAGEDKV})
+                    foreach(softcap ${SOFTCAP})
+                        foreach(packgqa ${PACKGQA})
+                            if(packgqa STREQUAL "__EMPTY__" OR (paged STREQUAL "__EMPTY__" AND split STREQUAL "__EMPTY__"))
+                                if(NOT dtype STREQUAL "e4m3")
+                                    set(name "flash_attn_v3/instantiations/flash_fwd_hdim64_512_${dtype}${paged}${split}${softcap}${packgqa}_sm90.cu")
+                                    string(REPLACE "__EMPTY__" "" refine_name "${name}")
+                                    list(APPEND sources_fwd_sm90 "${refine_name}")
+                                endif()
+                                set(name "flash_attn_v3/instantiations/flash_fwd_hdim192_128_${dtype}${paged}${split}${softcap}${packgqa}_sm90.cu")
+                                string(REPLACE "__EMPTY__" "" refine_name "${name}")
+                                list(APPEND sources_fwd_sm90 "${refine_name}")
+                            endif()
+                        endforeach()
+                    endforeach()
+                endforeach()
+            endforeach()
+        endforeach()
+    endif()
+
+    if(FA3_SPLIT_SM90_FWD_BY_HDIM)
+        # CUDA 13.2 ptxas can ICE on multiple SM90 forward instantiations even
+        # after hdimall/hdimdiff are split, so keep the workaround scoped to
+        # SM90 forward sources instead of weakening backward or SM80 builds.
+        set(fa3_sm90_fwd_ptxas_o0_sources ${sources_fwd_sm90})
+    endif()
 
     set(sources_bwd_sm80)
     foreach(hdim ${HEAD_DIMENSIONS_BWD})
@@ -389,6 +432,11 @@ if(NOT SKIP_BUILD_FA)
       -gencode arch=compute_90a,code=sm_90a
       --expt-relaxed-constexpr
       >)
+
+    if(FA3_SPLIT_SM90_FWD_BY_HDIM AND fa3_sm90_fwd_ptxas_o0_sources)
+      set_property(SOURCE ${fa3_sm90_fwd_ptxas_o0_sources} APPEND PROPERTY
+        COMPILE_OPTIONS -Xptxas -O0)
+    endif()
 
     INSTALL(TARGETS flashattnv3 LIBRARY DESTINATION "lib")
   
@@ -576,6 +624,13 @@ if(NOT SKIP_BUILD_FA)
         endforeach()
     endforeach()
 
+    set(flashmaskv2_sm90_fwd_ptxas_o0_sources)
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
+        # CUDA 13.2 ptxas can ICE on FlashMaskV2 SM90 forward instantiations
+        # even though these files are already split by head dimension.
+        set(flashmaskv2_sm90_fwd_ptxas_o0_sources ${flashmaskv2_sources_fwd_sm90})
+    endif()
+
     set(flashmaskv2_sources_bwd_sm80)
     foreach(hdim ${FLASHMASKV2_HEAD_DIMENSIONS_BWD})
         foreach(dtype ${FLASHMASKV2_DTYPE_BWD})
@@ -684,6 +739,11 @@ if(NOT SKIP_BUILD_FA)
       -gencode arch=compute_90a,code=sm_90a
       --expt-relaxed-constexpr
       >)
+
+    if(flashmaskv2_sm90_fwd_ptxas_o0_sources)
+      set_property(SOURCE ${flashmaskv2_sm90_fwd_ptxas_o0_sources} APPEND PROPERTY
+        COMPILE_OPTIONS -Xptxas -O0)
+    endif()
 
     if(WITH_DISTRIBUTED_OVERLAP)
         target_include_directories(flashmaskv2 PRIVATE ${NVSHMEM_INCLUDE_DIR})

@@ -28,10 +28,29 @@
 #pragma once
 
 #include "utils.h"
+#include <cstddef>
 #include <fmha/utils.h>
 #include <fmha/gemm.h>
 
 namespace fmha {
+
+#if defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
+// CUDA 13.x can ICE in the legacy FA1 dense-mask path when these loops are
+// fully unrolled around shared-memory address arithmetic.
+#define FMHA_COMPAT_UNROLL _Pragma("unroll 1")
+#define FMHA_COMPAT_HELPER __device__ __noinline__
+using Smem_offset_type = uint32_t;
+#else
+#define FMHA_COMPAT_UNROLL _Pragma("unroll")
+#define FMHA_COMPAT_HELPER inline __device__
+using Smem_offset_type = uint32_t;
+#endif
+
+template <typename T>
+inline __device__ uint32_t ToSmemPtr(T ptr) {
+    return static_cast<uint32_t>(ptr);
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1259,9 +1278,9 @@ struct Smem_tile_mma {
     template<int M, int N>
     inline __device__ void store(const uint4 (&regs)[M][N]) {
         static_assert(COLS == Cta_tile::N);
-        #pragma unroll
+        FMHA_COMPAT_UNROLL
         for( int mi = 0; mi < M; mi++ ) {
-            #pragma unroll
+            FMHA_COMPAT_UNROLL
             for( int ni = 0; ni < N; ni++ ) {
                 // size_t offset = write_offset_ + mi * WARPS_M * 16 * BYTES_PER_ROW + ni * WARPS_N * 16 * BYTES_PER_ELT;
                 // fmha::sts(smem_ + offset + 0 * BYTES_PER_ROW, regs[mi][ni].x);
@@ -1270,12 +1289,14 @@ struct Smem_tile_mma {
                 // fmha::sts(smem_ + offset + 0 * BYTES_PER_ROW, regs[mi][ni].y);
                 // fmha::sts(smem_ + offset + 8 * BYTES_PER_ROW, regs[mi][ni].w);
                 // size_t offset = smem_write_ + mi * WARPS_M * 16 * BYTES_PER_ROW + ni * WARPS_N * 16 * BYTES_PER_ELT;
-                uint32_t offset = smem_write_ + mi * WARPS_M * 16 * BYTES_PER_ROW + ni * WARPS_N * 16 * BYTES_PER_ELT;
-                fmha::sts(offset + 0 * BYTES_PER_ROW, regs[mi][ni].x);
-                fmha::sts(offset + 8 * BYTES_PER_ROW, regs[mi][ni].z);
+                Smem_offset_type offset =
+                    smem_write_ + mi * WARPS_M * 16 * BYTES_PER_ROW +
+                    ni * WARPS_N * 16 * BYTES_PER_ELT;
+                fmha::sts(ToSmemPtr(offset + 0 * BYTES_PER_ROW), regs[mi][ni].x);
+                fmha::sts(ToSmemPtr(offset + 8 * BYTES_PER_ROW), regs[mi][ni].z);
                 offset ^= 4 * BYTES_PER_STS;
-                fmha::sts(offset + 0 * BYTES_PER_ROW, regs[mi][ni].y);
-                fmha::sts(offset + 8 * BYTES_PER_ROW, regs[mi][ni].w);
+                fmha::sts(ToSmemPtr(offset + 0 * BYTES_PER_ROW), regs[mi][ni].y);
+                fmha::sts(ToSmemPtr(offset + 8 * BYTES_PER_ROW), regs[mi][ni].w);
             }
         }
     }
@@ -1284,9 +1305,9 @@ struct Smem_tile_mma {
     inline __device__ void store(const Fragment (&frag)[N][M]) {
         static_assert(COLS == Cta_tile::N);
         uint4 regs[M][N];
-        #pragma unroll
+        FMHA_COMPAT_UNROLL
         for( int mi = 0; mi < M; mi++ ) {
-            #pragma unroll
+            FMHA_COMPAT_UNROLL
             for( int ni = 0; ni < N; ni++ ) {
                 // Need to transpose ref(1) and reg(2) here since when we load it we transpose again.
                 regs[mi][ni] = make_uint4(frag[ni][mi].reg(0), frag[ni][mi].reg(2),
@@ -1333,8 +1354,10 @@ struct Smem_tile_mma_transposed : public Base {
                 uint4 dst;
                 // fmha::ldsmt(dst, this->smem_ + offset);
                 // size_t offset = smem_read_ + mi * WARPS_M * 16 * BYTES_PER_ROW + ni * WARPS_N * 16 * BYTES_PER_ELT;
-                uint32_t offset = smem_read_ + mi * WARPS_M * 16 * BYTES_PER_ROW + ni * WARPS_N * 16 * BYTES_PER_ELT;
-                fmha::ldsmt(dst, offset);
+                Smem_offset_type offset =
+                    smem_read_ + mi * WARPS_M * 16 * BYTES_PER_ROW +
+                    ni * WARPS_N * 16 * BYTES_PER_ELT;
+                fmha::ldsmt(dst, ToSmemPtr(offset));
                 frag[mi][ni].reg(0) = dst.x;
                 frag[mi][ni].reg(1) = dst.z;  // Fragment A regs col major!
                 frag[mi][ni].reg(2) = dst.y;
@@ -1379,16 +1402,16 @@ struct Smem_tile_mma_epilogue : public Base {
             // size_t offset = read_offset_ + ii * ROWS_PER_LDS * BYTES_PER_ROW;
             // fmha::lds(data[ii], this->smem_ + offset);
             // size_t offset = smem_read_ + ii * ROWS_PER_LDS * BYTES_PER_ROW;
-            uint32_t offset = smem_read_ + ii * ROWS_PER_LDS * BYTES_PER_ROW;
-            fmha::lds(data[ii], offset);
+            Smem_offset_type offset = smem_read_ + ii * ROWS_PER_LDS * BYTES_PER_ROW;
+            fmha::lds(data[ii], ToSmemPtr(offset));
         }
     }
 
     template<typename elem_type=__half, int M, int N>
     inline __device__ void store(const Acc (&acc)[M][N]){
-        #pragma unroll
+        FMHA_COMPAT_UNROLL
         for( int mi = 0; mi < M; mi++ ) {
-            #pragma unroll
+            FMHA_COMPAT_UNROLL
             for( int ni = 0; ni < N; ni++ ) {
                 // 1st row - 4 elements per row.
                 float tmp00 = acc[mi][ni].elt(0);
@@ -1413,15 +1436,16 @@ struct Smem_tile_mma_epilogue : public Base {
                 // fmha::sts(this->smem_ + offset + 0 * BYTES_PER_ROW, y);
                 // fmha::sts(this->smem_ + offset + 8 * BYTES_PER_ROW, w);
                 // size_t offset = (this->smem_write_ ^ (ni * 32)) + mi * WARPS_M * 16 * BYTES_PER_ROW;
-                uint32_t offset = (this->smem_write_ ^ (ni * 32)) + mi * WARPS_M * 16 * BYTES_PER_ROW;
+                Smem_offset_type offset =
+                    (this->smem_write_ ^ (ni * 32)) + mi * WARPS_M * 16 * BYTES_PER_ROW;
                 // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0)) {
                 //     printf("mi = %d, ni = %d, offset - smem_write_ = %d\n", mi, ni, offset - this->smem_write_);
                 // }
-                fmha::sts(offset + 0 * BYTES_PER_ROW, x);
-                fmha::sts(offset + 8 * BYTES_PER_ROW, z);
+                fmha::sts(ToSmemPtr(offset + 0 * BYTES_PER_ROW), x);
+                fmha::sts(ToSmemPtr(offset + 8 * BYTES_PER_ROW), z);
                 offset ^= 4 * Base::BYTES_PER_STS;
-                fmha::sts(offset + 0 * BYTES_PER_ROW, y);
-                fmha::sts(offset + 8 * BYTES_PER_ROW, w);
+                fmha::sts(ToSmemPtr(offset + 0 * BYTES_PER_ROW), y);
+                fmha::sts(ToSmemPtr(offset + 8 * BYTES_PER_ROW), w);
             }
         }
     }
@@ -1431,12 +1455,13 @@ struct Smem_tile_mma_epilogue : public Base {
         for( int mi = 0; mi < M; mi++ ) {
             for( int ni = 0; ni < N; ni++ ) {
                 // size_t offset = (this->write_offset_ ^ (ni * 32)) + mi * WARPS_M * 16 * BYTES_PER_ROW;
-                uint32_t offset = (this->write_offset_ ^ (ni * 32)) + mi * WARPS_M * 16 * BYTES_PER_ROW;
-                fmha::sts(this->smem_ + offset + 0 * BYTES_PER_ROW, regs[mi][ni].x);
-                fmha::sts(this->smem_ + offset + 8 * BYTES_PER_ROW, regs[mi][ni].z);
+                Smem_offset_type offset =
+                    (this->write_offset_ ^ (ni * 32)) + mi * WARPS_M * 16 * BYTES_PER_ROW;
+                fmha::sts(ToSmemPtr(this->smem_ + offset + 0 * BYTES_PER_ROW), regs[mi][ni].x);
+                fmha::sts(ToSmemPtr(this->smem_ + offset + 8 * BYTES_PER_ROW), regs[mi][ni].z);
                 offset ^= 4 * Base::BYTES_PER_STS;
-                fmha::sts(this->smem_ + offset + 0 * BYTES_PER_ROW, regs[mi][ni].y);
-                fmha::sts(this->smem_ + offset + 8 * BYTES_PER_ROW, regs[mi][ni].w);
+                fmha::sts(ToSmemPtr(this->smem_ + offset + 0 * BYTES_PER_ROW), regs[mi][ni].y);
+                fmha::sts(ToSmemPtr(this->smem_ + offset + 8 * BYTES_PER_ROW), regs[mi][ni].w);
             }
         }
     }
@@ -1485,7 +1510,6 @@ struct Smem_tile_transpose {
         write_col ^= (write_row & 0x07) * 4;
 
         write_offset_ = write_row * BYTES_PER_ROW + write_col * BYTES_PER_STS;
-        // smem_write_ = smem_ + write_row * BYTES_PER_ROW + write_col * BYTES_PER_STS;
 
         int read_row, read_col;
         read_row = (tidx & 0x0f);
@@ -1493,31 +1517,48 @@ struct Smem_tile_transpose {
 
         read_col ^= (read_row & 0x07);
         read_offset_ = read_row * BYTES_PER_ROW + read_col * BYTES_PER_LDS;
-        // smem_read_ = smem_ + read_row * BYTES_PER_ROW + read_col * BYTES_PER_LDS;
+    }
+
+    FMHA_COMPAT_HELPER
+    void store_fragment(Smem_offset_type base_offset, const Fragment_write &frag) {
+        const uint32_t ptr0 = ToSmemPtr(smem_ + base_offset + 0 * BYTES_PER_ROW);
+        const uint32_t ptr1 = ToSmemPtr(smem_ + base_offset + 8 * BYTES_PER_ROW);
+        const Smem_offset_type swizzled_offset = base_offset ^ (4 * BYTES_PER_STS);
+        const uint32_t ptr2 = ToSmemPtr(smem_ + swizzled_offset + 0 * BYTES_PER_ROW);
+        const uint32_t ptr3 = ToSmemPtr(smem_ + swizzled_offset + 8 * BYTES_PER_ROW);
+        const uint32_t reg0 = frag.reg(0);
+        const uint32_t reg1 = frag.reg(1);
+        const uint32_t reg2 = frag.reg(2);
+        const uint32_t reg3 = frag.reg(3);
+        fmha::sts(ptr0, reg0);
+        fmha::sts(ptr1, reg2);
+        fmha::sts(ptr2, reg1);
+        fmha::sts(ptr3, reg3);
+    }
+
+    FMHA_COMPAT_HELPER
+    uint4 load_fragment(Smem_offset_type offset) {
+        uint4 dst;
+        fmha::ldsmt(dst, ToSmemPtr(smem_ + offset));
+        return dst;
     }
 
     template<int M, int N>
     inline __device__ void store(const Fragment_write (&frag_w)[M][N], int mi) {
-        #pragma unroll
+        FMHA_COMPAT_UNROLL
         for( int ni = 0; ni < N; ni++ ) {
-            // size_t offset = write_offset_ + ni * WARPS_N * 16 * BYTES_PER_ELT;
-            uint32_t offset = write_offset_ + ni * WARPS_N * 16 * BYTES_PER_ELT;
-            fmha::sts(smem_ + offset + 0 * BYTES_PER_ROW, frag_w[ni][mi].reg(0));
-            fmha::sts(smem_ + offset + 8 * BYTES_PER_ROW, frag_w[ni][mi].reg(2));
-            offset ^= 4 * BYTES_PER_STS;
-            fmha::sts(smem_ + offset + 0 * BYTES_PER_ROW, frag_w[ni][mi].reg(1));
-            fmha::sts(smem_ + offset + 8 * BYTES_PER_ROW, frag_w[ni][mi].reg(3));
+            const Smem_offset_type base =
+                write_offset_ + ni * WARPS_N * 16 * BYTES_PER_ELT;
+            store_fragment(base, frag_w[ni][mi]);
         }
     }
 
     template<int N>
     inline __device__ void load(Fragment_read (&frag_r)[N]) {
-        #pragma unroll
+        FMHA_COMPAT_UNROLL
         for( int ni = 0; ni < N; ni++ ) {
-            // size_t offset = read_offset_ + ni * WARPS_N * 16 * BYTES_PER_ELT;
-            uint32_t offset = read_offset_ + ni * WARPS_N * 16 * BYTES_PER_ELT;
-            uint4 dst;
-            fmha::ldsmt(dst, this->smem_ + offset);
+            Smem_offset_type offset = read_offset_ + ni * WARPS_N * 16 * BYTES_PER_ELT;
+            const uint4 dst = load_fragment(offset);
             frag_r[ni].reg(0) = dst.x;
             frag_r[ni].reg(1) = dst.y;  // Fragment B regs col major!
             frag_r[ni].reg(2) = dst.z;
@@ -1528,23 +1569,16 @@ struct Smem_tile_transpose {
     template<int M, int N>
     inline __device__ void transpose(const Fragment_write (&frag_w)[M][N], Fragment_read (&frag_r)[M], int mi) {
         static_assert(COLS == Cta_tile::N);
-        #pragma unroll
+        FMHA_COMPAT_UNROLL
         for( int ni = 0; ni < N; ni++ ) {
-            // size_t offset = write_offset_ + ni * WARPS_N * 16 * BYTES_PER_ELT;
-            uint32_t offset = write_offset_ + ni * WARPS_N * 16 * BYTES_PER_ELT;
-            fmha::sts(smem_ + offset + 0 * BYTES_PER_ROW, frag_w[ni][mi].reg(0));
-            fmha::sts(smem_ + offset + 8 * BYTES_PER_ROW, frag_w[ni][mi].reg(2));
-            offset ^= 4 * BYTES_PER_STS;
-            fmha::sts(smem_ + offset + 0 * BYTES_PER_ROW, frag_w[ni][mi].reg(1));
-            fmha::sts(smem_ + offset + 8 * BYTES_PER_ROW, frag_w[ni][mi].reg(3));
+            const Smem_offset_type base =
+                write_offset_ + ni * WARPS_N * 16 * BYTES_PER_ELT;
+            store_fragment(base, frag_w[ni][mi]);
         }
-        #pragma unroll
+        FMHA_COMPAT_UNROLL
         for( int ni = 0; ni < N; ni++ ) {
-            // size_t offset = read_offset_ + ni * WARPS_N * 16 * BYTES_PER_ELT;
-            // size_t offset = read_offset_ + ni * WARPS_N * 16 * BYTES_PER_ELT;
-            uint32_t offset = read_offset_ + ni * WARPS_N * 16 * BYTES_PER_ELT;
-            uint4 dst;
-            fmha::ldsmt(dst, this->smem_ + offset);
+            Smem_offset_type offset = read_offset_ + ni * WARPS_N * 16 * BYTES_PER_ELT;
+            const uint4 dst = load_fragment(offset);
             frag_r[ni].reg(0) = dst.x;
             frag_r[ni].reg(1) = dst.y;  // Fragment B regs col major!
             frag_r[ni].reg(2) = dst.z;
@@ -1555,8 +1589,6 @@ struct Smem_tile_transpose {
     uint32_t smem_;
     uint32_t write_offset_;
     uint32_t read_offset_;
-    // uint32_t smem_write_;
-    // uint32_t smem_read_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

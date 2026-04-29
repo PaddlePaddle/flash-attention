@@ -271,7 +271,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         const int work_id_m1 = work_id - 1;
         const int batch_id = work_id_m1 / chunk_per_batch;
         const int seq_work_id = (work_id_m1 % chunk_per_batch) + 1;     // this is in range [1, chunk_per_batch]
-        int mask_index = bwd ? (work_id - 1) : (chunk_per_batch * (batch_id + 1) - seq_work_id);
+        int mask_index = 0;
         int seqlen_id = 0, remote_pe = 0;
         int src_addr = 0;
         bool is_phase1 = true;
@@ -286,8 +286,12 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             target_rank = info.target_rank;  // Data owner (semaphore wait target)
             remote_pe = info.src_pe;         // PE to fetch from (Phase 1: = target_rank; Phase 2: = same-node rank)
             is_phase1 = info.is_phase1;
-
             seqlen_id = hier::hier_seqlen_id(logical_pos, row_within_chunk, row_per_block, total_n_pes, S_chunk, bwd);
+
+            // mask_index: seqlen_id → copy_chunk_mask entry
+            // copy_chunk_mask computed from processed_mask (rearranged to match SR buffer layout)
+            // BWD: skip_local=true → mask starts at seqlen S_chunk; FWD: skip_local=false → at seqlen 0
+            mask_index = batch_id * chunk_per_batch + (seqlen_id - (bwd ? S_chunk : 0)) / row_per_block;
 
             // Source address in remote_pe's SR buffer
             const int src_chunk_seqlen = hier::hier_src_chunk_offset(
@@ -307,10 +311,20 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             }
             target_rank = remote_pe;  // Non-hierarchical: target_rank = remote_pe
             src_addr = batch_id * batch_stride + (seqlen_offset + (seqlen_id % S_chunk)) * S_stride;
+            mask_index = bwd ? (work_id - 1) : (chunk_per_batch * (batch_id + 1) - seq_work_id);
         }
 
-        if (copy_chunk_mask[mask_index]) {
-            // Masked: no get needed, but still counts toward rank release
+        bool should_skip = false;
+        if constexpr (use_hierarchical) {
+            // Sparse skip: Phase 1 (cross-node) must NEVER skip because same-node
+            // ranks may need the data via Phase 2. Only Phase 2 can be skipped.
+            // TODO(heqianyue): we can actually use sparse comm if we reduce-and all the 
+            // copy_chunk_mask across the local ranks (the union of all the required chunks)
+            should_skip = (!is_phase1) && copy_chunk_mask[mask_index];
+        } else {
+            should_skip = copy_chunk_mask[mask_index];
+        }
+        if (should_skip) {
             try_release_rank(target_rank, remote_pe, is_phase1);
             __syncthreads();
             work_id = update_wptr_and_work_id_sync(work_id);

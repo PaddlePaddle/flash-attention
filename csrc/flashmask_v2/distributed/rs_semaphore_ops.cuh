@@ -3,6 +3,7 @@
 #include <nvshmem.h>
 #include <nvshmemx.h>
 #include "debug_logger.cuh"
+#include "hierarchical_rank_map.cuh"
 
 namespace flashmask {
 namespace sema {
@@ -179,6 +180,67 @@ __device__ void producer_wait_empty(
     WARN_PRINT("Producer block %d waits remote %d empty ...\n", blockIdx.x, target_pe);
     nvshmem_int64_wait_until(const_cast<int64_t*>(semaphores) + target_pe, NVSHMEM_CMP_NE, 0);   // wait until not 0
     WARN_PRINT("Producer block %d waits remote %d empty succeeded.\n", blockIdx.x, target_pe);
+}
+
+// ---------------------------------------------------------------------------
+// Hierarchical variants for RS-overlap
+// ---------------------------------------------------------------------------
+
+/**
+ * Hierarchical FusedConsumerNotifyEmpty.
+ *
+ * In hierarchical mode, the producers for my_pe are NOT a contiguous rank range.
+ * For segment [logical_pos_base, logical_pos_base+num_chunks), PE X sends chunk c
+ * to my_pe iff X == hier_sender_at_pos(logical_pos_base+c, my_pe, ...).
+ * This kernel sets semaphores[self_rank]=local_flag (pre-computed bitmask of senders),
+ * then notifies each sender that the buffer slot is empty and ready to receive.
+ *
+ * Launch: <<<1, num_chunks>>>
+ */
+__global__ void HierFusedConsumerNotifyEmpty(
+    int64_t* const __restrict__ semaphores,
+    int logical_pos_base,
+    int num_chunks,
+    int total_n_pes,
+    int gpus_per_node,
+    int64_t local_flag,
+    int self_rank
+) {
+    if (threadIdx.x == 0) {
+        semaphores[self_rank] = local_flag;
+        DEBUG_PRINT("HierConsumer %d sets self flag: %lx\n", self_rank, local_flag);
+    }
+    __threadfence();
+    __syncthreads();
+
+    const int logical_pos = logical_pos_base + threadIdx.x;
+    const int sender = hier::hier_sender_at_pos(logical_pos, self_rank, total_n_pes, gpus_per_node);
+    if (sender == self_rank) return;  // local chunk, no notification needed
+    nvshmem_int64_p(semaphores + self_rank, 1, sender);
+    DEBUG_PRINT("HierConsumer %d notifies sender %d (logical_pos %d) empty\n", self_rank, sender, logical_pos);
+}
+
+/**
+ * Host wrapper: compute sender bitmask and launch HierFusedConsumerNotifyEmpty.
+ */
+void notify_consumer_empty_hier(
+    int64_t* const semaphores,
+    int segment_idx,
+    int num_chunks,
+    int total_n_pes,
+    int gpus_per_node,
+    int self_rank,
+    cudaStream_t stream
+) {
+    const int logical_pos_base = segment_idx * num_chunks;
+    int64_t local_flag = 0;
+    for (int c = 0; c < num_chunks; c++) {
+        const int sender = hier::hier_sender_at_pos(logical_pos_base + c, self_rank, total_n_pes, gpus_per_node);
+        if (sender != self_rank) local_flag |= (1LL << sender);
+    }
+    HierFusedConsumerNotifyEmpty<<<1, num_chunks, 0, stream>>>(
+        semaphores, logical_pos_base, num_chunks, total_n_pes, gpus_per_node, local_flag, self_rank
+    );
 }
 
 }   // namespace rs

@@ -12,9 +12,24 @@
  * FWD is the physical reverse of BWD (right-to-left traversal).
  *
  * When num_nodes == 1 (single node), degenerates to the current circular shift order.
+ *
+ * Performance note: gpus_per_node and num_nodes are always powers of 2 (typical values: 4 or 8).
+ * All mod/div/mul by these values are replaced with bit operations (&, >>, <<).
  */
 
 namespace flashmask::hier {
+
+/**
+ * Integer log2 for power-of-2 values. Used to convert div/mod/mul to bit ops.
+ * Precondition: x must be a positive power of 2.
+ */
+__device__ __host__ inline int ilog2(unsigned x) {
+#ifdef __CUDA_ARCH__
+    return __ffs(x) - 1;   // __ffs returns 1-indexed position of lowest set bit
+#else
+    return __builtin_ctz(x);  // counts trailing zeros = log2 for power of 2
+#endif
+}
 
 struct HierRankInfo {
     int target_rank;    // The rank whose KV data is at this position
@@ -27,11 +42,9 @@ struct HierRankInfo {
 /**
  * Map a logical chunk position to rank info in the hierarchical traversal order.
  *
- * @param logical_pos  0-based chunk position (0 = local, 1..nranks-1 = remote)
- * @param my_pe        This PE's global rank
- * @param total_n_pes  Total number of PEs (= nranks)
- * @param gpus_per_node  Number of GPUs per node
- * @return HierRankInfo with target_rank, src_pe, phase info
+ * Rank layout: rank = slot + node * gpus_per_node
+ *   slot = rank & (gpus_per_node - 1)   (intra-node index)
+ *   node = rank >> log2(gpus_per_node)   (node index)
  */
 __device__ __host__ inline HierRankInfo hier_map_chunk(
     int logical_pos,
@@ -39,60 +52,74 @@ __device__ __host__ inline HierRankInfo hier_map_chunk(
     int total_n_pes,
     int gpus_per_node
 ) {
+    const int log2_gpn  = ilog2(gpus_per_node);
+    const int gpn_mask  = gpus_per_node - 1;
+    const int num_nodes = total_n_pes >> log2_gpn;
+    const int log2_nn   = ilog2(num_nodes);
+    const int nn_mask   = num_nodes - 1;
+    const int my_slot   = my_pe & gpn_mask;
+    const int my_node   = my_pe >> log2_gpn;
+
     HierRankInfo info;
     info.logical_pos = logical_pos;
-
-    const int my_pe_node = my_pe % gpus_per_node;  // my_pe's index within its node
-    const int my_node_id = my_pe / gpus_per_node;  // my_pe's node index (NOT the target's)
-    const int num_nodes = total_n_pes / gpus_per_node;
 
     // Slot 0: local rank's congruence group (positions 0..num_nodes-1)
     //   Position 0: local chunk
     //   Position 1..num_nodes-1: congruence partners (Phase 1, cross-node)
     // Slot s (s >= 1): same-node rank's congruence group (Phase 2, intra-node)
     //   Positions s*num_nodes .. (s+1)*num_nodes-1
-
     if (logical_pos < num_nodes) {
-        // Slot 0: local congruence group
-        // sub = logical_pos = node offset from my_node (0=my node, 1=next node, ...)
-        // The congruence partner at node (my_node_id + sub) % num_nodes
-        // target_rank = my_pe_node + ((my_node_id + sub) % num_nodes) * gpus_per_node
-        //   Example: rank 0 (my_pe_node=0, my_node_id=0), sub=1 → 0 + (1%4)*8 = 8
-        int sub = logical_pos;
-        info.target_rank = my_pe_node + ((my_node_id + sub) % num_nodes) * gpus_per_node;
-        info.is_local = (logical_pos == 0);
-        info.is_phase1 = (logical_pos > 0);  // Congruence partners are Phase 1
-        info.src_pe = info.target_rank;       // Phase 1: fetch directly from target
+        info.target_rank = my_slot | (((my_node + logical_pos) & nn_mask) << log2_gpn);
+        info.is_local  = (logical_pos == 0);
+        info.is_phase1 = (logical_pos > 0);
+        info.src_pe    = info.target_rank;
         return info;
     }
 
-    // Slot s >= 1: same-node rank's congruence group
-    int adj_pos = logical_pos - num_nodes;  // 0-based within non-local slots
-    int slot = adj_pos / num_nodes + 1;     // slot index (1-based)
-    int sub = adj_pos % num_nodes;           // sub index within the slot
+    const int adj  = logical_pos - num_nodes;
+    const int slot = (adj >> log2_nn) + 1;    // slot index (1-based)
+    const int sub  = adj & nn_mask;            // sub index within the slot
+    const int base = (my_slot + slot) & gpn_mask;
 
-    // Base node-local rank for this slot (wraps around gpus_per_node)
-    int base = (my_pe_node + slot) % gpus_per_node;
-
-    // Target rank: base rank's congruence partner at node (my_node_id + sub) % num_nodes
-    info.target_rank = base + ((my_node_id + sub) % num_nodes) * gpus_per_node;
-    info.is_local = false;
-    info.is_phase1 = false;  // Phase 2: intra-node redistribution
-
-    // Source PE: the same-node rank that holds target_rank's data
-    // This is the PE with node-local index = base, on our node
-    info.src_pe = base + my_node_id * gpus_per_node;
-
+    info.target_rank = base | (((my_node + sub) & nn_mask) << log2_gpn);
+    info.is_local  = false;
+    info.is_phase1 = false;
+    info.src_pe    = base | (my_node << log2_gpn);  // base slot on our node
     return info;
+}
+
+/**
+ * Compute the target rank for a given logical chunk position.
+ * Same result as hier_map_chunk(...).target_rank but without computing the full struct.
+ */
+__device__ __host__ inline int hier_target_rank(
+    int logical_pos,
+    int my_pe,
+    int total_n_pes,
+    int gpus_per_node
+) {
+    const int log2_gpn  = ilog2(gpus_per_node);
+    const int gpn_mask  = gpus_per_node - 1;
+    const int num_nodes = total_n_pes >> log2_gpn;
+    const int log2_nn   = ilog2(num_nodes);
+    const int nn_mask   = num_nodes - 1;
+    const int my_slot   = my_pe & gpn_mask;
+    const int my_node   = my_pe >> log2_gpn;
+
+    if (logical_pos < num_nodes)
+        return my_slot | (((my_node + logical_pos) & nn_mask) << log2_gpn);
+
+    const int adj  = logical_pos - num_nodes;
+    const int slot = (adj >> log2_nn) + 1;
+    const int sub  = adj & nn_mask;
+    return ((my_slot + slot) & gpn_mask) | (((my_node + sub) & nn_mask) << log2_gpn);
 }
 
 /**
  * Compute the chunk position of target_rank's data in src_pe's SR buffer.
  * Used to calculate src_addr for Phase 2 (intra-node) fetches.
  *
- * Precondition: target_rank is in src_pe's congruence group
- *   (target_rank % gpus_per_node == src_pe % gpus_per_node)
- *
+ * Precondition: target_rank and src_pe are congruent (same slot, different nodes).
  * @return Chunk position (0-based) in src_pe's hierarchical order
  */
 __device__ __host__ inline int hier_position_in_src_pe(
@@ -101,26 +128,16 @@ __device__ __host__ inline int hier_position_in_src_pe(
     int total_n_pes,
     int gpus_per_node
 ) {
-    const int src_node_id = src_pe / gpus_per_node;
-    const int target_node_id = target_rank / gpus_per_node;
-    const int num_nodes = total_n_pes / gpus_per_node;
-
-    // target_rank is in src_pe's slot 0 (congruence group)
-    // Position j: the congruence partner at node (src_node_id + j) % num_nodes
-    // We need j such that (src_node_id + j) % num_nodes == target_node_id
-    int j = (target_node_id - src_node_id + num_nodes) % num_nodes;
-    return j;
+    const int log2_gpn  = ilog2(gpus_per_node);
+    const int num_nodes = total_n_pes >> log2_gpn;
+    const int nn_mask   = num_nodes - 1;
+    const int src_node  = src_pe >> log2_gpn;
+    const int tgt_node  = target_rank >> log2_gpn;
+    return (tgt_node - src_node + num_nodes) & nn_mask;
 }
 
 /**
  * Compute seqlen_id for a given logical chunk position and direction.
- *
- * @param logical_pos  0-based chunk position
- * @param row_within_chunk  Row offset within the chunk (in units of row_per_block)
- * @param row_per_block  Granularity of work items
- * @param nranks  Total number of ranks
- * @param S_chunk  Size of each chunk (= S_local)
- * @param bwd  True for backward (left-to-right), false for forward (right-to-left)
  */
 __device__ __host__ inline int hier_seqlen_id(
     int logical_pos,
@@ -131,25 +148,16 @@ __device__ __host__ inline int hier_seqlen_id(
     bool bwd
 ) {
     if (bwd) {
-        // BWD: left-to-right, position 0 at seqlen 0
         return logical_pos * S_chunk + row_within_chunk * row_per_block;
     } else {
-        // FWD: right-to-left, position 0 at seqlen (nranks-1)*S_chunk
         return (nranks - 1 - logical_pos) * S_chunk + row_within_chunk * row_per_block;
     }
 }
 
 /**
  * Compute the source chunk's seqlen offset in src_pe's SR buffer.
- * For Phase 1, this is the local chunk offset (same as current seqlen_offset).
- * For Phase 2, this is the position of target_rank's data in src_pe's SR buffer.
- *
- * @param info  The HierRankInfo for this chunk
- * @param nranks  Total number of ranks
- * @param S_chunk  Size of each chunk
- * @param total_n_pes  Total number of PEs
- * @param gpus_per_node  GPUs per node
- * @param bwd  Direction flag
+ * Phase 1: src_pe's local chunk (always at position 0 for BWD, nranks-1 for FWD).
+ * Phase 2: position of target_rank's data in src_pe's SR buffer.
  */
 __device__ __host__ inline int hier_src_chunk_offset(
     const HierRankInfo& info,
@@ -160,68 +168,79 @@ __device__ __host__ inline int hier_src_chunk_offset(
     bool bwd
 ) {
     if (info.is_phase1 || info.is_local) {
-        // Phase 1: fetch from remote PE's local chunk
-        // Same as current seqlen_offset
-        if (bwd) {
-            return 0;  // BWD: local chunk at position 0
-        } else {
-            return (nranks - 1) * S_chunk;  // FWD: local chunk at last position
-        }
+        return bwd ? 0 : (nranks - 1) * S_chunk;
     }
-
-    // Phase 2: fetch from src_pe's SR buffer at the position of target_rank's data
     int src_chunk_pos = hier_position_in_src_pe(info.target_rank, info.src_pe, total_n_pes, gpus_per_node);
-
-    if (bwd) {
-        return src_chunk_pos * S_chunk;
-    } else {
-        return (nranks - 1 - src_chunk_pos) * S_chunk;
-    }
+    return bwd ? src_chunk_pos * S_chunk : (nranks - 1 - src_chunk_pos) * S_chunk;
 }
 
 /**
- * Check if hierarchical overlap should be used.
- * When num_nodes == 1 (single node), hierarchical degenerates to circular shift.
+ * Inverse of hier_map_chunk: given that MY PE is the consumer at logical_pos,
+ * which PE is the sender (producer) of that chunk?
+ *
+ * Derivation:
+ *   For pos < num_nodes (congruence group):
+ *     target = X_slot | ((X_node + pos) & nn_mask) << log2_gpn
+ *     X_slot = my_slot,  X_node = (my_node - pos) & nn_mask
+ *   For pos >= num_nodes (intra-node redistribution):
+ *     adj = pos - num_nodes; slot = (adj >> log2_nn) + 1; sub = adj & nn_mask
+ *     target = (X_slot + slot) & gpn_mask  |  ((X_node + sub) & nn_mask) << log2_gpn
+ *     X_slot = (my_slot - slot) & gpn_mask
+ *     X_node = (my_node - sub) & nn_mask
  */
+__device__ __host__ inline int hier_sender_at_pos(
+    int logical_pos,
+    int my_pe,
+    int total_n_pes,
+    int gpus_per_node
+) {
+    const int log2_gpn  = ilog2(gpus_per_node);
+    const int gpn_mask  = gpus_per_node - 1;
+    const int num_nodes = total_n_pes >> log2_gpn;
+    const int log2_nn   = ilog2(num_nodes);
+    const int nn_mask   = num_nodes - 1;
+    const int my_slot   = my_pe & gpn_mask;
+    const int my_node   = my_pe >> log2_gpn;
+
+    if (logical_pos < num_nodes) {
+        const int sender_node = (my_node - logical_pos + num_nodes) & nn_mask;
+        return my_slot | (sender_node << log2_gpn);
+    }
+
+    const int adj         = logical_pos - num_nodes;
+    const int slot        = (adj >> log2_nn) + 1;
+    const int sub         = adj & nn_mask;
+    const int sender_slot = (my_slot - slot + gpus_per_node) & gpn_mask;
+    const int sender_node = (my_node - sub + num_nodes) & nn_mask;
+    return sender_slot | (sender_node << log2_gpn);
+}
+
+// ---------------------------------------------------------------------------
+// Non-hot-path helpers (called once on host, no bit-op optimization needed)
+// ---------------------------------------------------------------------------
+
 __device__ __host__ inline bool hier_is_effective(int total_n_pes, int gpus_per_node) {
     return total_n_pes > gpus_per_node;
 }
 
-/**
- * Compute the initial reference count for the local chunk's semaphore.
- * This is the number of consumers that will come read our local KV:
- *   - (num_nodes - 1) cross-node congruence partners (Phase 1)
- *   - (gpus_per_node - 1) same-node ranks (Phase 2)
- */
+/** Number of consumers that will read our local KV: (num_nodes-1) + (gpus_per_node-1) */
 __device__ __host__ inline int hier_local_refcount(int total_n_pes, int gpus_per_node) {
-    int num_nodes = total_n_pes / gpus_per_node;
-    return (num_nodes - 1) + (gpus_per_node - 1);
+    return total_n_pes / gpus_per_node - 1 + gpus_per_node - 1;
 }
 
-/**
- * Compute the initial reference count for a congruence partner's data.
- * After we fetch a congruence partner's KV, same-node ranks will come read it.
- * Count = (gpus_per_node - 1) (all same-node ranks except us, since we already have it)
- */
+/** After fetching a congruence partner, (gpus_per_node-1) same-node ranks will read it. */
 __device__ __host__ inline int hier_congruence_refcount(int gpus_per_node) {
     return gpus_per_node - 1;
 }
 
-/**
- * Compute number of chunks in Phase 1 (cross-node congruence group, excluding local).
- * = num_nodes - 1
- */
+/** Number of Phase 1 chunks (cross-node congruence group, excluding local). */
 __device__ __host__ inline int hier_phase1_chunk_count(int total_n_pes, int gpus_per_node) {
     return total_n_pes / gpus_per_node - 1;
 }
 
-/**
- * Compute number of chunks in Phase 2 (intra-node redistribution).
- * = nranks - num_nodes (all chunks not in local's congruence group)
- */
+/** Number of Phase 2 chunks (intra-node redistribution). */
 __device__ __host__ inline int hier_phase2_chunk_count(int total_n_pes, int gpus_per_node) {
-    int num_nodes = total_n_pes / gpus_per_node;
-    return total_n_pes - num_nodes;
+    return total_n_pes - total_n_pes / gpus_per_node;
 }
 
-} // namespace flashmask::comm::hier
+} // namespace flashmask::hier

@@ -288,9 +288,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             is_phase1 = info.is_phase1;
             seqlen_id = hier::hier_seqlen_id(logical_pos, row_within_chunk, row_per_block, total_n_pes, S_chunk, bwd);
 
-            // mask_index: seqlen_id → copy_chunk_mask entry
+            // mask_index: seqlen_id to copy_chunk_mask entry
             // copy_chunk_mask computed from processed_mask (rearranged to match SR buffer layout)
-            // BWD: skip_local=true → mask starts at seqlen S_chunk; FWD: skip_local=false → at seqlen 0
+            // BWD: skip_local=true to mask starts at seqlen S_chunk; FWD: skip_local=false to at seqlen 0
             mask_index = batch_id * chunk_per_batch + (seqlen_id - (bwd ? S_chunk : 0)) / row_per_block;
 
             // Source address in remote_pe's SR buffer

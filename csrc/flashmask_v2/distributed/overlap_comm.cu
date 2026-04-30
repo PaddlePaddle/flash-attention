@@ -680,25 +680,26 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
 #undef SparseLargeChunkSplittedKernel
 #undef SeqlenCase
 
-#define SegmentIdxPutKernelDispatch(_num_chunks, _has_local, seg_idx)       \
-SparseLargeKVChunkRemotePutKernel<KVType, S_chunk, num_warps,               \
-            RDMA_ROW_PER_WARP, _num_chunks, _has_local, PER_STAGE_BUFFER>   \
-            <<<num_blocks, num_warps * 32, dynamic_smem, p_stream>>>(       \
-        dkv_buffer->k_send(seg_idx),                                        \
-        dkv_buffer->v_send(seg_idx),                                        \
-        dkv_buffer->k_recv(seg_idx),                                        \
-        dkv_buffer->v_recv(seg_idx),                                        \
-        rs_cnt,                                                             \
-        commit_counters,                                                    \
-        copy_chunk_mask,                                                    \
-        _my_pe,                                                             \
-        remote_consumer_start_rank,                                         \
-        _total_n_pes,                                                       \
-        seg_idx,                                                            \
-        B,                                                                  \
-        H * D,                                                              \
-        dkv_buffer->semaphores(seg_idx),                                    \
-        num_segments()                                                      \
+#define SegmentIdxPutKernelDispatch(_num_chunks, _has_local, _use_hier, seg_idx)     \
+SparseLargeKVChunkRemotePutKernel<KVType, S_chunk, num_warps,                        \
+            RDMA_ROW_PER_WARP, _num_chunks, _has_local, PER_STAGE_BUFFER, _use_hier> \
+            <<<num_blocks, num_warps * 32, dynamic_smem, p_stream>>>(               \
+        dkv_buffer->k_send(seg_idx),                                                \
+        dkv_buffer->v_send(seg_idx),                                                \
+        dkv_buffer->k_recv(seg_idx),                                                \
+        dkv_buffer->v_recv(seg_idx),                                                \
+        rs_cnt,                                                                     \
+        commit_counters,                                                            \
+        copy_chunk_mask,                                                            \
+        _my_pe,                                                                     \
+        remote_consumer_start_rank,                                                 \
+        _total_n_pes,                                                               \
+        seg_idx,                                                                    \
+        B,                                                                          \
+        H * D,                                                                      \
+        dkv_buffer->semaphores(seg_idx),                                            \
+        num_segments(),                                                             \
+        _gpus_per_node                                                              \
     )
 
 template <typename KVType>
@@ -725,7 +726,7 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
     cudaStreamWaitEvent(aux_c_stream, done_event);
 
     const int remote_consumer_start_rank = (_my_pe + num_chunks * segment_idx) % _total_n_pes;
-    const int remote_producer_end_rank = (_my_pe - num_chunks * segment_idx) % _total_n_pes;
+    const int remote_producer_end_rank = (_my_pe - num_chunks * segment_idx + _total_n_pes) % _total_n_pes;
 
     // When capacity >= num_segments, each segment owns a dedicated buffer slot.
     // notify_consumer_empty is deferred to post-reduce, so that producer_wait_empty latency
@@ -738,12 +739,21 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
 
     if (!post_reduce_notify) {
         if (segment_idx) dkv_buffer->zero_recv_buf(segment_idx, aux_c_stream);
-        sema::rs::notify_consumer_empty(
-            dkv_buffer->semaphores(segment_idx),
-            remote_producer_end_rank,
-            num_chunks, _total_n_pes, _my_pe,
-            aux_c_stream
-        );
+        if (_use_hierarchical) {
+            sema::rs::notify_consumer_empty_hier(
+                dkv_buffer->semaphores(segment_idx),
+                segment_idx, num_chunks,
+                _total_n_pes, _gpus_per_node, _my_pe,
+                aux_c_stream
+            );
+        } else {
+            sema::rs::notify_consumer_empty(
+                dkv_buffer->semaphores(segment_idx),
+                remote_producer_end_rank,
+                num_chunks, _total_n_pes, _my_pe,
+                aux_c_stream
+            );
+        }
     }
 
     // step 2. local producer (put) wait empty (in the kernel) and start remote_put
@@ -752,7 +762,11 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         constexpr int S_chunk = _S_chunk;                                                                   \
         const int dynamic_smem = B * sizeof(int) * S_chunk * num_chunks / (num_warps * RDMA_ROW_PER_WARP);  \
         if (segment_idx) {                                                                              \
-            NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks, false, segment_idx);      \
+            if (_use_hierarchical) {                                                                    \
+                NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks, false, true, segment_idx); \
+            } else {                                                                                    \
+                NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks, false, false, segment_idx); \
+            }                                                                                           \
         } else {                                                                                        \
             const int S_stride = H * D;                                                                 \
             const int batch_stride = num_chunks * S_chunk * S_stride;                                   \
@@ -766,7 +780,11 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
             }                                                                                           \
             cudaEventRecord(local_moved, p_stream);                                                     \
             cudaStreamWaitEvent(aux_c_stream, local_moved);                                             \
-            NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks, true, segment_idx);       \
+            if (_use_hierarchical) {                                                                    \
+                NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks, true, true, segment_idx);  \
+            } else {                                                                                         \
+                NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks, true, false, segment_idx); \
+            }                                                                                           \
         }                                                                                               \
         dkv_buffer->release_buffer(segment_idx, p_stream);                                              \
         /* consumer wait full + reduce */                                                               \
@@ -788,11 +806,20 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         if (post_reduce_notify) {                                                                       \
             dkv_buffer->zero_recv_buf(segment_idx, aux_c_stream);                                       \
             if constexpr (PER_STAGE_BUFFER == false) {                                                  \
-                sema::rs::notify_consumer_empty(                                                        \
-                    dkv_buffer->semaphores(segment_idx),                                                \
-                    remote_producer_end_rank, num_chunks, _total_n_pes, _my_pe,                         \
-                    aux_c_stream                                                                        \
-                );                                                                                      \
+                if (_use_hierarchical) {                                                                \
+                    sema::rs::notify_consumer_empty_hier(                                               \
+                        dkv_buffer->semaphores(segment_idx),                                            \
+                        segment_idx, num_chunks,                                                        \
+                        _total_n_pes, _gpus_per_node, _my_pe,                                           \
+                        aux_c_stream                                                                    \
+                    );                                                                                  \
+                } else {                                                                                \
+                    sema::rs::notify_consumer_empty(                                                    \
+                        dkv_buffer->semaphores(segment_idx),                                            \
+                        remote_producer_end_rank, num_chunks, _total_n_pes, _my_pe,                     \
+                        aux_c_stream                                                                    \
+                    );                                                                                  \
+                }                                                                                       \
             }                                                                                           \
         }                                                                                               \
     } while(0)

@@ -382,12 +382,16 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     int batch_stride = _local_batch_stride * _total_n_pes;
     if (fwd == false && dkv_buffer) {
         batch_stride = _local_batch_stride * num_chunks;
-        const size_t copy_bytes = B * _local_batch_stride * sizeof(KVType);
-        // save local KV chunks at the end of SR buffer
-        CUDA_DEBUG_CHECK(cudaMemcpyAsync(local_k_data(), new_k_data, copy_bytes, 
-                                cudaMemcpyDeviceToDevice, comm_stream));
-        CUDA_DEBUG_CHECK(cudaMemcpyAsync(local_v_data(), new_v_data, copy_bytes,
-                                cudaMemcpyDeviceToDevice, comm_stream));
+        // Non-hierarchical BWD: save local KV at the SR tail so remote ranks can Phase-1 fetch it.
+        // Hierarchical BWD: local KV lives at segment-0 offset-0 (SR base) and is never overwritten,
+        // so no tail backup is needed.
+        if (!_use_hierarchical) {
+            const size_t copy_bytes = B * _local_batch_stride * sizeof(KVType);
+            CUDA_DEBUG_CHECK(cudaMemcpyAsync(local_k_data(), new_k_data, copy_bytes,
+                                    cudaMemcpyDeviceToDevice, comm_stream));
+            CUDA_DEBUG_CHECK(cudaMemcpyAsync(local_v_data(), new_v_data, copy_bytes,
+                                    cudaMemcpyDeviceToDevice, comm_stream));
+        }
     }
     for (int bid = 0; bid < B; bid++) {
         CUDA_DEBUG_CHECK(cudaMemcpyAsync(kv_buffer->k_data() + local_offset + bid * batch_stride,
@@ -578,28 +582,30 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
 #undef SeqlenDispatch
 #undef SparseLargeChunkKernel
 
-#define SparseLargeChunkSplittedKernel(num_chunk, _has_local, start_rank, seg_idx, num_segs, smem_bytes)\
+#define SparseLargeChunkSplittedKernel(num_chunk, _has_local, _use_hier, start_rank, seg_idx, num_segs, smem_bytes) \
     SparseLargeKVChunkSplittedRemoteGetKernel<KVType, S_chunk,                                  \
-        num_warps, RDMA_ROW_PER_WARP, num_chunk, _has_local, USE_STREAM_COORD, USE_SEMAPHORES>  \
-        <<<num_blocks, num_warps * 32, smem_bytes, comm_stream>>>(                          \
-                        kv_buffer->k_data(),                                                \
-                        kv_buffer->v_data(),                                                \
-                        local_k_data(),                                                     \
-                        local_v_data(),                                                     \
-                        write_ptr,                                                          \
-                        block_work_ids,                                                     \
-                        block_cnt_semaphore,                                                \
-                        stream_coordinator,                                                 \
-                        copy_chunk_mask,                                                    \
-                        _my_pe,                                                             \
-                        start_rank,                                                         \
-                        seg_idx,                                                            \
-                        _total_n_pes,                                                       \
-                        B,                                                                  \
-                        H * D,                                                              \
-                        num_segs,                                                           \
-                        kv_buffer->semaphores(),                                            \
-                        rank_empty_counters                                                 \
+        num_warps, RDMA_ROW_PER_WARP, num_chunk, _has_local, USE_STREAM_COORD, USE_SEMAPHORES,  \
+        _use_hier>                                                                              \
+        <<<num_blocks, num_warps * 32, smem_bytes, comm_stream>>>(                              \
+                        _k_sr_ptr,                                                              \
+                        _v_sr_ptr,                                                              \
+                        _local_k_ptr,                                                           \
+                        _local_v_ptr,                                                           \
+                        write_ptr,                                                              \
+                        block_work_ids,                                                         \
+                        block_cnt_semaphore,                                                    \
+                        stream_coordinator,                                                     \
+                        copy_chunk_mask,                                                        \
+                        _my_pe,                                                                 \
+                        start_rank,                                                             \
+                        seg_idx,                                                                \
+                        _total_n_pes,                                                           \
+                        B,                                                                      \
+                        H * D,                                                                  \
+                        num_segs,                                                               \
+                        kv_buffer->semaphores(),                                                \
+                        rank_empty_counters,                                                    \
+                        _gpus_per_node                                                          \
                     )
 
 #define NumChunkDispatchSplitted(MACRO_FUNC, num_chunk, _has_local, ...)  \
@@ -631,14 +637,36 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
             cudaMemsetAsync(rank_empty_counters, 0, sizeof(int) * num_chunks, comm_stream);                   \
         }                                                                                                     \
         cudaMemsetAsync(block_work_ids, 0, sizeof(int) * _bitmap_region_size, comm_stream);                   \
+        /* Compute stage-advanced dst (k_sr) and base src (local_k) pointers. */                              \
+        /* Hierarchical: SR buffer is num_segments sub-tensors; each stage uses its own region. */            \
+        /* Non-hierarchical: circular-reuse; k_sr stays at base, local_k at tail backup. */                   \
+        const size_t _stage_elems = (size_t)num_chunks * S_chunk * H * D;                                     \
+        KVType* const _k_sr_ptr = _use_hierarchical                                                           \
+            ? kv_buffer->k_data() + (size_t)segment_idx * B * _stage_elems                                    \
+            : kv_buffer->k_data();                                                                            \
+        KVType* const _v_sr_ptr = _use_hierarchical                                                           \
+            ? kv_buffer->v_data() + (size_t)segment_idx * B * _stage_elems                                    \
+            : kv_buffer->v_data();                                                                            \
+        const KVType* const _local_k_ptr = _use_hierarchical ? kv_buffer->k_data() : local_k_data();          \
+        const KVType* const _local_v_ptr = _use_hierarchical ? kv_buffer->v_data() : local_v_data();          \
         if (segment_idx) {                                                                                    \
-            NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks, false,                       \
-                start_pe, segment_idx, num_segs, mask_smem_bytes);                                            \
+            if (_use_hierarchical) {                                                                          \
+                NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks, false, true,             \
+                    start_pe, segment_idx, num_segs, mask_smem_bytes);                                        \
+            } else {                                                                                          \
+                NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks, false, false,            \
+                    start_pe, segment_idx, num_segs, mask_smem_bytes);                                        \
+            }                                                                                                 \
         } else {                                                                                              \
             constexpr int work_to_skip = S_chunk / (num_warps * RDMA_ROW_PER_WARP);                           \
             InitBitmapForLocalSkip<<<1, std::max(work_to_skip, 1), 0, comm_stream>>>(block_work_ids);         \
-            NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks, true,                        \
-                start_pe, segment_idx, num_segs, mask_smem_bytes);                                            \
+            if (_use_hierarchical) {                                                                          \
+                NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks, true, true,              \
+                    start_pe, segment_idx, num_segs, mask_smem_bytes);                                        \
+            } else {                                                                                          \
+                NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks, true, false,             \
+                    start_pe, segment_idx, num_segs, mask_smem_bytes);                                        \
+            }                                                                                                 \
         }                                                                                                     \
     } while(0)
 

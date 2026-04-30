@@ -125,6 +125,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     int scaled_seqlen_k = params.seqlen_k;
     int* bwd_work_done_ptr = nullptr;   // per-work ready flag: work_done[] array for compute kernel
     int bwd_comm_rpb = 0;               // per-work ready flag: row_per_block (0 = contiguous wptr mode)
+    // Hierarchical BWD-splitted: base pointers into SR buffer saved before the segment loop.
+    // Each segment reads a different sub-tensor of the SR buffer; k_ptr/v_ptr are advanced per iteration.
+    const void* bwd_sr_k_base = nullptr;
+    const void* bwd_sr_v_base = nullptr;
 #ifdef NVSHMEM_DISTRIBUTED_OVERLAP
     use_overlap = params.nranks > 1 && (!flashmask::comm::is_singleton_null());
     std::unique_ptr<flash::flashmask::MaskPtrUpdater<kBlockN>> mask_ptr_updater = nullptr;
@@ -168,6 +172,9 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         // Re-route the KV data to the nvshmem_alloc SR buffer.
         params.k_ptr = comm_singleton.k_data();
         params.v_ptr = comm_singleton.v_data();
+        // Save SR buffer base for per-segment k_ptr/v_ptr advancement (hierarchical BWD).
+        bwd_sr_k_base = params.k_ptr;
+        bwd_sr_v_base = params.v_ptr;
         // prepare mask_ptr mask_ptr_updater and set params.num_segments to enable correct mask access in bwd kernel
         if (overlap_rs) {
             mask_ptr_updater = std::make_unique<flash::flashmask::MaskPtrUpdater<kBlockN>>(params, params.seqlen_k, comm_singleton.chunk_per_seg());
@@ -190,6 +197,15 @@ SEGMENT_LOOP_START:
 
     if (use_overlap) {
         auto& comm_singleton = flashmask::comm::singleton();
+        // Hierarchical RS-overlap: each segment reads a distinct sub-tensor of the SR buffer.
+        // Advance k_ptr/v_ptr by segment_idx * B * k_batch_stride bytes so that the compute
+        // kernel addresses the correct segment region.  params.k_batch_stride was already scaled
+        // to num_chunks * S_local * H * D (= per-segment batch stride) before this loop.
+        if (overlap_rs && comm_singleton.is_hierarchical()) {
+            const size_t seg_byte_offset = (size_t)segment_idx * params.b * params.k_batch_stride * sizeof(Element);
+            params.k_ptr = static_cast<const char*>(bwd_sr_k_base) + seg_byte_offset;
+            params.v_ptr = static_cast<const char*>(bwd_sr_v_base) + seg_byte_offset;
+        }
         // Note(heqianyue): for RS-overlap, before the last computation kernel, communication kernel won't start
         comm_singleton.wait_wptr_init();        // wait until wptr is initialized
         if (overlap_rs) {  // RS-overlap splits the AG and attn kernel

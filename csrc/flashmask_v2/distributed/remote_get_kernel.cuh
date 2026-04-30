@@ -325,7 +325,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             should_skip = copy_chunk_mask[mask_index];
         }
         if (should_skip) {
-            try_release_rank(target_rank, remote_pe, is_phase1);
+            try_release_rank(target_rank, remote_pe, false);
             __syncthreads();
             work_id = update_wptr_and_work_id_sync(work_id);
             continue;
@@ -367,7 +367,11 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 //
 // @param num_chunks  total chunks per segment (always the real count, e.g. 4 for CP16)
 // @param has_local_chunk  true iff segment 0 (the first chunk is local and should be skipped)
-template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunks=4, bool has_local_chunk=false, bool use_stream_coord=false, bool use_semaphore=false>
+// @param use_hierarchical  when true, use hierarchical comm (Phase1: cross-node IB, Phase2: intra-node NVLink).
+//                          In hierarchical mode the SR buffer is NOT reused across segments; each segment writes
+//                          to a unique [segment_idx * num_chunks * S_chunk, (segment_idx+1) * ...) region so that
+//                          later segments' Phase-2 consumers can still read Phase-1 data fetched in earlier segments.
+template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunks=4, bool has_local_chunk=false, bool use_stream_coord=false, bool use_semaphore=false, bool use_hierarchical=false>
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkSplittedRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
@@ -379,14 +383,15 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     int* const __restrict__ stream_coordinator,
     const int* const __restrict__ copy_chunk_mask,
     const int my_pe,
-    const int start_rank,               // first call is my_pe + 1
+    const int start_rank,               // first call is my_pe + 1 (non-hierarchical only)
     const int segment_idx,
     const int total_n_pes,
     const int num_batch,                // B
     const int S_stride,                 // H * D
     const int num_segments = 4,
     int64_t* const __restrict__ semaphores = nullptr,
-    int* const __restrict__ rank_empty_counters = nullptr
+    int* const __restrict__ rank_empty_counters = nullptr,
+    const int gpus_per_node = 1         // only used when use_hierarchical=true
 ) {
     if constexpr (use_stream_coord) {
         // notify computation stream that one of the CTAs for communication kernel is running
@@ -410,7 +415,11 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     // for batch_idx > 0, those skippable local works cannot be skipped **directly**.
     const int total_works = num_batch * work_per_seg;
     const int works_per_rank = num_batch * work_per_chunk;
-    // this batch_stride is the segment batch stride, not full (num_segs * segment_size) batch stride
+    // Per-stage batch stride = num_chunks * S_chunk * S_stride.
+    // Both dst (k_sr) and src (local_k) live in the same SR buffer that is partitioned
+    // into num_segments independent sub-tensors each of size B * num_chunks * S_chunk.
+    // Stage separation is handled by the caller advancing k_sr/local_k per segment.
+    // Non-hierarchical: same formula, overwrites the single segment region.
     const int batch_stride = S * S_stride;
     const int local_batch_stride = S_chunk * S_stride;
 
@@ -459,20 +468,52 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     // P2P empty notify: when all works for a source PE (chunk) are done, notify it immediately.
     // Counter indexed by chunk_id - chunk_offset (same scheme as remote_put's try_commit_rank).
     // wait_full ensures the producer has set its bitmask before we send the atomic_add.
-    auto try_release_rank = [&](int chunk_id) {
+    //
+    // Hierarchical mode:
+    //   Phase 1 release: dec on target_rank (cross-node owner) + congruence_notify to same-node ranks
+    //   Phase 2 release: clear local sema[target_rank] + dec on src_pe (same-node holder)
+    //   target_rank and src_pe are passed explicitly for hierarchical; non-hier uses start_rank+chunk_id.
+    auto try_release_rank = [&](int chunk_id, int target_rank_val = -1, int src_pe_val = -1, bool is_phase1_val = false) {
         if constexpr (use_semaphore) {
             if (threadIdx.x == 0) {
                 int counter_idx = chunk_id - chunk_offset;
                 int prev = atomicAdd(&rank_empty_counters[counter_idx], 1);
                 if (prev + 1 == works_per_rank) {
-                    int target_rank = (start_rank + chunk_id) % total_n_pes;
-                    if (cached_semaphores[target_rank] == 0) {
-                        sema::ag::wait_full(semaphores, target_rank);
+                    if constexpr (use_hierarchical) {
+                        // target_rank_val is the data owner whose semaphore we need to check/update
+                        if (cached_semaphores[target_rank_val] == 0) {
+                            sema::ag::wait_full(semaphores, target_rank_val);
+                        }
+                        if (is_phase1_val) {
+                            // Phase 1: cross-node congruence group release
+                            // 1. Decrement refcount on target_rank (data owner)
+                            nvshmem_long_atomic_add(semaphores + target_rank_val, -1, target_rank_val);
+                            // 2. Set local refcount for Phase 2 consumers + broadcast to same-node ranks
+                            semaphores[target_rank_val] = hier::hier_congruence_refcount(gpus_per_node);
+                            __threadfence();
+                            const int my_pe_node = my_pe % gpus_per_node;
+                            const int my_node_id = my_pe / gpus_per_node;
+                            for (int slot = 1; slot < gpus_per_node; slot++) {
+                                int base = (my_pe_node + slot) % gpus_per_node;
+                                int sn_rank = base + my_node_id * gpus_per_node;
+                                nvshmem_int64_p(semaphores + target_rank_val, 1, sn_rank);
+                            }
+                        } else {
+                            // Phase 2: intra-node redistribution release
+                            semaphores[target_rank_val] = 0;
+                            nvshmem_long_atomic_add(semaphores + target_rank_val, -1, src_pe_val);
+                        }
+                    } else {
+                        // Non-hierarchical: bitmask release
+                        int target_rank = (start_rank + chunk_id) % total_n_pes;
+                        if (cached_semaphores[target_rank] == 0) {
+                            sema::ag::wait_full(semaphores, target_rank);
+                        }
+                        semaphores[target_rank] = 0;
+                        nvshmem_long_atomic_add(
+                            semaphores + target_rank,
+                            -(1LL << my_pe), target_rank);
                     }
-                    semaphores[target_rank] = 0;
-                    nvshmem_long_atomic_add(
-                        semaphores + target_rank,
-                        -(1LL << my_pe), target_rank);
                 }
             }
         }
@@ -494,28 +535,70 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 
         int chunk_id = seq_work_id / work_per_chunk;
 
-        if (smem_chunk_mask[work_id_m1]) {
-            // Masked remote: no get needed, but still counts toward rank release
-            try_release_rank(chunk_id);
+        // Compute remote PE, src/dst addresses (done early so masked-skip can check Phase 1)
+        int seqlen_id = 0, remote_pe = 0, src_addr = 0;
+        bool is_phase1 = false;
+        int target_rank = 0;
+
+        if constexpr (use_hierarchical) {
+            // Hierarchical: global_logical_pos maps to target_rank via congruence-group-first order
+            const int global_logical_pos = segment_idx * num_chunks + chunk_id;
+            const int row_within_chunk = seq_work_id % work_per_chunk;
+            auto info = hier::hier_map_chunk(global_logical_pos, my_pe, total_n_pes, gpus_per_node);
+
+            target_rank = info.target_rank;
+            remote_pe   = info.src_pe;
+            is_phase1   = info.is_phase1;
+
+            // dst: segment-local offset (k_sr is already advanced to this segment's region by caller)
+            // seq_work_id * row_per_block == chunk_id * S_chunk + row_within_chunk * row_per_block
+            seqlen_id = seq_work_id * row_per_block;
+
+            // src: from local_k (caller passes the stage-advanced SR buffer base for Phase 2 reads,
+            //   OR the actual local KV base for Phase 1; both use the same batch_stride).
+            //   Phase 1 (bwd): target_rank's local KV at position 0 in its SR buffer stage.
+            //   Phase 2 (bwd): target_rank's data at position j in src_pe's SR buffer stage 0,
+            //     where src_pe wrote Phase 1 data during segment 0 at seqlen j * S_chunk.
+            const int src_chunk_seqlen = hier::hier_src_chunk_offset(
+                info, total_n_pes, S_chunk, total_n_pes, gpus_per_node, /*bwd=*/true);
+            src_addr = batch_id * batch_stride + (src_chunk_seqlen + row_within_chunk * row_per_block) * S_stride;
+        } else {
+            // Non-hierarchical: circular shift order
+            seqlen_id = seq_work_id * row_per_block;
+            remote_pe = start_rank + seqlen_id / S_chunk;
+            remote_pe = remote_pe < total_n_pes ? remote_pe : remote_pe - total_n_pes;
+            target_rank = remote_pe;
+            src_addr = batch_id * local_batch_stride + (seqlen_id % S_chunk) * S_stride;
+        }
+
+        bool should_skip = false;
+        if constexpr (use_hierarchical) {
+            should_skip = (!is_phase1) && smem_chunk_mask[work_id_m1];
+        } else {
+            should_skip = smem_chunk_mask[work_id_m1];
+        }
+
+        if (should_skip) {
+            try_release_rank(chunk_id, target_rank, remote_pe, /*is_phase1=*/false);
             __syncthreads();
             work_id = update_wptr_and_work_id_sync(work_id);
             continue;
         }
-        // calculate seqlen offset via work_id
-        int seqlen_id = seq_work_id * row_per_block;
-        int remote_pe = start_rank + seqlen_id / S_chunk;
-        remote_pe = remote_pe < total_n_pes ? remote_pe : remote_pe - total_n_pes;
 
         if constexpr (use_semaphore) {
-            if (threadIdx.x == 0 && cached_semaphores[remote_pe] == 0) {
-                sema::ag::wait_full(semaphores, remote_pe);
-                cached_semaphores[remote_pe] = 1;
+            if (threadIdx.x == 0 && cached_semaphores[target_rank] == 0) {
+                sema::ag::wait_full(semaphores, target_rank);
+                cached_semaphores[target_rank] = 1;
             }
         }
 
         // copy upto 4 heads (S_stride = H * D), and row_per_block rows (seqlen axis) per CTA
-        const int src_addr = batch_id * local_batch_stride + (seqlen_id % S_chunk) * S_stride;
         const int dst_addr = batch_id * batch_stride + seqlen_id * S_stride;
+        // src is always local_k/local_v (the SR buffer base pointer on remote_pe, passed by caller):
+        //   Hierarchical Phase 1: remote_pe == target_rank, reads its local KV at SR offset 0.
+        //   Hierarchical Phase 2: remote_pe == src_pe (same-node), reads target's congruence slot.
+        //   Non-hierarchical: remote_pe's original local KV buffer (same pointer name, different meaning).
+        // In all cases local_k is the correct base; src_addr encodes the per-case offset.
         shmem::two_buffers_getmem_block(
             k_sr + dst_addr,
             v_sr + dst_addr,
@@ -526,7 +609,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         // buffer getmem_block will call syncthreads(), so next_work_id will not be updated.
         // therefore, next_work_id's update is visible to all threads and won't be overwritten
         // before some threads reading it. Safe!
-        try_release_rank(chunk_id);
+        try_release_rank(chunk_id, target_rank, remote_pe, is_phase1);
         work_id = update_wptr_and_work_id_sync(work_id);
     }
 }

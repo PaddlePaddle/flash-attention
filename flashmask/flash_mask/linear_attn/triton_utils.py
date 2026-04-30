@@ -5,6 +5,49 @@
 import os
 from contextlib import contextmanager
 
+
+def _get_triton_python_include():
+    """Return the Python include path Triton will pass to the C compiler."""
+    import sysconfig
+
+    scheme = sysconfig.get_default_scheme()
+    if scheme == "posix_local":
+        scheme = "posix_prefix"
+    return sysconfig.get_paths(scheme=scheme).get("include")
+
+
+def _ensure_python_include_path():
+    """Ensure the Python include path used by Triton's C compiler is valid."""
+    import sys
+    import sysconfig
+
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    include_candidates = [
+        _get_triton_python_include(),
+        sysconfig.get_path("include"),
+        sysconfig.get_path("platinclude"),
+        sysconfig.get_config_var("INCLUDEPY"),
+        sysconfig.get_config_var("CONFINCLUDEPY"),
+        os.path.join(sys.prefix, "include", version),
+        os.path.join(sys.base_prefix, "include", version),
+        f"/usr/local/include/{version}",
+        f"/usr/include/{version}",
+    ]
+
+    for include_dir in include_candidates:
+        if include_dir and os.path.isfile(os.path.join(include_dir, "Python.h")):
+            for env_name in ("C_INCLUDE_PATH", "CPATH"):
+                existing = os.environ.get(env_name, "")
+                existing_paths = existing.split(os.pathsep) if existing else []
+                if include_dir not in existing_paths:
+                    os.environ[env_name] = os.pathsep.join(
+                        [include_dir, *existing_paths]
+                    )
+            return
+
+
+_ensure_python_include_path()
+
 import paddle
 from functools import cache
 from importlib.metadata import PackageNotFoundError, distribution

@@ -12,7 +12,6 @@ from cutlass.cutlass_dsl import min as dsl_min
 import flash_mask.flash_attn_v4.utils as utils
 from flash_mask.flash_attn_v4.block_info import BlockInfo
 from flash_mask.flash_attn_v4.seqlen_info import SeqlenInfoQK
-from quack import layout_utils
 MaskGenFn: TypeAlias = Callable[[int], Uint32]
 MASK_R2P_CHUNK_SIZE: int = 32
 

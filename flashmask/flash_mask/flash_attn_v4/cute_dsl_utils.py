@@ -16,8 +16,6 @@ except ImportError:
 if _backend_name == 'torch':
     from flash_mask.flash_attn_v4.torch.cute_dsl_utils import (  # noqa: F401
         StaticTypes,
-        cute_compile_patched,
-        load_cubin_module_data_patched,
         get_max_active_clusters,
         get_device_capacity,
         assume_strides_aligned,
@@ -33,8 +31,6 @@ if _backend_name == 'torch':
     )
 else:
     from flash_mask.flash_attn_v4.paddle.cute_dsl_utils import (  # noqa: F401
-        cute_compile_patched,
-        load_cubin_module_data_patched,
         get_max_active_clusters,
         get_device_capacity,
         assume_strides_aligned,

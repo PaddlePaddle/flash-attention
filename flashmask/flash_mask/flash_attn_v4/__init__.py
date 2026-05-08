@@ -30,20 +30,16 @@ _lazy_cache = {}
 def __getattr__(name):
     if name in ("flash_attn_func", "flash_attn_varlen_func"):
         if name not in _lazy_cache:
-            import cutlass.cute as cute
             if _backend_name == 'torch':
                 from flash_mask.flash_attn_v4.torch.interface import (
                     flash_attn_func as _func,
                     flash_attn_varlen_func as _varlen_func,
                 )
-                from flash_mask.flash_attn_v4.torch.cute_dsl_utils import cute_compile_patched
             else:
                 from flash_mask.flash_attn_v4.paddle.interface import (
                     flash_attn_func as _func,
                     flash_attn_varlen_func as _varlen_func,
                 )
-                from flash_mask.flash_attn_v4.paddle.cute_dsl_utils import cute_compile_patched
-            cute.compile = cute_compile_patched
             _lazy_cache["flash_attn_func"] = _func
             _lazy_cache["flash_attn_varlen_func"] = _varlen_func
         return _lazy_cache[name]

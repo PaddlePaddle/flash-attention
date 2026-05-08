@@ -23,13 +23,23 @@ except ImportError:
 class BlockSparseTensors(NamedTuple):
     mask_block_cnt: cute.Tensor
     mask_block_idx: cute.Tensor
-    full_block_cnt: cute.Tensor | None
-    full_block_idx: cute.Tensor | None
+    full_block_cnt: cute.Tensor | None = None
+    full_block_idx: cute.Tensor | None = None
+    cu_total_m_blocks: cute.Tensor | None = None
+    cu_block_idx_offsets: cute.Tensor | None = None
+    dq_write_order: cute.Tensor | None = None
+    dq_write_order_full: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
-        if len(values) == 2:
-            values = (*values, None, None)
-        return BlockSparseTensors(*values)
+        new_fields = []
+        idx = 0
+        for original in self:
+            if original is None:
+                new_fields.append(None)
+            else:
+                new_fields.append(values[idx])
+                idx += 1
+        return BlockSparseTensors(*new_fields)
 
 
 if _backend_name == 'torch':

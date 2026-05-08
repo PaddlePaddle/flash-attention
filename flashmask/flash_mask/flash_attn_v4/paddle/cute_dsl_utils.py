@@ -32,6 +32,11 @@ paddle2cute_dtype_map = {
     paddle.bfloat16: cutlass.BFloat16,
     paddle.float32: cutlass.Float32,
 }
+# FP8 dtypes are optional in paddle; add them if available
+for _name, _ctype in (("float8_e4m3fn", "Float8E4M3FN"), ("float8_e5m2", "Float8E5M2")):
+    _pdt = getattr(paddle, _name, None)
+    if _pdt is not None:
+        paddle2cute_dtype_map[_pdt] = getattr(cutlass, _ctype)
 
 
 @lru_cache
@@ -95,7 +100,23 @@ def assume_tensor_aligned(t):
 
 def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
     """Convert paddle tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
-    tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
+    # NOTE: FP8 dtypes may not be supported via DLPack in all paddle versions.
+    # Export raw bytes as uint8 and tell cutlass the correct type.
+    fp8_e4m3 = getattr(paddle, "float8_e4m3fn", None)
+    fp8_e5m2 = getattr(paddle, "float8_e5m2", None)
+    if (fp8_e4m3 is not None and t.dtype == fp8_e4m3) or (
+        fp8_e5m2 is not None and t.dtype == fp8_e5m2
+    ):
+        tensor = from_dlpack(
+            t.view(paddle.uint8).detach(),
+            assumed_align=assumed_align,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+        tensor.element_type = (
+            cutlass.Float8E4M3FN if t.dtype == fp8_e4m3 else cutlass.Float8E5M2
+        )
+    else:
+        tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
     if fully_dynamic:
         return tensor.mark_layout_dynamic()
     if leading_dim == -1:
@@ -216,3 +237,39 @@ def make_fake_tensor(dtype, shape, divisibility=1, leading_dim=-1):
     return cute.runtime.make_fake_tensor(
         dtype, shape, stride=stride, assumed_align=divisibility * dtype.width // 8
     )
+
+
+# credit: monellz (https://github.com/NVIDIA/cutlass/issues/2658#issuecomment-3630564264)
+def dump_kernel_attributes(compiled_kernel):
+    from cuda.bindings import driver
+    from cutlass.utils import HardwareInfo
+
+    device_id = paddle.device.cuda.current_device()
+    if hasattr(device_id, "index"):
+        device_id = device_id.index
+    hardware_info = HardwareInfo(device_id=device_id)
+    cubin_data = compiled_kernel.artifacts.CUBIN
+    assert cubin_data is not None, "cubin_data is None, need '--keep-cubin' option when compiling"
+    cuda_library = hardware_info._checkCudaErrors(
+        driver.cuLibraryLoadData(cubin_data, None, None, 0, None, None, 0)
+    )
+    kernels = hardware_info._checkCudaErrors(driver.cuLibraryEnumerateKernels(1, cuda_library))
+    kernel = hardware_info._checkCudaErrors(driver.cuKernelGetFunction(kernels[0]))
+    # more metrics: https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html#group__CUDA__EXEC_1g5e92a1b0d8d1b82cb00dcfb2de15961b
+    local_size_bytes = hardware_info._checkCudaErrors(
+        driver.cuFuncGetAttribute(
+            driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+            kernel,
+        )
+    )
+    num_regs = hardware_info._checkCudaErrors(
+        driver.cuFuncGetAttribute(
+            driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS,
+            kernel,
+        )
+    )
+
+    print("--- Kernel Info ---")
+    print(f"local_size_bytes: {local_size_bytes}")
+    print(f"num_regs: {num_regs}")
+    print("--- End Kernel Info ---")

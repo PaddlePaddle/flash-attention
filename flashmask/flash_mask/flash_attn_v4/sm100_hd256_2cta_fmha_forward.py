@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
+# Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
 
 import math
 from typing import Tuple, Optional
@@ -177,6 +177,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
+        descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         stream: cuda.CUstream = None,
@@ -198,6 +199,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         assert window_size_left is None and window_size_right is None, (
             "SM100 forward with head_dim=256 does not support runtime window_size overrides"
+        )
+        assert descale_tensors is None, (
+            "SM100 forward with head_dim=256 does not support descale_tensors"
         )
 
         q_tensor, k_tensor, v_tensor, o_tensor = mQ, mK, mV, mO

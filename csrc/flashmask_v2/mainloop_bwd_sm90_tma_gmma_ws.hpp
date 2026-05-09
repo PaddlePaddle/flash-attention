@@ -513,7 +513,8 @@ struct CollectiveMainloopBwdSm90 {
 
 
     CUTLASS_DEVICE
-    void load_n_block_info( int32_t *  fm_mem, int32_t * flashmask_index_smem_, int32_t* blockmask_smem_, cute::tuple<int32_t, int32_t, int32_t> block_coord, Params const& params){
+    void load_n_block_info( int32_t *  fm_mem, int32_t * flashmask_index_smem_, int32_t* blockmask_smem_, int32_t* empty_tile, cute::tuple<int32_t, int32_t, int32_t> block_coord, Params const& params){
+
         auto [n_block, bidh, bidb] = block_coord;
         int const seqlen_k = get<0>(params.shape_K);
         int const seqlen_q = get<0>(params.shape_Q);
@@ -550,6 +551,15 @@ struct CollectiveMainloopBwdSm90 {
                 fm_mem[6] = (params.ut_end_nblockmax[bh_offset_block + n_block] - 1) / kBlockM;
                 fm_mem[7] = params.ut_end_nblockmin[bh_offset_block + n_block] / kBlockM;
             }
+
+            if constexpr (!Is_causal and !Has_ut_start) {
+                *empty_tile = params.ut_end_nblockmin[bh_offset_block + n_block] >= params.lt_start_nblockmin[bh_offset_block + n_block] &&
+                              params.lt_start_nblockmax[bh_offset_block + n_block] == params.lt_start_nblockmin[bh_offset_block + n_block] &&
+                              params.ut_end_nblockmax[bh_offset_block + n_block] == params.ut_end_nblockmin[bh_offset_block + n_block];
+            } else {
+                *empty_tile = false;
+            }
+
             // if(bidb ==1 and bidh == 0) printf("params.ut_end_nblockmax: %d, params.ut_end_nblockmin: %d ,n_block: %d\n", fm_mem[6], fm_mem[7], n_block);
             // printf("bidh: %d, bidb: %d, n_block: %d\n", bidh, bidb, n_block);
             // printf("params.h_flashmask: %d, params.h_h_flashmask_ratio: %d,get<0>(params.shape_Q): %d", params.h_flashmask, params.h_h_flashmask_ratio, get<0>(params.shape_Q));
@@ -591,7 +601,7 @@ struct CollectiveMainloopBwdSm90 {
         }
         // if(thread_idx < kBlockN) if(bidb ==1 and bidh == 0) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, ut_end_flashmask_index_smem_%d: %d\n", thread_idx,bidb,bidh,n_block,thread_idx + row_offset-seqlen,thread_idx,flashmask_index_smem_[thread_idx + 3 * kBlockN]);
             // if(bidb ==0 and (bidh == 0 or bidh == 2) and n_block * kBlockN + i < seqlen and params.ut_end_ptr != nullptr) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, ut_end_flashmask_index_smem_%d: %d, params.ut_end_ptr_val: %d, params.ut_end_ptr_ptr: %p\n", thread_idx,bidb,bidh,n_block,row_offset,i,flashmask_index_smem_[i + 3 * kBlockN],params.ut_end_ptr[i + row_offset],params.ut_end_ptr + i + row_offset);
-        cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskProducer) /*id*/);
+        cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskProducer) /*id*/);
     }
 
     template <typename SharedStorage>
@@ -988,6 +998,30 @@ struct CollectiveMainloopBwdSm90 {
                 /* Do Nothing, just wait */
 				Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
             }
+        }
+    }
+
+    CUTLASS_DEVICE void
+    store_dq_empty_tile(Params const& params, cute::tuple<int32_t, int32_t, int32_t> block_coord) {
+        if constexpr (!Deterministic || !dQacc_use_TMA) { return; }
+
+        auto [n_block, bidh, bidb] = block_coord;
+        SeqlenInfo_t seqlen_info{
+            bidb, get<0>(params.shape_Q), size<0>(params.shape_K),
+            params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k
+        };
+
+        int const num_batch = params.num_batch;
+        int const num_head = get<2>(params.shape_Q);
+        int *lock_ptr = params.dq_semaphore + bidb * num_head + bidh;
+        using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>;
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+
+        int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
+        for (int m_block = 0; m_block < m_block_global_max; m_block++) {
+            Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
+            /* Do Nothing, just wait */
+            Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
         }
     }
 

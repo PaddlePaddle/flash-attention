@@ -24,9 +24,9 @@ def _swap_last_two_dims(t: paddle.Tensor) -> paddle.Tensor:
 
 
 def _dim_order(t: paddle.Tensor) -> tuple:
-    """Return dimension indices sorted by stride ascending, matching torch.Tensor.dim_order()."""
+    """Return dimension indices sorted by stride descending (outermost first), matching torch.Tensor.dim_order()."""
     strides = list(t.strides)
-    return tuple(sorted(range(len(strides)), key=lambda i: strides[i]))
+    return tuple(sorted(range(len(strides)), key=lambda i: strides[i], reverse=True))
 
 
 import cuda.bindings.driver as cuda
@@ -1260,7 +1260,6 @@ def _flash_attn_bwd(
     seqused_k: Optional[paddle.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
-    deterministic: bool = False,
     dq: Optional[paddle.Tensor] = None,
     dk: Optional[paddle.Tensor] = None,
     dv: Optional[paddle.Tensor] = None,
@@ -1271,6 +1270,8 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsPaddle] = None,
     dlse: Optional[paddle.Tensor] = None,
 ) -> Tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor]:
+    deterministic = paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"]
+
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     sparse_q = None
@@ -1950,7 +1951,6 @@ class FlashAttnFunc(paddle.autograd.PyLayer):
         softcap: float = 0.0,
         num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
-        deterministic: bool = False,
         score_mod: Optional[Callable] = None,
         score_mod_bwd: Optional[Callable] = None,
         mask_mod: Optional[Callable] = None,
@@ -1984,7 +1984,6 @@ class FlashAttnFunc(paddle.autograd.PyLayer):
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.softcap = softcap
-        ctx.deterministic = deterministic
         ctx.return_lse = return_lse
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
@@ -2019,7 +2018,6 @@ class FlashAttnFunc(paddle.autograd.PyLayer):
             ctx.softcap,
             window_size_left=ctx.window_size[0],
             window_size_right=ctx.window_size[1],
-            deterministic=ctx.deterministic,
             score_mod=ctx.score_mod,
             score_mod_bwd=ctx.score_mod_bwd,
             mask_mod=ctx.mask_mod,
@@ -2065,7 +2063,6 @@ class FlashAttnVarlenFunc(paddle.autograd.PyLayer):
         softcap: float = 0.0,
         num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
-        deterministic: bool = False,
         score_mod: Optional[Callable] = None,
         score_mod_bwd: Optional[Callable] = None,
         mask_mod: Optional[Callable] = None,
@@ -2117,7 +2114,6 @@ class FlashAttnVarlenFunc(paddle.autograd.PyLayer):
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.softcap = softcap
-        ctx.deterministic = deterministic
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.return_lse = return_lse
@@ -2161,7 +2157,6 @@ class FlashAttnVarlenFunc(paddle.autograd.PyLayer):
             seqused_k=seqused_k,
             max_seqlen_q=ctx.max_seqlen_q,
             max_seqlen_k=ctx.max_seqlen_k,
-            deterministic=ctx.deterministic,
             score_mod=ctx.score_mod,
             score_mod_bwd=ctx.score_mod_bwd,
             aux_tensors=aux_tensors,
@@ -2207,7 +2202,6 @@ def flash_attn_func(
     softcap: float = 0.0,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
-    deterministic: bool = False,
     score_mod: Optional[Callable] = None,
     score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
@@ -2229,7 +2223,6 @@ def flash_attn_func(
         softcap,
         num_splits,
         pack_gqa,
-        deterministic,
         score_mod,
         score_mod_bwd,
         mask_mod,
@@ -2261,7 +2254,6 @@ def flash_attn_varlen_func(
     softcap: float = 0.0,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
-    deterministic: bool = False,
     score_mod: Optional[Callable] = None,
     score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
@@ -2304,7 +2296,6 @@ def flash_attn_varlen_func(
         softcap,
         num_splits,
         pack_gqa,
-        deterministic,
         score_mod,
         score_mod_bwd,
         mask_mod,

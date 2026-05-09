@@ -129,7 +129,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     if constexpr (Arch >= 90) {
         // setting scheduler tile_count_semaphore / zeroing write_ptr / record write_ptr ready event
         overlap_sm_margin = need_overlap_comm ? flashmask::comm::singleton().overlap_sm_margin() : 0;
-        prepare_flashmask(params, stream, params.num_sm - overlap_sm_margin, Scheduler::pipelining, 
+        if (need_overlap_comm) flashmask::comm::singleton().ensure_ag_done(stream);
+        prepare_flashmask(params, stream, params.num_sm - overlap_sm_margin, Scheduler::pipelining,
             need_overlap_comm ? &flashmask::comm::singleton().wptr_init : nullptr,
             need_overlap_comm ? flashmask::comm::singleton().get_block_cnt_semaphore() : nullptr);
     }

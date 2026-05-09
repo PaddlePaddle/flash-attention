@@ -190,6 +190,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 
 SEGMENT_LOOP_START:
     if constexpr (Arch >= 90) {
+        if (use_overlap) flashmask::comm::singleton().ensure_ag_done(stream);
         prepare_flashmask(params, stream, params.num_sm - overlap_sm_margin,
             use_overlap ? &flashmask::comm::singleton().wptr_init : nullptr,
             use_overlap ? flashmask::comm::singleton().get_block_cnt_semaphore() : nullptr);

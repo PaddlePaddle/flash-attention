@@ -212,7 +212,9 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
                                   greatest_priority);
     cudaEventCreateWithFlags(&wptr_init, cudaEventDisableTiming);
     cudaEventCreateWithFlags(&sr_usable, cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&ag_done, cudaEventDisableTiming);
     cudaEventRecord(sr_usable, comm_stream);                    // set initial status for SR buffer
+    cudaEventRecord(ag_done, comm_stream);                      // initial state: no AG pending
     _local_batch_stride = s_kv * h_kv * d_kv;
     _total_numel = _local_batch_stride * b_kv * nranks;             // won't overflow, but should be careful
 
@@ -290,6 +292,7 @@ OverlapCommunicator<KVType>::~OverlapCommunicator() {
     CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
     CUDA_DEBUG_CHECK(cudaEventDestroy(wptr_init));
     CUDA_DEBUG_CHECK(cudaEventDestroy(sr_usable));
+    CUDA_DEBUG_CHECK(cudaEventDestroy(ag_done));
     CUDA_DEBUG_CHECK(cudaStreamDestroy(comm_stream));
     kv_buffer->release();           // do not depend on auto-release
     if (dkv_buffer) {
@@ -575,6 +578,7 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
     SChunkDispatch(AgKernelBody, S_local);
 #undef AgKernelBody
 
+    cudaEventRecord(ag_done, comm_stream);
     WARN_PRINT_SYNC(comm_stream, "After remote_get kernel\n");
     // P2P empty notification is now done inline in the get kernel (try_release_rank),
     // no separate notify_all_empty kernel needed.
@@ -673,6 +677,7 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
     SChunkDispatch(SplittedAgBody, S_local);
 #undef SplittedAgBody
 
+    cudaEventRecord(ag_done, comm_stream);
     // P2P empty notification is now done inline in the get kernel (try_release_rank),
     // no separate notify_segment_empty kernel needed.
     WARN_PRINT_SYNC(comm_stream, "(%d) After run_overlap_splitted_ag_kernel, segment: %d\n", _my_pe, segment_idx);

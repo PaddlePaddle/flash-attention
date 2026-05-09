@@ -160,6 +160,13 @@ public:
         return block_cnt_semaphore;
     }
 
+    // Ensure previous AG kernel on comm_stream has completed before comp_stream
+    // resets block_cnt_semaphore (via prepare_flashmask). Prevents race where
+    // block_cnt_semaphore is reset while the AG kernel is still using it.
+    void ensure_ag_done(cudaStream_t stream) {
+        cudaStreamWaitEvent(stream, ag_done);
+    }
+
     // Per-work ready flag accessors for BWD compute kernel.
     // work_done array = block_work_ids (bitmap region, 1-based indexing).
     int* get_work_done_ptr() const {
@@ -204,7 +211,10 @@ public:
     // bwd_done (only when RS-overlap): comp_stream notifies aux_streams, bwd post-proc done
     // reduce_done (only when RS-overlap): aux_c_stream notifies comp_stream, dk/v recv buffer are released and ready
     // local_moved (only when RS-overlap): for segment 0, aux_p_stream notifies aux_c_stream whether the memcpy d2d is completed.
-    cudaEvent_t wptr_init, sr_usable, bwd_done, reduce_done, local_moved;
+    // ag_done: is all-gather done. Record for comm_stream after each AG and prepare_flashmask (comp_stream) should wait for it
+    //      if compute is extremely fast, the previous AG might not finish and the 
+    //      next prepare_flashmask starts, overwrite block_cnt_semaphore.
+    cudaEvent_t wptr_init, sr_usable, ag_done, bwd_done, reduce_done, local_moved;
     /**
      * If overlap_rs is set, dkv_buffer will be populated.
      * and since the fwd AG buffer is always bigger than bwd AG

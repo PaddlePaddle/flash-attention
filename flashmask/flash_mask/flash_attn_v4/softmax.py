@@ -11,6 +11,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Boolean
 
 import flash_mask.flash_attn_v4.utils as utils
+from flash_mask.flash_attn_v4 import layout_utils
 from flash_mask.flash_attn_v4.cute_dsl_utils import ParamsBase
 from flash_mask.flash_attn_v4.seqlen_info import SeqlenInfoQK
 
@@ -63,7 +64,7 @@ class Softmax(ParamsBase):
         :type is_first: cutlass.Constexpr
         """
         # Change acc_S to M,N layout view.
-        acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
+        acc_S_mn = layout_utils.make_acc_tensor_mn_view(acc_S)
         row_scale = cute.make_fragment_like(self.row_max, Float32)
 
         row_max = self.row_max
@@ -159,7 +160,7 @@ class Softmax(ParamsBase):
         :param row_scale: row_scale tensor
         :type row_scale: cute.Tensor
         """
-        acc_O_mn = utils.make_acc_tensor_mn_view(acc_O)
+        acc_O_mn = layout_utils.make_acc_tensor_mn_view(acc_O)
         assert cute.size(row_scale) == cute.size(acc_O_mn, mode=[0])
         for r in cutlass.range(cute.size(row_scale), unroll_full=True):
             acc_O_mn[r, None].store(acc_O_mn[r, None].load() * row_scale[r])

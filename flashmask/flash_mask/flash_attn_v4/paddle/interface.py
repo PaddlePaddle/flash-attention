@@ -1281,6 +1281,16 @@ def _flash_attn_bwd(
     num_head, head_dim = q.shape[-2:]
     head_dim_v = v.shape[-1]
 
+    # TODO: varlen backward preprocess uses broadcast-stride predicate in cute.copy,
+    # which fails IR verification on the installed nvidia-cutlass-dsl when head_dim_v
+    # is not a multiple of 32 (check_hdim_v_oob path). Upstream flash-attention has
+    # the same issue. Assert-guard this case until the DSL or the kernel is fixed.
+    assert head_dim_v % 32 == 0, (
+        f"flash_attn backward does not support head_dim_v={head_dim_v} "
+        f"(must be a multiple of 32) due to a cute.copy IR verifier limitation "
+        f"in flash_bwd_preprocess.py."
+    )
+
     window_size = [window_size_left, window_size_right]
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right

@@ -294,7 +294,7 @@ class FlashAttentionBackwardPreprocess:
             t0OcO = gmem_thr_copy_O.get_slice(0).partition_S(cO)
             tOpO = None
             if const_expr(self.check_hdim_v_oob):
-                tOpO = copy_utils.predicate_k(tOcO, limit=headdim_v)
+                tOpO = utils.predicate_k(tOcO, limit=headdim_v)
             # Each copy will use the same predicate
             copy = partial(copy_utils.copy, pred=tOpO)
 

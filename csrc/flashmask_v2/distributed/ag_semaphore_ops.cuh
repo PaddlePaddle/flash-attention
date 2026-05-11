@@ -27,16 +27,6 @@ __device__ __forceinline__ void wait_full(
     nvshmem_int64_wait_until(const_cast<int64_t*>(semaphores) + target_pe, NVSHMEM_CMP_GT, 0);
 }
 
-/**
- * @brief (Device Function) Wait until semaphores[target_pe] == 0 (all consumers done).
- *   Used in Phase 1 to ensure previous relay data is fully consumed before overwriting.
- */
-__device__ __forceinline__ void wait_empty(
-    const int64_t* const __restrict__ semaphores,
-    const int target_pe
-) {
-    nvshmem_int64_wait_until(const_cast<int64_t*>(semaphores) + target_pe, NVSHMEM_CMP_EQ, 0);
-}
 
 /**
  * @brief (Device Function) Wait until semaphores[target_pe] has batch_idx bit set.

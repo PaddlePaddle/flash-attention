@@ -206,15 +206,23 @@ public:
     int overlap_sm_margin() const;
     void prepare_dkv_buffer(cudaStream_t stream);
 
-    // wptr_init: comp_stream notifies comm_stream, write_ptr is usable
-    // sr_usable: comp_stream notifies comm_stream, KV SR buffer local chunk can be reused (since computation is done)
-    // bwd_done (only when RS-overlap): comp_stream notifies aux_streams, bwd post-proc done
-    // reduce_done (only when RS-overlap): aux_c_stream notifies comp_stream, dk/v recv buffer are released and ready
-    // local_moved (only when RS-overlap): for segment 0, aux_p_stream notifies aux_c_stream whether the memcpy d2d is completed.
-    // ag_done: is all-gather done. Record for comm_stream after each AG and prepare_flashmask (comp_stream) should wait for it
-    //      if compute is extremely fast, the previous AG might not finish and the 
-    //      next prepare_flashmask starts, overwrite block_cnt_semaphore.
-    cudaEvent_t wptr_init, sr_usable, ag_done, bwd_done, reduce_done, local_moved;
+    // ── Cross-stream synchronization events ──────────────────────────────
+    //
+    //  Event          Direction                        Contract
+    //  ─────────────  ───────────────────────────────  ──────────────────────────────────────
+    //  wptr_init      comp_stream → comm_stream        write_ptr is initialized, AG kernel may start
+    //  sr_usable      comp_stream → comm_stream        Attention consumed local KV chunk, SR buffer reusable
+    //  ag_done        comm_stream → comp_stream        AG kernel finished; safe to reset block_cnt_semaphore
+    //  bwd_done       comp_stream → aux_{p,c}_stream   BWD post-proc done, dK/dV send buffers ready  (RS-overlap only)
+    //  reduce_done    aux_c_stream → comp_stream       dK/dV recv buffers released and ready          (RS-overlap only)
+    //  local_moved    aux_p_stream → aux_c_stream      Segment-0 local dKV memcpy d2d completed       (RS-overlap only)
+    //
+    cudaEvent_t wptr_init;
+    cudaEvent_t sr_usable;
+    cudaEvent_t ag_done;
+    cudaEvent_t bwd_done;       // RS-overlap only
+    cudaEvent_t reduce_done;    // RS-overlap only
+    cudaEvent_t local_moved;    // RS-overlap only
     /**
      * If overlap_rs is set, dkv_buffer will be populated.
      * and since the fwd AG buffer is always bigger than bwd AG
@@ -289,6 +297,17 @@ private:
     int _num_copy_chunks;                   // block_work_ids array size tracking
     int _bitmap_region_size;                // bitmap region size (work_done + frontier)
 
+    // ── Compound device allocation (single cudaMalloc) ───────────────────
+    //
+    //  Offset (int elements)                       Field
+    //  ──────────────────────────────────────────   ──────────────────────────────
+    //  [0 .. bitmap_region)                        block_work_ids  (= work_done bitmap + frontier)
+    //  [bitmap_region .. bitmap_region+1)          block_cnt_semaphore
+    //  [bitmap_region+1 .. bitmap_region+1+N)      copy_chunk_mask  (N = _num_copy_chunks)
+    //  [bitmap_region+1+N .. bitmap_region+2+N)    stream_coordinator
+    //  [bitmap_region+2+N .. bitmap_region+2+2N)   rank_commit_counters  (RS-overlap: per-rank)
+    //  [bitmap_region+2+2N .. bitmap_region+2+3N)  rank_empty_counters   (RS-overlap: per-rank)
+    //
     int* block_work_ids;
     int* block_cnt_semaphore;
     int* copy_chunk_mask;

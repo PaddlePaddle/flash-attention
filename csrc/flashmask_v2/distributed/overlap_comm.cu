@@ -69,13 +69,13 @@ void dump_sr_buffer(const Ty* const src, int num_elem, int rank, std::string buf
     CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
 
     size_t size_in_bytes = num_elem * sizeof(Ty);
-    
+
     // 1. Allocate CPU staging memory
     std::vector<char> host_buffer(size_in_bytes);
 
     // 2. Copy data from GPU (Global Memory) to CPU
     cudaError_t err = cudaMemcpy(host_buffer.data(), src, size_in_bytes, cudaMemcpyDeviceToHost);
-    
+
     if (err != cudaSuccess) {
         std::cerr << "CUDA Memcpy failed: " << cudaGetErrorString(err) << std::endl;
         return;
@@ -84,7 +84,7 @@ void dump_sr_buffer(const Ty* const src, int num_elem, int rank, std::string buf
     // 3. Construct filename and write to binary file
     std::string filename = buffer_name + std::to_string(rank) + ".bin";
     std::ofstream outfile(filename, std::ios::out | std::ios::binary);
-    
+
     if (outfile.is_open()) {
         outfile.write(host_buffer.data(), size_in_bytes);
         outfile.close();

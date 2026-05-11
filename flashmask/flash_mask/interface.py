@@ -75,35 +75,176 @@ flash_attn_func        = _mod.flash_attn_func
 flash_attn_varlen_func = _mod.flash_attn_varlen_func
 flash_attn_combine     = _mod.flash_attn_combine
 
-def convert_to_varlen(
+def _convert_to_varlen_bound2(
     query: paddle.Tensor,
     key: paddle.Tensor,
     value: paddle.Tensor,
     startend_row_indices: paddle.Tensor,
     causal: bool,
 ):
+    """Convert padded tensors to varlen format using lts+ute boundary detection.
+
+    Supports asymmetric seqlen_q != seqlen_k and zero-length documents.
+    Requires bound_num == 2 (both lts and ute available).
+    """
+    b, sq, hq, d = query.shape
+    _, sk, hkv, dv = value.shape
+
+    sri_np = startend_row_indices.numpy()  # (batch, 1, sk, 2)
+    lts_np = sri_np[:, 0, :, 0]  # (batch, sk)
+    ute_np = sri_np[:, 0, :, 1]  # (batch, sk)
+
+    cu_seqlens_q_list = []
+    cu_seqlens_k_list = []
+    max_doc_sq = 0
+    max_doc_sk = 0
+
+    for bi in range(b):
+        lts = lts_np[bi]  # (sk,)
+        ute = ute_np[bi]  # (sk,)
+
+        # Detect K-side document boundaries
+        # Boundary at col j > 0 if:
+        #   1. lts[j] != lts[j-1]  (Q endpoint changed)
+        #   2. ute[j] == lts[j] AND ute[j-1] < lts[j-1]  (transition to zero-Q doc)
+        k_starts = [0]
+        for j in range(1, sk):
+            if lts[j] != lts[j - 1]:
+                k_starts.append(j)
+            elif ute[j] == lts[j] and ute[j - 1] < lts[j - 1]:
+                k_starts.append(j)
+
+        # Build cu_seqlens_q: [0, lts_doc0, lts_doc1, ..., lts_doc_{n-1}]
+        # Build cu_seqlens_k: [0, k_start_1, k_start_2, ..., sk]
+        q_bounds = [np.int32(0)]
+        k_bounds = [np.int32(k) for k in k_starts] + [np.int32(sk)]
+
+        for doc_idx in range(len(k_starts)):
+            doc_lts = np.int32(lts[k_starts[doc_idx]])
+            q_bounds.append(doc_lts)
+
+        assert q_bounds[-1] == sq, (
+            f"Batch {bi}: last document lts={q_bounds[-1]} != seqlen_q={sq}. "
+            f"All Q positions must be covered by documents."
+        )
+
+        # Compute per-doc max lengths
+        for i in range(len(k_starts)):
+            doc_sq = int(q_bounds[i + 1]) - int(q_bounds[i])
+            doc_sk = int(k_bounds[i + 1]) - int(k_bounds[i])
+            max_doc_sq = max(max_doc_sq, doc_sq)
+            max_doc_sk = max(max_doc_sk, doc_sk)
+
+        # Add batch offsets
+        cu_seqlens_q_list.append(
+            np.array(q_bounds[:-1], dtype=np.int32) + np.int32(bi * sq)
+        )
+        cu_seqlens_k_list.append(
+            np.array(k_bounds[:-1], dtype=np.int32) + np.int32(bi * sk)
+        )
+
+    # Concatenate with final sentinel
+    cu_seqlens_q_np = np.concatenate(
+        cu_seqlens_q_list + [np.array([b * sq], dtype=np.int32)]
+    )
+    cu_seqlens_k_np = np.concatenate(
+        cu_seqlens_k_list + [np.array([b * sk], dtype=np.int32)]
+    )
+    cu_seqlens_q = paddle.to_tensor(cu_seqlens_q_np)
+    cu_seqlens_k = paddle.to_tensor(cu_seqlens_k_np)
+
+    # Flatten tensors
+    q_varlen = query.reshape([b * sq, hq, d])
+    k_varlen = key.reshape([b * sk, hkv, d])
+    v_varlen = value.reshape([b * sk, hkv, dv])
+
+    # Causal detection: for causal=False, check if ute matches causal pattern
+    varlen_causal = causal
+    if not causal:
+        is_causal = True
+        for bi in range(b):
+            lts = lts_np[bi]
+            ute = ute_np[bi]
+            # Re-detect boundaries for verification
+            k_starts_bi = [0]
+            for j in range(1, sk):
+                if lts[j] != lts[j - 1]:
+                    k_starts_bi.append(j)
+                elif ute[j] == lts[j] and ute[j - 1] < lts[j - 1]:
+                    k_starts_bi.append(j)
+            k_starts_bi.append(sk)
+
+            prev_q_end = 0
+            for doc_idx in range(len(k_starts_bi) - 1):
+                k_start = k_starts_bi[doc_idx]
+                k_end = k_starts_bi[doc_idx + 1]
+                doc_sk = k_end - k_start
+                q_offset = prev_q_end
+                doc_lts = int(lts[k_start])
+                doc_sq = doc_lts - q_offset
+                prev_q_end = doc_lts
+
+                if doc_sq == 0:
+                    # Zero-Q doc: ute should equal lts for all its cols
+                    for j in range(k_start, k_end):
+                        if ute[j] != lts[j]:
+                            is_causal = False
+                            break
+                else:
+                    # Verify: ute[k_start + j] == q_offset + max(0, j - (sk - sq))
+                    for j_local in range(doc_sk):
+                        expected = q_offset + max(0, j_local - (doc_sk - doc_sq))
+                        if int(ute[k_start + j_local]) != expected:
+                            is_causal = False
+                            break
+                if not is_causal:
+                    break
+            if not is_causal:
+                break
+        if is_causal:
+            varlen_causal = True
+
+    return {
+        "q": q_varlen,
+        "k": k_varlen,
+        "v": v_varlen,
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_k": cu_seqlens_k,
+        "max_seqlen_q": max_doc_sq,
+        "max_seqlen_k": max_doc_sk,
+        "causal": varlen_causal,
+    }
+
+
+def _convert_to_varlen_bound1(
+    query: paddle.Tensor,
+    key: paddle.Tensor,
+    value: paddle.Tensor,
+    startend_row_indices: paddle.Tensor,
+    causal: bool,
+):
+    """Convert padded tensors to varlen format using lts-only boundary detection.
+
+    Only supports symmetric seqlen_q == seqlen_k. Kept for backward compatibility
+    with bound_num == 1 masks.
+    """
     b, sq, hq, d = query.shape
     _, skv, hkv, dv = value.shape
-    assert sq == skv
+    assert sq == skv, (
+        f"bound_num==1 requires seqlen_q == seqlen_k, "
+        f"got seqlen_q={sq}, seqlen_k={skv}"
+    )
 
-    _, hfm, _, bound_num = startend_row_indices.shape
-    assert hfm == 1
-    assert bound_num == 1 or bound_num == 2
-
-    # ── Move startend_row_indices to numpy (single GPU→CPU transfer) ──
-    sri_np = startend_row_indices.numpy()  # (batch, hfm, seqlen_k, bound_num)
+    sri_np = startend_row_indices.numpy()
     s_np = sri_np[:, 0, :, 0]  # (batch, seqlen_k)
 
-    # ── Vectorised boundary detection in numpy ──
-    # Compare consecutive elements per batch: (b, skv-1)
+    # Boundary detection from lts changes
     diffs = s_np[:, 1:] != s_np[:, :-1]
 
-    # Real ends per batch
-    real_ends_np = s_np.max(axis=1)  # (b,)
+    real_ends_np = s_np.max(axis=1)
     real_ends = real_ends_np.tolist()
     needs_padding_fixup = bool(np.any(real_ends_np < skv))
 
-    # Per-batch boundary extraction (b is typically 1-2, loop is trivial)
     cu_seqlens_list = []
     max_doc_len = 0
     for bi in range(b):
@@ -117,26 +258,16 @@ def convert_to_varlen(
         max_doc_len = max(max_doc_len, int(doc_lens.max()))
         cu_seqlens_list.append(boundaries[:-1] + np.int32(bi * skv))
 
-    # Build cu_seqlens: one numpy concat, one paddle tensor creation
     cu_seqlens_np = np.concatenate(
         cu_seqlens_list + [np.array([b * skv], dtype=np.int32)]
     )
     cu_seqlens = paddle.to_tensor(cu_seqlens_np)
 
-    # ── Flatten q, k, v: (batch, seqlen, heads, dim) -> (total, heads, dim)
     q_varlen = query.reshape([b * sq, hq, d])
     k_varlen = key.reshape([b * skv, hkv, d])
     v_varlen = value.reshape([b * skv, hkv, dv])
 
-    # ── Detect simulated causal masks (numpy) ────────────────────────
     varlen_causal = causal
-    if not causal and bound_num == 2:
-        lts_all = s_np  # (b, skv), already extracted
-        ute_all = sri_np[:, 0, :, 1]  # (b, skv)
-        arange_ref = np.arange(skv, dtype=np.int32).reshape(1, skv)
-        expected_causal_ute = np.minimum(arange_ref, lts_all)
-        if np.array_equal(ute_all, expected_causal_ute):
-            varlen_causal = True
 
     result = {
         "q": q_varlen,
@@ -149,10 +280,6 @@ def convert_to_varlen(
         "causal": varlen_causal,
     }
 
-    # For non-causal masks with trailing padding: padding rows attend to
-    # nothing in flashmask (zero output), but varlen computes non-zero
-    # output for them.  Zero out padding rows per batch to match flashmask.
-    # Note: real_end can differ across batch items.
     if needs_padding_fixup:
         _b, _sq = b, sq
         _real_ends = real_ends
@@ -161,18 +288,48 @@ def convert_to_varlen(
             nh = out_varlen_pt.shape[1]
             dv_out = out_varlen_pt.shape[2]
             out_padded = out_varlen_pt.reshape(_b, _sq, nh, dv_out)
-            # Vectorised per-batch zeroing
             row_idx = paddle.arange(_sq)
             real_end_t = paddle.to_tensor(
                 _real_ends, dtype=paddle.int64,
             ).unsqueeze(1)
-            padding_mask = row_idx.unsqueeze(0) >= real_end_t  # (b, sq)
+            padding_mask = row_idx.unsqueeze(0) >= real_end_t
             out_padded[padding_mask] = 0
             return out_padded
 
         result["output_to_padded"] = output_to_padded
 
     return result
+
+
+def convert_to_varlen(
+    query: paddle.Tensor,
+    key: paddle.Tensor,
+    value: paddle.Tensor,
+    startend_row_indices: paddle.Tensor,
+    causal: bool,
+):
+    _, hfm, _, bound_num = startend_row_indices.shape
+    b, sq, hq, d = query.shape
+    sk = value.shape[1]
+
+    assert hfm == 1
+    assert bound_num == 1 or bound_num == 2
+
+    if bound_num == 2:
+        assert not causal, (
+            # TODO
+        )
+        return _convert_to_varlen_bound2(
+            query, key, value, startend_row_indices, causal
+        )
+    else:
+        assert sq == sk, (
+            f"Asymmetric seqlen_q != seqlen_k requires bound_num == 2, "
+            f"got bound_num=1 with seqlen_q={sq}, seqlen_k={sk}"
+        )
+        return _convert_to_varlen_bound1(
+            query, key, value, startend_row_indices, causal
+        )
 
 def flashmask_attention(
     query: paddle.Tensor,
@@ -216,10 +373,6 @@ def flashmask_attention(
 
         batch_size, seqlen_q, nheads, d = query.shape
         seqlen_k = key.shape[1]
-        assert seqlen_q == seqlen_k, (
-            f"use_varlen requires seqlen_q == seqlen_k, ",
-            f"currently seqlen_q={seqlen_q}, seqlen_k={seqlen_k}",
-        )
 
         dv = value.shape[-1]
 

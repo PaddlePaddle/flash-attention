@@ -243,6 +243,13 @@ private:
         return kv_buffer->v_data() + _total_numel - B * _local_batch_stride;
     }
 
+    // Semaphore accessors for hierarchical dual-array protocol:
+    //   sema_inter [0..num_nodes-1]: cross-node data-ready flags (0/1)
+    //   sema_intra [0..total_n_pes-1]: refcount + intra-node consumption signals
+    // Non-hierarchical: sema_inter_size=0, sema_intra() == semaphores()
+    inline int64_t* sema_inter() const { return kv_buffer->semaphores(); }
+    inline int64_t* sema_intra() const { return kv_buffer->semaphores() + _sema_inter_size; }
+
     // Helper to (re)allocate block_work_ids and derived pointers
     void reallocate_block_work_ids();
     // Helper to create or recreate the dkv_buffer for RS-overlap
@@ -272,6 +279,7 @@ private:
     int _my_pe_node;        // This PE's index within its node (from nvshmem_team_my_pe)
     int _num_nodes;         // Number of nodes (= _total_n_pes / _gpus_per_node)
     bool _use_hierarchical; // Whether to use hierarchical overlap (from USE_HIERARCHICAL_OVERLAP env)
+    int _sema_inter_size;   // num_nodes for hierarchical, 0 otherwise (offset into semaphore array)
 
     // Configuration tracking for dynamic reconfiguration
     OverlapConfig _config;

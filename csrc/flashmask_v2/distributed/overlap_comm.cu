@@ -220,9 +220,11 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
 
     // This variable is simply a int32_t, so can be passed by value
     nvshmem_team_t cp_team = NVSHMEM_TEAM_WORLD;
-    kv_buffer = std::make_unique<SRBuffer<KVType>>(_total_numel, cp_team, USE_SEMAPHORES ? _total_n_pes : 0);
+    const int sema_count = USE_SEMAPHORES ? (_use_hierarchical ? _num_nodes + _total_n_pes : _total_n_pes) : 0;
+    _sema_inter_size = _use_hierarchical ? _num_nodes : 0;
+    kv_buffer = std::make_unique<SRBuffer<KVType>>(_total_numel, cp_team, sema_count);
     if constexpr (USE_SEMAPHORES) {
-        cudaMemset(kv_buffer->semaphores(), 0, sizeof(int64_t) * _total_n_pes);
+        cudaMemset(kv_buffer->semaphores(), 0, sizeof(int64_t) * sema_count);
     }
     const int num_copy_chunks = b_kv * s_kv * nranks / (RDMA_ROW_PER_WARP * num_warps);
     // FWD uses num_blocks slots (reduce-based wptr). BWD uses work_done[0..N] bitmap (per-work flag).
@@ -230,7 +232,10 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     _bitmap_region_size = ((num_copy_chunks + 1) + 3) & ~3;
     const int head_region_size = std::max(num_blocks, _bitmap_region_size);
     // block_cnt_semaphore (AG overlap only requires only 1 extra int, 2 is for RS overlap, 2 more for padding)
-    CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (head_region_size + num_copy_chunks + 4 + 2 * nranks), comm_stream));
+    // rank_commit_counters: nranks (for RS P2P commit)
+    // rank_empty_counters: B * nranks (for hierarchical per-batch Phase 1 AG counters)
+    const int rank_counters_size = (b_kv + 1) * nranks;
+    CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (head_region_size + num_copy_chunks + 4 + rank_counters_size), comm_stream));
     copy_chunk_mask = block_work_ids + head_region_size;
     block_cnt_semaphore = copy_chunk_mask + num_copy_chunks;
     stream_coordinator = block_cnt_semaphore + STREAM_COORD_OFFSET;
@@ -360,11 +365,21 @@ void OverlapCommunicator<KVType>::wait_sr_buffer_empty(cudaStream_t stream) {
         WARN_PRINT("Before wait_self_empty\n");
         // block if computation that uses the local chunk is not finished
         // so that we won't corrupt the local buffer being used
-        sema::ag::wait_self_empty(
-            kv_buffer->semaphores(),
-            _my_pe,
-            comm_stream
-        );
+        if (_use_hierarchical) {
+            sema::ag::wait_self_empty_hier(
+                sema_intra(),
+                _my_pe,
+                _gpus_per_node,
+                _num_nodes,
+                comm_stream
+            );
+        } else {
+            sema::ag::wait_self_empty(
+                sema_intra(),
+                _my_pe,
+                comm_stream
+            );
+        }
         WARN_PRINT_SYNC(comm_stream, "After wait_self_empty\n");
     }
 }
@@ -412,10 +427,11 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
         // notify all other PEs that the local data is ready (1. set self to be `total_pes - 1`. 2. broadcast to other PEs)
         if (_use_hierarchical) {
             sema::ag::notify_full_hier(
-                kv_buffer->semaphores(),
+                sema_inter(),
+                sema_intra(),
                 _my_pe, _total_n_pes,
                 _gpus_per_node, _num_nodes,
-                comm_stream
+                B, comm_stream
             );
         } else {
             sema::ag::notify_full(
@@ -460,7 +476,8 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                         H * D,                                                        \
                         kv_buffer->semaphores(),                                      \
                         rank_empty_counters,                                          \
-                        _gpus_per_node                                                \
+                        _gpus_per_node,                                               \
+                        _sema_inter_size                                              \
                     )
 
 #define SparseLargeChunkKernel(_S, bwd)                                             \
@@ -560,7 +577,11 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
     // set 0 every time we start the comm kernel --- meaning that we don't have any available attn-blocks
     cudaMemsetAsync(block_work_ids, 0, sizeof(int) * num_blocks, comm_stream);
     if constexpr (USE_SEMAPHORES) {
-        cudaMemsetAsync(rank_empty_counters, 0, sizeof(int) * _total_n_pes, comm_stream);
+        // Hierarchical: per-batch Phase 1 counters (B * total_n_pes)
+        // Non-hierarchical: no counters needed (release is done by post-AG kernel)
+        if (_use_hierarchical) {
+            cudaMemsetAsync(rank_empty_counters, 0, sizeof(int) * B * _total_n_pes, comm_stream);
+        }
     }
     WARN_PRINT_SYNC(comm_stream, "Before remote get kernel: %d\n", _my_pe);
 
@@ -578,10 +599,27 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
     SChunkDispatch(AgKernelBody, S_local);
 #undef AgKernelBody
 
+    // Post-AG cleanup: notify all remote producers that we finished consuming their data.
+    // This replaces the old inline try_release_rank in the get kernel.
+    if constexpr (USE_SEMAPHORES) {
+        if (_use_hierarchical) {
+            sema::ag::notify_all_empty_hier(
+                sema_inter(), sema_intra(),
+                _my_pe, _total_n_pes,
+                _gpus_per_node, _num_nodes,
+                B,
+                comm_stream
+            );
+        } else {
+            sema::ag::notify_all_empty(
+                kv_buffer->semaphores(),
+                _my_pe, _total_n_pes,
+                comm_stream
+            );
+        }
+    }
     cudaEventRecord(ag_done, comm_stream);
     WARN_PRINT_SYNC(comm_stream, "After remote_get kernel\n");
-    // P2P empty notification is now done inline in the get kernel (try_release_rank),
-    // no separate notify_all_empty kernel needed.
 }
 #undef SeqlenDispatch
 #undef SparseLargeChunkKernel
@@ -595,7 +633,6 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
                         _v_sr_ptr,                                                              \
                         _local_k_ptr,                                                           \
                         _local_v_ptr,                                                           \
-                        write_ptr,                                                              \
                         block_work_ids,                                                         \
                         block_cnt_semaphore,                                                    \
                         stream_coordinator,                                                     \
@@ -609,7 +646,8 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(
                         num_segs,                                                               \
                         kv_buffer->semaphores(),                                                \
                         rank_empty_counters,                                                    \
-                        _gpus_per_node                                                          \
+                        _gpus_per_node,                                                         \
+                        _sema_inter_size                                                        \
                     )
 
 #define NumChunkDispatchSplitted(MACRO_FUNC, num_chunk, _has_local, ...)  \
@@ -638,7 +676,11 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
         constexpr int S_chunk = _S_chunk;                                                                     \
         const int mask_smem_bytes = B * sizeof(int) * num_chunks * S_chunk / (num_warps * RDMA_ROW_PER_WARP); \
         if constexpr (USE_SEMAPHORES) {                                                                       \
-            cudaMemsetAsync(rank_empty_counters, 0, sizeof(int) * num_chunks, comm_stream);                   \
+            /* Hierarchical: per-batch Phase 1 counters (B * num_chunks) */                                 \
+            /* Non-hierarchical: no counters needed (release by post-AG kernel) */                          \
+            if (_use_hierarchical) {                                                                        \
+                cudaMemsetAsync(rank_empty_counters, 0, sizeof(int) * B * num_chunks, comm_stream);         \
+            }                                                                                               \
         }                                                                                                     \
         cudaMemsetAsync(block_work_ids, 0, sizeof(int) * _bitmap_region_size, comm_stream);                   \
         /* Compute stage-advanced dst (k_sr) and base src (local_k) pointers. */                              \
@@ -663,7 +705,10 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
             }                                                                                                 \
         } else {                                                                                              \
             constexpr int work_to_skip = S_chunk / (num_warps * RDMA_ROW_PER_WARP);                           \
-            InitBitmapForLocalSkip<<<1, std::max(work_to_skip, 1), 0, comm_stream>>>(block_work_ids);         \
+            const int work_per_seg = num_chunks * work_to_skip;                                             \
+            const int total_fill = B * work_to_skip;                                                       \
+            InitBitmapForLocalSkip<<<1, std::min(std::max(total_fill, 1), 256), 0, comm_stream>>>(         \
+                block_work_ids, work_to_skip, work_per_seg, B);                                            \
             if (_use_hierarchical) {                                                                          \
                 NumChunkDispatchSplitted(SparseLargeChunkSplittedKernel, num_chunks, true, true,              \
                     start_pe, segment_idx, num_segs, mask_smem_bytes);                                        \
@@ -677,9 +722,26 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(
     SChunkDispatch(SplittedAgBody, S_local);
 #undef SplittedAgBody
 
+    // Post-AG cleanup: notify producers we finished consuming their data in this segment.
+    if constexpr (USE_SEMAPHORES) {
+        if (_use_hierarchical) {
+            sema::ag::notify_segment_empty_hier(
+                sema_inter(), sema_intra(),
+                _my_pe, segment_idx, num_chunks,
+                _total_n_pes, _gpus_per_node,
+                B,
+                comm_stream
+            );
+        } else {
+            sema::ag::notify_segment_empty(
+                kv_buffer->semaphores(),
+                _my_pe, start_pe, num_chunks,
+                _total_n_pes,
+                comm_stream
+            );
+        }
+    }
     cudaEventRecord(ag_done, comm_stream);
-    // P2P empty notification is now done inline in the get kernel (try_release_rank),
-    // no separate notify_segment_empty kernel needed.
     WARN_PRINT_SYNC(comm_stream, "(%d) After run_overlap_splitted_ag_kernel, segment: %d\n", _my_pe, segment_idx);
 }
 #undef SparseLargeChunkSplittedKernel
@@ -895,7 +957,8 @@ void OverlapCommunicator<KVType>::reallocate_block_work_ids() {
     _num_copy_chunks = B * S_local * _total_n_pes / (RDMA_ROW_PER_WARP * num_warps);
     _bitmap_region_size = ((_num_copy_chunks + 1) + 3) & ~3;
     const int head_region_size = std::max(num_blocks, _bitmap_region_size);
-    CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (head_region_size + _num_copy_chunks + 4 + 2 * _total_n_pes), comm_stream));
+    const int rank_counters_size = _total_n_pes + B * _total_n_pes;
+    CUDA_DEBUG_CHECK(cudaMallocAsync(&block_work_ids, sizeof(int) * (head_region_size + _num_copy_chunks + 4 + rank_counters_size), comm_stream));
     copy_chunk_mask = block_work_ids + head_region_size;
     block_cnt_semaphore = copy_chunk_mask + _num_copy_chunks;
     stream_coordinator = block_cnt_semaphore + STREAM_COORD_OFFSET;
@@ -1088,9 +1151,10 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
         new_capacity = (new_capacity + 31) & ~static_cast<size_t>(31);  // align to 32
 
         kv_buffer->release_for_realloc();
-        kv_buffer = std::make_unique<SRBuffer<KVType>>(new_capacity, cp_team, USE_SEMAPHORES ? _total_n_pes : 0);
+        const int reconf_sema_count = USE_SEMAPHORES ? (_use_hierarchical ? _num_nodes + _total_n_pes : _total_n_pes) : 0;
+        kv_buffer = std::make_unique<SRBuffer<KVType>>(new_capacity, cp_team, reconf_sema_count);
         if constexpr (USE_SEMAPHORES) {
-            cudaMemset(kv_buffer->semaphores(), 0, sizeof(int64_t) * _total_n_pes);
+            cudaMemset(kv_buffer->semaphores(), 0, sizeof(int64_t) * reconf_sema_count);
         }
         WARN_PRINT("[FlashMask Overlap] Reconfigure: reallocated SRBuffer, capacity: %zu -> %zu\n",
             _sr_buffer_capacity, new_capacity);

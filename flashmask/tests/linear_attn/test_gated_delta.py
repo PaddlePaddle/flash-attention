@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Tests for Gated Delta Rule operators on PaddlePaddle
-# Aligned with tests/ops/test_gated_delta.py
+# Migrated from flash-attention/flashmask/tests/linear_attn/test_gated_delta.py
 
 import os
 
@@ -9,11 +9,11 @@ import paddle.nn.functional as F
 import pytest
 from einops import repeat
 
-from linear_attn.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-from linear_attn.ops.gated_delta_rule.gate import fused_gdn_gate, naive_gdn_gate
-from linear_attn.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
+from flash_mask.linear_attn.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from flash_mask.linear_attn.ops.gated_delta_rule.gate import fused_gdn_gate, naive_gdn_gate
+from flash_mask.linear_attn.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
 
-from .conftest import assert_close
+from tests.linear_attn.conftest import assert_close
 
 
 @pytest.mark.parametrize(
@@ -846,7 +846,6 @@ def test_chunk_gate_in_kernel_varlen(
     A_log.stop_gradient = False
     if dt_bias is not None:
         dt_bias.stop_gradient = False
-
     do = paddle.randn(v.shape, dtype=v.dtype)
     dht = paddle.rand(h0.shape, dtype=h0.dtype)
 

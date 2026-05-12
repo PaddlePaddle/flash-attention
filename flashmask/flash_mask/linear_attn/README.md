@@ -12,12 +12,12 @@ Triton-based GDN (Gated Delta Networks) and KDA (Kimi Delta Attention) operators
 ## Environment Setup
 
 ```bash
-# Install the flash_mask package (includes linear_attn)
+# Install the flash_mask package (includes flash_mask.linear_attn)
 cd /path/to/flash-attention/flashmask
 FLASHMASK_BUILD=fla pip install -e . --no-build-isolation
 ```
 
-`FLASHMASK_BUILD` supports `fa3`, `fa4`, `fla`, `all`, and combinations such as `fa3+fla` or `fa3, fla`. Use `fla` when you only need the linear-attention GDN/KDA operators.
+`FLASHMASK_BUILD` supports `fa3`, `fa4`, `fla`, `all`, and combinations such as `fa3+fla` or `fa3, fla`. Use `fla` when you only need the linear-attention GDN/KDA operators. Import operators from the installed package namespace, for example `from flash_mask.linear_attn.ops.kda import chunk_kda`. The legacy top-level `linear_attn` module is not installed as a separate package.
 
 ## Running Tests
 
@@ -31,23 +31,23 @@ Test files are located at `flashmask/tests/linear_attn/`:
 Each test compares the Triton-optimized implementation against a naive Python reference, checking both forward output and backward gradients.
 
 ```bash
-cd /path/to/flash-attention/flashmask/tests/linear_attn
+cd /path/to/flash-attention/flashmask
 
 # Run all tests
-pytest test_gated_delta.py test_kda.py -v
+pytest tests/linear_attn/test_gated_delta.py tests/linear_attn/test_kda.py -v
 
 # Run GDN tests only
-pytest test_gated_delta.py -v
+pytest tests/linear_attn/test_gated_delta.py -v
 
 # Run KDA tests only
-pytest test_kda.py -v
+pytest tests/linear_attn/test_kda.py -v
 
 # Run a single test function
-pytest test_gated_delta.py::test_fused_recurrent -v
-pytest test_kda.py::test_chunk -v
+pytest tests/linear_attn/test_gated_delta.py::test_fused_recurrent -v
+pytest tests/linear_attn/test_kda.py::test_chunk -v
 
 # Filter by parametrized id
-pytest test_gated_delta.py -k "test_fused_recurrent and B1-T63" -v
+pytest tests/linear_attn/test_gated_delta.py -k "test_fused_recurrent and B1-T63" -v
 ```
 
 ### Optional Environment Variables
@@ -58,7 +58,7 @@ pytest test_gated_delta.py -k "test_fused_recurrent and B1-T63" -v
 | `FLA_BENCHMARK=1` | `0` | Disable driver probing overhead |
 
 ```bash
-SKIP_TEST_CHUNK_VARLEN=1 pytest test_gated_delta.py test_kda.py -v
+SKIP_TEST_CHUNK_VARLEN=1 pytest tests/linear_attn/test_gated_delta.py tests/linear_attn/test_kda.py -v
 ```
 
 ## Running Benchmarks

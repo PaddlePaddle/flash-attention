@@ -52,10 +52,40 @@ import paddle
 from functools import cache
 from importlib.metadata import PackageNotFoundError, distribution
 
-# Patch triton nvidia backend is_active() to not depend on torch.
-# triton 3.6.0 uses torch.cuda.is_available() which fails without torch
-# or with an incompatible torch build. Use cuInit() directly instead.
+@cache
+def _is_package_installed(dist_name: str) -> bool:
+    try:
+        distribution(dist_name)
+        return True
+    except PackageNotFoundError:
+        return False
+
+
+_HAS_TORCH = _is_package_installed("torch")
+
+
+# Patch triton nvidia backend helpers to not depend on torch.
+# Triton 3.6.0 uses torch.cuda for driver activation and benchmark timing.
+# Use CUDA/Paddle directly so linear attention works in Paddle-only envs.
 import ctypes as _ctypes
+
+
+class _PaddleCudaInterface:
+    Event = staticmethod(paddle.device.cuda.Event)
+
+    @staticmethod
+    def synchronize():
+        paddle.device.synchronize()
+
+    @staticmethod
+    def current_device():
+        device = paddle.device.get_device()
+        if isinstance(device, str) and ':' in device:
+            return int(device.rsplit(':', 1)[1])
+        return 0
+
+
+_PADDLE_CUDA_INTERFACE = _PaddleCudaInterface()
 
 
 def _triton_cuda_is_active():
@@ -65,21 +95,34 @@ def _triton_cuda_is_active():
         return False
 
 
+def _triton_get_device_interface(self):
+    return _PADDLE_CUDA_INTERFACE
+
+
+def _triton_get_active_paddle_device(self):
+    return paddle.CUDAPlace(self.get_current_device())
+
+
+def _triton_get_empty_cache_for_benchmark(self):
+    return paddle.empty([64 * 1024 * 1024], dtype='int32')
+
+
+def _triton_clear_cache(self, cache):
+    if cache is not None:
+        cache.zero_()
+
+
 try:
     from triton.backends.nvidia import driver as _triton_nvidia_driver
 
     _triton_nvidia_driver.CudaDriver.is_active = staticmethod(_triton_cuda_is_active)
+    if not _HAS_TORCH:
+        _triton_nvidia_driver.CudaDriver.get_device_interface = _triton_get_device_interface
+        _triton_nvidia_driver.CudaDriver.get_active_torch_device = _triton_get_active_paddle_device
+        _triton_nvidia_driver.CudaDriver.get_empty_cache_for_benchmark = _triton_get_empty_cache_for_benchmark
+        _triton_nvidia_driver.CudaDriver.clear_cache = _triton_clear_cache
 except Exception:
     pass  # triton not installed or no nvidia backend, skip
-
-
-@cache
-def _is_package_installed(dist_name: str) -> bool:
-    try:
-        distribution(dist_name)
-        return True
-    except PackageNotFoundError:
-        return False
 
 
 # Pre-create Paddle triton driver (works with or without torch)

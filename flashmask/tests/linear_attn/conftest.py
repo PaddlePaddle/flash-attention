@@ -84,7 +84,7 @@ class FrameworkTracker:
         """
         if self._benchmark:
             return self._detect_triton_driver_snapshot()
-        from linear_attn.triton_utils import get_driver_probe_result
+        from flash_mask.linear_attn.triton_utils import get_driver_probe_result
         result = get_driver_probe_result()
         if result == "not_probed":
             return self._detect_triton_driver_snapshot()
@@ -95,7 +95,7 @@ class FrameworkTracker:
         """Inspect the current triton active driver (outside kernel execution)."""
         try:
             from triton.runtime.driver import driver
-            from linear_attn.triton_utils import _detect_driver_framework
+            from flash_mask.linear_attn.triton_utils import _detect_driver_framework
             return _detect_driver_framework(driver.active)
         except Exception as e:
             return f'error({e})'
@@ -149,7 +149,7 @@ def _driver_probe_lifecycle():
     if os.environ.get("FLA_BENCHMARK", "0") == "1":
         yield
         return
-    from linear_attn.triton_utils import enable_driver_probe, disable_driver_probe
+    from flash_mask.linear_attn.triton_utils import enable_driver_probe, disable_driver_probe
     enable_driver_probe()
     yield
     disable_driver_probe()
@@ -159,8 +159,9 @@ def _driver_probe_lifecycle():
 def _linear_attn_cache_isolation():
     modules = []
     for name in (
-        'linear_attn.ops.common.chunk_o',
-        'linear_attn.ops.kda.wy_fast',
+        'flash_mask.linear_attn.ops.common.chunk_o',
+        'flash_mask.linear_attn.ops.kda.wy_fast',
+        'flash_mask.linear_attn.ops.gated_delta_rule.wy_fast',
     ):
         try:
             modules.append(importlib.import_module(name))

@@ -86,6 +86,9 @@ def _convert_to_varlen_bound2(
 
     Supports asymmetric seqlen_q != seqlen_k and zero-length documents.
     Requires bound_num == 2 (both lts and ute available).
+
+    Handles Q padding: when last doc's lts < seqlen_q, adds a trailing doc with sk=0
+    and zeros out the padding Q positions via output_to_padded.
     """
     b, sq, hq, d = query.shape
     _, sk, hkv, dv = value.shape
@@ -98,6 +101,8 @@ def _convert_to_varlen_bound2(
     cu_seqlens_k_list = []
     max_doc_sq = 0
     max_doc_sk = 0
+    needs_q_padding = False
+    q_padding_starts = []
 
     for bi in range(b):
         lts = lts_np[bi]  # (sk,)
@@ -114,8 +119,7 @@ def _convert_to_varlen_bound2(
             elif ute[j] == lts[j] and ute[j - 1] < lts[j - 1]:
                 k_starts.append(j)
 
-        # Build cu_seqlens_q: [0, lts_doc0, lts_doc1, ..., lts_doc_{n-1}]
-        # Build cu_seqlens_k: [0, k_start_1, k_start_2, ..., sk]
+        # Build q_bounds and k_bounds
         q_bounds = [np.int32(0)]
         k_bounds = [np.int32(k) for k in k_starts] + [np.int32(sk)]
 
@@ -123,13 +127,16 @@ def _convert_to_varlen_bound2(
             doc_lts = np.int32(lts[k_starts[doc_idx]])
             q_bounds.append(doc_lts)
 
-        assert q_bounds[-1] == sq, (
-            f"Batch {bi}: last document lts={q_bounds[-1]} != seqlen_q={sq}. "
-            f"All Q positions must be covered by documents."
-        )
+        # Handle Q padding: if last doc doesn't cover all Q positions
+        q_pad_start = int(q_bounds[-1])
+        q_padding_starts.append(q_pad_start)
+        if q_pad_start < sq:
+            needs_q_padding = True
+            q_bounds.append(np.int32(sq))
+            k_bounds.append(np.int32(sk))  # padding doc has sk=0 (sk - sk = 0)
 
         # Compute per-doc max lengths
-        for i in range(len(k_starts)):
+        for i in range(len(q_bounds) - 1):
             doc_sq = int(q_bounds[i + 1]) - int(q_bounds[i])
             doc_sk = int(k_bounds[i + 1]) - int(k_bounds[i])
             max_doc_sq = max(max_doc_sq, doc_sq)
@@ -185,13 +192,11 @@ def _convert_to_varlen_bound2(
                 prev_q_end = doc_lts
 
                 if doc_sq == 0:
-                    # Zero-Q doc: ute should equal lts for all its cols
                     for j in range(k_start, k_end):
                         if ute[j] != lts[j]:
                             is_causal = False
                             break
                 else:
-                    # Verify: ute[k_start + j] == q_offset + max(0, j - (sk - sq))
                     for j_local in range(doc_sk):
                         expected = q_offset + max(0, j_local - (doc_sk - doc_sq))
                         if int(ute[k_start + j_local]) != expected:
@@ -204,7 +209,7 @@ def _convert_to_varlen_bound2(
         if is_causal:
             varlen_causal = True
 
-    return {
+    result = {
         "q": q_varlen,
         "k": k_varlen,
         "v": v_varlen,
@@ -214,6 +219,25 @@ def _convert_to_varlen_bound2(
         "max_seqlen_k": max_doc_sk,
         "causal": varlen_causal,
     }
+
+    # Add output_to_padded if Q padding exists
+    if needs_q_padding:
+        _b, _sq = b, sq
+        _q_padding_starts = q_padding_starts
+
+        def output_to_padded(out_varlen_pt):
+            nh = out_varlen_pt.shape[1]
+            dv_out = out_varlen_pt.shape[2]
+            out_padded = out_varlen_pt.reshape([_b, _sq, nh, dv_out])
+            for bi_inner in range(_b):
+                q_end = _q_padding_starts[bi_inner]
+                if q_end < _sq:
+                    out_padded[bi_inner, q_end:, :, :] = 0
+            return out_padded
+
+        result["output_to_padded"] = output_to_padded
+
+    return result
 
 
 def _convert_to_varlen_bound1(
@@ -388,6 +412,7 @@ def flashmask_attention(
             value=value,
             startend_row_indices=startend_row_indices,
             causal=causal)
+
         out, lse = flash_attn_varlen_func(
             q=varlen_args["q"],
             k=varlen_args["k"],

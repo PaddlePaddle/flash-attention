@@ -63,6 +63,7 @@ class FlashAttentionBackwardSm100:
         deterministic: bool = False,
         cluster_size: int = 1,
         use_2cta_instrs: bool = False,
+        is_split_d: bool = False,
     ):
         # padding head_dim to a multiple of 64 to match head_dim_rounded in interface
         hdim_multiple_of = 64
@@ -73,12 +74,23 @@ class FlashAttentionBackwardSm100:
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
 
+        self.is_split_d = is_split_d
+        if self.is_split_d:
+            assert self.tile_hdim == 256 and self.tile_hdimv == 256
+            self.half_hdim = self.tile_hdim // 2
+            self.half_hdimv = self.tile_hdimv // 2
+            use_2cta_instrs = False
+            cluster_size = 1
+            self.dK_as_reduce = True
+        else:
+            self.dK_as_reduce = False
+
         self.tile_m = tile_m
         self.tile_n = tile_n
-        self.debug_print = False
+        self.debug_print = True
 
-        assert self.tile_hdim <= 128 or (self.tile_hdim == 192 and self.tile_hdimv == 128)
-        assert self.tile_hdimv <= 128
+        assert self.tile_hdim <= 128 or (self.tile_hdim == 192 and self.tile_hdimv == 128) or self.is_split_d
+        assert self.tile_hdimv <= 128 or self.is_split_d
 
         self.use_2cta_instrs = bool(use_2cta_instrs and cluster_size == 2)
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
@@ -86,18 +98,24 @@ class FlashAttentionBackwardSm100:
         assert self.tile_hdim != 192 or self.use_2cta_instrs, "Must use 2CTA for hdim 192"
 
         # CTA tiler
-        self.cta_tiler = (tile_n, tile_m, self.tile_hdim)
+        if self.is_split_d:
+            hdim_for_mma = self.half_hdim
+            hdimv_for_mma = self.half_hdimv
+        else:
+            hdim_for_mma = self.tile_hdim
+            hdimv_for_mma = self.tile_hdimv
+        self.cta_tiler = (tile_n, tile_m, hdim_for_mma)
         # S = K @ Q.T
-        self.mma_tiler_kq = (self.cta_group_size * tile_n, tile_m, self.tile_hdim)
+        self.mma_tiler_kq = (self.cta_group_size * tile_n, tile_m, hdim_for_mma)
         # dP = V @ dO.T
-        self.mma_tiler_vdo = (self.cta_group_size * tile_n, tile_m, self.tile_hdimv)
+        self.mma_tiler_vdo = (self.cta_group_size * tile_n, tile_m, hdimv_for_mma)
         # dV = P.T @ dO
-        self.mma_tiler_pdo = (self.cta_group_size * tile_n, self.tile_hdimv, tile_m)
+        self.mma_tiler_pdo = (self.cta_group_size * tile_n, hdimv_for_mma, tile_m)
         # dK = dS.T @ Q
-        self.mma_tiler_dsq = (self.cta_group_size * tile_n, self.tile_hdim, tile_m)
+        self.mma_tiler_dsq = (self.cta_group_size * tile_n, hdim_for_mma, tile_m)
         # dQ = dS @ K
         # 2-CTA: reduction dim is cluster-wide (tile_n * cta_group_size).
-        self.mma_tiler_dsk = (tile_m, self.tile_hdim, tile_n * self.cta_group_size)
+        self.mma_tiler_dsk = (tile_m, hdim_for_mma, tile_n * self.cta_group_size)
 
         self.acc_dtype = Float32
         self.startend_row_indices_dtype = Int32
@@ -109,7 +127,7 @@ class FlashAttentionBackwardSm100:
         self.is_local = False
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = False
-        self.dKV_postprocess = self.qhead_per_kvhead > 1
+        self.dKV_postprocess = self.qhead_per_kvhead > 1 or self.is_split_d
         self.deterministic = deterministic
 
         # Speed optimizations, does not affect correctness
@@ -154,16 +172,18 @@ class FlashAttentionBackwardSm100:
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
-        # self.tmem_dK_offset = 0
-        # self.tmem_dV_offset = self.tmem_dK_offset + self.tile_hdim
-        # self.tmem_dQ_offset = self.tmem_dV_offset + self.tile_hdimv
-        # self.tmem_dP_offset = self.tmem_dQ_offset  # overlap with dQ
-        # self.tmem_S_offset = self.tmem_dQ_offset + max(self.tile_m, self.tile_hdim)
-        # self.tmem_P_offset = self.tmem_S_offset  # overlap with S
-        # self.tmem_total = self.tmem_S_offset + self.tile_n
-        # assert self.tmem_total <= self.tmem_alloc_cols
-
-        if self.use_2cta_instrs and self.tile_hdim == 192 and self.tile_hdimv == 128:
+        if self.is_split_d:
+            # Split-D TMEM layout (512 cols, 100% utilization):
+            # S/P [0, 128) | dV_low [128, 256) | dV_high [256, 384) | dP/dS [384, 512)
+            # dK_partial and dQ_partial time-share with S/P at [0, 128)
+            self.tmem_S_offset = 0
+            self.tmem_P_offset = 0
+            self.tmem_dV_offset = self.tile_n               # 128
+            self.tmem_dP_offset = self.tmem_dV_offset + self.tile_hdimv  # 384
+            self.tmem_dS_offset = self.tmem_dP_offset
+            self.tmem_dK_offset = 0                          # time-shares with S/P
+            self.tmem_dQ_offset = 0                          # time-shares with S/P
+        elif self.use_2cta_instrs and self.tile_hdim == 192 and self.tile_hdimv == 128:
             assert self.tile_m == 128
             assert self.tile_n == 128
             self.tmem_dV_offset = 0
@@ -214,8 +234,14 @@ class FlashAttentionBackwardSm100:
         self.buffer_align_bytes = 1024
 
     def _setup_attributes(self):
-        self.Q_stage = 1 if self.use_2cta_instrs else 2
-        self.dO_stage = 1
+        if self.is_split_d:
+            self.Q_stage = 1
+            self.dO_stage = 1
+            self.K_smem_stages = 2
+        else:
+            self.Q_stage = 1 if self.use_2cta_instrs else 2
+            self.dO_stage = 1
+            self.K_smem_stages = 1
         self.single_stage = 1
         # LSE_stage = Q_stage and dPsum_stage = dO_stage
         self.sdKVaccum_stage = 2
@@ -234,12 +260,13 @@ class FlashAttentionBackwardSm100:
                 self.dQ_reduce_ncol = 32
                 self.sdQaccum_stage = 64 // self.dQ_reduce_ncol
                 self.dQ_reduce_ncol_t2r = self.dQ_reduce_ncol
-        assert (self.tile_hdim // self.cta_group_size) % self.dQ_reduce_ncol == 0
-        self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
-        self.dQaccum_reduce_stage_t2r = self.tile_hdim // self.dQ_reduce_ncol_t2r
+        hdim_for_reduce = self.half_hdim if self.is_split_d else self.tile_hdim
+        assert (hdim_for_reduce // self.cta_group_size) % self.dQ_reduce_ncol == 0
+        self.dQaccum_reduce_stage = hdim_for_reduce // self.dQ_reduce_ncol
+        self.dQaccum_reduce_stage_t2r = hdim_for_reduce // self.dQ_reduce_ncol_t2r
         self.cluster_reduce_dQ = False and cute.size(self.cluster_shape_mn) > 1
         # number of tma reduce adds for dKacc and dVacc epilogue
-        self.dK_reduce_ncol = 32
+        self.dK_reduce_ncol = math.gcd(32, hdim_for_reduce // 2)
         # CTA group for MMA operations
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -303,9 +330,12 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_S,
             self.mma_tiler_kq,
             self.k_dtype,
-            1,
+            self.K_smem_stages,
         )
-        self.sK_layout = cute.slice_(sK_layout, (None, None, None, 0))
+        if self.is_split_d:
+            self.sK_layout = sK_layout
+        else:
+            self.sK_layout = cute.slice_(sK_layout, (None, None, None, 0))
         self.sQ_layout = sm100_utils_basic.make_smem_layout_b(
             self.tiled_mma_S,
             self.mma_tiler_kq,
@@ -317,7 +347,7 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_dP,
             self.mma_tiler_vdo,
             self.v_dtype,
-            1,
+            self.K_smem_stages,
         )
         self.sV_layout = cute.slice_(sV_layout, (None, None, None, 0))
         self.sdOt_layout = sm100_utils_basic.make_smem_layout_b(
@@ -373,9 +403,12 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_dQ,
             self.mma_tiler_dsk,
             self.k_dtype,
-            1,
+            self.K_smem_stages,
         )
-        self.sKt_layout = cute.slice_(sKt_layout, (None, None, None, 0))
+        if self.is_split_d:
+            self.sKt_layout = sKt_layout
+        else:
+            self.sKt_layout = cute.slice_(sKt_layout, (None, None, None, 0))
         self.sdS_xchg_layout = cute.make_layout(shape=(self.tile_n, self.tile_m // 2))
         self.sdQaccum_layout = cute.make_layout(
             (self.tile_m * self.dQ_reduce_ncol, self.sdQaccum_stage)
@@ -388,19 +421,21 @@ class FlashAttentionBackwardSm100:
             shape=(self.tile_m, self.dO_stage),
             stride=(1, cute.round_up(self.tile_m, 64)),
         )
+        hdim_epi = self.half_hdim if self.is_split_d else self.tile_hdim
+        hdimv_epi = self.half_hdimv if self.is_split_d else self.tile_hdimv
         self.sdK_epi_tile = (
             self.tile_n,
-            math.gcd(128 // (self.dk_dtype.width // 8), self.tile_hdim // 2),  # 64 or 32
+            math.gcd(128 // (self.dk_dtype.width // 8), hdim_epi // 2),  # 64 or 32
         )  # subtiles mma_tiler_dsq[:2] = mma_tiler_pdo[:2]
         self.sdV_epi_tile = (
             self.tile_n,
-            math.gcd(128 // (self.dk_dtype.width // 8), self.tile_hdimv // 2),  # 64 or 32
+            math.gcd(128 // (self.dk_dtype.width // 8), hdimv_epi // 2),  # 64 or 32
         )  # subtiles mma_tiler_pdo[:2]
         # headdim_64 gets 1 stage
-        self.num_epi_stages = max(1, (self.tile_hdim // 2) // self.sdK_epi_tile[1])
-        self.num_epi_stages_v = max(1, (self.tile_hdimv // 2) // self.sdV_epi_tile[1])
-        self.sdK_flat_epi_tile = self.tile_n * (self.tile_hdim // 2) // self.num_epi_stages
-        self.sdV_flat_epi_tile = self.tile_n * (self.tile_hdimv // 2) // self.num_epi_stages_v
+        self.num_epi_stages = max(1, (hdim_epi // 2) // self.sdK_epi_tile[1])
+        self.num_epi_stages_v = max(1, (hdimv_epi // 2) // self.sdV_epi_tile[1])
+        self.sdK_flat_epi_tile = self.tile_n * (hdim_epi // 2) // self.num_epi_stages
+        self.sdV_flat_epi_tile = self.tile_n * (hdimv_epi // 2) // self.num_epi_stages_v
 
         if const_expr(not self.dKV_postprocess):
             self.sdK_layout = sm100_utils_basic.make_smem_layout_epi(
@@ -504,7 +539,7 @@ class FlashAttentionBackwardSm100:
             assert mdQ_semaphore is not None
             mdQ_semaphore = utils.select(mdQ_semaphore, mode=semaphore_transpose)
 
-        if const_expr(self.deterministic and self.dKV_postprocess):
+        if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
             assert mdK_semaphore is not None
             assert mdV_semaphore is not None
             mdK_semaphore, mdV_semaphore = [
@@ -525,6 +560,8 @@ class FlashAttentionBackwardSm100:
         self._setup_smem_layout()
 
         self.use_tma_store = not (self.qhead_per_kvhead == 1 and mCuSeqlensK is not None)
+        if const_expr(self.is_split_d):
+            self.use_tma_store = True
 
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -1323,6 +1360,23 @@ class FlashAttentionBackwardSm100:
         dvacc_shape = thr_mma_dV.partition_shape_C(self.mma_tiler_pdo[:2])
         tdVtdV = thr_mma_dV.make_fragment_C(dvacc_shape)
         tdVtdV = cute.make_tensor(tmem_ptr + self.tmem_dV_offset, tdVtdV.layout)
+        if const_expr(self.is_split_d):
+            tdVtdV_high = cute.make_tensor(
+                tmem_ptr + self.tmem_dV_offset + self.half_hdimv, tdVtdV.layout
+            )
+        else:
+            tdVtdV_high = tdVtdV
+        if const_expr(self.debug_print):
+            if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == 0:
+                cute.printf(
+                    "[DBG-setup] is_split_d=%d dV_off=%d half_hdimv=%d tdV=%d tdV_high=%d",
+                    1 if self.is_split_d else 0,
+                    self.tmem_dV_offset,
+                    self.half_hdimv,
+                    tdVtdV.iterator.toint(),
+                    tdVtdV_high.iterator.toint(),
+                )
+
         tP = cute.make_tensor(
             cute.recast_ptr(tmem_ptr + self.tmem_P_offset, dtype=self.do_dtype), tP_layout.outer
         )
@@ -1475,6 +1529,7 @@ class FlashAttentionBackwardSm100:
                 tStS,
                 tdPtdP,
                 tdVtdV,
+                tdVtdV_high,
                 tdKtdK,
                 tdQtdQ,
                 dS_cluster_full_mbar_ptr,
@@ -1555,6 +1610,7 @@ class FlashAttentionBackwardSm100:
                 tiled_copy_r2s_dKV,
                 mdK_semaphore,
                 mdV_semaphore,
+                tdVtdV_high if const_expr(self.is_split_d) else None,
                 flashmask_info,
                 sStartEndRowIndices,
                 sFM_max_min,
@@ -1578,6 +1634,7 @@ class FlashAttentionBackwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 mdQ_semaphore,
+                mdK if const_expr(self.is_split_d) else None,
                 flashmask_info,
                 sFM_max_min,
                 flashmask_loaded_mbar_ptr,
@@ -1756,12 +1813,16 @@ class FlashAttentionBackwardSm100:
             load_dOt = load_Qt = load_Kt = None
 
             a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
+            if const_expr(self.is_split_d):
+                sK_stage0 = sK[None, None, None, 0]
+            else:
+                sK_stage0 = sK
             load_K, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_K,
                 block_in_cluster_coord_vmnk[2],
                 a_cta_layout,
                 tSgK,
-                sK,
+                sK_stage0,
                 single_stage=True,
             )
             load_V, _, _ = copy_utils.tma_get_copy_fn(
@@ -1994,6 +2055,8 @@ class FlashAttentionBackwardSm100:
                     pipeline_dO.producer_tail(producer_state_O_Ot)
                     pipeline_dPsum.producer_tail(producer_state_dPsum)
 
+
+
                 else:
                     #### Prologue (2CTA hdim128) ####
                     # K & Q (for S)
@@ -2109,6 +2172,497 @@ class FlashAttentionBackwardSm100:
                         pipeline_Qt.producer_tail(producer_state_Qt)
                     pipeline_dO.producer_tail(producer_state_dO_dPsum.clone())
                     pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
+
+            elif const_expr(self.is_split_d):
+                #### Split-D load path (1CTA, hdim=hdimv=256, split into 128+128) ####
+                # Iterates the same flashmask sub-ranges as the compute warp so that
+                # pipeline_Q / pipeline_LSE / pipeline_dO / pipeline_dPsum producer
+                # counts match consumers (no producer/consumer mismatch deadlock).
+                # K_low / K_high GMEM tiles
+                sK_low = sK[None, None, None, 0]
+                sK_high = sK[None, None, None, 1]
+                gK_low = cute.local_tile(
+                    mK_cur, cute.select(self.mma_tiler_kq, mode=[0, 2]),
+                    (n_block_cta_group, 0),
+                )
+                gK_high = cute.local_tile(
+                    mK_cur, cute.select(self.mma_tiler_kq, mode=[0, 2]),
+                    (n_block_cta_group, 1),
+                )
+                tSgK_low = thr_mma_S.partition_A(gK_low)
+                tSgK_high = thr_mma_S.partition_A(gK_high)
+                load_K_low, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_K, block_in_cluster_coord_vmnk[2], a_cta_layout,
+                    tSgK_low, sK_low, single_stage=True,
+                )
+                load_K_high, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_K, block_in_cluster_coord_vmnk[2], a_cta_layout,
+                    tSgK_high, sK_high, single_stage=True,
+                )
+                # Q_low / Q_high GMEM tiles
+                gQ_low = cute.local_tile(
+                    mQ_cur, cute.select(self.mma_tiler_kq, mode=[1, 2]), (None, 0)
+                )
+                gQ_high = cute.local_tile(
+                    mQ_cur, cute.select(self.mma_tiler_kq, mode=[1, 2]), (None, 1)
+                )
+                tSgQ_low = thr_mma_S.partition_B(gQ_low)
+                tSgQ_high = thr_mma_S.partition_B(gQ_high)
+                load_Q_low_raw, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_Q, block_in_cluster_coord_vmnk[1], b_cta_layout,
+                    tSgQ_low, sQ, mcast_mask=q_do_mcast_mask,
+                )
+                load_Q_high_raw, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_Q, block_in_cluster_coord_vmnk[1], b_cta_layout,
+                    tSgQ_high, sQ, mcast_mask=q_do_mcast_mask,
+                )
+                load_Q_low = copy_utils.tma_producer_copy_fn(load_Q_low_raw, pipeline_Q)
+                load_Q_high = copy_utils.tma_producer_copy_fn(load_Q_high_raw, pipeline_Q)
+                # V_low / V_high GMEM tiles
+                gV_low = cute.local_tile(
+                    mV_cur, cute.select(self.mma_tiler_vdo, mode=[0, 2]),
+                    (n_block_cta_group, 0),
+                )
+                gV_high = cute.local_tile(
+                    mV_cur, cute.select(self.mma_tiler_vdo, mode=[0, 2]),
+                    (n_block_cta_group, 1),
+                )
+                tdPgV_low = thr_mma_dP.partition_A(gV_low)
+                tdPgV_high = thr_mma_dP.partition_A(gV_high)
+                load_V_low, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_V, 0, cute.make_layout(1),
+                    tdPgV_low, sV, single_stage=True,
+                )
+                load_V_high, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_V, 0, cute.make_layout(1),
+                    tdPgV_high, sV, single_stage=True,
+                )
+                # dO_low / dO_high GMEM tiles (for dV = P^T @ dO)
+                gdO_low = cute.local_tile(
+                    mdO_cur, cute.select(self.mma_tiler_pdo, mode=[1, 2]), (0, None)
+                )
+                gdO_high = cute.local_tile(
+                    mdO_cur, cute.select(self.mma_tiler_pdo, mode=[1, 2]), (1, None)
+                )
+                tdVgdO_low = thr_mma_dV.partition_B(gdO_low)
+                tdVgdO_high = thr_mma_dV.partition_B(gdO_high)
+                load_dO_low_raw, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_dO, block_in_cluster_coord_vmnk[1], b_cta_layout,
+                    tdVgdO_low, sdO, mcast_mask=q_do_mcast_mask,
+                )
+                load_dO_high_raw, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_dO, block_in_cluster_coord_vmnk[1], b_cta_layout,
+                    tdVgdO_high, sdO, mcast_mask=q_do_mcast_mask,
+                )
+                load_dO_low = copy_utils.tma_producer_copy_fn(load_dO_low_raw, pipeline_dO)
+                load_dO_high = copy_utils.tma_producer_copy_fn(load_dO_high_raw, pipeline_dO)
+
+                # ---- Flashmask sub-range setup ----
+                prefetch_m_block = m_block_min
+                prefetch_lte = False
+                zero_block = False
+                if const_expr(self.enable_flashmask):
+                    self.load_fm(
+                        flashmask_info, sStartEndRowIndices, sFM_max_min,
+                        seqlen, mQ.shape[2], n_block, head_idx, batch_idx,
+                    )
+                    cute.arch.mbarrier_arrive(flashmask_loaded_mbar_ptr)
+
+                    if const_expr(not self.is_causal):
+                        has_uts = const_expr(
+                            flashmask_info.UTS_nblock_max is not None
+                        )
+                        if not has_uts or prefetch_m_block > sFM_max_min[4]:
+                            prefetch_m_block = sFM_max_min[7]
+                    if prefetch_m_block > sFM_max_min[0]:
+                        has_lte = const_expr(
+                            flashmask_info.LTE_nblock_max is not None
+                        )
+                        if has_lte:
+                            prefetch_m_block = max(m_block_min, sFM_max_min[3])
+                            prefetch_lte = True
+                        else:
+                            prefetch_m_block = m_block_max
+                    if prefetch_m_block >= m_block_max:
+                        zero_block = True
+
+                if tidx == 0 and self.debug_print:
+                    cute.printf(
+                        'SPLIT_D_LOAD enter: n_block=%d, m_block_min=%d, '
+                        'm_block_max=%d, prefetch_m_block=%d, zero=%d',
+                        n_block, m_block_min, m_block_max,
+                        prefetch_m_block, Int32(1 if zero_block else 0),
+                    )
+
+                if not zero_block:
+                    # ---- Prologue: first unmasked m_block ----
+                    if tidx == 0 and self.debug_print:
+                        cute.printf(
+                            'SPLIT_D_LOAD prologue m_block=%d',
+                            prefetch_m_block,
+                        )
+                    # 1) K_low + Q_low + LSE -> pipeline_Q
+                    pipeline_Q.producer_acquire(
+                        producer_state_Q_LSE,
+                        extra_tx_count=self.tma_copy_bytes["K"],
+                    )
+                    load_K_low(
+                        tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE)
+                    )
+                    load_Q_low(prefetch_m_block, producer_state=producer_state_Q_LSE)
+                    pipeline_Q.producer_commit(producer_state_Q_LSE)
+                    pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+                    with cute.arch.elect_one():
+                        copy_stats(
+                            gLSE[None, prefetch_m_block],
+                            sLSE[None, producer_state_Q_LSE.index],
+                            mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                        )
+                    producer_state_Q_LSE.advance()
+                    # 2) K_high + Q_high -> pipeline_Q
+                    pipeline_Q.producer_acquire(
+                        producer_state_Q_LSE,
+                        extra_tx_count=self.tma_copy_bytes["K"],
+                    )
+                    load_K_high(
+                        tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE)
+                    )
+                    load_Q_high(prefetch_m_block, producer_state=producer_state_Q_LSE)
+                    pipeline_Q.producer_commit(producer_state_Q_LSE)
+                    producer_state_Q_LSE.advance()
+                    # 3) V_low + dO_low -> pipeline_dO; dPsum
+                    pipeline_dO.producer_acquire(
+                        producer_state_dO_dPsum,
+                        extra_tx_count=self.tma_copy_bytes["V"],
+                    )
+                    load_V_low(
+                        tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum)
+                    )
+                    load_dO_low(prefetch_m_block, producer_state=producer_state_dO_dPsum)
+                    pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                    pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+                    with cute.arch.elect_one():
+                        copy_stats(
+                            gdPsum[None, prefetch_m_block],
+                            sdPsum[None, producer_state_dO_dPsum.index],
+                            mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                        )
+                    producer_state_dO_dPsum.advance()
+                    # 4) V_high + dO_high
+                    pipeline_dO.producer_acquire(
+                        producer_state_dO_dPsum,
+                        extra_tx_count=self.tma_copy_bytes["V"],
+                    )
+                    load_V_high(
+                        tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum)
+                    )
+                    load_dO_high(prefetch_m_block, producer_state=producer_state_dO_dPsum)
+                    pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                    producer_state_dO_dPsum.advance()
+                    # 5) dO_low reload (for dV_low)
+                    pipeline_dO.producer_acquire(producer_state_dO_dPsum)
+                    load_dO_low(prefetch_m_block, producer_state=producer_state_dO_dPsum)
+                    pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                    producer_state_dO_dPsum.advance()
+                    # 6) Q_low reload (for dK_low + dQ_low)
+                    pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                    load_Q_low(prefetch_m_block, producer_state=producer_state_Q_LSE)
+                    pipeline_Q.producer_commit(producer_state_Q_LSE)
+                    producer_state_Q_LSE.advance()
+
+                    # ---- Main loop ----
+                    if const_expr(self.enable_flashmask):
+                        loop_start = m_block_min
+                        if const_expr(not self.is_causal):
+                            has_uts = const_expr(
+                                flashmask_info.UTS_nblock_max is not None
+                            )
+                            if has_uts and prefetch_m_block <= sFM_max_min[4]:
+                                loop_end = sFM_max_min[4] + 1
+                                # 0 ~ UTS
+                                for m_block in cutlass.range(
+                                    loop_start + 1, loop_end, unroll=1
+                                ):
+                                    if tidx == 0 and self.debug_print:
+                                        cute.printf(
+                                            'SPLIT_D_LOAD UTS m_block=%d',
+                                            m_block,
+                                        )
+                                    # 1) Q_low + LSE -> pipeline_Q
+                                    pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                                    load_Q_low(m_block, producer_state=producer_state_Q_LSE)
+                                    pipeline_Q.producer_commit(producer_state_Q_LSE)
+                                    pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+                                    with cute.arch.elect_one():
+                                        copy_stats(
+                                            gLSE[None, m_block],
+                                            sLSE[None, producer_state_Q_LSE.index],
+                                            mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                                        )
+                                    producer_state_Q_LSE.advance()
+                                    # 2) Q_high -> pipeline_Q
+                                    pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                                    load_Q_high(m_block, producer_state=producer_state_Q_LSE)
+                                    pipeline_Q.producer_commit(producer_state_Q_LSE)
+                                    producer_state_Q_LSE.advance()
+                                    # 3) V_low + dO_low -> pipeline_dO; dPsum
+                                    pipeline_dO.producer_acquire(
+                                        producer_state_dO_dPsum,
+                                        extra_tx_count=self.tma_copy_bytes["V"],
+                                    )
+                                    load_V_low(
+                                        tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum)
+                                    )
+                                    load_dO_low(m_block, producer_state=producer_state_dO_dPsum)
+                                    pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                                    pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+                                    with cute.arch.elect_one():
+                                        copy_stats(
+                                            gdPsum[None, m_block],
+                                            sdPsum[None, producer_state_dO_dPsum.index],
+                                            mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                                        )
+                                    producer_state_dO_dPsum.advance()
+                                    # 4) V_high + dO_high
+                                    pipeline_dO.producer_acquire(
+                                        producer_state_dO_dPsum,
+                                        extra_tx_count=self.tma_copy_bytes["V"],
+                                    )
+                                    load_V_high(
+                                        tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum)
+                                    )
+                                    load_dO_high(m_block, producer_state=producer_state_dO_dPsum)
+                                    pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                                    producer_state_dO_dPsum.advance()
+                                    # 5) dO_low reload (for dV_low)
+                                    pipeline_dO.producer_acquire(producer_state_dO_dPsum)
+                                    load_dO_low(m_block, producer_state=producer_state_dO_dPsum)
+                                    pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                                    producer_state_dO_dPsum.advance()
+                                    # 6) Q_low reload (for dK_low + dQ_low)
+                                    pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                                    load_Q_low(m_block, producer_state=producer_state_Q_LSE)
+                                    pipeline_Q.producer_commit(producer_state_Q_LSE)
+                                    producer_state_Q_LSE.advance()
+                                # Subtract 1 to keep loop_start + 1 uniform.
+                                loop_start = sFM_max_min[7] - 1
+                            else:
+                                loop_start = sFM_max_min[7]
+
+                        # UTE ~ LTS
+                        loop_end = min(m_block_max, sFM_max_min[0] + 1)
+                        for m_block in cutlass.range(
+                            loop_start + 1, loop_end, unroll=1
+                        ):
+                            if tidx == 0 and self.debug_print:
+                                cute.printf(
+                                    'SPLIT_D_LOAD UTE~LTS m_block=%d',
+                                    m_block,
+                                )
+                            # 1) Q_low + LSE -> pipeline_Q
+                            pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                            load_Q_low(m_block, producer_state=producer_state_Q_LSE)
+                            pipeline_Q.producer_commit(producer_state_Q_LSE)
+                            pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+                            with cute.arch.elect_one():
+                                copy_stats(
+                                    gLSE[None, m_block],
+                                    sLSE[None, producer_state_Q_LSE.index],
+                                    mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                                )
+                            producer_state_Q_LSE.advance()
+                            # 2) Q_high -> pipeline_Q
+                            pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                            load_Q_high(m_block, producer_state=producer_state_Q_LSE)
+                            pipeline_Q.producer_commit(producer_state_Q_LSE)
+                            producer_state_Q_LSE.advance()
+                            # 3) V_low + dO_low -> pipeline_dO; dPsum
+                            pipeline_dO.producer_acquire(
+                                producer_state_dO_dPsum,
+                                extra_tx_count=self.tma_copy_bytes["V"],
+                            )
+                            load_V_low(
+                                tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum)
+                            )
+                            load_dO_low(m_block, producer_state=producer_state_dO_dPsum)
+                            pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                            pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+                            with cute.arch.elect_one():
+                                copy_stats(
+                                    gdPsum[None, m_block],
+                                    sdPsum[None, producer_state_dO_dPsum.index],
+                                    mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                                )
+                            producer_state_dO_dPsum.advance()
+                            # 4) V_high + dO_high
+                            pipeline_dO.producer_acquire(
+                                producer_state_dO_dPsum,
+                                extra_tx_count=self.tma_copy_bytes["V"],
+                            )
+                            load_V_high(
+                                tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum)
+                            )
+                            load_dO_high(m_block, producer_state=producer_state_dO_dPsum)
+                            pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                            producer_state_dO_dPsum.advance()
+                            # 5) dO_low reload (for dV_low)
+                            pipeline_dO.producer_acquire(producer_state_dO_dPsum)
+                            load_dO_low(m_block, producer_state=producer_state_dO_dPsum)
+                            pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                            producer_state_dO_dPsum.advance()
+                            # 6) Q_low reload (for dK_low + dQ_low)
+                            pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                            load_Q_low(m_block, producer_state=producer_state_Q_LSE)
+                            pipeline_Q.producer_commit(producer_state_Q_LSE)
+                            producer_state_Q_LSE.advance()
+
+                        # LTE ~ seqlen_q
+                        has_lte = const_expr(
+                            flashmask_info.LTE_nblock_max is not None
+                        )
+                        if has_lte:
+                            loop_start = max(sFM_max_min[0], sFM_max_min[3])
+                            if not prefetch_lte and sFM_max_min[3] > sFM_max_min[0]:
+                                loop_start = sFM_max_min[3] - 1
+                            loop_start = max(m_block_min, loop_start)
+                            loop_end = m_block_max
+                            for m_block in cutlass.range(
+                                loop_start + 1, loop_end, unroll=1
+                            ):
+                                if tidx == 0 and self.debug_print:
+                                    cute.printf(
+                                        'SPLIT_D_LOAD LTE~seqlen_q m_block=%d',
+                                        m_block,
+                                    )
+                                # 1) Q_low + LSE -> pipeline_Q
+                                pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                                load_Q_low(m_block, producer_state=producer_state_Q_LSE)
+                                pipeline_Q.producer_commit(producer_state_Q_LSE)
+                                pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+                                with cute.arch.elect_one():
+                                    copy_stats(
+                                        gLSE[None, m_block],
+                                        sLSE[None, producer_state_Q_LSE.index],
+                                        mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                                    )
+                                producer_state_Q_LSE.advance()
+                                # 2) Q_high -> pipeline_Q
+                                pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                                load_Q_high(m_block, producer_state=producer_state_Q_LSE)
+                                pipeline_Q.producer_commit(producer_state_Q_LSE)
+                                producer_state_Q_LSE.advance()
+                                # 3) V_low + dO_low -> pipeline_dO; dPsum
+                                pipeline_dO.producer_acquire(
+                                    producer_state_dO_dPsum,
+                                    extra_tx_count=self.tma_copy_bytes["V"],
+                                )
+                                load_V_low(
+                                    tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum)
+                                )
+                                load_dO_low(m_block, producer_state=producer_state_dO_dPsum)
+                                pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                                pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+                                with cute.arch.elect_one():
+                                    copy_stats(
+                                        gdPsum[None, m_block],
+                                        sdPsum[None, producer_state_dO_dPsum.index],
+                                        mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                                    )
+                                producer_state_dO_dPsum.advance()
+                                # 4) V_high + dO_high
+                                pipeline_dO.producer_acquire(
+                                    producer_state_dO_dPsum,
+                                    extra_tx_count=self.tma_copy_bytes["V"],
+                                )
+                                load_V_high(
+                                    tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum)
+                                )
+                                load_dO_high(m_block, producer_state=producer_state_dO_dPsum)
+                                pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                                producer_state_dO_dPsum.advance()
+                                # 5) dO_low reload (for dV_low)
+                                pipeline_dO.producer_acquire(producer_state_dO_dPsum)
+                                load_dO_low(m_block, producer_state=producer_state_dO_dPsum)
+                                pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                                producer_state_dO_dPsum.advance()
+                                # 6) Q_low reload (for dK_low + dQ_low)
+                                pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                                load_Q_low(m_block, producer_state=producer_state_Q_LSE)
+                                pipeline_Q.producer_commit(producer_state_Q_LSE)
+                                producer_state_Q_LSE.advance()
+                    else:
+                        # No flashmask: full range.
+                        for m_block in cutlass.range(
+                            m_block_min + 1, m_block_max, unroll=1
+                        ):
+                            if tidx == 0 and self.debug_print:
+                                cute.printf(
+                                    'SPLIT_D_LOAD full m_block=%d', m_block
+                                )
+                            # 1) Q_low + LSE -> pipeline_Q
+                            pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                            load_Q_low(m_block, producer_state=producer_state_Q_LSE)
+                            pipeline_Q.producer_commit(producer_state_Q_LSE)
+                            pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+                            with cute.arch.elect_one():
+                                copy_stats(
+                                    gLSE[None, m_block],
+                                    sLSE[None, producer_state_Q_LSE.index],
+                                    mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                                )
+                            producer_state_Q_LSE.advance()
+                            # 2) Q_high -> pipeline_Q
+                            pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                            load_Q_high(m_block, producer_state=producer_state_Q_LSE)
+                            pipeline_Q.producer_commit(producer_state_Q_LSE)
+                            producer_state_Q_LSE.advance()
+                            # 3) V_low + dO_low -> pipeline_dO; dPsum
+                            pipeline_dO.producer_acquire(
+                                producer_state_dO_dPsum,
+                                extra_tx_count=self.tma_copy_bytes["V"],
+                            )
+                            load_V_low(
+                                tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum)
+                            )
+                            load_dO_low(m_block, producer_state=producer_state_dO_dPsum)
+                            pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                            pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+                            with cute.arch.elect_one():
+                                copy_stats(
+                                    gdPsum[None, m_block],
+                                    sdPsum[None, producer_state_dO_dPsum.index],
+                                    mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                                )
+                            producer_state_dO_dPsum.advance()
+                            # 4) V_high + dO_high
+                            pipeline_dO.producer_acquire(
+                                producer_state_dO_dPsum,
+                                extra_tx_count=self.tma_copy_bytes["V"],
+                            )
+                            load_V_high(
+                                tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum)
+                            )
+                            load_dO_high(m_block, producer_state=producer_state_dO_dPsum)
+                            pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                            producer_state_dO_dPsum.advance()
+                            # 5) dO_low reload (for dV_low)
+                            pipeline_dO.producer_acquire(producer_state_dO_dPsum)
+                            load_dO_low(m_block, producer_state=producer_state_dO_dPsum)
+                            pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                            producer_state_dO_dPsum.advance()
+                            # 6) Q_low reload (for dK_low + dQ_low)
+                            pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                            load_Q_low(m_block, producer_state=producer_state_Q_LSE)
+                            pipeline_Q.producer_commit(producer_state_Q_LSE)
+                            producer_state_Q_LSE.advance()
+
+                    # ---- Producer tails ----
+                    pipeline_Q.producer_tail(producer_state_Q_LSE.clone())
+                    pipeline_LSE.producer_tail(producer_state_Q_LSE)
+                    pipeline_dO.producer_tail(producer_state_dO_dPsum.clone())
+                    pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
+                if tidx == 0 and self.debug_print:
+                    cute.printf('SPLIT_D_LOAD exit: n_block=%d', n_block)
 
             elif const_expr(self.enable_flashmask):
                 self.load_fm(flashmask_info, sStartEndRowIndices, sFM_max_min, seqlen, mQ.shape[2], n_block, head_idx, batch_idx)
@@ -2510,6 +3064,7 @@ class FlashAttentionBackwardSm100:
         tStS: cute.Tensor,
         tdPtdP: cute.Tensor,
         tdVtdV: cute.Tensor,
+        tdVtdV_high: cute.Tensor,
         tdKtdK: cute.Tensor,
         tdQtdQ: cute.Tensor,
         dS_cluster_full_mbar_ptr: cute.Pointer,
@@ -2588,6 +3143,20 @@ class FlashAttentionBackwardSm100:
             tA_addr=self.tmem_P_offset,
             cta_group=self.cta_group_size,
         )
+
+        if const_expr(self.is_split_d):
+            mma_pdo_high_fn = partial(
+                gemm_ptx_w_idx,
+                tiled_mma_dV,
+                tdVtdV_high,
+                tdVrP,
+                tdVrdO,
+                sA=None,
+                sB=sdO,
+                tA_addr=self.tmem_P_offset,
+                cta_group=self.cta_group_size,
+            )
+
         num_unroll_groups = 2 if const_expr(self.use_2cta_instrs) else 1
         mma_dsk_fn = partial(gemm_w_idx, tiled_mma_dQ, tdQtdQ, tdQrdS, tdQrK, zero_init=True, num_unroll_groups=num_unroll_groups)
         # mma_dsk_fn = partial(
@@ -2889,6 +3458,190 @@ class FlashAttentionBackwardSm100:
 
                     producer_phase_acc ^= 1
 
+            elif const_expr(self.is_split_d):
+                if is_leader_cta and num_blocks > 0:
+                    # ==========================================================
+                    # Split-D MMA: 10 sub-GEMMs per M-block
+                    # TMEM [0,128) is time-shared by S/P and dK/dQ.
+                    # pipeline_dQ empty/full must be paired for each of the 4
+                    # reduce outputs (dK_high, dK_low, dQ_low, dQ_high) so the
+                    # reduce warp reads TMEM before the next write overwrites it.
+                    # NOTE: under flashmask, num_blocks is the count of unmasked
+                    # m-blocks (UTS / UTE~LTS / LTE~seqlen_q sub-ranges, see
+                    # ~2948-2985). The split-d load and compute warps both
+                    # iterate the same unmasked m-blocks, so MMA must use
+                    # num_blocks (not m_block_max - m_block_min) to keep
+                    # pipeline arrival counts in sync. With flashmask=False,
+                    # num_blocks == m_block_max - m_block_min.
+                    # ==========================================================
+                    accumulate_dK = False
+                    producer_phase_dQ = Int32(1)
+
+                    main_loop_iters = num_blocks
+                    if tidx == 0 and self.debug_print:
+                        cute.printf(
+                            'SPLIT_D_MMA enter: n_block=%d, num_blocks=%d, '
+                            'main_loop_iters=%d, m_block_min=%d, m_block_max=%d',
+                            n_block, num_blocks, main_loop_iters,
+                            m_block_min, m_block_max,
+                        )
+
+                    for iter_idx in cutlass.range(main_loop_iters, unroll=1):
+                        if tidx == 0 and self.debug_print:
+                            cute.printf(
+                                'SPLIT_D_MMA iter begin: n_block=%d, iter=%d/%d',
+                                n_block, iter_idx, main_loop_iters,
+                            )
+                        # --- Phase 1: S^T (contraction split) ---
+                        # 1a) S_low = K_low @ Q_low^T (zero_init)
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P1a: iter=%d before Q.wait', iter_idx)
+                        handle_Q = pipeline_Q_consumer.wait_and_advance()
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P1a: iter=%d before S_P.empty.wait phase=%d', iter_idx, producer_phase_acc)
+                        pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P1a: iter=%d before dQ.empty.wait phase=%d', iter_idx, producer_phase_dQ)
+                        pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                        mma_qk_fn(A_idx=0, B_idx=handle_Q.index, zero_init=True)
+                        handle_Q.release()
+
+                        # 1b) S_high = K_high @ Q_high^T (accumulate)
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P1b: iter=%d before Q.wait', iter_idx)
+                        handle_Q = pipeline_Q_consumer.wait_and_advance()
+                        mma_qk_fn(A_idx=1, B_idx=handle_Q.index, zero_init=False)
+                        pipeline_S_P.sync_object_full.arrive(
+                            0, pipeline_S_P.producer_mask, cta_group
+                        )
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P1b: iter=%d after S_P.full.arrive', iter_idx)
+
+                        # --- Phase 2: dP^T (contraction split) ---
+                        # 2a) dP_low = V_low @ dO_low^T (zero_init)
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P2a: iter=%d before dO.wait', iter_idx)
+                        pipeline_dO.consumer_wait(consumer_state_dO)
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P2a: iter=%d before dP.empty.wait', iter_idx)
+                        pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
+                        mma_dov_fn(B_idx=consumer_state_dO.index, zero_init=True)
+                        pipeline_dO.consumer_release(consumer_state_dO)
+                        consumer_state_dO.advance()
+
+                        # 2b) dP_high = V_high @ dO_high^T (accumulate)
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P2b: iter=%d before dO.wait', iter_idx)
+                        pipeline_dO.consumer_wait(consumer_state_dO)
+                        mma_dov_fn(B_idx=consumer_state_dO.index, zero_init=False)
+                        pipeline_dP.sync_object_full.arrive(
+                            0, pipeline_dP.producer_mask, cta_group
+                        )
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P2b: iter=%d after dP.full.arrive', iter_idx)
+
+                        producer_phase_acc ^= 1
+
+                        # --- Phase 3: dV (output split) ---
+                        # Wait for P ready from compute warps
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P3: iter=%d before S_P.empty.wait phase=%d', iter_idx, producer_phase_acc)
+                        pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P3: iter=%d after S_P.empty.wait', iter_idx)
+
+                        # 3a) dV_high += P^T @ dO_high (dO_high still in sdO)
+                        if tidx == 0 and self.debug_print:
+                            cute.printf(
+                                "[DBG-mma3a-pre] iter=%d dO_idx=%d zero=%d tdV_high_addr=%d",
+                                iter_idx, consumer_state_dO.index, 1 if iter_idx == 0 else 0,
+                                tdVtdV_high.iterator.toint(),
+                            )
+                        mma_pdo_high_fn(
+                            B_idx=consumer_state_dO.index,
+                            zero_init=(iter_idx == 0),
+                        )
+                        pipeline_dO.consumer_release(consumer_state_dO)
+                        consumer_state_dO.advance()
+
+                        # 3b) dV_low += P^T @ dO_low (reloaded)
+                        pipeline_dO.consumer_wait(consumer_state_dO)
+                        if tidx == 0 and self.debug_print:
+                            cute.printf(
+                                "[DBG-mma3b-pre] iter=%d dO_idx=%d zero=%d tdV_low_addr=%d",
+                                iter_idx, consumer_state_dO.index, 1 if iter_idx == 0 else 0,
+                                tdVtdV.iterator.toint(),
+                            )
+                        mma_pdo_fn(
+                            B_idx=consumer_state_dO.index,
+                            zero_init=(iter_idx == 0),
+                        )
+                        pipeline_dO.consumer_release(consumer_state_dO)
+                        consumer_state_dO.advance()
+
+                        # --- Phase 4: dK (output split → reduce) ---
+                        # Wait for dS from compute warps
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P4: iter=%d before dS.wait', iter_idx)
+                        pipeline_dS.consumer_wait(consumer_state_dS)
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P4: iter=%d after dS.wait', iter_idx)
+
+                        # 4a) dK_high = dS^T @ Q_high (Q_high still from step 1b)
+                        mma_dsq_fn(B_idx=handle_Q.index, zero_init=True)
+                        pipeline_dQ.sync_object_full.arrive(
+                            0, pipeline_dQ.producer_mask, cta_group
+                        )
+                        producer_phase_dQ ^= 1
+                        handle_Q.release()
+
+                        # 4b) dK_low = dS^T @ Q_low (reloaded)
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P4b: iter=%d before Q.wait (reload)', iter_idx)
+                        handle_Q = pipeline_Q_consumer.wait_and_advance()
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA P4b: iter=%d before dQ.empty.wait phase=%d', iter_idx, producer_phase_dQ)
+                        pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                        mma_dsq_fn(B_idx=handle_Q.index, zero_init=True)
+                        pipeline_dQ.sync_object_full.arrive(
+                            0, pipeline_dQ.producer_mask, cta_group
+                        )
+                        producer_phase_dQ ^= 1
+
+                        # --- Phase 5: dQ (output split → reduce) ---
+                        # 5a) dQ_low = dS @ K_low
+                        pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                        mma_dsk_fn(B_idx=0)
+                        pipeline_dQ.sync_object_full.arrive(
+                            0, pipeline_dQ.producer_mask, cta_group
+                        )
+                        producer_phase_dQ ^= 1
+
+                        # 5b) dQ_high = dS @ K_high
+                        pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                        mma_dsk_fn(B_idx=1)
+                        pipeline_dQ.sync_object_full.arrive(
+                            0, pipeline_dQ.producer_mask, cta_group
+                        )
+                        producer_phase_dQ ^= 1
+
+                        handle_Q.release()
+                        pipeline_dS.consumer_release(consumer_state_dS)
+                        consumer_state_dS.advance()
+                        if tidx == 0 and self.debug_print:
+                            cute.printf('SD_MMA iter end: iter=%d/%d', iter_idx, main_loop_iters)
+
+                    # Signal dV_low ready (stage 0) and dV_high ready (stage 1)
+                    pipeline_dKV.sync_object_empty.wait(0, producer_phase_dKV)
+                    pipeline_dKV.sync_object_full.arrive(
+                        0, pipeline_dKV.producer_mask, cta_group
+                    )
+                    pipeline_dKV.sync_object_empty.wait(1, producer_phase_dKV)
+                    pipeline_dKV.sync_object_full.arrive(
+                        1, pipeline_dKV.producer_mask, cta_group
+                    )
+                    producer_phase_dKV ^= 1
+
             elif is_leader_cta and num_blocks > 0:
                 accumulate_dK = False
                 # -----------------------------------------------------------
@@ -3125,6 +3878,7 @@ class FlashAttentionBackwardSm100:
         tiled_copy_r2s_dKV: Optional[cute.TiledCopy],
         mdK_semaphore: Optional[cute.Tensor],
         mdV_semaphore: Optional[cute.Tensor],
+        tdVtdV_high: Optional[cute.Tensor],
         flashmask_info: FlashMaskInfo,
         sStartEndRowIndices: cute.Tensor,
         sFM_max_min: cute.Tensor,
@@ -3528,6 +4282,58 @@ class FlashAttentionBackwardSm100:
                         )
                     else:
                         thr_copy_r2s_dKV = tiled_copy_r2s_dKV.get_slice(dp_idx)
+
+                    if const_expr(self.is_split_d):
+                        if tidx == 0 and self.debug_print:
+                            cute.printf(
+                                "[DBG-epi-low ] n_block=%d tdV_addr=%d",
+                                n_block, tdVtdV.iterator.toint(),
+                            )
+                        #### STORE dV_low
+                        consumer_state_dKV = self.epilogue_dK_or_dV_tma(
+                            dp_idx,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            thr_mma_dV,
+                            tdVtdV,
+                            mdV_tma_tensor,
+                            sdV,
+                            tma_atom_dV,
+                            thr_copy_r2s_dKV,
+                            pipeline_dKV,
+                            consumer_state_dKV,
+                            None,  # Don't scale
+                            int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
+                            mdV_semaphore,
+                            "V",
+                        )
+                        #### STORE dV_high (stage 1 of pipeline_dKV)
+                        if tidx == 0 and self.debug_print:
+                            cute.printf(
+                                "[DBG-epi-high] n_block=%d tdV_high_addr=%d",
+                                n_block, tdVtdV_high.iterator.toint(),
+                            )
+                        consumer_state_dKV = self.epilogue_dK_or_dV_tma(
+                            dp_idx,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            thr_mma_dV,
+                            tdVtdV_high,
+                            mdV_tma_tensor,
+                            sdV,
+                            tma_atom_dV,
+                            thr_copy_r2s_dKV,
+                            pipeline_dKV,
+                            consumer_state_dKV,
+                            None,  # Don't scale
+                            int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
+                            mdV_semaphore,
+                            "V",
+                            is_high_half=True,
+                        )
+                    else:
                         #### STORE dV
                         consumer_state_dKV = self.epilogue_dK_or_dV_tma(
                             dp_idx,
@@ -3788,7 +4594,7 @@ class FlashAttentionBackwardSm100:
         if const_expr(not self.use_smem_dS_for_mma_dK):
             cute.arch.fence_view_async_tmem_store()
 
-        if const_expr(self.use_2cta_instrs):
+        if const_expr(self.use_2cta_instrs or self.is_split_d):
             # use pipeline_dP to signal tmem store of dS
             with cute.arch.elect_one():
                 pipeline_dP.consumer_release(consumer_state_S_P_dP)
@@ -3857,6 +4663,7 @@ class FlashAttentionBackwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         mdQ_semaphore: Optional[cute.Tensor],
+        mdK: Optional[cute.Tensor],
         flashmask_info: FlashMaskInfo,
         sFM_max_min: cute.Tensor,
         flashmask_loaded_mbar_ptr: cute.Pointer,
@@ -3909,12 +4716,56 @@ class FlashAttentionBackwardSm100:
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block_cta_group
             )
-            mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
-            gdQaccum_ = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (None,))
-            # (M * K / STAGE, STAGE, _)
-            gdQaccum = cute.flat_divide(
-                gdQaccum_, (self.tile_m * self.tile_hdim // self.dQaccum_reduce_stage,)
-            )
+
+            if const_expr(self.is_split_d):
+                # Split-D: tile dQ and dK accum as two contiguous halves (low, high)
+                # Buffer layout: [all_low_half, all_high_half], each seqlen*half_hdim
+                half_hdim = self.half_hdim
+                mdQaccum_low_cur = mdQaccum[None, head_idx, batch_idx]
+                dQ_half_offset = cute.size(mdQaccum_low_cur) // 2
+                mdQaccum_high_cur = cute.domain_offset(
+                    (dQ_half_offset,), mdQaccum_low_cur
+                )
+                gdQaccum_low_ = cute.local_tile(
+                    mdQaccum_low_cur, (self.tile_m * half_hdim,), (None,)
+                )
+                gdQaccum_low = cute.flat_divide(
+                    gdQaccum_low_, (self.tile_m * self.dQ_reduce_ncol,)
+                )
+                gdQaccum_high_ = cute.local_tile(
+                    mdQaccum_high_cur, (self.tile_m * half_hdim,), (None,)
+                )
+                gdQaccum_high = cute.flat_divide(
+                    gdQaccum_high_, (self.tile_m * self.dQ_reduce_ncol,)
+                )
+                # dK accum tiling
+                head_idx_kv = head_idx // self.qhead_per_kvhead
+
+                mdKaccum_low_cur = mdK[None, head_idx_kv, batch_idx]
+                dK_half_offset = cute.size(mdKaccum_low_cur) // 2
+                mdKaccum_high_cur = cute.domain_offset(
+                    (dK_half_offset,), mdKaccum_low_cur
+                )
+                gdKaccum_low_ = cute.local_tile(
+                    mdKaccum_low_cur, (self.tile_n * half_hdim,), (None,)
+                )
+                gdKaccum_low = cute.flat_divide(
+                    gdKaccum_low_, (self.tile_n * self.dK_reduce_ncol,)
+                )
+                gdKaccum_high_ = cute.local_tile(
+                    mdKaccum_high_cur, (self.tile_n * half_hdim,), (None,)
+                )
+                gdKaccum_high = cute.flat_divide(
+                    gdKaccum_high_, (self.tile_n * self.dK_reduce_ncol,)
+                )
+            else:
+                mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
+                gdQaccum_ = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (None,))
+                # (M * K / STAGE, STAGE, _)
+                gdQaccum = cute.flat_divide(
+                    gdQaccum_, (self.tile_m * self.tile_hdim // self.dQaccum_reduce_stage,)
+                )
+
 
             if const_expr(self.deterministic):
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
@@ -3939,7 +4790,11 @@ class FlashAttentionBackwardSm100:
                 tdQtdQ_t2r=tdQtdQ_t2r,
                 tdQsdQ=tdQsdQ,
                 sdQaccum=sdQaccum,
-                gdQaccum=gdQaccum,
+                gdQaccum=gdQaccum if const_expr(not self.is_split_d) else None,
+                gdKaccum_low=gdKaccum_low if const_expr(self.is_split_d) else None,
+                gdKaccum_high=gdKaccum_high if const_expr(self.is_split_d) else None,
+                gdQaccum_low=gdQaccum_low if const_expr(self.is_split_d) else None,
+                gdQaccum_high=gdQaccum_high if const_expr(self.is_split_d) else None,
                 thr_copy_dQaccum_r2s=thr_copy_dQaccum_r2s,
                 thr_copy_t2r=thr_copy_t2r,
                 pipeline_dQ=pipeline_dQ,
@@ -4067,6 +4922,10 @@ class FlashAttentionBackwardSm100:
         tdQsdQ: cute.Tensor,
         sdQaccum: cute.Tensor,
         gdQaccum: cute.Tensor,
+        gdKaccum_low: cute.Tensor,
+        gdKaccum_high: cute.Tensor,
+        gdQaccum_low: cute.Tensor,
+        gdQaccum_high: cute.Tensor,
         thr_copy_dQaccum_r2s: cute.TiledCopy,
         thr_copy_t2r: cute.TiledCopy,
         pipeline_dQ: PipelineAsync,
@@ -4086,108 +4945,207 @@ class FlashAttentionBackwardSm100:
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         if tidx == 0 and self.debug_print:
             cute.printf('n_block: %d, m_block:%d, reduce_step before pipeline_dQ.consumer_wait', n_block, m_block)
-        pipeline_dQ.consumer_wait(dQ_consumer_state)
-        # TMEM -> RMEM
-        tdQrdQ_t2r = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
-        cute.copy(thr_copy_t2r, tdQtdQ_t2r, tdQrdQ_t2r)
-        cute.arch.fence_view_async_tmem_load()
-        cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            pipeline_dQ.consumer_release(dQ_consumer_state)
-        dQ_consumer_state.advance()
-        if tidx == 0 and self.debug_print:
-            cute.printf('n_block: %d, m_block:%d, reduce_step after pipeline_dQ.consumer_wait', n_block, m_block)
+
+        if const_expr(self.is_split_d):
+            hdim_for_reduce_shape = self.half_hdim
+        else:
+            hdim_for_reduce_shape = self.tile_hdim
     
-        gdQaccum_cur = gdQaccum[None, None, m_block]
+        if const_expr(self.is_split_d):
+            # Split-D: 4 reduces per M-block
+            # Order: dK_high(0), dK_low(1), dQ_low(2), dQ_high(3)
+            gdKaccum_high_n = gdKaccum_high[None, None, n_block_cta_group]
+            gdKaccum_low_n = gdKaccum_low[None, None, n_block_cta_group]
+            gdQaccum_low_m = gdQaccum_low[None, None, m_block]
+            gdQaccum_high_m = gdQaccum_high[None, None, m_block]
 
-        tdQrdQ_shape = (
-            self.dQ_reduce_ncol,
-            self.tile_hdim // self.cta_group_size // self.dQ_reduce_ncol,
-        )
-        tdQrdQ = cute.make_tensor(tdQrdQ_t2r.iterator, tdQrdQ_shape)
+            for reduce_idx in cutlass.range_constexpr(4):
+                pipeline_dQ.consumer_wait(dQ_consumer_state)
+                tdQrdQ_t2r = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
+                cute.copy(thr_copy_t2r, tdQtdQ_t2r, tdQrdQ_t2r)
+                cute.arch.fence_view_async_tmem_load()
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    pipeline_dQ.consumer_release(dQ_consumer_state)
+                dQ_consumer_state.advance()
 
-        for stage in cutlass.range_constexpr(cute.size(tdQrdQ, mode=[1])):  # 4
-            if tidx == 0 and self.debug_print:
-                cute.printf('REDUCE_STEP: cta_rank=%d, n_block=%d, m_block=%d, stage=%d, stage+offset=%d', cta_rank_in_cluster, n_block, m_block, stage, stage + stage_offset)
-            smem_idx = dQ_tma_store_producer_state.index
-            tdQsdQ_r2s = tdQsdQ[None, None, smem_idx]
-            tdQrdQ_r2s = cute.make_tensor(
-                tdQrdQ[None, stage].iterator, tdQsdQ_r2s.shape
-            )
-            cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
-            # Fence and barrier to make sure shared memory store is visible to TMA store
-            cute.arch.fence_view_async_shared()
-            # semaphore acquire
-            if const_expr(self.deterministic and stage == 0):
-                if const_expr(self.spt):
-                    _, n_block_max_for_m_block = block_info.get_n_block_min_max(
-                        seqlen, m_block
-                    )
-                    lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
+                if const_expr(reduce_idx == 0):
+                    gdAccum_cur = gdKaccum_high_n
+                    cur_tma_bytes = self.tma_copy_bytes["dKacc"]
+                elif const_expr(reduce_idx == 1):
+                    gdAccum_cur = gdKaccum_low_n
+                    cur_tma_bytes = self.tma_copy_bytes["dKacc"]
+                elif const_expr(reduce_idx == 2):
+                    gdAccum_cur = gdQaccum_low_m
+                    cur_tma_bytes = self.tma_copy_bytes["dQ"]
                 else:
-                    lock_value = n_block_cta_group
-                if tidx == 0 and self.debug_print:
-                    cute.printf('n_block: %d, m_block: %d, stage: %d, lock_value: %d, reduce_step before barrier.wait_eq', n_block, m_block, stage, lock_value)
-                barrier.wait_eq(
-                    mdQ_semaphore_cur[(m_block, None)].iterator, tidx, cta_rank_in_cluster, lock_value
+                    gdAccum_cur = gdQaccum_high_m
+                    cur_tma_bytes = self.tma_copy_bytes["dQ"]
+
+                tdQrdQ_shape = (
+                    self.dQ_reduce_ncol,
+                    hdim_for_reduce_shape // self.cta_group_size // self.dQ_reduce_ncol,
+                )
+                tdQrdQ = cute.make_tensor(tdQrdQ_t2r.iterator, tdQrdQ_shape)
+
+                for stage in cutlass.range_constexpr(cute.size(tdQrdQ, mode=[1])):
+                    smem_idx = dQ_tma_store_producer_state.index
+                    tdQsdQ_r2s = tdQsdQ[None, None, smem_idx]
+                    tdQrdQ_r2s = cute.make_tensor(
+                        tdQrdQ[None, stage].iterator, tdQsdQ_r2s.shape
+                    )
+                    cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
+                    cute.arch.fence_view_async_shared()
+                    # Deterministic semaphore acquire: first dQ half (reduce_idx==2), stage 0
+                    if const_expr(self.deterministic and reduce_idx == 2 and stage == 0):
+                        if const_expr(self.spt):
+                            _, n_block_max_for_m_block = block_info.get_n_block_min_max(
+                                seqlen, m_block
+                            )
+                            lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
+                        else:
+                            lock_value = n_block_cta_group
+                        barrier.wait_eq(
+                            mdQ_semaphore_cur[(m_block, None)].iterator,
+                            tidx,
+                            cta_rank_in_cluster,
+                            lock_value,
+                        )
+                    self.reduce_sync_barrier.arrive_and_wait()
+                    if is_tma_warp:
+                        with cute.arch.elect_one():
+                            copy_utils.cpasync_reduce_bulk_add_f32(
+                                sdQaccum[None, smem_idx].iterator,
+                                gdAccum_cur[None, stage + stage_offset].iterator,
+                                cur_tma_bytes // 1,
+                            )
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(
+                            self.sdQaccum_stage - 1, read=read_flag
+                        )
+                    self.reduce_sync_barrier.arrive_and_wait()
+                    dQ_tma_store_producer_state.advance()
+                    # Deterministic semaphore release for prior m_block
+                    if const_expr(
+                        self.deterministic
+                        and reduce_idx == 2
+                        and stage == 0
+                        and delay_semaphore_release
+                    ):
+                        if m_block > m_block_min:
+                            barrier.arrive_inc(
+                                mdQ_semaphore_cur[(m_block - 1, None)].iterator,
+                                tidx,
+                                cta_rank_in_cluster,
+                                1,
+                            )
+
+            # Deterministic semaphore release (non-delayed, Split-D)
+
+            # Deterministic semaphore release (non-delayed, Split-D)
+            if const_expr(self.deterministic and not delay_semaphore_release):
+                if is_tma_warp:
+                    cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                self.reduce_sync_barrier.arrive_and_wait()
+                barrier.arrive_inc(
+                    mdQ_semaphore_cur[m_block, None].iterator,
+                    tidx,
+                    cta_rank_in_cluster,
+                    1,
+                )
+
+        else:
+            # Non-Split-D: single reduce per M-block
+            pipeline_dQ.consumer_wait(dQ_consumer_state)
+            # TMEM -> RMEM
+            tdQrdQ_t2r = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
+            cute.copy(thr_copy_t2r, tdQtdQ_t2r, tdQrdQ_t2r)
+            cute.arch.fence_view_async_tmem_load()
+            cute.arch.sync_warp()
+            with cute.arch.elect_one():
+                pipeline_dQ.consumer_release(dQ_consumer_state)
+            dQ_consumer_state.advance()
+
+            gdQaccum_cur = gdQaccum[None, None, m_block]
+
+            tdQrdQ_shape = (
+                self.dQ_reduce_ncol,
+                hdim_for_reduce_shape // self.cta_group_size // self.dQ_reduce_ncol,
+            )
+            tdQrdQ = cute.make_tensor(tdQrdQ_t2r.iterator, tdQrdQ_shape)
+
+            for stage in cutlass.range_constexpr(cute.size(tdQrdQ, mode=[1])):
+                smem_idx = dQ_tma_store_producer_state.index
+                tdQsdQ_r2s = tdQsdQ[None, None, smem_idx]
+                tdQrdQ_r2s = cute.make_tensor(
+                    tdQrdQ[None, stage].iterator, tdQsdQ_r2s.shape
+                )
+                cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
+                # Fence and barrier to make sure shared memory store is visible to TMA store
+                cute.arch.fence_view_async_shared()
+                # semaphore acquire
+                if const_expr(self.deterministic and stage == 0):
+                    if const_expr(self.spt):
+                        _, n_block_max_for_m_block = block_info.get_n_block_min_max(
+                            seqlen, m_block
+                        )
+                        lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
+                    else:
+                        lock_value = n_block_cta_group
+                    barrier.wait_eq(
+                        mdQ_semaphore_cur[(m_block, None)].iterator,
+                        tidx,
+                        cta_rank_in_cluster,
+                        lock_value,
+                    )
+                self.reduce_sync_barrier.arrive_and_wait()
+                # Copy from shared memory to global memory
+                if is_tma_warp:
+                    with cute.arch.elect_one():
+                        copy_utils.cpasync_reduce_bulk_add_f32(
+                            sdQaccum[None, smem_idx].iterator,
+                            gdQaccum_cur[None, stage + stage_offset].iterator,
+                            self.tma_copy_bytes["dQ"] // 1,
+                        )
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(
+                        self.sdQaccum_stage - 1, read=read_flag
+                    )
+                self.reduce_sync_barrier.arrive_and_wait()
+                dQ_tma_store_producer_state.advance()
+                # semaphore release for prior m_block
+                if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
+                    if m_block > m_block_min:
+                        barrier.arrive_inc(
+                            mdQ_semaphore_cur[(m_block - 1, None)].iterator,
+                            tidx,
+                            cta_rank_in_cluster,
+                            1,
+                        )
+
+            if const_expr(self.tile_hdim == 192):
+                if const_expr(self.sdQaccum_stage > 1):
+                    if is_tma_warp:
+                        cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                    self.reduce_sync_barrier.arrive_and_wait()
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(dQaccum_empty_mbar_ptr)
+
+            # semaphore release
+            # NOTE: arrive_inc calls red_release which issues membar
+            if const_expr(self.deterministic and not delay_semaphore_release):
+                if const_expr(self.sdQaccum_stage > 1 and not self.tile_hdim == 192):
+                    if is_tma_warp:
+                        cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                    self.reduce_sync_barrier.arrive_and_wait()
+                barrier.arrive_inc(
+                    mdQ_semaphore_cur[m_block, None].iterator,
+                    tidx,
+                    cta_rank_in_cluster,
+                    1,
                 )
                 if tidx == 0 and self.debug_print:
-                    cute.printf('n_block: %d, m_block: %d, stage: %d, lock_value: %d, reduce_step after barrier.wait_eq', n_block, m_block, stage, lock_value)
-            self.reduce_sync_barrier.arrive_and_wait()
-            # Copy from shared memory to global memory
-            if is_tma_warp:
-                with cute.arch.elect_one():
-                    copy_utils.cpasync_reduce_bulk_add_f32(
-                        sdQaccum[None, smem_idx].iterator,
-                        gdQaccum_cur[None, stage + stage_offset].iterator,
-                        self.tma_copy_bytes["dQ"] // 1,
-                    )
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(self.sdQaccum_stage - 1, read=read_flag)
-            self.reduce_sync_barrier.arrive_and_wait()
-            if tidx == 0 and self.debug_print:
-                cute.printf('n_block: %d, m_block: %d, stage: %d, reduce_step after dQ_tma_store_producer_state.advance', n_block, m_block, stage)
-            dQ_tma_store_producer_state.advance()
-            # Directly add to gmem, much slower
-            # tdQgdQ = thr_copy_dQaccum_r2s.partition_D(gdQaccum[None, stage, m_block])
-            # assert cute.size(tdQrdQ_r2s) == cute.size(tdQgdQ)
-            # for i in cutlass.range(cute.size(tdQrdQ_r2s) // 4, unroll_full=True):
-            #     copy_utils.atomic_add_fp32x4(
-            #         tdQrdQ_r2s[4 * i],
-            #         tdQrdQ_r2s[4 * i + 1],
-            #         tdQrdQ_r2s[4 * i + 2],
-            #         tdQrdQ_r2s[4 * i + 3],
-            #         utils.elem_pointer(tdQgdQ, 4 * i),
-            #     )
-            # semaphore release for prior m_block
-            if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
-                if m_block > m_block_min:
-                    if tidx == 0 and self.debug_print:
-                        cute.printf('n_block: %d, m_block: %d, stage: %d, lock_value: %d, reduce_step before barrier.arrive_inc in stage', n_block, m_block, stage, lock_value)
-                    barrier.arrive_inc(
-                        mdQ_semaphore_cur[(m_block - 1, None)].iterator, tidx, cta_rank_in_cluster, 1
-                    )
-                    if tidx == 0 and self.debug_print:
-                        cute.printf('n_block: %d, m_block: %d, stage: %d, lock_value: %d, reduce_step after barrier.arrive_inc in stage', n_block, m_block, stage, lock_value)
-    
-        if const_expr(self.tile_hdim == 192):
-            if const_expr(self.sdQaccum_stage > 1):
-                if is_tma_warp:
-                    cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-                self.reduce_sync_barrier.arrive_and_wait()
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive(dQaccum_empty_mbar_ptr)
-
-        # semaphore release
-        # NOTE: arrive_inc calls red_release which issues membar
-        if const_expr(self.deterministic and not delay_semaphore_release):
-            if const_expr(self.sdQaccum_stage > 1 and not self.tile_hdim == 192):
-                if is_tma_warp:
-                    cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-                self.reduce_sync_barrier.arrive_and_wait()
-            barrier.arrive_inc(mdQ_semaphore_cur[m_block, None].iterator, tidx, cta_rank_in_cluster, 1)
-            if tidx == 0 and self.debug_print:
-                cute.printf('n_block: %d, m_block: %d, reduce_step after barrier.arrive_inc', n_block, m_block)
+                    cute.printf('n_block: %d, m_block: %d, reduce_step after barrier.arrive_inc', n_block, m_block)
 
         return dQ_consumer_state, dQ_tma_store_producer_state
 
@@ -4346,9 +5304,13 @@ class FlashAttentionBackwardSm100:
         barrier_id: Int32,
         mdKV_semaphore: Optional[cute.Tensor],
         K_or_V: cutlass.Constexpr[str],
+        is_high_half: cutlass.Constexpr[bool] = False,
     ) -> cutlass.pipeline.PipelineState:
         assert K_or_V in ("K", "V")
-        tile_hdim = self.tile_hdim if const_expr(K_or_V == "K") else self.tile_hdimv
+        if const_expr(self.is_split_d):
+            tile_hdim = self.half_hdim if const_expr(K_or_V == "K") else self.half_hdimv
+        else:
+            tile_hdim = self.tile_hdim if const_expr(K_or_V == "K") else self.tile_hdimv
         dtype = self.dk_dtype if const_expr(K_or_V == "K") else self.dv_dtype
         epi_tile = self.sdK_epi_tile if const_expr(K_or_V == "K") else self.sdV_epi_tile
         flat_epi_tile = (
@@ -4374,22 +5336,29 @@ class FlashAttentionBackwardSm100:
             mdKV_cur = mdKV[None, None, head_idx_kv, batch_idx]  # (seqlen, hdim)
             gdKV_p = cute.local_tile(
                 mdKV_cur, (self.tile_n, tile_hdim), (n_block, 0)
-            )  # (tile_n, hdim)
+            )  # (tile_n, hdim) - per CTA
             gdKV = self.split_wg(gdKV_p, wg_idx, num_wg)  # (tile_n, hdim / 2)
             gdKV_epi = cute.local_tile(
                 gdKV, epi_tile, (0, None)
             )  # (tile_n, 64, epi_stage = (hdim / 2) / 64)
+
         else:
             mdKV_cur = mdKV[None, head_idx_kv, batch_idx]  # (seqlen * hdim)
+
+            if const_expr(is_high_half):
+                dKV_half_offset = cute.size(mdKV_cur) // 2
+                mdKV_cur = cute.domain_offset((dKV_half_offset,), mdKV_cur)
+
             gdKV_p = cute.local_tile(
                 mdKV_cur, (self.tile_n * tile_hdim,), (n_block,)
             )  # (tile_n * hdim)
             gdKV = cute.logical_divide(gdKV_p, (self.tile_n * tile_hdim // num_wg,))[
                 ((None, wg_idx),)
             ]  # (tile_n * hdim / 2)
+            postprocess_epi_tile = self.tile_n * self.dK_reduce_ncol
             gdKV_epi = cute.flat_divide(
-                gdKV, (flat_epi_tile,)
-            )  # (tile_n * hdim / 2 / epi_stage, epi_stage)
+                gdKV, (postprocess_epi_tile,)
+            )  # (tile_n * dK_reduce_ncol, epi_stages)
 
         deterministic_KV = self.deterministic and self.dKV_postprocess
         if const_expr(deterministic_KV):
@@ -4411,18 +5380,20 @@ class FlashAttentionBackwardSm100:
             else:
                 assert num_epi_stages == self.num_epi_stages_v, f"Epi stage calculation is wrong (V). num_epi_stages:{num_epi_stages} != self.num_epi_stages_v: {self.num_epi_stages_v}"
         else:
-            num_epi_stages = self.num_epi_stages if const_expr(K_or_V == "K") else self.num_epi_stages_v
+            num_epi_stages = (tile_hdim // num_wg) // self.dK_reduce_ncol
 
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dK_reduce_ncol)), Float32
         )
+
 
         read_flag = const_expr(not deterministic_KV)
 
         pipeline_dKV.consumer_wait(consumer_state_dKV)
 
-        # semaphore acquire
-        if const_expr(deterministic_KV):
+        # semaphore acquire — for Split-D, only on the first half (low) since both
+        # halves share one semaphore slot per Q-head ordering
+        if const_expr(deterministic_KV and not is_high_half):
             barrier.wait_eq(
                 mdKV_semaphore_cur.iterator, tidx, wg_idx, head_idx % self.qhead_per_kvhead
             )
@@ -4479,7 +5450,7 @@ class FlashAttentionBackwardSm100:
                             gdKV_epi[None, epi_stage].iterator,
                             self.tma_copy_bytes["dKacc"],
                         )
-                if const_expr(epi_stage < num_epi_stages - 1):
+                if const_expr(epi_stage < num_epi_stages - 1 or self.is_split_d):
                     cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                 cute.arch.barrier_arrive(
@@ -4492,9 +5463,9 @@ class FlashAttentionBackwardSm100:
                 barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE
             )
 
-        # semaphore release
-        # NOTE: arrive_inc calls red_release which issues membar
-        if const_expr(deterministic_KV):
+        # semaphore release — for Split-D, only on the last half (high) so the
+        # semaphore increments exactly once per Q-head, matching non-split-d behavior
+        if const_expr(deterministic_KV and (is_high_half or not self.is_split_d)):
             if leader_warp:
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)

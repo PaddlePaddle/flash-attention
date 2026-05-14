@@ -97,3 +97,28 @@ except ImportError:
 if not _fa3_available and not _fa4_available:
     print("[WARNING] flash_mask: neither FA3 nor FA4 is available. "
           "Check your installation.")
+
+# ============================================================
+# Linear Attention: GDN and KDA operators
+# ============================================================
+_linear_attn_available = False
+try:
+    from .linear_attn import (
+        chunk_gated_delta_rule,
+        chunk_gdn,
+        fused_recurrent_gated_delta_rule,
+        fused_recurrent_gdn,
+        chunk_kda,
+        fused_recurrent_kda,
+    )
+    __all__ += [
+        "chunk_gated_delta_rule",
+        "chunk_gdn",
+        "fused_recurrent_gated_delta_rule",
+        "fused_recurrent_gdn",
+        "chunk_kda",
+        "fused_recurrent_kda",
+    ]
+    _linear_attn_available = True
+except ImportError:
+    pass  # linear_attn dependencies not installed

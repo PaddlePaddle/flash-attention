@@ -91,19 +91,22 @@ def pad_input(hidden_states, indices, batch, seqlen):
     return rearrange(output, "(b s) ... -> b s ...", b=batch)
 
 
-def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", zero_lengths=False):
+def generate_random_padding_mask(
+    max_seqlen, batch_size, device, mode="random", zero_lengths=False, min_seqlen=None
+):
     assert mode in ["full", "random", "third"]
+    min_seqlen = min_seqlen if min_seqlen is not None else 0 if zero_lengths else 1
     if mode == "full":
         lengths = paddle.full([batch_size, 1], max_seqlen, dtype=paddle.int32)
     elif mode == "random":
         lengths = paddle.randint(
-            max(0 if zero_lengths else 1, max_seqlen - 20),
+            max(min_seqlen, max_seqlen - 20),
             max_seqlen + 1,
             shape=[batch_size, 1],
         )
     else:
         lengths = paddle.randint(
-            max(0 if zero_lengths else 1, max_seqlen // 3),
+            max(min_seqlen, max_seqlen // 3),
             max_seqlen + 1,
             shape=[batch_size, 1],
         )
@@ -363,6 +366,8 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
+    return_lse=False,
+    gather_kv_indices=None,
 ):
     if causal:
         window_size = (window_size[0], 0)
@@ -418,10 +423,28 @@ def attention_ref(
         local_mask = (
             paddle.logical_or(local_mask, chunk_mask) if local_mask is not None else chunk_mask
         )
+    if gather_kv_indices is not None:
+        batch = q.shape[0]
+        topk_len = gather_kv_indices.shape[2]
+        if topk_len < seqlen_k:
+            topk_index_mask = paddle.zeros(
+                [batch, seqlen_q, seqlen_k], dtype=paddle.bool
+            )
+            topk_index_mask = paddle.put_along_axis(
+                topk_index_mask,
+                gather_kv_indices,
+                paddle.ones_like(gather_kv_indices, dtype=paddle.bool),
+                axis=-1,
+            )
+            inv_topk_mask = rearrange(~topk_index_mask, "b t s -> b 1 t s")
+            scores = paddle.where(inv_topk_mask, paddle.full_like(scores, float("-inf")), scores)
     if local_mask is not None:
         scores = paddle.where(local_mask, paddle.full_like(scores, float("-inf")), scores)
     if attn_bias is not None:
         scores = scores + attn_bias
+    # After all masks are applied, before softmax:
+    # scores shape: [b, h, t, s]
+    lse = paddle.logsumexp(scores, axis=-1)  # [b, h, t]
     if learnable_sink is None:
         attention = F.softmax(scores, axis=-1).cast(v.dtype)
     else:
@@ -433,6 +456,8 @@ def attention_ref(
         normalizer = unnormalized_scores.sum(axis=-1, keepdim=True) + paddle.exp(
             learnable_sink - logits_or_sinks_max
         )
+        # LSE with sink: log(Z) = log(normalizer) + max
+        lse = (paddle.log(normalizer.squeeze(-1)) + logits_or_sinks_max.squeeze(-1)).cast(dtype_og)
         attention = (unnormalized_scores / normalizer).cast(v.dtype)
     if query_padding_mask is not None:
         inv_q_mask = rearrange(~query_padding_mask, "b s -> b 1 s 1")
@@ -454,6 +479,8 @@ def attention_ref(
     if query_padding_mask is not None:
         inv_q_mask2 = rearrange(~query_padding_mask, "b s -> b s 1 1")
         output = paddle.where(inv_q_mask2, paddle.zeros_like(output), output)
+    if return_lse:
+        return output.cast(dtype_og), attention.cast(dtype_og), lse.cast(dtype_og)
     return output.cast(dtype_og), attention.cast(dtype_og)
 
 

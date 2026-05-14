@@ -199,11 +199,6 @@ def flashmask_attention(
         ), (
             "use_varlen only support fa4"
         )
-        assert (
-            not paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"]
-        ), (
-            "use_varlen does not support deterministic"
-        )
         assert dropout == 0, (
             "use_varlen does not support dropout"
         )

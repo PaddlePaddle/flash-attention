@@ -27,6 +27,7 @@ class FlashAttentionBackwardPreprocess:
         self,
         dtype: Type[cutlass.Numeric],
         head_dim: int,
+        head_dim_v: int,
         m_block_size: int = 128,
         num_threads: int = 128,
         dq_head_dim: Optional[int] = None,
@@ -35,8 +36,10 @@ class FlashAttentionBackwardPreprocess:
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
         should be a multiple of 8.
 
-        :param head_dim: head dimension
+        :param head_dim: head dimension for Q/K
         :type head_dim: int
+        :param head_dim_v: head dimension for V/O (can differ from head_dim for hdim=192/hdimv=128)
+        :type head_dim_v: int
         :param m_block_size: m block size
         :type m_block_size: int
         :param num_threads: number of threads
@@ -49,7 +52,9 @@ class FlashAttentionBackwardPreprocess:
         # padding head_dim to a multiple of 32 as k_block_size
         hdim_multiple_of = 32
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
+        self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_oob = head_dim != self.head_dim_padded
+        self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         # dQaccum may use a different head_dim_rounded (e.g., 128 for SM100 with head_dim=80)
         if dq_head_dim is not None:
             self.dq_head_dim_padded = int(math.ceil(dq_head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -92,11 +97,11 @@ class FlashAttentionBackwardPreprocess:
         # it's just between threads in the same warp
         gmem_k_block_size = (
             128
-            if self.head_dim_padded % 128 == 0
+            if self.head_dim_v_padded % 128 == 0
             else (
                 64
-                if self.head_dim_padded % 64 == 0
-                else (32 if self.head_dim_padded % 32 == 0 else 16)
+                if self.head_dim_v_padded % 64 == 0
+                else (32 if self.head_dim_v_padded % 32 == 0 else 16)
             )
         )
         self.gmem_tiled_copy_O = copy_utils.tiled_copy_2d(
@@ -250,7 +255,7 @@ class FlashAttentionBackwardPreprocess:
                 mdPsum_cur = cute.domain_offset((padded_offset_q,), mdPsum[num_head, None])
                 headdim_v = mO.shape[2]
 
-            blkOdO_shape = (self.m_block_size, self.head_dim_padded)
+            blkOdO_shape = (self.m_block_size, self.head_dim_v_padded)
             # (m_block_size, head_dim)
             gO = cute.local_tile(mO_cur, blkOdO_shape, (m_block, 0))
             gdO = cute.local_tile(mdO_cur, blkOdO_shape, (m_block, 0))
@@ -265,7 +270,7 @@ class FlashAttentionBackwardPreprocess:
             # of tile_shape
             # ///////////////////////////////////////////////////////////////////////////////
             # Construct identity layout for KV
-            cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
+            cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
             tOcO = gmem_thr_copy_O.partition_S(cO)
             t0OcO = gmem_thr_copy_O.get_slice(0).partition_S(cO)
             tOpO = utils.predicate_k(tOcO, limit=headdim_v)
@@ -289,7 +294,7 @@ class FlashAttentionBackwardPreprocess:
             tOrdO = cute.make_fragment_like(tOgdO)
             # Zero-fill fragments before predicated copy to avoid NaN in reduction
             # when head_dim is not a multiple of head_dim_padded
-            if cutlass.const_expr(self.check_hdim_oob):
+            if cutlass.const_expr(self.check_hdim_v_oob):
                 tOrO.fill(0)
                 tOrdO.fill(0)
             assert cute.size(tOgO, mode=[0]) == cute.size(tOgdO, mode=[0])
@@ -304,7 +309,7 @@ class FlashAttentionBackwardPreprocess:
                         tOgO[None, m, None],
                         tOrO[None, m, None],
                         pred=tOpO[None, m, None]
-                        if cutlass.const_expr(self.check_hdim_oob)
+                        if cutlass.const_expr(self.check_hdim_v_oob)
                         else None,
                     )
                     cute.copy(
@@ -312,7 +317,7 @@ class FlashAttentionBackwardPreprocess:
                         tOgdO[None, m, None],
                         tOrdO[None, m, None],
                         pred=tOpdO[None, m, None]
-                        if cutlass.const_expr(self.check_hdim_oob)
+                        if cutlass.const_expr(self.check_hdim_v_oob)
                         else None,
                     )
             # Sum across the "k" dimension

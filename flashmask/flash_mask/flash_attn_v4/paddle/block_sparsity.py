@@ -26,7 +26,138 @@ class BlockSparseTensorsPaddle(NamedTuple):
     mask_block_idx: paddle.Tensor
     full_block_cnt: paddle.Tensor | None = None
     full_block_idx: paddle.Tensor | None = None
+    cu_total_m_blocks: paddle.Tensor | None = None
+    cu_block_idx_offsets: paddle.Tensor | None = None
     block_size: tuple[int, int] | None = None
+    dq_write_order: paddle.Tensor | None = None
+    dq_write_order_full: paddle.Tensor | None = None
+    spt: bool | None = None
+
+
+def _ordered_to_dense_simple(
+    num_blocks: paddle.Tensor,
+    indices: paddle.Tensor,
+    num_cols: int,
+) -> paddle.Tensor:
+    """Convert ordered sparse representation to dense binary matrix.
+
+    Args:
+        num_blocks: [B, H, num_rows] count of valid entries per row
+        indices: [B, H, num_rows, max_entries] column indices (valid entries packed left)
+        num_cols: total number of columns
+
+    Returns:
+        dense: [B, H, num_rows, num_cols] binary int32 matrix
+    """
+    B, H, num_rows, max_entries = indices.shape
+    dense = paddle.zeros([B, H, num_rows, num_cols + 1], dtype=paddle.int32)
+    col_range = paddle.arange(max_entries)
+    valid = col_range.reshape([1, 1, 1, max_entries]) < num_blocks.unsqueeze(-1)
+    safe_indices = paddle.where(
+        valid, indices.cast(paddle.int64), paddle.full_like(indices, num_cols, dtype=paddle.int64)
+    )
+    ones = paddle.ones_like(safe_indices, dtype=paddle.int32)
+    dense = paddle.put_along_axis(dense, safe_indices, ones, axis=-1, reduce="assign")
+    return dense[:, :, :, :num_cols]
+
+
+def compute_dq_write_order(
+    fwd_mask_cnt: paddle.Tensor,
+    fwd_mask_idx: paddle.Tensor,
+    fwd_full_cnt: paddle.Tensor | None,
+    fwd_full_idx: paddle.Tensor | None,
+    bwd_mask_cnt: paddle.Tensor,
+    bwd_mask_idx: paddle.Tensor,
+    bwd_full_cnt: paddle.Tensor | None,
+    bwd_full_idx: paddle.Tensor | None,
+    spt: bool = False,
+) -> tuple[paddle.Tensor, paddle.Tensor | None]:
+    """Compute dQ write-order metadata for deterministic block-sparse backward.
+
+    For each (n_block, i) in the backward iteration, computes the semaphore
+    lock value: the rank of n_block in the combined (partial + full) sorted
+    contributor list for the target m_block.
+
+    Lock values are assigned in ascending n_block order (or descending if spt=True)
+    to guarantee deadlock-freedom with the CTA scheduling order.
+    """
+    B, H, num_m, max_kv_partial = fwd_mask_idx.shape
+    _, _, num_n, max_q_partial = bwd_mask_idx.shape
+
+    has_full = fwd_full_cnt is not None and fwd_full_idx is not None
+
+    dense_partial = _ordered_to_dense_simple(fwd_mask_cnt, fwd_mask_idx, num_n)
+    if has_full:
+        dense_full = _ordered_to_dense_simple(fwd_full_cnt, fwd_full_idx, num_n)
+        dense = paddle.clip(dense_partial + dense_full, max=1)
+    else:
+        dense = dense_partial
+
+    cumsum = dense.cumsum(axis=-1)
+    rank_table = (cumsum - dense).cast(paddle.int32)
+
+    if spt:
+        total_per_m = cumsum[:, :, :, -1:]
+        rank_table = (total_per_m - 1 - rank_table).cast(paddle.int32)
+
+    def _gather_write_order(bwd_idx, bwd_cnt):
+        # Use paddle.take_along_axis equivalent via advanced indexing.
+        # rank_table has shape [B, H, num_m, num_n]; we gather along the last two dims:
+        #   out[b, h, n, q] = rank_table[b, h, bwd_idx[b, h, n, q], n]
+        # Implement via take_along_axis on axis=2 then diagonalize on last axis.
+        m_vals = paddle.clip(bwd_idx.cast(paddle.int64), 0, num_m - 1)
+        # Expand rank_table on axis=2: [B,H,num_m,num_n] -> gather along num_m
+        # Broadcast m_vals from [B,H,num_n,max_q] to take along axis=2:
+        # We need to gather rank_table[:,:,m_vals[b,h,n,q],n] -> produce [B,H,num_n,max_q]
+        max_q = bwd_idx.shape[-1]
+        # index1: [B,H,num_n,max_q] for axis=2 gather; we'll produce tmp[b,h,n,q,n'] = rank_table[b,h,m_vals[b,h,n,q],n']
+        # Then pick n' = n.
+        m_idx_exp = m_vals.unsqueeze(-1).expand([B, H, num_n, max_q, num_n])
+        rank_exp = rank_table.unsqueeze(2).expand([B, H, num_n, num_m, num_n])
+        # gather along axis=3 (the num_m axis in rank_exp)
+        tmp = paddle.take_along_axis(rank_exp, m_idx_exp, axis=3)
+        # tmp shape: [B,H,num_n,max_q,num_n]; select n' = n
+        n_range = paddle.arange(num_n).reshape([1, 1, num_n, 1, 1]).expand([B, H, num_n, max_q, 1])
+        out = paddle.take_along_axis(tmp, n_range, axis=4).squeeze(-1)
+        return out.cast(paddle.int32)
+
+    dq_write_order = _gather_write_order(bwd_mask_idx, bwd_mask_cnt)
+
+    dq_write_order_full = None
+    if has_full and bwd_full_cnt is not None and bwd_full_idx is not None:
+        dq_write_order_full = _gather_write_order(bwd_full_idx, bwd_full_cnt)
+
+    return dq_write_order, dq_write_order_full
+
+
+def compute_dq_write_order_from_block_mask(
+    block_mask,
+    spt: bool = False,
+) -> tuple[paddle.Tensor, paddle.Tensor | None]:
+    (
+        _seq_q,
+        _seq_k,
+        kv_mask_cnt,
+        kv_mask_idx,
+        full_kv_cnt,
+        full_kv_idx,
+        q_mask_cnt,
+        q_mask_idx,
+        full_q_cnt,
+        full_q_idx,
+        *_,
+    ) = block_mask.as_tuple()
+    return compute_dq_write_order(
+        kv_mask_cnt,
+        kv_mask_idx,
+        full_kv_cnt,
+        full_kv_idx,
+        q_mask_cnt,
+        q_mask_idx,
+        full_q_cnt,
+        full_q_idx,
+        spt=spt,
+    )
 
 
 def get_sparse_q_block_size(
@@ -73,8 +204,8 @@ def _check_and_expand_block(
     name: str,
     cnt: paddle.Tensor | None,
     idx: paddle.Tensor | None,
-    expected_count_shape: Tuple[int, int, int],
-    expected_index_shape: Tuple[int, int, int, int],
+    expected_count_shape: Tuple[int, ...],
+    expected_index_shape: Tuple[int, ...],
     context: str | None,
     hint: str | Callable[[], str] | None,
 ) -> Tuple[paddle.Tensor | None, paddle.Tensor | None]:
@@ -100,6 +231,25 @@ def _check_and_expand_block(
         idx, expected_index_shape, f"{name}_block_idx", context, hint
     )
     return expanded_cnt, expanded_idx
+
+
+def _check_and_expand_metadata_tensor(
+    name: str,
+    tensor: paddle.Tensor | None,
+    expected_shape: Tuple[int, ...],
+    context: str | None,
+    hint: str | Callable[[], str] | None,
+    place,
+) -> paddle.Tensor | None:
+    if tensor is None:
+        return None
+    if tensor.dtype != paddle.int32:
+        raise ValueError(f"{name} must have dtype paddle.int32")
+    if str(tensor.place) != str(place):
+        raise ValueError(f"{name} must be on the same device as block sparse tensors")
+    if not tensor.place.is_gpu_place():
+        raise ValueError(f"{name} must live on CUDA (GPU)")
+    return _expand_sparsity_tensor(tensor, expected_shape, name, context, hint)
 
 
 def get_block_sparse_expected_shapes(
@@ -221,8 +371,8 @@ def get_block_sparse_expected_shapes_bwd(
 def normalize_block_sparse_tensors(
     tensors: BlockSparseTensorsPaddle,
     *,
-    expected_count_shape: Tuple[int, int, int],
-    expected_index_shape: Tuple[int, int, int, int],
+    expected_count_shape: Tuple[int, ...],
+    expected_index_shape: Tuple[int, ...],
     context: str | None = None,
     hint: str | Callable[[], str] | None = None,
 ) -> BlockSparseTensorsPaddle:
@@ -253,12 +403,39 @@ def normalize_block_sparse_tensors(
     if full_cnt is not None and str(mask_cnt.place) != str(full_cnt.place):
         raise ValueError("All block sparse tensors must be on the same device")
 
+    dq_write_order = _check_and_expand_metadata_tensor(
+        "dq_write_order",
+        tensors.dq_write_order,
+        tuple(mask_idx.shape),
+        context,
+        hint,
+        mask_cnt.place,
+    )
+    dq_write_order_full = _check_and_expand_metadata_tensor(
+        "dq_write_order_full",
+        tensors.dq_write_order_full,
+        tuple(full_idx.shape) if full_idx is not None else expected_index_shape,
+        context,
+        hint,
+        mask_cnt.place,
+    )
+    spt = tensors.spt
+    if spt is not None and not isinstance(spt, bool):
+        raise ValueError("spt must be a bool when provided")
+    if spt is not None and dq_write_order is None:
+        raise ValueError("spt requires dq_write_order to be provided")
+
     return BlockSparseTensorsPaddle(
         mask_block_cnt=mask_cnt,
         mask_block_idx=mask_idx,
         full_block_cnt=full_cnt,
         full_block_idx=full_idx,
+        cu_total_m_blocks=tensors.cu_total_m_blocks,
+        cu_block_idx_offsets=tensors.cu_block_idx_offsets,
         block_size=tensors.block_size,
+        dq_write_order=dq_write_order,
+        dq_write_order_full=dq_write_order_full,
+        spt=spt,
     )
 
 
@@ -278,6 +455,8 @@ def get_block_sparse_broadcast_pattern(
         tensors.mask_block_idx,
         tensors.full_block_cnt,
         tensors.full_block_idx,
+        tensors.dq_write_order,
+        tensors.dq_write_order_full,
     ):
         if tensor is not None:
             patterns.append(get_broadcast_dims(tensor))
@@ -296,6 +475,13 @@ def normalize_block_sparse_config(
     block_size: tuple[int, int],
     q_stage: int,
 ) -> tuple[BlockSparseTensorsPaddle, Tuple[Tuple[bool, ...], ...] | None, int]:
+    """Validate the block-sparse config, infer expected shapes, and normalize.
+
+    Handles both fixed-length (3D `[B, H, M]` / 4D `[B, H, M, N]`) and varlen
+    (2D `[H, total_m_blocks]` / `[H, total_n_blocks]`) layouts. Varlen is
+    detected by `tensors.cu_total_m_blocks is not None` and forces
+    `q_subtile_factor == 1` (TODO: potentially remove this restriction).
+    """
     m_block_size, n_block_size = block_size
     if tensors.block_size is None:
         sparse_block_size_q, sparse_block_size_kv = None, n_block_size
@@ -305,21 +491,34 @@ def normalize_block_sparse_config(
         raise ValueError(
             f"Block sparsity requires sparse_block_size[1]={n_block_size} to match tile_n."
         )
-    expected_count_shape, expected_index_shape, q_subtile_factor = (
-        infer_block_sparse_expected_shapes(
-            tensors,
-            batch_size=batch_size,
-            num_head=num_head,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
-            q_stage=q_stage,
-            context="forward",
-            sparse_block_size_q=sparse_block_size_q,
-            sparse_block_size_kv=sparse_block_size_kv,
+    if tensors.cu_total_m_blocks is not None:
+        base_m_block = q_stage * m_block_size
+        if sparse_block_size_q is not None and sparse_block_size_q != base_m_block:
+            raise ValueError(
+                f"Varlen block sparsity requires sparse_block_size[0]={base_m_block} "
+                f"(= q_stage * tile_m); got {sparse_block_size_q}."
+            )
+        total_m_blocks = tensors.mask_block_cnt.shape[-1]
+        total_n_blocks = tensors.mask_block_idx.shape[-1]
+        expected_count_shape = (num_head, total_m_blocks)
+        expected_index_shape = (num_head, total_n_blocks)
+        q_subtile_factor = 1
+    else:
+        expected_count_shape, expected_index_shape, q_subtile_factor = (
+            infer_block_sparse_expected_shapes(
+                tensors,
+                batch_size=batch_size,
+                num_head=num_head,
+                seqlen_q=seqlen_q,
+                seqlen_k=seqlen_k,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
+                q_stage=q_stage,
+                context="forward",
+                sparse_block_size_q=sparse_block_size_q,
+                sparse_block_size_kv=sparse_block_size_kv,
+            )
         )
-    )
     normalized_tensors = normalize_block_sparse_tensors(
         tensors,
         expected_count_shape=expected_count_shape,
@@ -385,30 +584,27 @@ def to_cute_block_sparse_tensors(
     """Convert paddle block sparsity tensors to CuTe tensors, optionally for tvm ffi."""
     if not is_block_sparsity_enabled(tensors):
         return None
-
-    (
-        mask_block_cnt,
-        mask_block_idx,
-        full_block_cnt,
-        full_block_idx,
-        *_,
-    ) = tensors
-
-    (
-        mask_block_cnt_tensor,
-        mask_block_idx_tensor,
-    ) = [
+    mask_block_cnt_tensor, mask_block_idx_tensor = [
         to_cute_tensor(t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi)
-        for t in (mask_block_cnt, mask_block_idx)
+        for t in (tensors.mask_block_cnt, tensors.mask_block_idx)
     ]
-    (
-        full_block_cnt_tensor,
-        full_block_idx_tensor,
-    ) = [
+    full_block_cnt_tensor, full_block_idx_tensor = [
         to_cute_tensor(t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi)
         if t is not None
         else None
-        for t in (full_block_cnt, full_block_idx)
+        for t in (tensors.full_block_cnt, tensors.full_block_idx)
+    ]
+    cu_total_m_blocks_tensor, cu_block_idx_offsets_tensor = [
+        to_cute_tensor(t, assumed_align=4, leading_dim=0, enable_tvm_ffi=enable_tvm_ffi)
+        if t is not None
+        else None
+        for t in (tensors.cu_total_m_blocks, tensors.cu_block_idx_offsets)
+    ]
+    dq_write_order_tensor, dq_write_order_full_tensor = [
+        to_cute_tensor(t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi)
+        if t is not None
+        else None
+        for t in (tensors.dq_write_order, tensors.dq_write_order_full)
     ]
 
     return BlockSparseTensors(
@@ -416,6 +612,10 @@ def to_cute_block_sparse_tensors(
         mask_block_idx_tensor,
         full_block_cnt_tensor,
         full_block_idx_tensor,
+        cu_total_m_blocks_tensor,
+        cu_block_idx_offsets_tensor,
+        dq_write_order_tensor,
+        dq_write_order_full_tensor,
     )
 
 

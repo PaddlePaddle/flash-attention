@@ -256,10 +256,10 @@ class AttentionMask:
                             )
                         if const_expr(self.window_size_right is not None):
                             col_limit_right = row_idx + local_row_offset_right
-                            if const_expr(mask_seqlen):
-                                col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                         else:
                             col_limit_right = self.tile_n
+                        if const_expr(mask_seqlen):
+                            col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                         col_limit_left = (
                             row_idx + local_row_offset_left
                             if const_expr(self.window_size_left is not None)
@@ -442,10 +442,10 @@ class AttentionMask:
                 )
                 if const_expr(self.window_size_right is not None):
                     col_limit_right = row_idx + local_row_offset_right
-                    if const_expr(mask_seqlen):
-                        col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                 else:
                     col_limit_right = self.tile_n
+                if const_expr(mask_seqlen):
+                    col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                 col_limit_left = (
                     row_idx + local_row_offset_left
                     if const_expr(self.window_size_left is not None)
@@ -512,6 +512,7 @@ class AttentionMask:
         mask_local: cutlass.Constexpr,
         sStartEndRowIndices: cute.Tensor,
         partially_masked: bool,
+        per_cta_tile_n: cutlass.Constexpr[int] = 0,
     ) -> None:
         """
         Backward pass: mask S = K @ Q.T where n_block tiles seqlen_k and m_block tiles seqlen_q.
@@ -519,20 +520,26 @@ class AttentionMask:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
+        # assert t0ScS_t2r[0][COL] == 0, "col0 == 0" # tmp comment for 2-cta bwd
         thr_col_offset = tScS_t2r[0][COL]
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
         #cute.printf('seqlenk_col_limit: %d, thr_col_offset: %d, t0ScS_t2r[0][COL]: %d, %d', seqlenk_col_limit, thr_col_offset, t0ScS_t2r[0][COL], t0ScS_t2r[32][COL])
         #cute.print_tensor(t0ScS_t2r)
         if const_expr(not mask_causal and not mask_local):
             if const_expr(mask_seqlen):
-                if t0ScS_t2r[0][COL] >= seqlenk_col_limit:
+                if seqlenk_col_limit <= 0:
                     for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                         acc_S[i] = -cutlass.Float32.inf
             # FlashMask
             if partially_masked:
+                # In 2CTA mode, COL coordinates span cta_group_size * tile_n (e.g. 256),
+                # but sStartEndRowIndices has per-CTA tile_n entries (e.g. 128).
+                # Convert global COL to per-CTA local coordinate.
+                _fm_tile_n = per_cta_tile_n if const_expr(per_cta_tile_n > 0) else self.tile_n
                 for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
-                    lts = sStartEndRowIndices[tScS_t2r[i][COL], 0] - m_block * self.tile_m 
-                    ute = sStartEndRowIndices[tScS_t2r[i][COL], 1] - m_block * self.tile_m
+                    col_local = tScS_t2r[i][COL] % _fm_tile_n
+                    lts = sStartEndRowIndices[col_local, 0] - m_block * self.tile_m 
+                    ute = sStartEndRowIndices[col_local, 1] - m_block * self.tile_m
                     acc_S[i] = (
                         -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts else acc_S[i]
                     )
@@ -542,19 +549,17 @@ class AttentionMask:
 
         else:  # Causal or local
             thr_row_offset = tScS_t2r[0][ROW]
-            causal_row_offset = (
-                seqlenk_col_limit - self.seqlen_q + m_block * self.tile_m + thr_row_offset
-            )
+            seqlenq_row_limit = self.seqlen_q - m_block * self.tile_m - thr_row_offset
+            causal_offset = seqlenq_row_limit - seqlenk_col_limit
             if const_expr(mask_causal):
-                col0 = t0ScS_t2r[0][COL]
-                row_limit_top = col0 - causal_row_offset
                 # tidx = cute.arch.thread_idx()[0] % 256
                 # if tidx < 32:
-                #     cute.printf("tidx = {}, {} {}, {} {}, col0 = {}", tidx, tScS_t2r[0][0], tScS_t2r[0][1], tScS_t2r[1][0], tScS_t2r[1][1], col0)
+                #     cute.printf("tidx = {}, {} {}, {} {}", tidx, tScS_t2r[0][0], tScS_t2r[0][1], tScS_t2r[1][0], tScS_t2r[1][1])
+                row_limit_top = causal_offset
                 if const_expr(mask_seqlen):
                     # If col is beyond the column limit, we want to mask out the entire
                     # column, by setting row limit to be self.tile_m.
-                    if t0ScS_t2r[0][COL] >= seqlenk_col_limit:
+                    if seqlenk_col_limit <= 0:
                         row_limit_top = self.tile_m
 
                 r2p = True
@@ -569,9 +574,14 @@ class AttentionMask:
 
                 if partially_masked:
                     # FlashMask
+                    # In 2CTA mode, COL coordinates span cta_group_size * tile_n (e.g. 256),
+                    # but sStartEndRowIndices has per-CTA tile_n entries (e.g. 128).
+                    # Convert global COL to per-CTA local coordinate.
+                    _fm_tile_n = per_cta_tile_n if const_expr(per_cta_tile_n > 0) else self.tile_n
                     for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
-                        lts = sStartEndRowIndices[tScS_t2r[i][COL], 0] - m_block * self.tile_m 
-                        lte = sStartEndRowIndices[tScS_t2r[i][COL], 1] - m_block * self.tile_m
+                        col_local = tScS_t2r[i][COL] % _fm_tile_n
+                        lts = sStartEndRowIndices[col_local, 0] - m_block * self.tile_m 
+                        lte = sStartEndRowIndices[col_local, 1] - m_block * self.tile_m
                         acc_S[i] = (
                             -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts and tScS_t2r[i][ROW] < lte else acc_S[i]
                         )

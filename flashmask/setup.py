@@ -115,13 +115,14 @@ packages = find_packages(exclude=exclude_packages)
 # ============================================================
 # Dependencies
 # ============================================================
-install_requires = ['typing_extensions']
+install_requires = ["typing_extensions"]
+
 if BUILD_FA4:
-    install_requires += [
-        'nvidia-cutlass==4.2.0.0',
-        'nvidia-cutlass-dsl==4.4.1',
-        "apache-tvm-ffi >= 0.1.5, < 0.2.0",
-    ]
+    install_requires.extend([
+        "nvidia-cutlass==4.2.0.0",
+        "nvidia-cutlass-dsl>=4.4.1,<=4.4.2",
+        "apache-tvm-ffi>=0.1.5,<0.2.0",
+    ])
 
 # ============================================================
 # Pre-install dependencies

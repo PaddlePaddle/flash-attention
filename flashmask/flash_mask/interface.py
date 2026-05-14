@@ -87,8 +87,9 @@ def _convert_to_varlen_bound2(
     Supports asymmetric seqlen_q != seqlen_k and zero-length documents.
     Requires bound_num == 2 (both lts and ute available).
 
-    Handles Q padding: when last doc's lts < seqlen_q, adds a trailing doc with sk=0
-    and zeros out the padding Q positions via output_to_padded.
+    Handles Q padding: when last doc's lts < seqlen_q, merges the Q padding
+    into the last document and zeros out the padding Q positions via
+    output_to_padded. This avoids creating documents with seqlen_k=0.
     """
     b, sq, hq, d = query.shape
     _, sk, hkv, dv = value.shape
@@ -108,15 +109,15 @@ def _convert_to_varlen_bound2(
         lts = lts_np[bi]  # (sk,)
         ute = ute_np[bi]  # (sk,)
 
-        # Detect K-side document boundaries
-        # Boundary at col j > 0 if:
-        #   1. lts[j] != lts[j-1]  (Q endpoint changed)
-        #   2. ute[j] == lts[j] AND ute[j-1] < lts[j-1]  (transition to zero-Q doc)
+        # Detect K-side document boundaries:
+        # 1. Where lts changes (different document in the original mask)
+        # 2. Where dead/active status transitions (ute >= lts vs ute < lts)
+        #    Dead K columns have no Q rows attending; they form zero-length Q docs.
         k_starts = [0]
         for j in range(1, sk):
             if lts[j] != lts[j - 1]:
                 k_starts.append(j)
-            elif ute[j] == lts[j] and ute[j - 1] < lts[j - 1]:
+            elif (ute[j - 1] >= lts[j - 1]) != (ute[j] >= lts[j]):
                 k_starts.append(j)
 
         # Build q_bounds and k_bounds
@@ -124,16 +125,21 @@ def _convert_to_varlen_bound2(
         k_bounds = [np.int32(k) for k in k_starts] + [np.int32(sk)]
 
         for doc_idx in range(len(k_starts)):
-            doc_lts = np.int32(lts[k_starts[doc_idx]])
-            q_bounds.append(doc_lts)
+            k_start = k_starts[doc_idx]
+            if ute[k_start] >= lts[k_start]:
+                # Dead segment: no Q rows attend, zero-length Q doc
+                q_bounds.append(q_bounds[-1])
+            else:
+                doc_lts = np.int32(lts[k_start])
+                q_bounds.append(doc_lts)
 
-        # Handle Q padding: if last doc doesn't cover all Q positions
+        # Handle Q padding: if last doc doesn't cover all Q positions,
+        # merge Q padding into the last doc (like _convert_to_varlen_bound1).
         q_pad_start = int(q_bounds[-1])
         q_padding_starts.append(q_pad_start)
         if q_pad_start < sq:
             needs_q_padding = True
-            q_bounds.append(np.int32(sq))
-            k_bounds.append(np.int32(sk))  # padding doc has sk=0 (sk - sk = 0)
+            q_bounds[-1] = np.int32(sq)
 
         # Compute per-doc max lengths
         for i in range(len(q_bounds) - 1):
@@ -165,39 +171,49 @@ def _convert_to_varlen_bound2(
     k_varlen = key.reshape([b * sk, hkv, d])
     v_varlen = value.reshape([b * sk, hkv, dv])
 
-    # Causal detection: for causal=False, check if ute matches causal pattern
+    # Causal detection: for causal=False, check if ute matches causal pattern.
+    # Uses the MERGED q_bounds/k_bounds (after Q padding merge) so that the
+    # causal formula uses the correct doc sizes.
     varlen_causal = causal
     if not causal:
         is_causal = True
         for bi in range(b):
             lts = lts_np[bi]
             ute = ute_np[bi]
-            # Re-detect boundaries for verification
+            # Reconstruct merged bounds for this batch (same logic as above)
             k_starts_bi = [0]
             for j in range(1, sk):
                 if lts[j] != lts[j - 1]:
                     k_starts_bi.append(j)
-                elif ute[j] == lts[j] and ute[j - 1] < lts[j - 1]:
+                elif (ute[j - 1] >= lts[j - 1]) != (ute[j] >= lts[j]):
                     k_starts_bi.append(j)
-            k_starts_bi.append(sk)
+            # q_bounds_bi: dead segments get zero-length Q, active get lts
+            q_bounds_bi = [0]
+            for idx in range(len(k_starts_bi)):
+                k_start_idx = k_starts_bi[idx]
+                if ute[k_start_idx] >= lts[k_start_idx]:
+                    q_bounds_bi.append(q_bounds_bi[-1])
+                else:
+                    q_bounds_bi.append(int(lts[k_start_idx]))
+            if q_bounds_bi[-1] < sq:
+                q_bounds_bi[-1] = sq
+            k_bounds_bi = k_starts_bi + [sk]
 
-            prev_q_end = 0
-            for doc_idx in range(len(k_starts_bi) - 1):
-                k_start = k_starts_bi[doc_idx]
-                k_end = k_starts_bi[doc_idx + 1]
+            for doc_idx in range(len(k_starts_bi)):
+                k_start = k_bounds_bi[doc_idx]
+                k_end = k_bounds_bi[doc_idx + 1]
                 doc_sk = k_end - k_start
-                q_offset = prev_q_end
-                doc_lts = int(lts[k_start])
-                doc_sq = doc_lts - q_offset
-                prev_q_end = doc_lts
+                q_offset = q_bounds_bi[doc_idx]
+                doc_sq = q_bounds_bi[doc_idx + 1] - q_offset
 
                 if doc_sq == 0:
-                    for j in range(k_start, k_end):
-                        if ute[j] != lts[j]:
-                            is_causal = False
-                            break
+                    # Dead doc: vacuously causal, skip
+                    continue
                 else:
                     for j_local in range(doc_sk):
+                        # Skip dead K columns (ute == lts means no Q attends)
+                        if int(ute[k_start + j_local]) == int(lts[k_start + j_local]):
+                            continue
                         expected = q_offset + max(0, j_local - (doc_sk - doc_sq))
                         if int(ute[k_start + j_local]) != expected:
                             is_causal = False
@@ -220,7 +236,7 @@ def _convert_to_varlen_bound2(
         "causal": varlen_causal,
     }
 
-    # Add output_to_padded if Q padding exists
+    # Zero out Q padding positions after kernel computes on the merged doc
     if needs_q_padding:
         _b, _sq = b, sq
         _q_padding_starts = q_padding_starts

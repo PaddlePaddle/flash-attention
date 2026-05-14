@@ -17,22 +17,12 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Int32
 
-try:
-    from flash_mask.flash_attn_v4.sm100_hd256_2cta_fmha_backward_dqkernel import (
-        BlackwellFusedMultiHeadAttentionBackwardDQKernel,
-    )
-    from flash_mask.flash_attn_v4.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
-        BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
-    )
-except ImportError:
-    # Allow direct execution as a script (no package context).
-    from flash_mask.flash_attn_v4.sm100_hd256_2cta_fmha_backward_dqkernel import (
-        BlackwellFusedMultiHeadAttentionBackwardDQKernel,
-    )
-    from flash_mask.flash_attn_v4.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
-        BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
-    )
-
+from flash_mask.flash_attn_v4.sm100_hd256_2cta_fmha_backward_dqkernel import (
+    BlackwellFusedMultiHeadAttentionBackwardDQKernel,
+)
+from flash_mask.flash_attn_v4.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
+    BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
+)
 
 def _as_bshkrd_tensor(
     tensor: cute.Tensor,

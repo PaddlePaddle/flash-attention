@@ -372,3 +372,74 @@ def tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsyn
         )
 
     return copy_fn
+
+
+# --- Vendored from quack/copy_utils.py (BSD-3, Tri Dao et al.) ---
+# Required by SM100 code paths that cannot depend on quack.
+
+BIG_INT = 2**30
+MAX_INT = 2**31 - 1
+BIG_INT_INV = 2**64 // BIG_INT
+
+
+@dsl_user_op
+def create_ragged_tensor_for_tma(
+    T: cute.Tensor,
+    ragged_dim: int = 0,
+    ptr_shift: bool = False,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Tensor:
+    rank = cute.rank(T)
+    if ragged_dim < 0:
+        ragged_dim += rank
+    if ptr_shift:
+        assert rank <= 4, "ptr_shift ragged tensor only supports up to 4 dimensions"
+        new_shape = T.shape[:ragged_dim] + (BIG_INT,) + T.shape[ragged_dim + 1 :] + (MAX_INT,)
+        new_stride = T.stride + (T.stride[ragged_dim],)
+        ptr_offset = (None,) * ragged_dim + (-BIG_INT,) + (None,) * (rank - ragged_dim - 1)
+        new_ptr = cute.domain_offset(ptr_offset, T).iterator
+        return cute.make_tensor(new_ptr, cute.make_layout(new_shape, stride=new_stride))
+    else:
+        assert rank <= 3, "non-ptr_shift ragged tensor only supports up to 3 dimensions"
+        stride_r = T.stride[ragged_dim]
+        new_shape = (
+            T.shape[:ragged_dim] + (BIG_INT,) + T.shape[ragged_dim + 1 :] + (MAX_INT, MAX_INT)
+        )
+        new_stride = (
+            T.stride[:ragged_dim]
+            + (stride_r,)
+            + T.stride[ragged_dim + 1 :]
+            + (BIG_INT_INV - stride_r, stride_r)
+        )
+        return cute.make_tensor(T.iterator, cute.make_layout(new_shape, stride=new_stride))
+
+
+@dsl_user_op
+def offset_ragged_tensor(
+    T: cute.Tensor,
+    offset: Int32,
+    length: Int32,
+    ragged_dim: int = 0,
+    ptr_shift: bool = False,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Tensor:
+    rank = cute.rank(T)
+    if ragged_dim < 0:
+        ragged_dim += rank
+    big_int = cute.size(T, mode=[ragged_dim])
+    offset_val = big_int - length
+    if ptr_shift:
+        # 1-extra-dim: rank = original_rank + 1
+        assert rank >= ragged_dim + 2
+        offset_tuple = (None,) * ragged_dim + (offset_val,) + (None,) * (rank - ragged_dim - 2)
+        index_tuple = (None,) * (rank - 1) + (offset + length,)
+    else:
+        # 2-extra-dim: rank = original_rank + 2, last 2 modes are the wraparound dims
+        assert rank >= ragged_dim + 3
+        offset_tuple = (None,) * ragged_dim + (offset_val,) + (None,) * (rank - ragged_dim - 3)
+        index_tuple = (None,) * (rank - 2) + (big_int, offset + length)
+    return cute.domain_offset(offset_tuple, T[index_tuple])

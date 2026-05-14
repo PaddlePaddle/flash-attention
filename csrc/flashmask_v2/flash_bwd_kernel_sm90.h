@@ -214,6 +214,7 @@ public:
         CollectiveEpilogue epilogue;
         __shared__ __align__(16) int32_t flashmask_smem_[8];
         __shared__ __align__(128) int32_t flashmask_index_smem_[kBlockN * 4];
+        __shared__ __align__(128) int32_t empty_tile[1];
         constexpr int max_seqlen_k = 1024 * 128;
         static constexpr bool Is_blockmask = CollectiveMainloop_::Is_blockmask;
         int32_t* blockmask_smem_ = nullptr;
@@ -255,13 +256,19 @@ public:
                  work_tile_info.is_valid(params.scheduler);
                  work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)
             ) {
+                scheduler.producer_notify();
                 auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
                 auto [n_block, bidh, bidb] = block_coord_;
                 cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                mainloop.load_n_block_info(flashmask_smem_, flashmask_index_smem_, blockmask_smem_, block_coord, params.mainloop);
-                scheduler.producer_notify();
+                mainloop.load_n_block_info(flashmask_smem_, flashmask_index_smem_, blockmask_smem_, empty_tile, block_coord, params.mainloop);
+                if (empty_tile[0]) {
+                    if (warp_idx_in_warpgroup == 1) {
+                        mainloop.store_dq_empty_tile(params.mainloop, block_coord);
+                    }
+                    scheduler.prefetch_next_work(params.scheduler, work_tile_info);
+                    continue;
+                }
                 if (warp_idx_in_warpgroup == 0) {  // Load K, V, and do TMA on Q and dO
-                    
                     // auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
                     // auto [n_block, bidh, bidb] = block_coord_;
                     // cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
@@ -307,6 +314,12 @@ public:
                 auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
                 auto [n_block, bidh, bidb] = block_coord_;
                 cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
+                cutlass::arch::NamedBarrier::sync(CollectiveMainloop::NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskProducer) /*id*/);
+                if (empty_tile[0]) {
+                    scheduler.consumer_notify();
+                    epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord);
+                    continue;
+                }
                 
                 bool tile_valid = mainloop.mma(
                     params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,

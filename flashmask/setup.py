@@ -16,11 +16,15 @@
 # Build mode control via FLASHMASK_BUILD env var:
 #   FLASHMASK_BUILD=fa4   - FA4 only (pure Python + CUTLASS DSL, no paddle needed)
 #   FLASHMASK_BUILD=fa3   - FA3 only (CUDA kernels, requires paddle)
-#   FLASHMASK_BUILD=all   - Both FA3 + FA4 default, requires paddle)
+#   FLASHMASK_BUILD=fla   - FLA only (Flash Linear Attention GDN/KDA ops)
+#   FLASHMASK_BUILD=all   - FA3 + FA4 + FLA (default, requires paddle)
+#   Components can be combined with comma, plus, or whitespace separators.
 #
 # Examples:
 #   FLASHMASK_BUILD=fa4 pip install -e . --no-build-isolation
-#   FLASHMASK_BUILD=fa3 pip install -e . --no-build-isolation
+#   FLASHMASK_BUILD=fla pip install -e . --no-build-isolation
+#   FLASHMASK_BUILD="fa3+fla" pip install -e . --no-build-isolation
+#   FLASHMASK_BUILD="fa3, fla" pip install -e . --no-build-isolation
 #   pip install -e . --no-build-isolation          # builds all
 # 
 # How to use fa4 varlen based on Torch:
@@ -32,6 +36,7 @@
 # ============================================================
 
 import os
+import re
 import sys
 import subprocess
 
@@ -41,15 +46,25 @@ from setuptools import setup as setuptools_setup, find_packages
 # Parse build mode
 # ============================================================
 FLASHMASK_BUILD = os.environ.get('FLASHMASK_BUILD', 'all').lower()
-assert FLASHMASK_BUILD in ('fa3', 'fa4', 'all'), (
-    f"FLASHMASK_BUILD must be one of: fa3, fa4, all. Got: {FLASHMASK_BUILD}"
+requested_components = set(re.split(r'[,\s+]+', FLASHMASK_BUILD.strip()))
+requested_components.discard('')
+ALLOWED_COMPONENTS = {'fa3', 'fa4', 'fla', 'all'}
+invalid_components = requested_components - ALLOWED_COMPONENTS
+assert requested_components and not invalid_components, (
+    f"Invalid FLASHMASK_BUILD component(s): {', '.join(sorted(invalid_components or requested_components))}. "
+    f"Allowed: {', '.join(sorted(ALLOWED_COMPONENTS))}. "
+    f"Combinations e.g. 'fa3+fa4', 'fa3+fla', 'fa4+fla', 'fa3+fa4+fla'."
 )
 
-BUILD_FA3 = FLASHMASK_BUILD in ('fa3', 'all')
-BUILD_FA4 = FLASHMASK_BUILD in ('fa4', 'all')
+_build_all = 'all' in requested_components
+BUILD_FA3 = _build_all or 'fa3' in requested_components
+BUILD_FA4 = _build_all or 'fa4' in requested_components
+BUILD_FLA = _build_all or 'fla' in requested_components
 
 print(f"[flashmask] FLASHMASK_BUILD={FLASHMASK_BUILD}  "
-      f"BUILD_FA3={BUILD_FA3}  BUILD_FA4={BUILD_FA4}")
+      f"BUILD_FA3={BUILD_FA3}  BUILD_FA4={BUILD_FA4}  BUILD_FLA={BUILD_FLA}")
+if BUILD_FLA:
+    print("[flashmask] Note: FLA (Flash Linear Attention) in flashmask currently only supports GDN and KDA operators.")
 
 # ============================================================
 # Config
@@ -109,6 +124,11 @@ if not BUILD_FA4:
         'flash_mask.cute',
         'flash_mask.cute.*',
     ]
+if not BUILD_FLA:
+    exclude_packages += [
+        'flash_mask.linear_attn',
+        'flash_mask.linear_attn.*',
+    ]
 
 packages = find_packages(exclude=exclude_packages)
 
@@ -116,6 +136,8 @@ packages = find_packages(exclude=exclude_packages)
 # Dependencies
 # ============================================================
 install_requires = ['typing_extensions']
+if BUILD_FLA:
+    install_requires += ['triton>=3.5.1']
 if BUILD_FA4:
     install_requires += [
         'nvidia-cutlass==4.2.0.0',

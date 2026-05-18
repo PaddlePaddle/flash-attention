@@ -12,5 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .cp_balance import balance_flashmask_input
+from .cp_balance import balance_flashmask_input, assign_tasks_heap
 from .cp_balance_cuda_kernels import indices_rerank_cuda, indices_to_chunks_cuda

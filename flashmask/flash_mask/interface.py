@@ -75,6 +75,75 @@ flash_attn_func        = _mod.flash_attn_func
 flash_attn_varlen_func = _mod.flash_attn_varlen_func
 flash_attn_combine     = _mod.flash_attn_combine
 
+def _find_dual_split(ute_doc, q_start, q_end, sk):
+    """Try to find a valid 2-way causal split for a document.
+
+    When a document's ute pattern doesn't match a single causal formula,
+    this function checks if it can be split into two sub-calls where each
+    sub-call is individually causal. This arises in dual-chunk context
+    parallel where two Q chunks with different causal diagonals share the
+    same K range.
+
+    Args:
+        ute_doc: ute values for K columns in this document (length sk).
+        q_start: start of Q range for this document.
+        q_end: end of Q range for this document.
+        sk: number of K columns in this document.
+
+    Returns:
+        (q_mid, k_split) on success, None on failure.
+        - q_mid: the Q split point. Call 0 uses Q[q_start:q_mid], Call 1 uses Q[q_mid:q_end].
+        - k_split: the K split point. Call 0 uses K[0:k_split], Call 1 uses K[0:sk] (full K).
+    """
+    sq = q_end - q_start
+    if sq <= 1 or sk <= 1:
+        return None
+
+    # Find plateau start: first j where ute[j] == ute[j+1] and ute[j] > q_start.
+    # The plateau value is q_mid (the boundary between the two Q chunks).
+    q_mid = None
+    k_split = None
+
+    for j in range(sk - 1):
+        if int(ute_doc[j]) == int(ute_doc[j + 1]) and int(ute_doc[j]) > q_start:
+            q_mid = int(ute_doc[j])
+            k_split = j
+            break
+
+    if q_mid is None or q_mid >= q_end:
+        return None
+
+    sq1 = q_mid - q_start
+    sk1 = k_split
+    sq2 = q_end - q_mid
+    sk2 = sk
+
+    if sq1 <= 0 or sk1 <= 0 or sq2 <= 0:
+        return None
+
+    # Verify sub-call 1: Q[q_start:q_mid] vs K[0:k_split], causal
+    for j in range(sk1):
+        expected = q_start + max(0, j - (sk1 - sq1))
+        if int(ute_doc[j]) != expected:
+            return None
+
+    # Verify sub-call 2: Q[q_mid:q_end] vs K[0:sk], causal
+    # effective_ute[j] = max(0, ute[j] - q_mid) should equal max(0, j - (sk2 - sq2))
+    for j in range(sk2):
+        effective_ute = max(0, int(ute_doc[j]) - q_mid)
+        expected = max(0, j - (sk2 - sq2))
+        if effective_ute != expected:
+            return None
+
+    # Also verify Q[q_start:q_mid] does NOT attend to K[k_split:sk]:
+    # ute[j] >= q_mid for all j >= k_split
+    for j in range(k_split, sk):
+        if int(ute_doc[j]) < q_mid:
+            return None
+
+    return (q_mid, k_split)
+
+
 def _convert_to_varlen_bound2(
     query: paddle.Tensor,
     key: paddle.Tensor,
@@ -90,6 +159,10 @@ def _convert_to_varlen_bound2(
     Handles Q padding: when last doc's lts < seqlen_q, merges the Q padding
     into the last document and zeros out the padding Q positions via
     output_to_padded. This avoids creating documents with seqlen_k=0.
+
+    When a document's ute pattern cannot be expressed as a single causal call,
+    attempts a dual-split into two separate varlen calls (for dual-chunk CP).
+    Returns a result with "multi_call": True in that case.
     """
     b, sq, hq, d = query.shape
     _, sk, hkv, dv = value.shape
@@ -224,6 +297,13 @@ def _convert_to_varlen_bound2(
                 break
         if is_causal:
             varlen_causal = True
+        else:
+            # Single causal failed. Try dual-split for dual-chunk CP patterns.
+            dual_split = _try_dual_split_all_batches(
+                query, key, value, lts_np, ute_np, b, sq, sk, hq, hkv, d, dv
+            )
+            if dual_split is not None:
+                return dual_split
 
     result = {
         "q": q_varlen,
@@ -250,6 +330,184 @@ def _convert_to_varlen_bound2(
                 if q_end < _sq:
                     out_padded[bi_inner, q_end:, :, :] = 0
             return out_padded
+
+        result["output_to_padded"] = output_to_padded
+
+    return result
+
+
+def _try_dual_split_all_batches(
+    query, key, value, lts_np, ute_np, b, sq, sk, hq, hkv, d, dv
+):
+    """Attempt to split into two varlen calls for dual-chunk CP patterns.
+
+    Checks all batch items for a consistent dual-split. If found, returns
+    a multi-call result dict. Otherwise returns None.
+
+    Handles dead K tails (ute >= lts) by excluding them from both calls,
+    and handles Q padding (when active docs don't cover the full Q range).
+    """
+    # For each batch, reconstruct doc boundaries and try dual split on each doc.
+    split_q_mid = None
+    split_k_split = None
+    split_k_end = None  # end of the active K range (excluding dead tail)
+
+    for bi in range(b):
+        lts = lts_np[bi]
+        ute = ute_np[bi]
+
+        # Reconstruct doc boundaries
+        k_starts_bi = [0]
+        for j in range(1, sk):
+            if lts[j] != lts[j - 1]:
+                k_starts_bi.append(j)
+            elif (ute[j - 1] >= lts[j - 1]) != (ute[j] >= lts[j]):
+                k_starts_bi.append(j)
+
+        q_bounds_bi = [0]
+        for idx in range(len(k_starts_bi)):
+            k_start_idx = k_starts_bi[idx]
+            if ute[k_start_idx] >= lts[k_start_idx]:
+                q_bounds_bi.append(q_bounds_bi[-1])
+            else:
+                q_bounds_bi.append(int(lts[k_start_idx]))
+        if q_bounds_bi[-1] < sq:
+            q_bounds_bi[-1] = sq
+        k_bounds_bi = k_starts_bi + [sk]
+
+        # Find the non-causal document and try dual split
+        for doc_idx in range(len(k_starts_bi)):
+            k_start = k_bounds_bi[doc_idx]
+            k_end = k_bounds_bi[doc_idx + 1]
+            doc_sk = k_end - k_start
+            q_offset = q_bounds_bi[doc_idx]
+            doc_sq = q_bounds_bi[doc_idx + 1] - q_offset
+
+            if doc_sq == 0:
+                continue
+
+            # Check if this doc is already causal
+            doc_is_causal = True
+            for j_local in range(doc_sk):
+                if int(ute[k_start + j_local]) == int(lts[k_start + j_local]):
+                    continue
+                expected = q_offset + max(0, j_local - (doc_sk - doc_sq))
+                if int(ute[k_start + j_local]) != expected:
+                    doc_is_causal = False
+                    break
+
+            if doc_is_causal:
+                continue
+
+            # Try dual split on this document
+            ute_doc = ute[k_start:k_end]
+            split_result = _find_dual_split(ute_doc, q_offset, q_offset + doc_sq, doc_sk)
+            if split_result is None:
+                return None
+
+            q_mid, k_split_doc = split_result
+
+            if split_q_mid is None:
+                split_q_mid = q_mid
+                split_k_split = k_split_doc
+                split_k_end = k_end
+            elif split_q_mid != q_mid or split_k_split != k_split_doc:
+                # Inconsistent splits across batches/docs
+                return None
+            else:
+                # Track the K end (should be consistent across batches)
+                if split_k_end != k_end:
+                    return None
+
+    if split_q_mid is None:
+        return None
+
+    # Build the two-call result
+    q_mid = split_q_mid
+    k_split = split_k_split
+    k_active_end = split_k_end  # end of active K (excludes dead tail)
+    sq1 = q_mid  # Q[0:q_mid]
+    sq2 = sq - q_mid  # Q[q_mid:sq]
+
+    # Determine if Q padding is needed.
+    # In dual-chunk CP, the actual attending Q range is [0, lts_value).
+    # If lts_value < sq, Q rows [lts_value:sq] are padding.
+    # Since q_mid comes from the active doc and q_end = doc's q_end,
+    # check if the second call's Q extends beyond the real Q range.
+    # Real Q end = lts value for the active doc = q_mid + (actual sq2).
+    # With dead K tail, the Q range is already determined by the active doc.
+    # If sq > q_mid + actual_sq2_from_split, we have padding in call 1.
+    # actual_sq2 = lts_np[0, 0] - q_mid (the lts of the active doc minus q_mid)
+    lts_val = int(lts_np[0, 0])  # lts is constant within the active doc
+    real_q_end = min(lts_val, sq)
+    real_sq2 = real_q_end - q_mid
+    needs_q_padding_call1 = (sq2 > real_sq2)
+
+    # Call 0: Q[0:q_mid] vs K[0:k_split]
+    q0 = query[:, :q_mid, :, :].reshape([b * sq1, hq, d])
+    k0 = key[:, :k_split, :, :].reshape([b * k_split, hkv, d])
+    v0 = value[:, :k_split, :, :].reshape([b * k_split, hkv, dv])
+    cu_seqlens_q0 = paddle.to_tensor(
+        np.arange(b + 1, dtype=np.int32) * np.int32(sq1)
+    )
+    cu_seqlens_k0 = paddle.to_tensor(
+        np.arange(b + 1, dtype=np.int32) * np.int32(k_split)
+    )
+
+    # Call 1: Q[q_mid:sq] vs K[0:k_active_end] (active K only, excludes dead tail)
+    q1 = query[:, q_mid:, :, :].reshape([b * sq2, hq, d])
+    k1 = key[:, :k_active_end, :, :].reshape([b * k_active_end, hkv, d])
+    v1 = value[:, :k_active_end, :, :].reshape([b * k_active_end, hkv, dv])
+    cu_seqlens_q1 = paddle.to_tensor(
+        np.arange(b + 1, dtype=np.int32) * np.int32(sq2)
+    )
+    cu_seqlens_k1 = paddle.to_tensor(
+        np.arange(b + 1, dtype=np.int32) * np.int32(k_active_end)
+    )
+
+    result = {
+        "multi_call": True,
+        "calls": [
+            {
+                "q": q0,
+                "k": k0,
+                "v": v0,
+                "cu_seqlens_q": cu_seqlens_q0,
+                "cu_seqlens_k": cu_seqlens_k0,
+                "max_seqlen_q": sq1,
+                "max_seqlen_k": k_split,
+                "causal": True,
+            },
+            {
+                "q": q1,
+                "k": k1,
+                "v": v1,
+                "cu_seqlens_q": cu_seqlens_q1,
+                "cu_seqlens_k": cu_seqlens_k1,
+                "max_seqlen_q": sq2,
+                "max_seqlen_k": k_active_end,
+                "causal": True,
+            },
+        ],
+        "q_split": q_mid,
+    }
+
+    # Handle Q padding: if the real Q range doesn't fill sq,
+    # we need to zero out the padded Q positions in the output.
+    if needs_q_padding_call1:
+        _b = b
+        _sq = sq
+        _q_mid = q_mid
+        _real_sq2 = real_sq2
+
+        def output_to_padded(out):
+            """Zero out Q padding positions in call 1's output portion."""
+            # out is [batch, sq, nheads, dv] after concat in flashmask_attention
+            for bi_inner in range(_b):
+                pad_start = _q_mid + _real_sq2
+                if pad_start < _sq:
+                    out[bi_inner, pad_start:, :, :] = 0
+            return out
 
         result["output_to_padded"] = output_to_padded
 
@@ -424,28 +682,68 @@ def flashmask_attention(
             startend_row_indices=startend_row_indices,
             causal=causal)
 
-        out, lse = flash_attn_varlen_func(
-            q=varlen_args["q"],
-            k=varlen_args["k"],
-            v=varlen_args["v"],
-            cu_seqlens_q=varlen_args["cu_seqlens_q"],
-            cu_seqlens_k=varlen_args["cu_seqlens_k"],
-            max_seqlen_q=varlen_args["max_seqlen_q"],
-            max_seqlen_k=varlen_args["max_seqlen_k"],
-            softmax_scale=softmax_scale,
-            causal=varlen_args["causal"],
-            return_lse=return_softmax_lse,
-        )
+        if varlen_args.get("multi_call", False):
+            # Dual-split: two separate varlen calls with disjoint Q ranges.
+            outputs = []
+            lses = []
+            for call_args in varlen_args["calls"]:
+                out_i, lse_i = flash_attn_varlen_func(
+                    q=call_args["q"],
+                    k=call_args["k"],
+                    v=call_args["v"],
+                    cu_seqlens_q=call_args["cu_seqlens_q"],
+                    cu_seqlens_k=call_args["cu_seqlens_k"],
+                    max_seqlen_q=call_args["max_seqlen_q"],
+                    max_seqlen_k=call_args["max_seqlen_k"],
+                    softmax_scale=softmax_scale,
+                    causal=call_args["causal"],
+                    return_lse=return_softmax_lse,
+                )
+                outputs.append(out_i)
+                lses.append(lse_i)
 
-        if "output_to_padded" in varlen_args:
-            out = varlen_args["output_to_padded"](out)
-        else:
-            out = out.reshape([batch_size, seqlen_q, nheads, dv])
+            # Reshape each output to [batch, sq_i, nheads, dv] then concat along seq dim
+            q_split = varlen_args["q_split"]
+            sq1 = q_split
+            sq2 = seqlen_q - q_split
+            out0 = outputs[0].reshape([batch_size, sq1, nheads, dv])
+            out1 = outputs[1].reshape([batch_size, sq2, nheads, dv])
+            out = paddle.concat([out0, out1], axis=1)
 
-        if return_softmax_lse:
-            return [out, lse]
+            # Zero out Q padding positions if needed
+            if "output_to_padded" in varlen_args:
+                out = varlen_args["output_to_padded"](out)
+
+            if return_softmax_lse:
+                lse0 = lses[0].reshape([batch_size, nheads, sq1])
+                lse1 = lses[1].reshape([batch_size, nheads, sq2])
+                lse = paddle.concat([lse0, lse1], axis=2)
+                return [out, lse]
+            else:
+                return out
         else:
-            return out
+            out, lse = flash_attn_varlen_func(
+                q=varlen_args["q"],
+                k=varlen_args["k"],
+                v=varlen_args["v"],
+                cu_seqlens_q=varlen_args["cu_seqlens_q"],
+                cu_seqlens_k=varlen_args["cu_seqlens_k"],
+                max_seqlen_q=varlen_args["max_seqlen_q"],
+                max_seqlen_k=varlen_args["max_seqlen_k"],
+                softmax_scale=softmax_scale,
+                causal=varlen_args["causal"],
+                return_lse=return_softmax_lse,
+            )
+
+            if "output_to_padded" in varlen_args:
+                out = varlen_args["output_to_padded"](out)
+            else:
+                out = out.reshape([batch_size, seqlen_q, nheads, dv])
+
+            if return_softmax_lse:
+                return [out, lse]
+            else:
+                return out
     else:
         return _cute_flashmask_attention(
             query=query,

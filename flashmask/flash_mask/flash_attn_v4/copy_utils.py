@@ -105,6 +105,25 @@ def tiled_copy_2d(
     val_layout = cute.make_layout((1, copy_elems))
     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
+# TODO(umiswing): Support calling the Quack kernel directly
+# from Paddle rather than duplicating it here.
+def quack_tiled_copy_2d(
+    dtype: Type[cutlass.Numeric],
+    threads_per_row: int,
+    num_threads: int,
+    num_copy_elems: int = 1,
+    is_async: bool = False,
+) -> cute.TiledCopy:
+    num_copy_bits = num_copy_elems * dtype.width
+    copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+    copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
+    assert num_threads % threads_per_row == 0
+    thr_layout = cute.make_ordered_layout(
+        (num_threads // threads_per_row, threads_per_row),
+        order=(1, 0),
+    )
+    val_layout = cute.make_layout((1, num_copy_elems))
+    return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
 @dsl_user_op
 def atomic_add_fp32x4(

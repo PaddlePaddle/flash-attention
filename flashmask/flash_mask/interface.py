@@ -261,6 +261,8 @@ def _convert_to_varlen_bound2(
                 elif (ute[j - 1] >= lts[j - 1]) != (ute[j] >= lts[j]):
                     k_starts_bi.append(j)
             # q_bounds_bi: dead segments get zero-length Q, active get lts
+            # Use PRE-padding q_bounds for causal check (padding inflates last
+            # doc's sq beyond sk, corrupting the causal formula).
             q_bounds_bi = [0]
             for idx in range(len(k_starts_bi)):
                 k_start_idx = k_starts_bi[idx]
@@ -268,8 +270,7 @@ def _convert_to_varlen_bound2(
                     q_bounds_bi.append(q_bounds_bi[-1])
                 else:
                     q_bounds_bi.append(int(lts[k_start_idx]))
-            if q_bounds_bi[-1] < sq:
-                q_bounds_bi[-1] = sq
+            # Do NOT apply Q padding merge here — causal check uses real Q extents.
             k_bounds_bi = k_starts_bi + [sk]
 
             for doc_idx in range(len(k_starts_bi)):
@@ -297,6 +298,98 @@ def _convert_to_varlen_bound2(
                 break
         if is_causal:
             varlen_causal = True
+
+            # When causal is detected AND Q padding exists, the padding merge
+            # inflates the last doc's sq beyond sk, shifting the causal diagonal
+            # incorrectly. Fix: undo the merge, trim Q to real tokens only,
+            # and pad output back to full sq with zeros afterward.
+            # NOTE: different batches may have different q_padding_starts, so
+            # we handle per-batch Q lengths and accumulate offsets properly.
+            if needs_q_padding:
+                # Rebuild cu_seqlens without padding: use real q_bounds,
+                # with per-batch Q offsets accumulated from actual real Q lengths.
+                cu_seqlens_q_list_nopad = []
+                cu_seqlens_k_list_nopad = []
+                max_doc_sq_nopad = 0
+                max_doc_sk_nopad = 0
+                q_offset_acc = 0  # accumulated Q offset across batches
+
+                for bi in range(b):
+                    lts = lts_np[bi]
+                    ute = ute_np[bi]
+                    k_starts_tmp = [0]
+                    for j in range(1, sk):
+                        if lts[j] != lts[j - 1]:
+                            k_starts_tmp.append(j)
+                        elif (ute[j - 1] >= lts[j - 1]) != (ute[j] >= lts[j]):
+                            k_starts_tmp.append(j)
+                    q_bounds_tmp = [np.int32(0)]
+                    k_bounds_tmp = [np.int32(k) for k in k_starts_tmp] + [np.int32(sk)]
+                    for idx in range(len(k_starts_tmp)):
+                        k_start_idx = k_starts_tmp[idx]
+                        if ute[k_start_idx] >= lts[k_start_idx]:
+                            q_bounds_tmp.append(q_bounds_tmp[-1])
+                        else:
+                            q_bounds_tmp.append(np.int32(lts[k_start_idx]))
+                    # No merge: q_bounds_tmp[-1] = q_padding_starts[bi]
+
+                    for i in range(len(q_bounds_tmp) - 1):
+                        dsq = int(q_bounds_tmp[i + 1]) - int(q_bounds_tmp[i])
+                        dsk = int(k_bounds_tmp[i + 1]) - int(k_bounds_tmp[i])
+                        max_doc_sq_nopad = max(max_doc_sq_nopad, dsq)
+                        max_doc_sk_nopad = max(max_doc_sk_nopad, dsk)
+
+                    # Offsets based on accumulated real Q tokens
+                    cu_seqlens_q_list_nopad.append(
+                        np.array(q_bounds_tmp[:-1], dtype=np.int32) + np.int32(q_offset_acc)
+                    )
+                    cu_seqlens_k_list_nopad.append(
+                        np.array(k_bounds_tmp[:-1], dtype=np.int32) + np.int32(bi * sk)
+                    )
+                    q_offset_acc += q_padding_starts[bi]
+
+                total_real_q = q_offset_acc
+                cu_seqlens_q_nopad = paddle.to_tensor(np.concatenate(
+                    cu_seqlens_q_list_nopad + [np.array([total_real_q], dtype=np.int32)]
+                ))
+                cu_seqlens_k_nopad = paddle.to_tensor(np.concatenate(
+                    cu_seqlens_k_list_nopad + [np.array([b * sk], dtype=np.int32)]
+                ))
+
+                # Trim Q: keep only real tokens [0:q_padding_starts[bi]] from
+                # each batch. Concatenate since lengths may differ per batch.
+                q_parts = []
+                for bi in range(b):
+                    q_parts.append(query[bi, :q_padding_starts[bi], :, :])
+                q_trimmed = paddle.concat(q_parts, axis=0)  # [total_real_q, hq, d]
+
+                # output_to_padded: expand trimmed output back to [b, sq, nh, dv]
+                _b, _sq = b, sq
+                _q_padding_starts = list(q_padding_starts)
+
+                def output_to_padded(out_varlen_pt):
+                    nh = out_varlen_pt.shape[1]
+                    dv_out = out_varlen_pt.shape[2]
+                    out_padded = paddle.zeros([_b, _sq, nh, dv_out], dtype=out_varlen_pt.dtype)
+                    offset = 0
+                    for bi_inner in range(_b):
+                        real_len = _q_padding_starts[bi_inner]
+                        out_padded[bi_inner, :real_len, :, :] = out_varlen_pt[offset:offset + real_len, :, :]
+                        offset += real_len
+                    return out_padded
+
+                result = {
+                    "q": q_trimmed,
+                    "k": k_varlen,
+                    "v": v_varlen,
+                    "cu_seqlens_q": cu_seqlens_q_nopad,
+                    "cu_seqlens_k": cu_seqlens_k_nopad,
+                    "max_seqlen_q": max_doc_sq_nopad,
+                    "max_seqlen_k": max_doc_sk_nopad,
+                    "causal": varlen_causal,
+                    "output_to_padded": output_to_padded,
+                }
+                return result
         else:
             # Single causal failed. Try dual-split for dual-chunk CP patterns.
             dual_split = _try_dual_split_all_batches(

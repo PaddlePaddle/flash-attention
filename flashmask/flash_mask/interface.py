@@ -100,12 +100,12 @@ def convert_to_varlen(
 
     # Real ends per batch
     real_ends_np = s_np.max(axis=1)  # (b,)
-    real_ends = real_ends_np.tolist()
-    needs_padding_fixup = bool(np.any(real_ends_np < skv))
 
     # Per-batch boundary extraction (b is typically 1-2, loop is trivial)
-    cu_seqlens_list = []
-    max_doc_len = 0
+    cu_seqlens_q_list = []
+    cu_seqlens_k_list = []
+    max_doc_len_q = 0
+    max_doc_len_k = 0
     for bi in range(b):
         change_idx = np.nonzero(diffs[bi])[0].astype(np.int32) + 1
         boundaries = np.concatenate([
@@ -113,15 +113,59 @@ def convert_to_varlen(
             change_idx,
             np.array([skv], dtype=np.int32),
         ])
-        doc_lens = boundaries[1:] - boundaries[:-1]
-        max_doc_len = max(max_doc_len, int(doc_lens.max()))
-        cu_seqlens_list.append(boundaries[:-1] + np.int32(bi * skv))
+        real_end = int(real_ends_np[bi])
+
+        if real_end < skv:
+            # Has padding: only include real documents, then add two
+            # padding documents at tail.
+            # Find the boundary index where padding starts
+            real_boundaries = boundaries[boundaries <= real_end]
+            if real_boundaries[-1] != real_end:
+                real_boundaries = np.concatenate([
+                    real_boundaries, np.array([real_end], dtype=np.int32)
+                ])
+
+            doc_lens = real_boundaries[1:] - real_boundaries[:-1]
+            max_doc_len_q = max(max_doc_len_q, int(doc_lens.max()))
+            max_doc_len_k = max(max_doc_len_k, int(doc_lens.max()))
+
+            pad_len = skv - real_end
+
+            # cu_seqlens_q: [...real_doc_starts, real_end, real_end, real_end+pad_len]
+            #   -> docs: real docs, then (0 seqlen_q, pad_len seqlen_k), then (pad_len seqlen_q, 0 seqlen_k)
+            # cu_seqlens_k: [...real_doc_starts, real_end, real_end+pad_len, real_end+pad_len]
+            offset = np.int32(bi * skv)
+            cu_seqlens_q_list.append(np.concatenate([
+                real_boundaries[:-1] + offset,
+                np.array([real_end, real_end], dtype=np.int32) + offset,
+            ]))
+            cu_seqlens_k_list.append(np.concatenate([
+                real_boundaries[:-1] + offset,
+                np.array([real_end, real_end + pad_len], dtype=np.int32) + offset,
+            ]))
+
+            print(f"wsm debug {cu_seqlens_q_list=}")
+            print(f"wsm debug {cu_seqlens_k_list=}")
+
+            max_doc_len_k = max(max_doc_len_k, pad_len)
+            max_doc_len_q = max(max_doc_len_q, pad_len)
+        else:
+            # No padding
+            doc_lens = boundaries[1:] - boundaries[:-1]
+            max_doc_len_q = max(max_doc_len_q, int(doc_lens.max()))
+            max_doc_len_k = max(max_doc_len_k, int(doc_lens.max()))
+            cu_seqlens_q_list.append(boundaries[:-1] + np.int32(bi * skv))
+            cu_seqlens_k_list.append(boundaries[:-1] + np.int32(bi * skv))
 
     # Build cu_seqlens: one numpy concat, one paddle tensor creation
-    cu_seqlens_np = np.concatenate(
-        cu_seqlens_list + [np.array([b * skv], dtype=np.int32)]
+    cu_seqlens_q_np = np.concatenate(
+        cu_seqlens_q_list + [np.array([b * skv], dtype=np.int32)]
     )
-    cu_seqlens = paddle.to_tensor(cu_seqlens_np)
+    cu_seqlens_k_np = np.concatenate(
+        cu_seqlens_k_list + [np.array([b * skv], dtype=np.int32)]
+    )
+    cu_seqlens_q = paddle.to_tensor(cu_seqlens_q_np)
+    cu_seqlens_k = paddle.to_tensor(cu_seqlens_k_np)
 
     # ── Flatten q, k, v: (batch, seqlen, heads, dim) -> (total, heads, dim)
     q_varlen = query.reshape([b * sq, hq, d])
@@ -142,35 +186,12 @@ def convert_to_varlen(
         "q": q_varlen,
         "k": k_varlen,
         "v": v_varlen,
-        "cu_seqlens_q": cu_seqlens,
-        "cu_seqlens_k": cu_seqlens,
-        "max_seqlen_q": max_doc_len,
-        "max_seqlen_k": max_doc_len,
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_k": cu_seqlens_k,
+        "max_seqlen_q": max_doc_len_q,
+        "max_seqlen_k": max_doc_len_k,
         "causal": varlen_causal,
     }
-
-    # For non-causal masks with trailing padding: padding rows attend to
-    # nothing in flashmask (zero output), but varlen computes non-zero
-    # output for them.  Zero out padding rows per batch to match flashmask.
-    # Note: real_end can differ across batch items.
-    if needs_padding_fixup:
-        _b, _sq = b, sq
-        _real_ends = real_ends
-
-        def output_to_padded(out_varlen_pt):
-            nh = out_varlen_pt.shape[1]
-            dv_out = out_varlen_pt.shape[2]
-            out_padded = out_varlen_pt.reshape(_b, _sq, nh, dv_out)
-            # Vectorised per-batch zeroing
-            row_idx = paddle.arange(_sq)
-            real_end_t = paddle.to_tensor(
-                _real_ends, dtype=paddle.int64,
-            ).unsqueeze(1)
-            padding_mask = row_idx.unsqueeze(0) >= real_end_t  # (b, sq)
-            out_padded[padding_mask] = 0
-            return out_padded
-
-        result["output_to_padded"] = output_to_padded
 
     return result
 
@@ -243,10 +264,7 @@ def flashmask_attention(
             return_lse=return_softmax_lse,
         )
 
-        if "output_to_padded" in varlen_args:
-            out = varlen_args["output_to_padded"](out)
-        else:
-            out = out.reshape([batch_size, seqlen_q, nheads, dv])
+        out = out.reshape([batch_size, seqlen_q, nheads, dv])
 
         if return_softmax_lse:
             return [out, lse]

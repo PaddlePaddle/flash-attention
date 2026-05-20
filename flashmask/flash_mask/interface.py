@@ -76,15 +76,13 @@ flash_attn_varlen_func = _mod.flash_attn_varlen_func
 flash_attn_combine     = _mod.flash_attn_combine
 
 def convert_to_varlen(
-    query: paddle.Tensor,
-    key: paddle.Tensor,
-    value: paddle.Tensor,
+    batch_size: int,
+    seqlen_q: int,
+    seqlen_kv: int,
     startend_row_indices: paddle.Tensor,
     causal: bool,
 ):
-    b, sq, hq, d = query.shape
-    _, skv, hkv, dv = value.shape
-    assert sq == skv
+    assert seqlen_q == seqlen_kv
 
     _, hfm, _, bound_num = startend_row_indices.shape
     assert hfm == 1
@@ -95,27 +93,27 @@ def convert_to_varlen(
     s_np = sri_np[:, 0, :, 0]  # (batch, seqlen_k)
 
     # ── Vectorised boundary detection in numpy ──
-    # Compare consecutive elements per batch: (b, skv-1)
+    # Compare consecutive elements per batch: (batch_size, seqlen_kv-1)
     diffs = s_np[:, 1:] != s_np[:, :-1]
 
     # Real ends per batch
-    real_ends_np = s_np.max(axis=1)  # (b,)
+    real_ends_np = s_np.max(axis=1)  # (batch_size,)
 
-    # Per-batch boundary extraction (b is typically 1-2, loop is trivial)
+    # Per-batch boundary extraction (batch_size is typically 1-2, loop is trivial)
     cu_seqlens_q_list = []
     cu_seqlens_k_list = []
     max_doc_len_q = 0
     max_doc_len_k = 0
-    for bi in range(b):
+    for bi in range(batch_size):
         change_idx = np.nonzero(diffs[bi])[0].astype(np.int32) + 1
         boundaries = np.concatenate([
             np.zeros(1, dtype=np.int32),
             change_idx,
-            np.array([skv], dtype=np.int32),
+            np.array([seqlen_kv], dtype=np.int32),
         ])
         real_end = int(real_ends_np[bi])
 
-        if real_end < skv:
+        if real_end < seqlen_kv:
             # Has padding: only include real documents, then add two
             # padding documents at tail.
             # Find the boundary index where padding starts
@@ -129,12 +127,12 @@ def convert_to_varlen(
             max_doc_len_q = max(max_doc_len_q, int(doc_lens.max()))
             max_doc_len_k = max(max_doc_len_k, int(doc_lens.max()))
 
-            pad_len = skv - real_end
+            pad_len = seqlen_kv - real_end
 
             # cu_seqlens_q: [...real_doc_starts, real_end, real_end, real_end+pad_len]
             #   -> docs: real docs, then (0 seqlen_q, pad_len seqlen_k), then (pad_len seqlen_q, 0 seqlen_k)
             # cu_seqlens_k: [...real_doc_starts, real_end, real_end+pad_len, real_end+pad_len]
-            offset = np.int32(bi * skv)
+            offset = np.int32(bi * seqlen_kv)
             cu_seqlens_q_list.append(np.concatenate([
                 real_boundaries[:-1] + offset,
                 np.array([real_end, real_end], dtype=np.int32) + offset,
@@ -151,38 +149,30 @@ def convert_to_varlen(
             doc_lens = boundaries[1:] - boundaries[:-1]
             max_doc_len_q = max(max_doc_len_q, int(doc_lens.max()))
             max_doc_len_k = max(max_doc_len_k, int(doc_lens.max()))
-            cu_seqlens_q_list.append(boundaries[:-1] + np.int32(bi * skv))
-            cu_seqlens_k_list.append(boundaries[:-1] + np.int32(bi * skv))
+            cu_seqlens_q_list.append(boundaries[:-1] + np.int32(bi * seqlen_kv))
+            cu_seqlens_k_list.append(boundaries[:-1] + np.int32(bi * seqlen_kv))
 
     # Build cu_seqlens: one numpy concat, one paddle tensor creation
     cu_seqlens_q_np = np.concatenate(
-        cu_seqlens_q_list + [np.array([b * skv], dtype=np.int32)]
+        cu_seqlens_q_list + [np.array([batch_size * seqlen_kv], dtype=np.int32)]
     )
     cu_seqlens_k_np = np.concatenate(
-        cu_seqlens_k_list + [np.array([b * skv], dtype=np.int32)]
+        cu_seqlens_k_list + [np.array([batch_size * seqlen_kv], dtype=np.int32)]
     )
     cu_seqlens_q = paddle.to_tensor(cu_seqlens_q_np)
     cu_seqlens_k = paddle.to_tensor(cu_seqlens_k_np)
 
-    # ── Flatten q, k, v: (batch, seqlen, heads, dim) -> (total, heads, dim)
-    q_varlen = query.reshape([b * sq, hq, d])
-    k_varlen = key.reshape([b * skv, hkv, d])
-    v_varlen = value.reshape([b * skv, hkv, dv])
-
     # ── Detect simulated causal masks (numpy) ────────────────────────
     varlen_causal = causal
     if not causal and bound_num == 2:
-        lts_all = s_np  # (b, skv), already extracted
-        ute_all = sri_np[:, 0, :, 1]  # (b, skv)
-        arange_ref = np.arange(skv, dtype=np.int32).reshape(1, skv)
+        lts_all = s_np  # (batch_size, seqlen_kv), already extracted
+        ute_all = sri_np[:, 0, :, 1]  # (batch_size, seqlen_kv)
+        arange_ref = np.arange(seqlen_kv, dtype=np.int32).reshape(1, seqlen_kv)
         expected_causal_ute = np.minimum(arange_ref, lts_all)
         if np.array_equal(ute_all, expected_causal_ute):
             varlen_causal = True
 
     result = {
-        "q": q_varlen,
-        "k": k_varlen,
-        "v": v_varlen,
         "cu_seqlens_q": cu_seqlens_q,
         "cu_seqlens_k": cu_seqlens_k,
         "max_seqlen_q": max_doc_len_q,
@@ -228,10 +218,10 @@ def flashmask_attention(
         )
 
         batch_size, seqlen_q, nheads, d = query.shape
-        seqlen_k = key.shape[1]
-        assert seqlen_q == seqlen_k, (
-            f"use_varlen requires seqlen_q == seqlen_k, ",
-            f"currently seqlen_q={seqlen_q}, seqlen_k={seqlen_k}",
+        _, seqlen_kv, nheads_kv, dv = value.shape
+        assert seqlen_q == seqlen_kv, (
+            f"use_varlen requires seqlen_q == seqlen_kv, ",
+            f"currently seqlen_q={seqlen_q}, seqlen_kv={seqlen_kv}",
         )
 
         dv = value.shape[-1]
@@ -243,15 +233,15 @@ def flashmask_attention(
             )
 
         varlen_args = convert_to_varlen(
-            query=query,
-            key=key,
-            value=value,
+            batch_size=batch_size,
+            seqlen_q=seqlen_q,
+            seqlen_kv=seqlen_kv,
             startend_row_indices=startend_row_indices,
             causal=causal)
         out, lse = flash_attn_varlen_func(
-            q=varlen_args["q"],
-            k=varlen_args["k"],
-            v=varlen_args["v"],
+            q=query.reshape(batch_size * seqlen_q, nheads, d),
+            k=key.reshape(batch_size * seqlen_kv, nheads_kv, d),
+            v=value.reshape(batch_size * seqlen_kv, nheads_kv, dv),
             cu_seqlens_q=varlen_args["cu_seqlens_q"],
             cu_seqlens_k=varlen_args["cu_seqlens_k"],
             max_seqlen_q=varlen_args["max_seqlen_q"],

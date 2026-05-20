@@ -144,9 +144,6 @@ def convert_to_varlen(
                 np.array([real_end, real_end + pad_len], dtype=np.int32) + offset,
             ]))
 
-            print(f"wsm debug {cu_seqlens_q_list=}")
-            print(f"wsm debug {cu_seqlens_k_list=}")
-
             max_doc_len_k = max(max_doc_len_k, pad_len)
             max_doc_len_q = max(max_doc_len_q, pad_len)
         else:

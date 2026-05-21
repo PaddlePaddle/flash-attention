@@ -75,22 +75,22 @@ flash_attn_func        = _mod.flash_attn_func
 flash_attn_varlen_func = _mod.flash_attn_varlen_func
 flash_attn_combine     = _mod.flash_attn_combine
 
-def convert_to_varlen(
+def convert_to_varlen_np(
     batch_size: int,
     seqlen_q: int,
     seqlen_kv: int,
-    startend_row_indices: paddle.Tensor,
+    startend_row_indices: np.ndarray,
     causal: bool,
 ):
+    assert isinstance(startend_row_indices, np.ndarray), (
+        f"Expected np.ndarray, got {type(startend_row_indices)}"
+    )
     assert seqlen_q == seqlen_kv
 
     _, hfm, _, bound_num = startend_row_indices.shape
     assert hfm == 1
     assert bound_num == 1 or bound_num == 2
-
-    # ── Move startend_row_indices to numpy (single GPU→CPU transfer) ──
-    sri_np = startend_row_indices.numpy()  # (batch, hfm, seqlen_k, bound_num)
-    s_np = sri_np[:, 0, :, 0]  # (batch, seqlen_k)
+    s_np = startend_row_indices[:, 0, :, 0]  # (batch, seqlen_k)
 
     # ── Vectorised boundary detection in numpy ──
     # Compare consecutive elements per batch: (batch_size, seqlen_kv-1)
@@ -159,26 +159,59 @@ def convert_to_varlen(
     cu_seqlens_k_np = np.concatenate(
         cu_seqlens_k_list + [np.array([batch_size * seqlen_kv], dtype=np.int32)]
     )
-    cu_seqlens_q = paddle.to_tensor(cu_seqlens_q_np)
-    cu_seqlens_k = paddle.to_tensor(cu_seqlens_k_np)
 
     # ── Detect simulated causal masks (numpy) ────────────────────────
     varlen_causal = causal
     if not causal and bound_num == 2:
         lts_all = s_np  # (batch_size, seqlen_kv), already extracted
-        ute_all = sri_np[:, 0, :, 1]  # (batch_size, seqlen_kv)
+        ute_all = startend_row_indices[:, 0, :, 1]  # (batch_size, seqlen_kv)
         arange_ref = np.arange(seqlen_kv, dtype=np.int32).reshape(1, seqlen_kv)
         expected_causal_ute = np.minimum(arange_ref, lts_all)
         if np.array_equal(ute_all, expected_causal_ute):
             varlen_causal = True
 
     result = {
-        "cu_seqlens_q": cu_seqlens_q,
-        "cu_seqlens_k": cu_seqlens_k,
+        "cu_seqlens_q": cu_seqlens_q_np,
+        "cu_seqlens_k": cu_seqlens_k_np,
         "max_seqlen_q": max_doc_len_q,
         "max_seqlen_k": max_doc_len_k,
         "causal": varlen_causal,
     }
+
+    return result
+
+def convert_to_varlen(
+    batch_size: int,
+    seqlen_q: int,
+    seqlen_kv: int,
+    startend_row_indices: paddle.Tensor,
+    causal: bool,
+):
+    assert seqlen_q == seqlen_kv
+
+    _, hfm, _, bound_num = startend_row_indices.shape
+    assert hfm == 1
+    assert bound_num == 1 or bound_num == 2
+
+    # ── Move startend_row_indices to numpy (single GPU→CPU transfer) ──
+    sri_np = startend_row_indices.numpy()  # (batch, hfm, seqlen_k, bound_num)
+
+    result = convert_to_varlen_np(
+        batch_size,
+        seqlen_q,
+        seqlen_kv,
+        sri_np,
+        causal,
+    )
+
+    cu_seqlens_q_np = result["cu_seqlens_q"]
+    cu_seqlens_k_np = result["cu_seqlens_k"]
+
+    cu_seqlens_q = paddle.to_tensor(cu_seqlens_q_np)
+    cu_seqlens_k = paddle.to_tensor(cu_seqlens_k_np)
+
+    result["cu_seqlens_q"] = cu_seqlens_q
+    result["cu_seqlens_k"] = cu_seqlens_k
 
     return result
 

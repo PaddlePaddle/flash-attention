@@ -17,7 +17,8 @@ using namespace cute;
 // forward pass (especially hdim 128 causal). We instead reimplement the version of
 // PipelineTmaAsync before v3.6.0 where only 1 out of 128 threads signals the barrier.
 //
-// Assumption: params.num_consumers % NumThreadsPerWarpGroup == 0
+// Count consumers in whole warpgroups. A single consumer warp still needs one
+// mbarrier arrival count.
 template <int Stages_, class Base=cutlass::PipelineTmaAsync<Stages_>>
 class PipelineTmaAsyncNoCluster: public Base {
 public:
@@ -39,7 +40,8 @@ public:
     if (is_initializing_warp) {
       // Barrier FULL and EMPTY init
       constexpr int producer_arv_cnt = 1;
-      uint32_t const num_consumer_warpgroups_per_cluster = params.num_consumers / NumThreadsPerWarpGroup;
+      uint32_t const num_consumer_warpgroups_per_cluster =
+          (params.num_consumers + NumThreadsPerWarpGroup - 1) / NumThreadsPerWarpGroup;
       uint32_t const multicast_consumer_arrival_count = num_consumer_warpgroups_per_cluster;
 
       cutlass::arch::detail::initialize_barrier_array_pair_aligned<decltype(storage.full_barrier_), decltype(storage.empty_barrier_), Stages>(

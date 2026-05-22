@@ -16,13 +16,12 @@
 # - BF16 & FP16 dtype
 # - noncausal & causal attention
 # - MHA, GQA, MQA
-# - hdim 64, 96, 128, (192, 128).
+# - hdim 64, 96, 128, (192, 128), 256 (via Split-D, requires d == dv, no SplitKV / pack_gqa / varlen_q)
 # - varlen
 # - sliding window
 # - split-kv
 # Unsupported features that will be added later:
 # - page size != 128
-# - more hdim (192, 256)
 # Based on the cutlass example and cute-dsl example:
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
@@ -102,6 +101,7 @@ class FlashAttentionForwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
+        is_split_d: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -116,7 +116,9 @@ class FlashAttentionForwardSm100:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.m_block_size = m_block_size
         self.n_block_size = n_block_size
-        self.q_stage = 2
+        self.is_split_d = is_split_d
+        # Split-D: q_stage must be 1 to fit TMEM (S + O_full = 128 + 256 = 384, with gap total = 512)
+        self.q_stage = 1 if is_split_d else 2
         assert self.q_stage in [1, 2]
 
         # 2 Q tile per CTA
@@ -141,6 +143,12 @@ class FlashAttentionForwardSm100:
         assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
             "SplitKV is not supported for hdim >= 192"
         )
+        if is_split_d:
+            assert self.head_dim_padded > 192 and self.head_dim_padded == self.head_dim_v_padded, (
+                "Split-D requires head_dim > 192 and head_dim == head_dim_v"
+            )
+            assert not self.is_split_kv, "Split-D does not support SplitKV"
+            assert not self.pack_gqa, "Split-D does not support pack_gqa"
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         if cutlass.const_expr(has_aux_tensors):
@@ -202,6 +210,13 @@ class FlashAttentionForwardSm100:
             self.num_regs_softmax = 200
             self.num_regs_correction = 64
             self.num_regs_other = 48
+        elif self.is_split_d:
+            # Split-D (d=256): register budget must satisfy 8*S + 4*C + 4*O <= 65536 (SM100 has 65536 regs/SM)
+            # Equivalently: 2*S + C + O <= 512 (in units of 32-thread warps)
+            # Using S=200, C=80, O=32: 2*200 + 80 + 32 = 512
+            self.num_regs_softmax = 200
+            self.num_regs_correction = 80
+            self.num_regs_other = 32
         else:
             # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
             self.num_regs_softmax = 200
@@ -223,6 +238,21 @@ class FlashAttentionForwardSm100:
         self.generate_block_incomplete = 0x80000001 # Note(wusiming): Does cutlass.Int32 store Int32.min() as 0x80000000?
         self.generate_block_finish = 0x80000000
 
+    def _split_d_active_stage(self, stage):
+        """Return True if `stage` (0 or 1) requires real per-stage compute.
+
+        In Split-D (q_stage == 1) the two softmax warpgroups process the same Q against
+        the same full-d K, so S[0] == S[1] == P[0] == P[1]. Stage-1 PV gemm and stage-1
+        correction rescale are therefore skipped, while barrier produce/consume must still
+        be balanced. This helper centralizes the predicate. See the "Split-D barrier
+        invariants" comment in `__call__` for the full ownership map.
+        """
+        return self.q_stage == 2 or stage == 0
+
+    def _split_d_buffer_idx(self, stage):
+        """Buffer index to use for stage. Split-D folds stage 1's buffer onto stage 0."""
+        return stage if self.q_stage == 2 else 0
+
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
 
@@ -235,13 +265,17 @@ class FlashAttentionForwardSm100:
 
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128:
             self.kv_stage = 2 if self.enable_flashmask else 3
+        elif self.is_split_d:
+            # Split-D (d=dv=256): SMEM budget is tight (Q=64KB + KV=128KB=192KB with kv_stage=2)
+            self.kv_stage = 2
         elif self.q_dtype.width == 8 or self.q_stage == 1:
             self.kv_stage = 4
         else:
             self.kv_stage = 3
 
         self.acc_stage = 1
-        self.epi_stage = 2
+        # Split-D: reduce epi_stage to 1 to fit SMEM (O=128KB with epi_stage=2 is too large)
+        self.epi_stage = 1 if self.is_split_d else 2
         self.generate_block_stage = 2
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
         # 128 x 192 x 2 bytes x 3 stages = 144KB, and we need 96KB for Q.
@@ -577,7 +611,8 @@ class FlashAttentionForwardSm100:
 
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
-            (self.head_dim_v_padded >= 128 and self.is_split_kv)
+            (self.head_dim_v_padded >= 128 and self.is_split_kv) or
+            self.is_split_d
         )
         if const_expr(self.enable_flashmask):
             self.overlap_sO_sQ = True
@@ -630,12 +665,29 @@ class FlashAttentionForwardSm100:
         self.mbar_O_full_offset = self.mbar_S_full_offset + 2
         self.mbar_softmax_corr_full_offset = self.mbar_O_full_offset + 2
         self.mbar_softmax_corr_empty_offset = self.mbar_softmax_corr_full_offset + 2
-        self.mbar_corr_epi_full_offset = self.mbar_softmax_corr_empty_offset + self.epi_stage
-        self.mbar_corr_epi_empty_offset = self.mbar_corr_epi_full_offset + self.epi_stage
+        self.mbar_corr_epi_full_offset = self.mbar_softmax_corr_empty_offset + 2  # softmax_corr_empty always has 2 barriers
+        self.mbar_corr_epi_empty_offset = self.mbar_corr_epi_full_offset + self.q_stage  # corr_epi_full has q_stage barriers
         self.mbar_s0_s1_sequence_offset = self.mbar_corr_epi_empty_offset + 2
         self.mbar_tmem_dealloc_offset = self.mbar_s0_s1_sequence_offset + 8
         self.mbar_P_full_2_offset = self.mbar_tmem_dealloc_offset + 1
         self.mbar_generate_block_full_offset = self.mbar_P_full_2_offset + 2
+        # ------------------------------------------------------------------
+        # Split-D barrier invariants (q_stage == 1, head_dim == head_dim_v == 256):
+        #   - load_q_full/empty:    only stage 0 is initialized & used (range_constexpr(q_stage) == 1).
+        #   - S_full / O_full[s]:   producer = MMA, committed for s in {0,1} unconditionally; consumer
+        #                           = softmax (S_full) / correction (O_full). Stage 1 O_full drain happens
+        #                           in the post-loop epilogue tail (search "q_stage == 1" in correction_loop).
+        #   - P_full_2[s]:          producer = softmax-wg-`s` (still runs both wgs); consumer = MMA.
+        #                           Split-D replaces gemm_Pi[1]'s tcgen05 wait with a bare mbarrier_wait
+        #                           on P_full_2[1] so the arrive count stays balanced.
+        #   - P_full_O_rescaled[s]: producer = softmax-wg-`s` + correction warps (count = 256). Both
+        #                           still arrive in Split-D; only the rescale FFMA is skipped at stage 1.
+        #   - softmax_corr_full/empty[s]: softmax-wg-1 runs the full loop in Split-D (its sScale[..+1*M]
+        #                           writes are unused). The final per-tile drain block at the end of
+        #                           correction_loop consumes softmax_corr_full[1] and arrives empty[1].
+        # If you add/remove an arrive or wait on any of the above, mirror it on BOTH stages or update
+        # the Split-D drain block accordingly, otherwise you will deadlock only at head_dim == 256.
+        # ------------------------------------------------------------------
         self.mbar_generate_block_empty_offset = self.mbar_generate_block_full_offset + self.generate_block_stage
 
         self.mbar_load_startend_row_indices_full_offset = self.mbar_generate_block_empty_offset + self.generate_block_stage
@@ -676,7 +728,7 @@ class FlashAttentionForwardSm100:
             tmem_holding_buf: Int32
             # Smem tensors
             # store row max and row sum
-            sScale: cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 2]
+            sScale: cute.struct.MemRange[Float32, 2 * self.m_block_size * 2]
 
             s_startend_row_indices_size = 0
             s_startend_row_indices_block_max_min_size = 0
@@ -728,6 +780,16 @@ class FlashAttentionForwardSm100:
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
             raise NotImplementedError("Block sparsity + paged KV not supported on SM100")
+        # Split-D (q_stage=1, head_dim=256) shorts out the stage-1 softmax/correction/PV
+        # path and assumes no other code path also drains those barriers. The block-sparse
+        # empty-tile helper handle_block_sparse_empty_tile_correction_sm100 has not been
+        # audited for q_stage=1; reject the combination until that audit lands.
+        if cutlass.const_expr(self.is_split_d):
+            assert not self.use_block_sparsity, (
+                "Split-D (head_dim=256) is not supported together with block sparsity; "
+                "the stage-1 barrier drain pattern has not been audited in "
+                "handle_block_sparse_empty_tile_correction_sm100."
+            )
 
         # Launch the kernel synchronously
         self.kernel(
@@ -946,7 +1008,7 @@ class FlashAttentionForwardSm100:
         else:
             sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner, self.o_dtype), sO_layout.outer)
 
-        sScale = storage.sScale.get_tensor(cute.make_layout(self.q_stage * self.m_block_size * 2))
+        sScale = storage.sScale.get_tensor(cute.make_layout(2 * self.m_block_size * 2))
 
         thr_mma_qk = tiled_mma_qk.get_slice(0)  # default 1SM
         thr_mma_pv = tiled_mma_pv.get_slice(0)  # default 1SM
@@ -2006,7 +2068,7 @@ class FlashAttentionForwardSm100:
                 qk_mma_op,
                 self.tmem_s_offset[stage],
                 tSrQs[stage],
-                sA=sQ[None, None, None, stage],
+                sA=sQ[None, None, None, self._split_d_buffer_idx(stage)],
                 zero_init=True,
             )
             for stage in range(2)
@@ -2015,7 +2077,7 @@ class FlashAttentionForwardSm100:
             partial(
                 sm100_utils.gemm_ptx_partial,
                 pv_mma_op,
-                self.tmem_o_offset[stage if self.q_stage == 2 else 0],
+                self.tmem_o_offset[self._split_d_buffer_idx(stage)],
                 tOrPs[stage],
                 sA=None,
             )
@@ -2056,22 +2118,20 @@ class FlashAttentionForwardSm100:
                     process_tile = n_block_min < n_block_max
 
             if process_tile:
-                for stage in cutlass.range_constexpr(self.q_stage):
+                for stage in cutlass.range_constexpr(2):
                     # GEMM_QK00 (Q0 * K0 -> S0) or GEMM_QK01 (Q1 * K0 -> S1)
+                    # In split-d (q_stage=1), both S[0] and S[1] are computed from the same Q
+                    # and the same K (full head_dim=256 dot product). S[0]==S[1].
                     # 1. wait for Q0 / Q1
-                    cute.arch.mbarrier_wait(
-                        mbar_ptr + self.mbar_load_q_full_offset + stage, mma_q_consumer_phase
-                    )
+                    if const_expr(self._split_d_active_stage(stage)):
+                        cute.arch.mbarrier_wait(
+                            mbar_ptr + self.mbar_load_q_full_offset + self._split_d_buffer_idx(stage), mma_q_consumer_phase
+                        )
                     # 2. wait for K0
                     if const_expr(stage == 0):
                         pipeline_kv.consumer_wait(mma_kv_consumer_state)
                     tSrKi = tSrK[None, None, None, mma_kv_consumer_state.index]
-                    # We don't need to acquire empty S0 / S1.
-                    # For the first iteration, we don't need to wait as we're guaranteed S0 / S1
-                    # are empty. For subsequent iterations, the wait happened at the end
-                    # of the while loop.
                     # 3. gemm
-                    # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
                     sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(
@@ -2103,33 +2163,27 @@ class FlashAttentionForwardSm100:
                     tOrVi = tOrV[None, None, None, Vi_index]
                     for stage in cutlass.range_constexpr(2):
                         # 2. acquire corrected O0/O1_partial and P0 / P1
-                        # For the first iteration in this work tile, waiting for O0/O1_partial
-                        # means that the correction warps has finished reading tO during
-                        # the last iteration of the previous work tile has finished.
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
                             P_full_O_rescaled_phase,
                         )
-                        # 3. gemm
-                        # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
-                        # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
-                        sV_cur = sV[None, None, None, Vi_index]
-                        if const_expr(self.uneven_kv_smem):
-                            sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-                        gemm_Pi[stage](
-                            tCrB=tOrVi,
-                            sB=sV_cur,
-                            zero_init=not O_should_accumulate,
-                            mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                            mbar_phase=P_full_O_rescaled_phase,
-                        )
-                        # 4. release accumulated O0_partial / O1_partial
-                        # Don't need to signal O_full to the correction warps anymore since the
-                        # correction warps wait for the softmax warps anyway. By the time the softmax
-                        # warps finished, S_i for the next iteration must have been done, so O_i-1
-                        # must have been done as well.
-                        # with cute.arch.elect_one():
-                        #     tcgen05.commit(mbar_ptr + self.mbar_O_full_offset + stage)
+                        # 3. gemm (skip stage 1 in split-d: S[0]==S[1] so P0==P1, only need one PV)
+                        if const_expr(self._split_d_active_stage(stage)):
+                            sV_cur = sV[None, None, None, Vi_index]
+                            if const_expr(self.uneven_kv_smem):
+                                sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+                            gemm_Pi[stage](
+                                tCrB=tOrVi,
+                                sB=sV_cur,
+                                zero_init=not O_should_accumulate,
+                                mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                                mbar_phase=P_full_O_rescaled_phase,
+                            )
+                        else:
+                            # split-d stage 1: consume P_full_2 barrier without doing gemm
+                            cute.arch.mbarrier_wait(
+                                mbar_ptr + self.mbar_P_full_2_offset + stage, P_full_O_rescaled_phase
+                            )
                         # 5. release V(i-1)
                         if const_expr(stage == 1):
                             pipeline_kv.consumer_release(mma_kv_release_state)
@@ -2181,19 +2235,23 @@ class FlashAttentionForwardSm100:
                         mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage, P_full_O_rescaled_phase
                     )
 
-                    # 3. gemm
-                    # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
-                    # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
-                    sV_cur = sV[None, None, None, Vi_index]
-                    if const_expr(self.uneven_kv_smem):
-                        sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-                    gemm_Pi[stage](
-                        tCrB=tOrVi,
-                        sB=sV_cur,
-                        zero_init=not O_should_accumulate,
-                        mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                        mbar_phase=P_full_O_rescaled_phase,
-                    )
+                    # 3. gemm (skip stage 1 in split-d)
+                    if const_expr(self._split_d_active_stage(stage)):
+                        sV_cur = sV[None, None, None, Vi_index]
+                        if const_expr(self.uneven_kv_smem):
+                            sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+                        gemm_Pi[stage](
+                            tCrB=tOrVi,
+                            sB=sV_cur,
+                            zero_init=not O_should_accumulate,
+                            mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                            mbar_phase=P_full_O_rescaled_phase,
+                        )
+                    else:
+                        # split-d stage 1: consume P_full_2 barrier without doing gemm
+                        cute.arch.mbarrier_wait(
+                            mbar_ptr + self.mbar_P_full_2_offset + stage, P_full_O_rescaled_phase
+                        )
                     # 4. release accumulated O0_partial
                     # We do need O_full here since for the last tile, by the time the softmax warp
                     # has signaled to the correction warps, the softmax warp has just finished compute
@@ -2317,9 +2375,13 @@ class FlashAttentionForwardSm100:
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
+            # In split-d (q_stage=1), both softmax warp groups process the SAME Q block
+            # (stage is KV pipeline buffer index, not Q row index), so m_block should be identical.
+            # In non-split-d (q_stage=2), stage indexes different Q rows.
+            m_block_for_mask = self.q_stage * m_block + self._split_d_buffer_idx(stage)
             if const_expr(self.enable_flashmask):
                 shared_mask_kwargs = dict(
-                    m_block=self.q_stage * m_block + stage,
+                    m_block=m_block_for_mask,
                     thr_mma=thr_mma_qk,
                     thr_tmem_load=thr_tmem_load,
                     mask_causal=self.is_causal,
@@ -2341,7 +2403,7 @@ class FlashAttentionForwardSm100:
                 )
             else:
                 shared_mask_kwargs = dict(
-                    m_block=self.q_stage * m_block + stage,
+                    m_block=m_block_for_mask,
                     thr_mma=thr_mma_qk,
                     thr_tmem_load=thr_tmem_load,
                     mask_causal=self.is_causal,
@@ -2399,7 +2461,7 @@ class FlashAttentionForwardSm100:
                 stage=stage,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
-                m_block=self.q_stage * m_block + stage,
+                m_block=m_block_for_mask,
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
@@ -2960,10 +3022,14 @@ class FlashAttentionForwardSm100:
                         # Don't need O_full anymore, since by the time softmax has signaled the correction
                         # warps, S_i must have been done, so O_i-1 must have been done as well.
                         # cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase)
-                        if should_rescale:
-                            self.correction_rescale(
-                                thr_mma_pv, tOtOs[stage if self.q_stage == 2 else 0], tidx, scale
-                            )
+                        # In split-d, skip stage 1 rescale: S[0]==S[1] so softmax0 and softmax1
+                        # track identical max sequences, causing double rescaling of the same O buffer.
+                        # Only stage 0 correction is needed since only stage 0 PV gemm executes.
+                        if const_expr(self._split_d_active_stage(stage)):
+                            if should_rescale:
+                                self.correction_rescale(
+                                    thr_mma_pv, tOtOs[self._split_d_buffer_idx(stage)], tidx, scale
+                                )
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
 
                         cute.arch.mbarrier_arrive(
@@ -3044,6 +3110,19 @@ class FlashAttentionForwardSm100:
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
 
                     # if tidx == 0: cute.printf("Correction final scale for stage %d: %f\n", stage, scale)
+
+                # In split-d (q_stage=1), epilogue only processed stage 0. We must still consume
+                # stage 1's final softmax signal and O_full commit to prevent barrier deadlock.
+                if const_expr(self.q_stage == 1):
+                    cute.arch.mbarrier_wait(
+                        mbar_ptr + self.mbar_softmax_corr_full_offset + 1,
+                        softmax_corr_consumer_phase,
+                    )
+                    cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + 1)
+                    cute.arch.mbarrier_wait(
+                        mbar_ptr + self.mbar_O_full_offset + 1, o_corr_consumer_phase
+                    )
+                    cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + 1)
 
                 o_corr_consumer_phase ^= 1
                 softmax_corr_consumer_phase ^= 1

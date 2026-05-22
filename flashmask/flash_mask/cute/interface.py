@@ -152,8 +152,10 @@ def _flash_attn_fwd(
         fm_batch_size = startend_row_indices.shape[0]
         fm_heads = startend_row_indices.shape[1]
         # Note(wusiming): FA4 is so weird, but each cta process q_stage * m_block_size rows
-        q_stage = 2
+        # Split-D (d>192, d==dv) uses q_stage=1 to fit TMEM budget
+        q_stage = 1 if (head_dim > 192 and head_dim == v.shape[-1]) else 2
         num_m_blocks = (seqlen_q + (q_stage * m_block_size) - 1) // (q_stage * m_block_size)
+        print(f"[DEBUG-interface] flashmask: q_stage={q_stage}, num_m_blocks={num_m_blocks}, head_dim={head_dim}, m_block_size={m_block_size}, seqlen_q={seqlen_q}")
         flashmask_info = FlashMaskInfoPaddle(
             is_causal=causal,
             startend_row_indices=startend_row_indices,
@@ -364,6 +366,8 @@ def _flash_attn_fwd(
         # TODO: fix GQA + SplitKV + non-varlen
         if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
             pack_gqa = False
+        # Split-D for d=dv=256 (head_dim > 192 requires q_stage=1 to fit TMEM)
+        is_split_d = head_dim > 192 and head_dim == head_dim_v
 
     if num_splits < 1:
         max_seqlen_k = (
@@ -490,6 +494,7 @@ def _flash_attn_fwd(
         page_size not in [None, 128],  # paged KV non-TMA
         # flashmask
         startend_row_indices.shape[3] if startend_row_indices is not None else None,
+        is_split_d if compute_capability == 10 else False,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
@@ -537,6 +542,7 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 paged_kv_non_tma=page_size not in [None, 128],
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
+                is_split_d=is_split_d,
             )
         else:
             raise ValueError(
@@ -648,6 +654,7 @@ def _flash_attn_bwd(
         num_flashmask_tensors = 2 * flashmask_info.startend_row_indices.shape[-1]
 
     num_head, head_dim = q.shape[-2:]
+    is_split_d_bwd = False
 
     if compute_capability == 9:
         m_block_size = 80 if not causal else 64
@@ -673,6 +680,8 @@ def _flash_attn_bwd(
         need_large_cluster = (head_dim > 128) or (head_dim == 128 and flashmask_info is None)
         cluster_size = 2 if need_large_cluster else 1
         use_2cta_instrs = cluster_size == 2
+        # Split-D BWD for d=dv=256 (requires 2CTA + sub-GEMM decomposition)
+        is_split_d_bwd = head_dim > 192 and head_dim == head_dim_v
 
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
         maybe_contiguous(t)
@@ -780,7 +789,7 @@ def _flash_attn_bwd(
         dpsum = paddle.empty(shape=[num_head, total_q_rounded_padded], dtype=paddle.float32)
         lse_log2 = paddle.empty(shape=[num_head, total_q_rounded_padded], dtype=paddle.float32)
 
-    if qhead_per_kvhead > 1:
+    if qhead_per_kvhead > 1 or is_split_d_bwd:
         head_dim_v_rounded = (head_dim_v + hdim_round_to - 1) // hdim_round_to * hdim_round_to
         if cu_seqlens_k is None:
             seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
@@ -822,7 +831,7 @@ def _flash_attn_bwd(
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
         for t in (dq_accum, dpsum, lse_log2)
     ]
-    if qhead_per_kvhead > 1:
+    if qhead_per_kvhead > 1 or is_split_d_bwd:
         dk_accum_tensor, dv_accum_tensor = [
             from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
             for t in (dk_accum, dv_accum)
@@ -945,6 +954,7 @@ def _flash_attn_bwd(
             pack_gqa,
             cluster_size,
             deterministic,
+            is_split_d_bwd if compute_capability == 10 else False,
         )
     num_threads = 384
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -1000,6 +1010,7 @@ def _flash_attn_bwd(
                 cluster_size=cluster_size,
                 use_2cta_instrs=use_2cta_instrs,
                 deterministic=deterministic,
+                is_split_d=is_split_d_bwd,
             )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
@@ -1011,8 +1022,8 @@ def _flash_attn_bwd(
             lse_log2_tensor,
             dpsum_tensor,
             dq_accum_tensor,
-            dk_tensor if qhead_per_kvhead == 1 else dk_accum_tensor,
-            dv_tensor if qhead_per_kvhead == 1 else dv_accum_tensor,
+            dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd) else dk_accum_tensor,
+            dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd) else dv_accum_tensor,
             softmax_scale,
             current_stream,
             cu_seqlens_q_tensor,
@@ -1032,8 +1043,8 @@ def _flash_attn_bwd(
         lse_log2_tensor,
         dpsum_tensor,
         dq_accum_tensor,
-        dk_tensor if qhead_per_kvhead == 1 else dk_accum_tensor,
-        dv_tensor if qhead_per_kvhead == 1 else dv_accum_tensor,
+        dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd) else dk_accum_tensor,
+        dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd) else dv_accum_tensor,
         softmax_scale,
         current_stream,
         cu_seqlens_q_tensor,
@@ -1074,7 +1085,7 @@ def _flash_attn_bwd(
         current_stream,
     )
 
-    if qhead_per_kvhead > 1:
+    if qhead_per_kvhead > 1 or is_split_d_bwd:
         # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
         compile_key_post = (dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
@@ -1715,6 +1726,8 @@ def flashmask_attention(
             (query.shape[-1] <= 128 and key.shape[-1] <= 128 and value.shape[-1] <= 128)
             or
             (query.shape[-1] == 192 and key.shape[-1] == 192 and value.shape[-1] == 128)
+            or
+            (query.shape[-1] == 256 and key.shape[-1] == 256 and value.shape[-1] == 256)
         )
         and (startend_row_indices is None or startend_row_indices.shape[-1] != 4)
     ):
@@ -1855,6 +1868,8 @@ def flash_attention(
             (query.shape[-1] <= 128 and key.shape[-1] <= 128 and value.shape[-1] <= 128)
             or
             (query.shape[-1] == 192 and key.shape[-1] == 192 and value.shape[-1] == 128)
+            or
+            (query.shape[-1] == 256 and key.shape[-1] == 256 and value.shape[-1] == 256)
         )
     ):
         assert dropout == 0.0, (

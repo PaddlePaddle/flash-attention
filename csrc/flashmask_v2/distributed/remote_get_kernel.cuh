@@ -206,6 +206,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                 // if there is no more work to do: set the wid for the current block to be INT_MAX
                 wid = next_wid <= total_chunks ? wid : INT_MAX;
                 next_work_id = next_wid;
+                __threadfence();                // prevent the change on L2 visibility order (make sure previous stores are done) 
                 atomicExch(&block_work_idx[blockIdx.x], wid);
             }
             // make sure atomicExch happen before load from block_work_idx[threadIdx.x],
@@ -214,7 +215,6 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             wid = threadIdx.x != blockIdx.x ? load_global_cg(block_work_idx + threadIdx.x) : wid;
             wid = __reduce_min_sync(0xffffffff, wid);
             if (threadIdx.x == blockIdx.x) {
-                __threadfence();                // prevent the change on L2 visibility order (make sure previous stores are done) 
                 atomicMax(wptr, wid == INT_MAX ? INT_MAX : (wid * row_per_block));     // 256 or 512 * wid, or INT_MAX
             }
         }
@@ -231,11 +231,13 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         if constexpr (use_semaphore && use_hierarchical) {
             if (threadIdx.x == 0 && is_phase1_val) {
                 const int counter_offset = target_rank_val + total_n_pes * batch_id;
+                // Fence BEFORE publishing counter increment: ensures this CTA's SR buffer
+                // stores are at L2 before other CTAs can observe the count and trigger Phase 2 notification.
+                __threadfence();
                 int prev = atomicAdd(&rank_empty_counters[counter_offset], 1);
                 if (prev + 1 == work_per_chunk) {
                     // All works for this (batch, Phase 1 target) are done.
                     // Notify same-node ranks: relay data for this batch is ready.
-                    __threadfence();
                     const int my_pe_node = my_pe % gpus_per_node;
                     const int my_node_id = my_pe / gpus_per_node;
                     for (int slot = 1; slot < gpus_per_node; slot++) {
@@ -272,7 +274,11 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         if constexpr (use_hierarchical) {
             // Hierarchical traversal: congruence group first, intra-node second
             const int logical_pos = (seq_work_id - 1) / work_per_chunk + 1;  // 1-based remote chunk: skip local
-            const int row_within_chunk = (seq_work_id - 1) % work_per_chunk;
+            // FWD: reverse chunk-internal row order so that high-seqlen (rightmost) rows are
+            // fetched first (low work_id), matching wptr's right-to-left contiguous frontier semantic.
+            // BWD: keep original left-to-right order (BWD compute scans left-to-right).
+            const int raw_row = (seq_work_id - 1) % work_per_chunk;
+            const int row_within_chunk = bwd ? raw_row : (work_per_chunk - 1 - raw_row);
             auto info = hier::hier_map_chunk(logical_pos, my_pe, total_n_pes, gpus_per_node);
 
             target_rank = info.target_rank;  // Data owner (semaphore wait target)
@@ -482,9 +488,11 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         if constexpr (use_semaphore && use_hierarchical) {
             if (threadIdx.x == 0 && is_phase1_val) {
                 const int counter_idx = (chunk_id - chunk_offset) + num_chunks * batch_id;
+                // Fence BEFORE publishing counter increment: ensures this CTA's SR buffer
+                // stores are at L2 before other CTAs can observe the count and trigger Phase 2 notification.
+                __threadfence();
                 int prev = atomicAdd(&rank_empty_counters[counter_idx], 1);
                 if (prev + 1 == work_per_chunk) {
-                    __threadfence();
                     const int my_pe_node = my_pe % gpus_per_node;
                     const int my_node_id = my_pe / gpus_per_node;
                     for (int slot = 1; slot < gpus_per_node; slot++) {

@@ -99,22 +99,6 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             // Note: block_cnt_semaphore for remote_put starts from 0 (for remote get, starts from 1)
             int _work_id = atomicAdd(block_cnt_semaphore, 1);
             next_work_id = _work_id;
-            if constexpr (per_stage_buffer == false) {
-                // Guard: only wait for consumer "empty" signal for valid works.
-                // Invalid work_ids (>= total_works) must NOT call producer_wait_empty,
-                // because try_commit_rank may have already cleared semaphores[target] = 0.
-                if (_work_id < total_works) {
-                    // chunk ID changes first: chunk [0, 1, 2, 3, 0, 1, 2, 3, ...]
-                    int chunk_id = (_work_id % remote_chunks) + chunk_offset;
-                    int target_pe = compute_target_rank(chunk_id);
-                    // the current CTA might be scheduled to send things to different ranks
-                    // so each CTA should keep track of whether the target rank is empty
-                    if (cached_empty[chunk_id] == 0) {
-                        sema::rs::producer_wait_empty(semaphores, target_pe);
-                        cached_empty[chunk_id] = 1;
-                    }
-                }
-            }
         }
         __syncthreads();
         return next_work_id;
@@ -127,17 +111,19 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         if (threadIdx.x == 0) {
             // chunk_offset maps seg_chunk_id back to the counter index for remote chunks
             int counter_idx = seg_chunk_id - chunk_offset;
+            // Fence BEFORE publishing counter increment: ensures this CTA's NVSHMEM puts
+            // are delivered before other CTAs can observe the count and trigger the consumer signal.
+            nvshmem_fence();
             int prev = atomicAdd(&rank_commit_counters[counter_idx], 1);
             if (prev + 1 == works_per_rank) {
+                // wait before reset, in-case all chunks are skipped and we reset before remote put
+                sema::rs::producer_wait_empty(semaphores, target_rank);
                 // Last CTA to finish work for this rank.
-                // nvshmem_fence() is PE-level: ensures ALL prior puts from this GPU
-                // are delivered to their targets before the subsequent signal.
-                nvshmem_fence();
+                semaphores[target_rank] = 0;
                 // P2P notify: same semantics as ProducerNotifyFull but for one rank only
                 if constexpr (per_stage_buffer) {
                     nvshmem_long_atomic_add(semaphores + target_rank, 1, target_rank);
                 } else {
-                    semaphores[target_rank] = 0;
                     nvshmem_long_atomic_add(semaphores + target_rank, -(1LL << my_pe), target_rank);
                 }
             }
@@ -164,6 +150,15 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             __syncthreads();
             work_id = update_work_id_sync();
             continue;
+        }
+
+        if (threadIdx.x == 0) {
+            // the current CTA might be scheduled to send things to different ranks
+            // so each CTA should keep track of whether the target rank is empty
+            if (cached_empty[seg_chunk_id] == 0) {
+                sema::rs::producer_wait_empty(semaphores, target_rank);
+                cached_empty[seg_chunk_id] = 1;
+            }
         }
 
         // batch_offset + chunk_offset + work_offset, the src and dst in the buffer is the same

@@ -19,7 +19,7 @@ static constexpr bool USE_SEMAPHORES = true;
 // Note(heqianyue): If we can make sure CUDA_DEVICE_MAX_CONNECTION=1, stream_coord is actually not required
 static constexpr bool USE_STREAM_COORD = true;
 // (experimental): if true, the RS buffer capacity is the same as CP-size
-static constexpr bool PER_STAGE_BUFFER = false;
+static constexpr bool PER_STAGE_BUFFER = true;
 // whether to use multiple buffers, this can be set up to CP-size
 static constexpr int RS_BUFFER_CAPACITY = 1;
 // SM_MARGIN works for 128K CP16, but for 32K CP4, the performance is a bit degraded.
@@ -198,7 +198,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         _use_hierarchical = false;
     }
     if (_use_hierarchical) {
-        WARN_PRINT("[FlashMask Overlap] Hierarchical overlap enabled: %d nodes × %d GPUs/node, "
+        printf("[FlashMask Overlap] Hierarchical overlap enabled: %d nodes × %d GPUs/node, "
                    "local pe_node=%d, Phase1 chunks=%d, Phase2 chunks=%d\n",
                    _num_nodes, _gpus_per_node, _my_pe_node,
                    hier::hier_phase1_chunk_count(_total_n_pes, _gpus_per_node),
@@ -278,7 +278,13 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         printf("[FlashMask Overlap] Using RS-Overlap, buffer capacity: %d, num_chunks: %d\n",
                 PER_STAGE_BUFFER ? num_stages : RS_BUFFER_CAPACITY, num_chunks);
     }
+    // Ensure initialize_buffer memset completes before barrier so that after
+    // team_bar returns, all PEs' semaphores are guaranteed to be zeroed.
     kv_buffer->team_bar();
+    CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
+    if (overlap_rs && PER_STAGE_BUFFER) {
+        prime_rs_semaphores();
+    }
     // Initialize configuration tracking
     _config = {b_kv, s_kv, h_kv, mask_head, d_kv, nranks, overlap_rs};
     _sr_buffer_capacity = _total_numel;
@@ -872,21 +878,19 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         /* consumed the data, and no other segment will touch this slot within this BWD pass. */        \
         if (post_reduce_notify) {                                                                       \
             dkv_buffer->zero_recv_buf(segment_idx, aux_c_stream);                                       \
-            if constexpr (PER_STAGE_BUFFER == false) {                                                  \
-                if (_use_hierarchical) {                                                                \
-                    sema::rs::notify_consumer_empty_hier(                                               \
-                        dkv_buffer->semaphores(segment_idx),                                            \
-                        segment_idx, num_chunks,                                                        \
-                        _total_n_pes, _gpus_per_node, _my_pe,                                           \
-                        aux_c_stream                                                                    \
-                    );                                                                                  \
-                } else {                                                                                \
-                    sema::rs::notify_consumer_empty(                                                    \
-                        dkv_buffer->semaphores(segment_idx),                                            \
-                        remote_producer_end_rank, num_chunks, _total_n_pes, _my_pe,                     \
-                        aux_c_stream                                                                    \
-                    );                                                                                  \
-                }                                                                                       \
+            if (_use_hierarchical) {                                                                    \
+                sema::rs::notify_consumer_empty_hier(                                                   \
+                    dkv_buffer->semaphores(segment_idx),                                                \
+                    segment_idx, num_chunks,                                                            \
+                    _total_n_pes, _gpus_per_node, _my_pe,                                               \
+                    aux_c_stream, true                                                                  \
+                );                                                                                      \
+            } else {                                                                                    \
+                sema::rs::notify_consumer_empty(                                                        \
+                    dkv_buffer->semaphores(segment_idx),                                                \
+                    remote_producer_end_rank, num_chunks, _total_n_pes, _my_pe,                         \
+                    aux_c_stream, true                                                                  \
+                );                                                                                      \
             }                                                                                           \
         }                                                                                               \
     } while(0)
@@ -1011,6 +1015,9 @@ void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, nvshmem_team_t 
                 cudaEventCreateWithFlags(&bwd_done_events[i], cudaEventDisableTiming);
             }
             CUDA_DEBUG_CHECK(cudaMalloc(&rs_block_cnt, sizeof(int) * ns));
+            kv_buffer->team_bar();
+            CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
+            prime_rs_semaphores();
         }
 
         WARN_PRINT("[FlashMask Overlap] Reconfigure: created dkv_buffer, chunks: %d\n", num_chunks);
@@ -1054,6 +1061,10 @@ void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, nvshmem_team_t 
                     }
                     CUDA_DEBUG_CHECK(cudaMalloc(&rs_block_cnt, sizeof(int) * ns));
                 }
+                // Prime per-stage semaphores after buffer recreation
+                kv_buffer->team_bar();
+                CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
+                prime_rs_semaphores();
             }
 
             WARN_PRINT("[FlashMask Overlap] Reconfigure: recreated dkv_buffer, chunks: %d\n", num_chunks);
@@ -1084,6 +1095,22 @@ void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, nvshmem_team_t 
         _dkv_single_k_numel_capacity = 0;
         _dkv_num_chunks = 0;
         WARN_PRINT("[FlashMask Overlap] Reconfigure: destroyed dkv_buffer (RS-overlap disabled)\n");
+    }
+}
+
+template <typename KVType>
+void OverlapCommunicator<KVType>::prime_rs_semaphores() {
+    const int num_stages = _total_n_pes / num_chunks;
+    for (int seg = 0; seg < num_stages; seg++) {
+        if (_use_hierarchical) {
+            sema::rs::notify_consumer_empty_hier(
+                dkv_buffer->semaphores(seg), seg, num_chunks,
+                _total_n_pes, _gpus_per_node, _my_pe, aux_c_stream, true);
+        } else {
+            const int rpe = (_my_pe - num_chunks * seg + _total_n_pes) % _total_n_pes;
+            sema::rs::notify_consumer_empty(
+                dkv_buffer->semaphores(seg), rpe, num_chunks, _total_n_pes, _my_pe, aux_c_stream, true);
+        }
     }
 }
 

@@ -262,6 +262,8 @@ private:
     void reallocate_block_work_ids();
     // Helper to create or recreate the dkv_buffer for RS-overlap
     void setup_dkv_buffer(bool need_rs, nvshmem_team_t cp_team);
+    // Prime per-stage RS semaphores so the first BWD's producer_wait_empty can proceed
+    void prime_rs_semaphores();
 
 private:
     std::unique_ptr<SRBuffer<KVType>> kv_buffer;

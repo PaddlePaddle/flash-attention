@@ -113,13 +113,13 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             int counter_idx = seg_chunk_id - chunk_offset;
             // Fence BEFORE publishing counter increment: ensures this CTA's NVSHMEM puts
             // are delivered before other CTAs can observe the count and trigger the consumer signal.
-            nvshmem_fence();
             int prev = atomicAdd(&rank_commit_counters[counter_idx], 1);
             if (prev + 1 == works_per_rank) {
                 // wait before reset, in-case all chunks are skipped and we reset before remote put
                 sema::rs::producer_wait_empty(semaphores, target_rank);
                 // Last CTA to finish work for this rank.
                 semaphores[target_rank] = 0;
+                nvshmem_fence();
                 // P2P notify: same semantics as ProducerNotifyFull but for one rank only
                 if constexpr (per_stage_buffer) {
                     nvshmem_long_atomic_add(semaphores + target_rank, 1, target_rank);

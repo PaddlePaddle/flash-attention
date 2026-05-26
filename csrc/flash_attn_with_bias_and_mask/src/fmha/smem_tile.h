@@ -1501,16 +1501,16 @@ struct Smem_tile_transpose {
     }
 
     inline __device__ void store_fragment(uint32_t base_offset, const Fragment_write &frag) {
-        uint32_t offset = smem_ + base_offset;
+        uint32_t offset = base_offset;
         const uint32_t reg0 = frag.reg(0);
         const uint32_t reg1 = frag.reg(1);
         const uint32_t reg2 = frag.reg(2);
         const uint32_t reg3 = frag.reg(3);
-        fmha::sts(offset + 0 * BYTES_PER_ROW, reg0);
-        fmha::sts(offset + 8 * BYTES_PER_ROW, reg2);
+        fmha::sts(smem_ + offset + 0 * BYTES_PER_ROW, reg0);
+        fmha::sts(smem_ + offset + 8 * BYTES_PER_ROW, reg2);
         offset ^= 4 * BYTES_PER_STS;
-        fmha::sts(offset + 0 * BYTES_PER_ROW, reg1);
-        fmha::sts(offset + 8 * BYTES_PER_ROW, reg3);
+        fmha::sts(smem_ + offset + 0 * BYTES_PER_ROW, reg1);
+        fmha::sts(smem_ + offset + 8 * BYTES_PER_ROW, reg3);
     }
 
     inline __device__ uint4 load_fragment(uint32_t offset) {

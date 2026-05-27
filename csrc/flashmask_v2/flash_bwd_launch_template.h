@@ -125,6 +125,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     int scaled_seqlen_k = params.seqlen_k;
     int* bwd_work_done_ptr = nullptr;   // per-work ready flag: work_done[] array for compute kernel
     int bwd_comm_rpb = 0;               // per-work ready flag: row_per_block (0 = contiguous wptr mode)
+    int bwd_num_heads_kv_wptr = 1;      // BHSD: H_k; BSHD: 1
     // Hierarchical BWD-splitted: base pointers into SR buffer saved before the segment loop.
     // Each segment reads a different sub-tensor of the SR buffer; k_ptr/v_ptr are advanced per iteration.
     void* bwd_sr_k_base = nullptr;
@@ -172,6 +173,13 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         // Re-route the KV data to the nvshmem_alloc SR buffer.
         params.k_ptr = comm_singleton.k_data();
         params.v_ptr = comm_singleton.v_data();
+        if (comm_singleton.use_bhsd_layout()) {
+            // SR buffer is (B, H, S_total, D): row_stride and head_stride swap
+            params.k_row_stride = params.d;                                     // D
+            params.k_head_stride = static_cast<int64_t>(scaled_seqlen_k) * params.d;  // S_total * D
+            params.v_row_stride = params.d;
+            params.v_head_stride = static_cast<int64_t>(scaled_seqlen_k) * params.d;
+        }
         // Save SR buffer base for per-segment k_ptr/v_ptr advancement (hierarchical BWD).
         bwd_sr_k_base = params.k_ptr;
         bwd_sr_v_base = params.v_ptr;
@@ -184,6 +192,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         // params.write_ptr is still used by prepare_flashmask/comm kernel (contiguous wptr).
         bwd_work_done_ptr = overlap_rs ? comm_singleton.get_work_done_ptr() : nullptr;
         bwd_comm_rpb = overlap_rs ? comm_singleton.get_comm_rpb() : 0;
+        bwd_num_heads_kv_wptr = comm_singleton.use_bhsd_layout() ? params.h_k : 1;
     } else if (params.nranks > 1) {
         throw std::runtime_error("Overlap singleton instance is null but we try using overlap mechanism. This should be buggy.");
     }
@@ -279,7 +288,8 @@ SEGMENT_LOOP_START:
                 bwd_comm_rpb > 0 ? bwd_work_done_ptr : params.write_ptr,
                 segment_cnt,
                 params.seqlen_k,
-                bwd_comm_rpb
+                bwd_comm_rpb,
+                bwd_num_heads_kv_wptr
             };
         else
             return typename CollectiveMainloop::Arguments {

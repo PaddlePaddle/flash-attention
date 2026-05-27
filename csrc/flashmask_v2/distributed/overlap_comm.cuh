@@ -18,11 +18,12 @@ struct OverlapConfig {
     int D = 0;
     int nranks = 0;        // NVSHMEM-unsafe to change; kept for validation
     bool overlap_rs = false;
+    bool use_bhsd = false;     // SR buffer uses (B,H,S,D) layout instead of (B,S,H,D)
 
     bool operator==(const OverlapConfig& other) const {
         return B == other.B && S_local == other.S_local && H == other.H
             && H_mask == other.H_mask && D == other.D && nranks == other.nranks
-            && overlap_rs == other.overlap_rs;
+            && overlap_rs == other.overlap_rs && use_bhsd == other.use_bhsd;
     }
     bool operator!=(const OverlapConfig& other) const { return !(*this == other); }
 
@@ -40,7 +41,8 @@ struct OverlapConfig {
         return "B=" + std::to_string(B) + ", S_local=" + std::to_string(S_local)
             + ", H=" + std::to_string(H) + ", H_mask=" + std::to_string(H_mask)
             + ", D=" + std::to_string(D) + ", nranks=" + std::to_string(nranks)
-            + ", overlap_rs=" + std::to_string(int(overlap_rs));
+            + ", overlap_rs=" + std::to_string(int(overlap_rs))
+            + ", use_bhsd=" + std::to_string(int(use_bhsd));
     }
 };
 
@@ -197,6 +199,9 @@ public:
     bool use_hierarchical() const {
         return _use_hierarchical;
     }
+    bool use_bhsd_layout() const {
+        return _use_bhsd_layout;
+    }
 
     // this function is only called in the bwd
     int seqlen_scale() const;
@@ -289,6 +294,7 @@ private:
     int _my_pe_node;        // This PE's index within its node (from nvshmem_team_my_pe)
     int _num_nodes;         // Number of nodes (= _total_n_pes / _gpus_per_node)
     bool _use_hierarchical; // Whether to use hierarchical overlap (from USE_HIERARCHICAL_OVERLAP env)
+    bool _use_bhsd_layout;  // SR buffer uses (B,H,S,D) layout (from FLASHMASK_USE_BHSD_LAYOUT env)
     int _sema_inter_size;   // num_nodes for hierarchical, 0 otherwise (offset into semaphore array)
 
     // Configuration tracking for dynamic reconfiguration

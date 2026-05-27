@@ -160,12 +160,13 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int* const __restrict__ copy_chunk_mask,
     const int my_pe,
     const int total_n_pes,
-    const int num_batch,                // B
-    const int S_stride,                 // H * D
+    const int num_batch,                // B (or B*H when simulating per-head RDMA)
+    const int S_stride,                 // H * D (or D when simulating)
     int64_t* const __restrict__ semaphores = nullptr,
     int* const __restrict__ rank_empty_counters = nullptr,
     const int gpus_per_node = 1,
-    const int sema_inter_size = 0
+    const int sema_inter_size = 0,
+    const int num_heads_per_batch = 1   // >1: num_batch = B*H, mask indexed by batch_id/num_heads_per_batch
 ) {
     // Degenerate case: S == S_chunk means nranks=1, nothing to remote-get.
     // This template instantiation is unreachable at runtime (overlap requires nranks > 1)
@@ -289,7 +290,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             // mask_index: seqlen_id to copy_chunk_mask entry
             // copy_chunk_mask computed from processed_mask (rearranged to match SR buffer layout)
             // BWD: skip_local=true to mask starts at seqlen S_chunk; FWD: skip_local=false to at seqlen 0
-            mask_index = batch_id * chunk_per_batch + (seqlen_id - (bwd ? S_chunk : 0)) / row_per_block;
+            mask_index = (batch_id / num_heads_per_batch) * chunk_per_batch + (seqlen_id - (bwd ? S_chunk : 0)) / row_per_block;
 
             // Source address in remote_pe's SR buffer
             const int src_chunk_seqlen = hier::hier_src_chunk_offset(
@@ -309,7 +310,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             }
             target_rank = remote_pe;  // Non-hierarchical: target_rank = remote_pe
             src_addr = batch_id * batch_stride + (seqlen_offset + (seqlen_id % S_chunk)) * S_stride;
-            mask_index = bwd ? (work_id - 1) : (chunk_per_batch * (batch_id + 1) - seq_work_id);
+            mask_index = bwd
+                ? ((batch_id / num_heads_per_batch) * chunk_per_batch + (seq_work_id - 1))
+                : (chunk_per_batch * (batch_id / num_heads_per_batch + 1) - seq_work_id);
         }
 
         bool should_skip = false;
@@ -401,7 +404,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     int64_t* const __restrict__ semaphores = nullptr,
     int* const __restrict__ rank_empty_counters = nullptr,
     const int gpus_per_node = 1,        // only used when use_hierarchical=true
-    const int sema_inter_size = 0
+    const int sema_inter_size = 0,
+    const int num_heads_per_batch = 1   // >1: num_batch = B*H, mask indexed by batch_id/num_heads_per_batch
 ) {
     if constexpr (use_stream_coord) {
         // notify computation stream that one of the CTAs for communication kernel is running
@@ -443,7 +447,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     // Barrier: first update_wptr_and_work_id_sync call has __syncthreads() before any read.
     for (int i = threadIdx.x; i < total_works; i += blockDim.x) {
         const int batch_id = i / work_per_seg;
-        auto* src_ptr = copy_chunk_mask + (segment_idx + batch_id * num_segments) * work_per_seg
+        const int real_batch = batch_id / num_heads_per_batch;
+        auto* src_ptr = copy_chunk_mask + (segment_idx + real_batch * num_segments) * work_per_seg
             + (i % work_per_seg);
         smem_chunk_mask[i] = *src_ptr;
     }

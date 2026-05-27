@@ -454,6 +454,7 @@ struct CollectiveMainloopFwdSm90 {
 
         const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
         const int kv_chunk_size = 8192;                   // local KV chunk size for distributed overlap
+        const int num_heads_kv_wptr = 1;                  // >1 enables per-head wptr encoding (simulation)
     };
 
     // Device side kernel params
@@ -540,6 +541,7 @@ struct CollectiveMainloopFwdSm90 {
 
         const int* __restrict__ write_ptr = nullptr;      // used in distributed overlapping mode
         const int kv_chunk_size = 8192;                   // local KV chunk size for distributed overlap
+        const int num_heads_kv_wptr = 1;                  // >1 enables per-head wptr encoding (simulation)
     };
 
     static Params
@@ -668,7 +670,8 @@ struct CollectiveMainloopFwdSm90 {
                 // m_factor,n_factor,
                 args.block_mask_ptr,
                 args.write_ptr,
-                args.kv_chunk_size};
+                args.kv_chunk_size,
+                args.num_heads_kv_wptr};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1148,10 +1151,9 @@ struct CollectiveMainloopFwdSm90 {
             if (params.write_ptr == nullptr) return;
             const int reverse_blockN_id = seqlen_info.seqlen_k - n_block * kBlockN - params.kv_chunk_size;
             if (reverse_blockN_id >= 0) {
-                const int target = bidb * (seqlen_info.seqlen_k - params.kv_chunk_size) + reverse_blockN_id;
+                const int batch_head_idx = bidb * params.num_heads_kv_wptr + (params.num_heads_kv_wptr > 1 ? bidh_kv : 0);
+                const int target = batch_head_idx * (seqlen_info.seqlen_k - params.kv_chunk_size) + reverse_blockN_id;
                 if (old_wptr_val >= target) return; // use the cached value to avoid frequent load from GMEM
-                // TODO(heqianyue): this should be made more generalized
-                // if num_head > 4: (bidb * num_head + bidh) / 2 * ..., divide by 2: overlap_comm copy 2 heads at once 
 
                 // TODO(heqianyue): timeout mechanism should be added for debugging purposes (`trap()`)
                 do {

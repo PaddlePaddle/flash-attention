@@ -361,6 +361,8 @@ struct CollectiveMainloopBwdSm90 {
         // Per-work ready flag mode for BWD: when > 0, write_ptr points to work_done[] array
         // and comm_rpb = row_per_block (num_warps * RDMA_ROW_PER_WARP). 0 = contiguous wptr mode.
         const int comm_rpb = 0;
+        // BHSD: num_heads_kv_wptr > 1 means work_done is indexed by (bidb*H + bidh_kv) not bidb
+        const int num_heads_kv_wptr = 1;
     };
 
     // Device side kernel params
@@ -419,6 +421,7 @@ struct CollectiveMainloopBwdSm90 {
         const int num_segments = 1;
         const int kv_chunk_size = 8192;
         const int comm_rpb = 0;
+        const int num_heads_kv_wptr = 1;
     };
 
     static Params
@@ -490,7 +493,8 @@ struct CollectiveMainloopBwdSm90 {
                 args.write_ptr,
                 args.num_segments,
                 args.kv_chunk_size,
-                args.comm_rpb};
+                args.comm_rpb,
+                args.num_heads_kv_wptr};
     }
 
      enum class FmBlockInfo {
@@ -727,9 +731,12 @@ struct CollectiveMainloopBwdSm90 {
                 // Per-work ready flag mode: write_ptr points to work_done[] array.
                 // Each work covers comm_rpb rows. Map nblock_id to work_id and check directly.
                 // work_id is 1-based: work 1 covers rows [0, rpb), work 2 covers [rpb, 2*rpb), ...
-                // For batch > 0, add batch offset: batch_id * work_per_seg.
+                // For batch > 0, add batch offset: batch_head_id * work_per_seg.
+                // BHSD: batch_head_id = bidb * H + bidh_kv (num_heads_kv_wptr = H)
+                // BSHD: batch_head_id = bidb (num_heads_kv_wptr = 1)
                 const int work_per_seg = seqlen_info.seqlen_k / params.comm_rpb;
-                const int work_id = bidb * work_per_seg + (nblock_id - 1) / params.comm_rpb + 1;
+                const int batch_head_id = bidb * params.num_heads_kv_wptr + (params.num_heads_kv_wptr > 1 ? bidh_kv : 0);
+                const int work_id = batch_head_id * work_per_seg + (nblock_id - 1) / params.comm_rpb + 1;
                 int flag = 0;
                 do {
                     asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(flag) : "l"(params.write_ptr + work_id));

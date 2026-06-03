@@ -17,14 +17,14 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
-fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
+fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
+mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
+add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd="rn")
 sub_packed_f32x2 = partial(
     cute.arch.calc_packed_f32x2_op,
     src_c=None,
     calc_func=nvvm.sub_packed_f32x2,
-    rnd=nvvm.RoundingModeKind.RN
+    rnd="rn"
 )
 
 _MIXER_ATTRS = ("__vec_size__",)

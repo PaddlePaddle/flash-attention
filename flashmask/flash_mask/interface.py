@@ -75,35 +75,567 @@ flash_attn_func        = _mod.flash_attn_func
 flash_attn_varlen_func = _mod.flash_attn_varlen_func
 flash_attn_combine     = _mod.flash_attn_combine
 
-def convert_to_varlen(
+def _find_dual_split(ute_doc, q_start, q_end, sk):
+    """Try to find a valid 2-way causal split for a document.
+
+    When a document's ute pattern doesn't match a single causal formula,
+    this function checks if it can be split into two sub-calls where each
+    sub-call is individually causal. This arises in dual-chunk context
+    parallel where two Q chunks with different causal diagonals share the
+    same K range.
+
+    Args:
+        ute_doc: ute values for K columns in this document (length sk).
+        q_start: start of Q range for this document.
+        q_end: end of Q range for this document.
+        sk: number of K columns in this document.
+
+    Returns:
+        (q_mid, k_split) on success, None on failure.
+        - q_mid: the Q split point. Call 0 uses Q[q_start:q_mid], Call 1 uses Q[q_mid:q_end].
+        - k_split: the K split point. Call 0 uses K[0:k_split], Call 1 uses K[0:sk] (full K).
+    """
+    sq = q_end - q_start
+    if sq <= 1 or sk <= 1:
+        return None
+
+    # Find plateau start: first j where ute[j] == ute[j+1] and ute[j] > q_start.
+    # The plateau value is q_mid (the boundary between the two Q chunks).
+    q_mid = None
+    k_split = None
+
+    for j in range(sk - 1):
+        if int(ute_doc[j]) == int(ute_doc[j + 1]) and int(ute_doc[j]) > q_start:
+            q_mid = int(ute_doc[j])
+            k_split = j
+            break
+
+    if q_mid is None or q_mid >= q_end:
+        return None
+
+    sq1 = q_mid - q_start
+    sk1 = k_split
+    sq2 = q_end - q_mid
+    sk2 = sk
+
+    if sq1 <= 0 or sk1 <= 0 or sq2 <= 0:
+        return None
+
+    # Verify sub-call 1: Q[q_start:q_mid] vs K[0:k_split], causal
+    for j in range(sk1):
+        expected = q_start + max(0, j - (sk1 - sq1))
+        if int(ute_doc[j]) != expected:
+            return None
+
+    # Verify sub-call 2: Q[q_mid:q_end] vs K[0:sk], causal
+    # effective_ute[j] = max(0, ute[j] - q_mid) should equal max(0, j - (sk2 - sq2))
+    for j in range(sk2):
+        effective_ute = max(0, int(ute_doc[j]) - q_mid)
+        expected = max(0, j - (sk2 - sq2))
+        if effective_ute != expected:
+            return None
+
+    # Also verify Q[q_start:q_mid] does NOT attend to K[k_split:sk]:
+    # ute[j] >= q_mid for all j >= k_split
+    for j in range(k_split, sk):
+        if int(ute_doc[j]) < q_mid:
+            return None
+
+    return (q_mid, k_split)
+
+
+def _convert_to_varlen_bound2(
     query: paddle.Tensor,
     key: paddle.Tensor,
     value: paddle.Tensor,
     startend_row_indices: paddle.Tensor,
     causal: bool,
 ):
+    """Convert padded tensors to varlen format using lts+ute boundary detection.
+
+    Supports asymmetric seqlen_q != seqlen_k and zero-length documents.
+    Requires bound_num == 2 (both lts and ute available).
+
+    Handles Q padding: when last doc's lts < seqlen_q, merges the Q padding
+    into the last document and zeros out the padding Q positions via
+    output_to_padded. This avoids creating documents with seqlen_k=0.
+
+    When a document's ute pattern cannot be expressed as a single causal call,
+    attempts a dual-split into two separate varlen calls (for dual-chunk CP).
+    Returns a result with "multi_call": True in that case.
+    """
+    b, sq, hq, d = query.shape
+    _, sk, hkv, dv = value.shape
+
+    sri_np = startend_row_indices.numpy()  # (batch, 1, sk, 2)
+    lts_np = sri_np[:, 0, :, 0]  # (batch, sk)
+    ute_np = sri_np[:, 0, :, 1]  # (batch, sk)
+
+    cu_seqlens_q_list = []
+    cu_seqlens_k_list = []
+    max_doc_sq = 0
+    max_doc_sk = 0
+    needs_q_padding = False
+    q_padding_starts = []
+
+    for bi in range(b):
+        lts = lts_np[bi]  # (sk,)
+        ute = ute_np[bi]  # (sk,)
+
+        # Detect K-side document boundaries:
+        # 1. Where lts changes (different document in the original mask)
+        # 2. Where dead/active status transitions (ute >= lts vs ute < lts)
+        #    Dead K columns have no Q rows attending; they form zero-length Q docs.
+        k_starts = [0]
+        for j in range(1, sk):
+            if lts[j] != lts[j - 1]:
+                k_starts.append(j)
+            elif (ute[j - 1] >= lts[j - 1]) != (ute[j] >= lts[j]):
+                k_starts.append(j)
+
+        # Build q_bounds and k_bounds
+        q_bounds = [np.int32(0)]
+        k_bounds = [np.int32(k) for k in k_starts] + [np.int32(sk)]
+
+        for doc_idx in range(len(k_starts)):
+            k_start = k_starts[doc_idx]
+            if ute[k_start] >= lts[k_start]:
+                # Dead segment: no Q rows attend, zero-length Q doc
+                q_bounds.append(q_bounds[-1])
+            else:
+                doc_lts = np.int32(lts[k_start])
+                q_bounds.append(doc_lts)
+
+        # Handle Q padding: if last doc doesn't cover all Q positions,
+        # merge Q padding into the last doc (like _convert_to_varlen_bound1).
+        q_pad_start = int(q_bounds[-1])
+        q_padding_starts.append(q_pad_start)
+        if q_pad_start < sq:
+            needs_q_padding = True
+            q_bounds[-1] = np.int32(sq)
+
+        # Compute per-doc max lengths
+        for i in range(len(q_bounds) - 1):
+            doc_sq = int(q_bounds[i + 1]) - int(q_bounds[i])
+            doc_sk = int(k_bounds[i + 1]) - int(k_bounds[i])
+            max_doc_sq = max(max_doc_sq, doc_sq)
+            max_doc_sk = max(max_doc_sk, doc_sk)
+
+        # Add batch offsets
+        cu_seqlens_q_list.append(
+            np.array(q_bounds[:-1], dtype=np.int32) + np.int32(bi * sq)
+        )
+        cu_seqlens_k_list.append(
+            np.array(k_bounds[:-1], dtype=np.int32) + np.int32(bi * sk)
+        )
+
+    # Concatenate with final sentinel
+    cu_seqlens_q_np = np.concatenate(
+        cu_seqlens_q_list + [np.array([b * sq], dtype=np.int32)]
+    )
+    cu_seqlens_k_np = np.concatenate(
+        cu_seqlens_k_list + [np.array([b * sk], dtype=np.int32)]
+    )
+    cu_seqlens_q = paddle.to_tensor(cu_seqlens_q_np)
+    cu_seqlens_k = paddle.to_tensor(cu_seqlens_k_np)
+
+    # Flatten tensors
+    q_varlen = query.reshape([b * sq, hq, d])
+    k_varlen = key.reshape([b * sk, hkv, d])
+    v_varlen = value.reshape([b * sk, hkv, dv])
+
+    # Causal detection: for causal=False, check if ute matches causal pattern.
+    # Uses the MERGED q_bounds/k_bounds (after Q padding merge) so that the
+    # causal formula uses the correct doc sizes.
+    varlen_causal = causal
+    if not causal:
+        is_causal = True
+        for bi in range(b):
+            lts = lts_np[bi]
+            ute = ute_np[bi]
+            # Reconstruct merged bounds for this batch (same logic as above)
+            k_starts_bi = [0]
+            for j in range(1, sk):
+                if lts[j] != lts[j - 1]:
+                    k_starts_bi.append(j)
+                elif (ute[j - 1] >= lts[j - 1]) != (ute[j] >= lts[j]):
+                    k_starts_bi.append(j)
+            # q_bounds_bi: dead segments get zero-length Q, active get lts
+            # Use PRE-padding q_bounds for causal check (padding inflates last
+            # doc's sq beyond sk, corrupting the causal formula).
+            q_bounds_bi = [0]
+            for idx in range(len(k_starts_bi)):
+                k_start_idx = k_starts_bi[idx]
+                if ute[k_start_idx] >= lts[k_start_idx]:
+                    q_bounds_bi.append(q_bounds_bi[-1])
+                else:
+                    q_bounds_bi.append(int(lts[k_start_idx]))
+            # Do NOT apply Q padding merge here — causal check uses real Q extents.
+            k_bounds_bi = k_starts_bi + [sk]
+
+            for doc_idx in range(len(k_starts_bi)):
+                k_start = k_bounds_bi[doc_idx]
+                k_end = k_bounds_bi[doc_idx + 1]
+                doc_sk = k_end - k_start
+                q_offset = q_bounds_bi[doc_idx]
+                doc_sq = q_bounds_bi[doc_idx + 1] - q_offset
+
+                if doc_sq == 0:
+                    # Dead doc: vacuously causal, skip
+                    continue
+                else:
+                    for j_local in range(doc_sk):
+                        # Skip dead K columns (ute == lts means no Q attends)
+                        if int(ute[k_start + j_local]) == int(lts[k_start + j_local]):
+                            continue
+                        expected = q_offset + max(0, j_local - (doc_sk - doc_sq))
+                        if int(ute[k_start + j_local]) != expected:
+                            is_causal = False
+                            break
+                if not is_causal:
+                    break
+            if not is_causal:
+                break
+        if is_causal:
+            varlen_causal = True
+
+            # When causal is detected AND Q padding exists, the padding merge
+            # inflates the last doc's sq beyond sk, shifting the causal diagonal
+            # incorrectly. Fix: undo the merge, trim Q to real tokens only,
+            # and pad output back to full sq with zeros afterward.
+            # NOTE: different batches may have different q_padding_starts, so
+            # we handle per-batch Q lengths and accumulate offsets properly.
+            if needs_q_padding:
+                # Rebuild cu_seqlens without padding: use real q_bounds,
+                # with per-batch Q offsets accumulated from actual real Q lengths.
+                cu_seqlens_q_list_nopad = []
+                cu_seqlens_k_list_nopad = []
+                max_doc_sq_nopad = 0
+                max_doc_sk_nopad = 0
+                q_offset_acc = 0  # accumulated Q offset across batches
+
+                for bi in range(b):
+                    lts = lts_np[bi]
+                    ute = ute_np[bi]
+                    k_starts_tmp = [0]
+                    for j in range(1, sk):
+                        if lts[j] != lts[j - 1]:
+                            k_starts_tmp.append(j)
+                        elif (ute[j - 1] >= lts[j - 1]) != (ute[j] >= lts[j]):
+                            k_starts_tmp.append(j)
+                    q_bounds_tmp = [np.int32(0)]
+                    k_bounds_tmp = [np.int32(k) for k in k_starts_tmp] + [np.int32(sk)]
+                    for idx in range(len(k_starts_tmp)):
+                        k_start_idx = k_starts_tmp[idx]
+                        if ute[k_start_idx] >= lts[k_start_idx]:
+                            q_bounds_tmp.append(q_bounds_tmp[-1])
+                        else:
+                            q_bounds_tmp.append(np.int32(lts[k_start_idx]))
+                    # No merge: q_bounds_tmp[-1] = q_padding_starts[bi]
+
+                    for i in range(len(q_bounds_tmp) - 1):
+                        dsq = int(q_bounds_tmp[i + 1]) - int(q_bounds_tmp[i])
+                        dsk = int(k_bounds_tmp[i + 1]) - int(k_bounds_tmp[i])
+                        max_doc_sq_nopad = max(max_doc_sq_nopad, dsq)
+                        max_doc_sk_nopad = max(max_doc_sk_nopad, dsk)
+
+                    # Offsets based on accumulated real Q tokens
+                    cu_seqlens_q_list_nopad.append(
+                        np.array(q_bounds_tmp[:-1], dtype=np.int32) + np.int32(q_offset_acc)
+                    )
+                    cu_seqlens_k_list_nopad.append(
+                        np.array(k_bounds_tmp[:-1], dtype=np.int32) + np.int32(bi * sk)
+                    )
+                    q_offset_acc += q_padding_starts[bi]
+
+                total_real_q = q_offset_acc
+                cu_seqlens_q_nopad = paddle.to_tensor(np.concatenate(
+                    cu_seqlens_q_list_nopad + [np.array([total_real_q], dtype=np.int32)]
+                ))
+                cu_seqlens_k_nopad = paddle.to_tensor(np.concatenate(
+                    cu_seqlens_k_list_nopad + [np.array([b * sk], dtype=np.int32)]
+                ))
+
+                # Trim Q: keep only real tokens [0:q_padding_starts[bi]] from
+                # each batch. Concatenate since lengths may differ per batch.
+                q_parts = []
+                for bi in range(b):
+                    q_parts.append(query[bi, :q_padding_starts[bi], :, :])
+                q_trimmed = paddle.concat(q_parts, axis=0)  # [total_real_q, hq, d]
+
+                # output_to_padded: expand trimmed output back to [b, sq, nh, dv]
+                _b, _sq = b, sq
+                _q_padding_starts = list(q_padding_starts)
+
+                def output_to_padded(out_varlen_pt):
+                    nh = out_varlen_pt.shape[1]
+                    dv_out = out_varlen_pt.shape[2]
+                    out_padded = paddle.zeros([_b, _sq, nh, dv_out], dtype=out_varlen_pt.dtype)
+                    offset = 0
+                    for bi_inner in range(_b):
+                        real_len = _q_padding_starts[bi_inner]
+                        out_padded[bi_inner, :real_len, :, :] = out_varlen_pt[offset:offset + real_len, :, :]
+                        offset += real_len
+                    return out_padded
+
+                result = {
+                    "q": q_trimmed,
+                    "k": k_varlen,
+                    "v": v_varlen,
+                    "cu_seqlens_q": cu_seqlens_q_nopad,
+                    "cu_seqlens_k": cu_seqlens_k_nopad,
+                    "max_seqlen_q": max_doc_sq_nopad,
+                    "max_seqlen_k": max_doc_sk_nopad,
+                    "causal": varlen_causal,
+                    "output_to_padded": output_to_padded,
+                }
+                return result
+        else:
+            # Single causal failed. Try dual-split for dual-chunk CP patterns.
+            dual_split = _try_dual_split_all_batches(
+                query, key, value, lts_np, ute_np, b, sq, sk, hq, hkv, d, dv
+            )
+            if dual_split is not None:
+                return dual_split
+
+    result = {
+        "q": q_varlen,
+        "k": k_varlen,
+        "v": v_varlen,
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_k": cu_seqlens_k,
+        "max_seqlen_q": max_doc_sq,
+        "max_seqlen_k": max_doc_sk,
+        "causal": varlen_causal,
+    }
+
+    # Zero out Q padding positions after kernel computes on the merged doc
+    if needs_q_padding:
+        _b, _sq = b, sq
+        _q_padding_starts = q_padding_starts
+
+        def output_to_padded(out_varlen_pt):
+            nh = out_varlen_pt.shape[1]
+            dv_out = out_varlen_pt.shape[2]
+            out_padded = out_varlen_pt.reshape([_b, _sq, nh, dv_out])
+            for bi_inner in range(_b):
+                q_end = _q_padding_starts[bi_inner]
+                if q_end < _sq:
+                    out_padded[bi_inner, q_end:, :, :] = 0
+            return out_padded
+
+        result["output_to_padded"] = output_to_padded
+
+    return result
+
+
+def _try_dual_split_all_batches(
+    query, key, value, lts_np, ute_np, b, sq, sk, hq, hkv, d, dv
+):
+    """Attempt to split into two varlen calls for dual-chunk CP patterns.
+
+    Checks all batch items for a consistent dual-split. If found, returns
+    a multi-call result dict. Otherwise returns None.
+
+    Handles dead K tails (ute >= lts) by excluding them from both calls,
+    and handles Q padding (when active docs don't cover the full Q range).
+    """
+    # For each batch, reconstruct doc boundaries and try dual split on each doc.
+    split_q_mid = None
+    split_k_split = None
+    split_k_end = None  # end of the active K range (excluding dead tail)
+
+    for bi in range(b):
+        lts = lts_np[bi]
+        ute = ute_np[bi]
+
+        # Reconstruct doc boundaries
+        k_starts_bi = [0]
+        for j in range(1, sk):
+            if lts[j] != lts[j - 1]:
+                k_starts_bi.append(j)
+            elif (ute[j - 1] >= lts[j - 1]) != (ute[j] >= lts[j]):
+                k_starts_bi.append(j)
+
+        q_bounds_bi = [0]
+        for idx in range(len(k_starts_bi)):
+            k_start_idx = k_starts_bi[idx]
+            if ute[k_start_idx] >= lts[k_start_idx]:
+                q_bounds_bi.append(q_bounds_bi[-1])
+            else:
+                q_bounds_bi.append(int(lts[k_start_idx]))
+        if q_bounds_bi[-1] < sq:
+            q_bounds_bi[-1] = sq
+        k_bounds_bi = k_starts_bi + [sk]
+
+        # Find the non-causal document and try dual split
+        for doc_idx in range(len(k_starts_bi)):
+            k_start = k_bounds_bi[doc_idx]
+            k_end = k_bounds_bi[doc_idx + 1]
+            doc_sk = k_end - k_start
+            q_offset = q_bounds_bi[doc_idx]
+            doc_sq = q_bounds_bi[doc_idx + 1] - q_offset
+
+            if doc_sq == 0:
+                continue
+
+            # Check if this doc is already causal
+            doc_is_causal = True
+            for j_local in range(doc_sk):
+                if int(ute[k_start + j_local]) == int(lts[k_start + j_local]):
+                    continue
+                expected = q_offset + max(0, j_local - (doc_sk - doc_sq))
+                if int(ute[k_start + j_local]) != expected:
+                    doc_is_causal = False
+                    break
+
+            if doc_is_causal:
+                continue
+
+            # Try dual split on this document
+            ute_doc = ute[k_start:k_end]
+            split_result = _find_dual_split(ute_doc, q_offset, q_offset + doc_sq, doc_sk)
+            if split_result is None:
+                return None
+
+            q_mid, k_split_doc = split_result
+
+            if split_q_mid is None:
+                split_q_mid = q_mid
+                split_k_split = k_split_doc
+                split_k_end = k_end
+            elif split_q_mid != q_mid or split_k_split != k_split_doc:
+                # Inconsistent splits across batches/docs
+                return None
+            else:
+                # Track the K end (should be consistent across batches)
+                if split_k_end != k_end:
+                    return None
+
+    if split_q_mid is None:
+        return None
+
+    # Build the two-call result
+    q_mid = split_q_mid
+    k_split = split_k_split
+    k_active_end = split_k_end  # end of active K (excludes dead tail)
+    sq1 = q_mid  # Q[0:q_mid]
+    sq2 = sq - q_mid  # Q[q_mid:sq]
+
+    # Determine if Q padding is needed.
+    # In dual-chunk CP, the actual attending Q range is [0, lts_value).
+    # If lts_value < sq, Q rows [lts_value:sq] are padding.
+    # Since q_mid comes from the active doc and q_end = doc's q_end,
+    # check if the second call's Q extends beyond the real Q range.
+    # Real Q end = lts value for the active doc = q_mid + (actual sq2).
+    # With dead K tail, the Q range is already determined by the active doc.
+    # If sq > q_mid + actual_sq2_from_split, we have padding in call 1.
+    # actual_sq2 = lts_np[0, 0] - q_mid (the lts of the active doc minus q_mid)
+    lts_val = int(lts_np[0, 0])  # lts is constant within the active doc
+    real_q_end = min(lts_val, sq)
+    real_sq2 = real_q_end - q_mid
+    needs_q_padding_call1 = (sq2 > real_sq2)
+
+    # Call 0: Q[0:q_mid] vs K[0:k_split]
+    q0 = query[:, :q_mid, :, :].reshape([b * sq1, hq, d])
+    k0 = key[:, :k_split, :, :].reshape([b * k_split, hkv, d])
+    v0 = value[:, :k_split, :, :].reshape([b * k_split, hkv, dv])
+    cu_seqlens_q0 = paddle.to_tensor(
+        np.arange(b + 1, dtype=np.int32) * np.int32(sq1)
+    )
+    cu_seqlens_k0 = paddle.to_tensor(
+        np.arange(b + 1, dtype=np.int32) * np.int32(k_split)
+    )
+
+    # Call 1: Q[q_mid:sq] vs K[0:k_active_end] (active K only, excludes dead tail)
+    q1 = query[:, q_mid:, :, :].reshape([b * sq2, hq, d])
+    k1 = key[:, :k_active_end, :, :].reshape([b * k_active_end, hkv, d])
+    v1 = value[:, :k_active_end, :, :].reshape([b * k_active_end, hkv, dv])
+    cu_seqlens_q1 = paddle.to_tensor(
+        np.arange(b + 1, dtype=np.int32) * np.int32(sq2)
+    )
+    cu_seqlens_k1 = paddle.to_tensor(
+        np.arange(b + 1, dtype=np.int32) * np.int32(k_active_end)
+    )
+
+    result = {
+        "multi_call": True,
+        "calls": [
+            {
+                "q": q0,
+                "k": k0,
+                "v": v0,
+                "cu_seqlens_q": cu_seqlens_q0,
+                "cu_seqlens_k": cu_seqlens_k0,
+                "max_seqlen_q": sq1,
+                "max_seqlen_k": k_split,
+                "causal": True,
+            },
+            {
+                "q": q1,
+                "k": k1,
+                "v": v1,
+                "cu_seqlens_q": cu_seqlens_q1,
+                "cu_seqlens_k": cu_seqlens_k1,
+                "max_seqlen_q": sq2,
+                "max_seqlen_k": k_active_end,
+                "causal": True,
+            },
+        ],
+        "q_split": q_mid,
+    }
+
+    # Handle Q padding: if the real Q range doesn't fill sq,
+    # we need to zero out the padded Q positions in the output.
+    if needs_q_padding_call1:
+        _b = b
+        _sq = sq
+        _q_mid = q_mid
+        _real_sq2 = real_sq2
+
+        def output_to_padded(out):
+            """Zero out Q padding positions in call 1's output portion."""
+            # out is [batch, sq, nheads, dv] after concat in flashmask_attention
+            for bi_inner in range(_b):
+                pad_start = _q_mid + _real_sq2
+                if pad_start < _sq:
+                    out[bi_inner, pad_start:, :, :] = 0
+            return out
+
+        result["output_to_padded"] = output_to_padded
+
+    return result
+
+
+def _convert_to_varlen_bound1(
+    query: paddle.Tensor,
+    key: paddle.Tensor,
+    value: paddle.Tensor,
+    startend_row_indices: paddle.Tensor,
+    causal: bool,
+):
+    """Convert padded tensors to varlen format using lts-only boundary detection.
+
+    Only supports symmetric seqlen_q == seqlen_k. Kept for backward compatibility
+    with bound_num == 1 masks.
+    """
     b, sq, hq, d = query.shape
     _, skv, hkv, dv = value.shape
-    assert sq == skv
+    assert sq == skv, (
+        f"bound_num==1 requires seqlen_q == seqlen_k, "
+        f"got seqlen_q={sq}, seqlen_k={skv}"
+    )
 
-    _, hfm, _, bound_num = startend_row_indices.shape
-    assert hfm == 1
-    assert bound_num == 1 or bound_num == 2
-
-    # ── Move startend_row_indices to numpy (single GPU→CPU transfer) ──
-    sri_np = startend_row_indices.numpy()  # (batch, hfm, seqlen_k, bound_num)
+    sri_np = startend_row_indices.numpy()
     s_np = sri_np[:, 0, :, 0]  # (batch, seqlen_k)
 
-    # ── Vectorised boundary detection in numpy ──
-    # Compare consecutive elements per batch: (b, skv-1)
+    # Boundary detection from lts changes
     diffs = s_np[:, 1:] != s_np[:, :-1]
 
-    # Real ends per batch
-    real_ends_np = s_np.max(axis=1)  # (b,)
+    real_ends_np = s_np.max(axis=1)
     real_ends = real_ends_np.tolist()
     needs_padding_fixup = bool(np.any(real_ends_np < skv))
 
-    # Per-batch boundary extraction (b is typically 1-2, loop is trivial)
     cu_seqlens_list = []
     max_doc_len = 0
     for bi in range(b):
@@ -117,26 +649,16 @@ def convert_to_varlen(
         max_doc_len = max(max_doc_len, int(doc_lens.max()))
         cu_seqlens_list.append(boundaries[:-1] + np.int32(bi * skv))
 
-    # Build cu_seqlens: one numpy concat, one paddle tensor creation
     cu_seqlens_np = np.concatenate(
         cu_seqlens_list + [np.array([b * skv], dtype=np.int32)]
     )
     cu_seqlens = paddle.to_tensor(cu_seqlens_np)
 
-    # ── Flatten q, k, v: (batch, seqlen, heads, dim) -> (total, heads, dim)
     q_varlen = query.reshape([b * sq, hq, d])
     k_varlen = key.reshape([b * skv, hkv, d])
     v_varlen = value.reshape([b * skv, hkv, dv])
 
-    # ── Detect simulated causal masks (numpy) ────────────────────────
     varlen_causal = causal
-    if not causal and bound_num == 2:
-        lts_all = s_np  # (b, skv), already extracted
-        ute_all = sri_np[:, 0, :, 1]  # (b, skv)
-        arange_ref = np.arange(skv, dtype=np.int32).reshape(1, skv)
-        expected_causal_ute = np.minimum(arange_ref, lts_all)
-        if np.array_equal(ute_all, expected_causal_ute):
-            varlen_causal = True
 
     result = {
         "q": q_varlen,
@@ -149,10 +671,6 @@ def convert_to_varlen(
         "causal": varlen_causal,
     }
 
-    # For non-causal masks with trailing padding: padding rows attend to
-    # nothing in flashmask (zero output), but varlen computes non-zero
-    # output for them.  Zero out padding rows per batch to match flashmask.
-    # Note: real_end can differ across batch items.
     if needs_padding_fixup:
         _b, _sq = b, sq
         _real_ends = real_ends
@@ -161,18 +679,48 @@ def convert_to_varlen(
             nh = out_varlen_pt.shape[1]
             dv_out = out_varlen_pt.shape[2]
             out_padded = out_varlen_pt.reshape(_b, _sq, nh, dv_out)
-            # Vectorised per-batch zeroing
             row_idx = paddle.arange(_sq)
             real_end_t = paddle.to_tensor(
                 _real_ends, dtype=paddle.int64,
             ).unsqueeze(1)
-            padding_mask = row_idx.unsqueeze(0) >= real_end_t  # (b, sq)
+            padding_mask = row_idx.unsqueeze(0) >= real_end_t
             out_padded[padding_mask] = 0
             return out_padded
 
         result["output_to_padded"] = output_to_padded
 
     return result
+
+
+def convert_to_varlen(
+    query: paddle.Tensor,
+    key: paddle.Tensor,
+    value: paddle.Tensor,
+    startend_row_indices: paddle.Tensor,
+    causal: bool,
+):
+    _, hfm, _, bound_num = startend_row_indices.shape
+    b, sq, hq, d = query.shape
+    sk = value.shape[1]
+
+    assert hfm == 1
+    assert bound_num == 1 or bound_num == 2
+
+    if bound_num == 2:
+        assert not causal, (
+            # TODO
+        )
+        return _convert_to_varlen_bound2(
+            query, key, value, startend_row_indices, causal
+        )
+    else:
+        assert sq == sk, (
+            f"Asymmetric seqlen_q != seqlen_k requires bound_num == 2, "
+            f"got bound_num=1 with seqlen_q={sq}, seqlen_k={sk}"
+        )
+        return _convert_to_varlen_bound1(
+            query, key, value, startend_row_indices, causal
+        )
 
 def flashmask_attention(
     query: paddle.Tensor,
@@ -211,10 +759,6 @@ def flashmask_attention(
 
         batch_size, seqlen_q, nheads, d = query.shape
         seqlen_k = key.shape[1]
-        assert seqlen_q == seqlen_k, (
-            f"use_varlen requires seqlen_q == seqlen_k, ",
-            f"currently seqlen_q={seqlen_q}, seqlen_k={seqlen_k}",
-        )
 
         dv = value.shape[-1]
 
@@ -230,28 +774,69 @@ def flashmask_attention(
             value=value,
             startend_row_indices=startend_row_indices,
             causal=causal)
-        out, lse = flash_attn_varlen_func(
-            q=varlen_args["q"],
-            k=varlen_args["k"],
-            v=varlen_args["v"],
-            cu_seqlens_q=varlen_args["cu_seqlens_q"],
-            cu_seqlens_k=varlen_args["cu_seqlens_k"],
-            max_seqlen_q=varlen_args["max_seqlen_q"],
-            max_seqlen_k=varlen_args["max_seqlen_k"],
-            softmax_scale=softmax_scale,
-            causal=varlen_args["causal"],
-            return_lse=return_softmax_lse,
-        )
 
-        if "output_to_padded" in varlen_args:
-            out = varlen_args["output_to_padded"](out)
-        else:
-            out = out.reshape([batch_size, seqlen_q, nheads, dv])
+        if varlen_args.get("multi_call", False):
+            # Dual-split: two separate varlen calls with disjoint Q ranges.
+            outputs = []
+            lses = []
+            for call_args in varlen_args["calls"]:
+                out_i, lse_i = flash_attn_varlen_func(
+                    q=call_args["q"],
+                    k=call_args["k"],
+                    v=call_args["v"],
+                    cu_seqlens_q=call_args["cu_seqlens_q"],
+                    cu_seqlens_k=call_args["cu_seqlens_k"],
+                    max_seqlen_q=call_args["max_seqlen_q"],
+                    max_seqlen_k=call_args["max_seqlen_k"],
+                    softmax_scale=softmax_scale,
+                    causal=call_args["causal"],
+                    return_lse=return_softmax_lse,
+                )
+                outputs.append(out_i)
+                lses.append(lse_i)
 
-        if return_softmax_lse:
-            return [out, lse]
+            # Reshape each output to [batch, sq_i, nheads, dv] then concat along seq dim
+            q_split = varlen_args["q_split"]
+            sq1 = q_split
+            sq2 = seqlen_q - q_split
+            out0 = outputs[0].reshape([batch_size, sq1, nheads, dv])
+            out1 = outputs[1].reshape([batch_size, sq2, nheads, dv])
+            out = paddle.concat([out0, out1], axis=1)
+
+            # Zero out Q padding positions if needed
+            if "output_to_padded" in varlen_args:
+                out = varlen_args["output_to_padded"](out)
+
+            if return_softmax_lse:
+                lse0 = lses[0].reshape([batch_size, nheads, sq1])
+                lse1 = lses[1].reshape([batch_size, nheads, sq2])
+                lse = paddle.concat([lse0, lse1], axis=2)
+                return [out, lse]
+            else:
+                return out
         else:
-            return out
+            out, lse = flash_attn_varlen_func(
+                q=varlen_args["q"],
+                k=varlen_args["k"],
+                v=varlen_args["v"],
+                cu_seqlens_q=varlen_args["cu_seqlens_q"],
+                cu_seqlens_k=varlen_args["cu_seqlens_k"],
+                max_seqlen_q=varlen_args["max_seqlen_q"],
+                max_seqlen_k=varlen_args["max_seqlen_k"],
+                softmax_scale=softmax_scale,
+                causal=varlen_args["causal"],
+                return_lse=return_softmax_lse,
+            )
+
+            if "output_to_padded" in varlen_args:
+                out = varlen_args["output_to_padded"](out)
+            else:
+                out = out.reshape([batch_size, seqlen_q, nheads, dv])
+
+            if return_softmax_lse:
+                return [out, lse]
+            else:
+                return out
     else:
         return _cute_flashmask_attention(
             query=query,

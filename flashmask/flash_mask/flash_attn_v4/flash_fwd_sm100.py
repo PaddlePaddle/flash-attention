@@ -579,7 +579,7 @@ class FlashAttentionForwardSm100:
             async_copy_elems = 128 // self.q_dtype.width
             num_load_threads = cute.arch.WARP_SIZE * len(self.load_warp_ids)
             threads_per_row = math.gcd(self.head_dim_padded // async_copy_elems, num_load_threads)
-            gmem_tiled_copy_Q = copy_utils.tiled_copy_2d(
+            gmem_tiled_copy_Q = copy_utils.quack_tiled_copy_2d(
                 self.q_dtype, threads_per_row, num_load_threads, async_copy_elems, is_async=True
             )
 

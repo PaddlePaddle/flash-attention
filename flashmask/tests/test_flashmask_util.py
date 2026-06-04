@@ -73,6 +73,7 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
+    return_max_logit=False,
 ):
     """
     Arguments:
@@ -186,6 +187,13 @@ def attention_ref(
         all_inf_mask = (attn_bias == -np.inf).all(axis=-1, keepdim=True)
         scores = paddle.where(all_inf_mask, paddle.full_like(scores, -1e9), scores)
 
+    ref_max_logit = None
+    if return_max_logit:
+        # scores_max = scores[...,-128:]
+        scores_max = scores.clone()
+        # 此时 scores 已经应用了所有 mask
+        ref_max_logit = scores_max.max(axis=-1)
+
     attention = paddle.nn.functional.softmax(scores, axis=-1).cast(v.dtype)
 
     if attn_bias is not None:
@@ -221,6 +229,10 @@ def attention_ref(
     output = paddle.transpose(output, [0, 2, 1, 3])
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+
+    if return_max_logit:
+        return output.cast(dtype=dtype_og), attention.cast(dtype=dtype_og), ref_max_logit
+
     return output.cast(dtype=dtype_og), attention.cast(dtype=dtype_og)
 
 

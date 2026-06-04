@@ -97,8 +97,10 @@ def _flash_attn_fwd(
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsPaddle] = None,
     return_lse: bool = False,
+    return_max_logit: bool = False,
     out: Optional[paddle.Tensor] = None,
     lse: Optional[paddle.Tensor] = None,
+    max_logit: Optional[paddle.Tensor] = None,
     aux_tensors: Optional[list[paddle.Tensor]] = None,
     startend_row_indices: Optional[paddle.Tensor] = None,
 ) -> Tuple[paddle.Tensor, paddle.Tensor]:
@@ -110,6 +112,7 @@ def _flash_attn_fwd(
         mask_mod: A callable that takes token position information and selectively masks
         block_sparse_tensors: A tuple of tensors used for block sparsity.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
+        return_max_logit: Whether to return the maximum logit of the attention scores.
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
@@ -270,6 +273,9 @@ def _flash_attn_fwd(
         )
         assert lse.place.is_gpu_place(), "lse tensor must be on CUDA device"
 
+    if return_max_logit and max_logit is None:
+        max_logit = paddle.full(shape=lse_shape, fill_value=float('-inf'), dtype=paddle.float32)
+
     dtype = paddle2cute_dtype_map[q.dtype]
     (
         cu_seqlens_q_tensor,
@@ -382,6 +388,8 @@ def _flash_attn_fwd(
             shape=[num_splits, *q_batch_seqlen_shape, num_head, head_dim_v], dtype=paddle.float32
         )
         lse_partial = paddle.empty(shape=[num_splits, *lse_shape], dtype=paddle.float32)
+        if return_max_logit:
+            max_logit_partial = paddle.empty(shape=[num_splits, *lse_shape], fill_value=float('-inf'), dtype=paddle.float32)
 
     q_tensor, k_tensor, v_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
@@ -391,13 +399,23 @@ def _flash_attn_fwd(
         lse_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(
             leading_dim=lse_partial.ndim - 1
         )
+        if return_max_logit:
+            max_logit_tensor = from_dlpack(max_logit_partial.detach(), assumed_align=4).mark_layout_dynamic(
+                leading_dim=max_logit_partial.ndim - 1
+            )
     elif lse is not None:
         lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(
             leading_dim=lse.ndim - 1
         )
+        if return_max_logit:
+            max_logit_tensor = from_dlpack(max_logit.detach(), assumed_align=4).mark_layout_dynamic(
+                leading_dim=max_logit.ndim - 1
+            )
     else:
         lse_tensor = None
 
+    if not return_max_logit:
+        max_logit_tensor = None
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
@@ -457,6 +475,7 @@ def _flash_attn_fwd(
         use_block_sparsity,
         len(aux_tensors) if aux_tensors is not None else 0,
         lse is None,
+        max_logit is None,
         cu_seqlens_q is None,
         cu_seqlens_k is None,
         seqused_q is None,
@@ -480,6 +499,7 @@ def _flash_attn_fwd(
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
+            assert not return_max_logit, "return_max_logit not supported on SM 9.0"
             # fa_fwd = FlashAttentionForwardSm80(
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,
@@ -536,6 +556,7 @@ def _flash_attn_fwd(
             v_tensor,
             o_tensor,
             lse_tensor,
+            max_logit_tensor,
             softmax_scale,
             current_stream,
             cu_seqlens_q_tensor,
@@ -556,6 +577,7 @@ def _flash_attn_fwd(
         v_tensor,
         o_tensor,
         lse_tensor,
+        max_logit_tensor,
         softmax_scale,
         current_stream,
         cu_seqlens_q_tensor,
@@ -579,7 +601,8 @@ def _flash_attn_fwd(
             cu_seqlens_q,
             seqused_q,
         )
-    return out, lse
+        paddle.max(max_logit_partial, axis=0, keepdim=False, out=max_logit)
+    return out, lse, max_logit
 
 
 _flash_attn_fwd.compile_cache = {}
@@ -1686,21 +1709,23 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
         softmax_scale: float | None = None,
         startend_row_indices: paddle.Tensor | None = None,
         block_mask: paddle.Tensor | None = None,
+        return_max_logit: bool | None = False,
     ) -> paddle.Tensor | Tuple[paddle.Tensor, paddle.Tensor]:
-        out, lse = _flash_attn_fwd(
+        out, lse, max_logit = _flash_attn_fwd(
             query,
             key,
             value,
             causal=causal,
             softmax_scale=softmax_scale,
             return_lse=True,
+            return_max_logit=return_max_logit,
             startend_row_indices=startend_row_indices,
             pack_gqa=False,
         )
         ctx.save_for_backward(query, key, value, startend_row_indices, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
-        return [out, lse]
+        return [out, lse, max_logit]
 
     @staticmethod
     def backward(ctx, dout, *args) -> Tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor]:
@@ -1744,6 +1769,7 @@ def flashmask_attention(
     name: str | None = None,
     softmax_scale: float | None = None,
     block_mask: paddle.Tensor | None = None,
+    return_max_logit: bool = False,
 ):
     if (
         paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"] == 4
@@ -1824,21 +1850,29 @@ def flashmask_attention(
                     raise ValueError(
                         f"Invalid shape of startend_row_indices, when causal is False, the last dimension should be either 2 or 4 but got {startend_row_indices.shape[-1]}"
                     )
+        if return_max_logit:
+            assert return_softmax_lse, "max_logit requires lse to be calculated. Please set return_softmax_lse=True."
 
         # Note(wusiming): when softmax_scale is None, it will be set to 1.0 / math.sqrt(head_dim) in _flash_attn_fwd
-        out, lse = FlashMaskFunc.apply(
+        res = FlashMaskFunc.apply(
             query,
             key,
             value,
             causal=causal,
             softmax_scale=softmax_scale,
             startend_row_indices=startend_row_indices,
+            return_max_logit=return_max_logit,
         )
         if return_softmax_lse:
-            return [out, lse]
+            outputs = [res[0], res[1]] # 基础列表 [out, lse]
+            if return_max_logit:
+                outputs += [res[2]]    # 动态拼接 [out, lse, rowmax]
+            return outputs
         else:
-            return out
+            return res[0]
+
     else:
+        assert return_max_logit == False, "Only flashmask-v4 support return_max_logit"
         original_flash_attn_version = paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"]
         if original_flash_attn_version == 4:
             paddle.set_flags({"FLAGS_flash_attn_version": 2})

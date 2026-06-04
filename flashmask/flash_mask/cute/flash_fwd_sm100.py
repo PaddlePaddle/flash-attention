@@ -301,6 +301,7 @@ class FlashAttentionForwardSm100:
         mV: cute.Tensor,  # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table
         mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         softmax_scale: Float32,
         stream: cuda.CUstream,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
@@ -368,6 +369,11 @@ class FlashAttentionForwardSm100:
         mLSE = (
             cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
             if const_expr(mLSE is not None)
+            else None
+        )
+        mMaxLogit = (
+            cute.make_tensor(mMaxLogit.iterator, cute.select(mMaxLogit.layout, mode=LSE_layout_transpose))
+            if const_expr(mMaxLogit is not None)
             else None
         )
         # (s, d, h, b) -> (d, s, h, b)
@@ -533,6 +539,10 @@ class FlashAttentionForwardSm100:
                 mLSE = cute.make_tensor(
                     mLSE.iterator, cute.make_layout(shape_LSE_packed, stride=stride_LSE_packed)
                 )
+                if const_expr(mMaxLogit is not None):
+                    mMaxLogit = cute.make_tensor(
+                        mMaxLogit.iterator, cute.make_layout(shape_LSE_packed, stride=stride_LSE_packed)
+                    )
 
         self.tma_copy_bytes = {
             name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
@@ -798,6 +808,7 @@ class FlashAttentionForwardSm100:
             mV,
             mO,
             mLSE,
+            mMaxLogit,
             mCuSeqlensQ,
             mCuSeqlensK,
             mSeqUsedQ,
@@ -844,6 +855,7 @@ class FlashAttentionForwardSm100:
         mV: cute.Tensor,  # (d, s_k, h_k, b_k) or (d, total_k, h_k) if there is cu_seqlens_k or (d, page_size, h_k, num_pages) if there is page_table
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
@@ -1241,6 +1253,7 @@ class FlashAttentionForwardSm100:
                 thr_mma_qk=thr_mma_qk,
                 sScale=sScale,
                 mLSE=mLSE,
+                mMaxLogit=mMaxLogit,
                 learnable_sink=learnable_sink,
                 mbar_ptr=mbar_ptr,
                 block_info=block_info,
@@ -1291,6 +1304,7 @@ class FlashAttentionForwardSm100:
                 sScale,
                 mO,
                 mLSE,
+                mMaxLogit,
                 sO,
                 learnable_sink,
                 gmem_tiled_copy_O,
@@ -2284,6 +2298,7 @@ class FlashAttentionForwardSm100:
         tStSi: cute.Tensor,
         sScale: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         learnable_sink: Optional[cute.Tensor],
         mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
@@ -2433,7 +2448,7 @@ class FlashAttentionForwardSm100:
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
-                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
+                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) and const_expr(mMaxLogit is None) else 0.0,
                 softmax_scale=softmax_scale,
             )
             softmax.reset()
@@ -2918,6 +2933,7 @@ class FlashAttentionForwardSm100:
         sScale: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
+        mMaxLogit: cute.Tensor,
         sO: cute.Tensor,
         learnable_sink: Optional[cute.Tensor],
         gmem_tiled_copy_O: cute.TiledCopy,
@@ -3068,6 +3084,19 @@ class FlashAttentionForwardSm100:
                     else:
                         row_max = None
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage)
+
+                    if const_expr(mMaxLogit is not None):
+                        if const_expr(not seqlen.has_cu_seqlens_q):
+                            mRM_cur = mMaxLogit[None, head_idx, batch_idx]
+                        else:
+                            mRM_cur = cute.domain_offset((seqlen.offset_q,), mMaxLogit[None, head_idx])
+                            
+                        gRM = cute.local_tile(mRM_cur, (self.m_block_size,), (self.q_stage * m_block + stage,))
+                        
+                        # 边界检查并写回
+                        if tidx < seqlen.seqlen_q - (self.q_stage * m_block + stage) * self.m_block_size:
+                            gRM[tidx] = row_max
+
                     if const_expr(learnable_sink is not None):
                         LOG2_E = math.log2(math.e)
                         sink_val = learnable_sink_val[stage]

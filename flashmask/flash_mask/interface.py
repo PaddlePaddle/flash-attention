@@ -75,16 +75,119 @@ flash_attn_func        = _mod.flash_attn_func
 flash_attn_varlen_func = _mod.flash_attn_varlen_func
 flash_attn_combine     = _mod.flash_attn_combine
 
+def convert_to_varlen_np(
+    batch_size: int,
+    seqlen_q: int,
+    seqlen_kv: int,
+    startend_row_indices: np.ndarray,
+    causal: bool,
+):
+    assert isinstance(startend_row_indices, np.ndarray), (
+        f"Expected np.ndarray, got {type(startend_row_indices)}"
+    )
+    assert seqlen_q == seqlen_kv
+
+    _, hfm, _, bound_num = startend_row_indices.shape
+    assert hfm == 1
+    assert bound_num == 1 or bound_num == 2
+    s_np = startend_row_indices[:, 0, :, 0]  # (batch, seqlen_k)
+
+    # ── Vectorised boundary detection in numpy ──
+    # Compare consecutive elements per batch: (batch_size, seqlen_kv-1)
+    diffs = s_np[:, 1:] != s_np[:, :-1]
+
+    # Real ends per batch
+    real_ends_np = s_np.max(axis=1)  # (batch_size,)
+
+    # Per-batch boundary extraction (batch_size is typically 1-2, loop is trivial)
+    cu_seqlens_q_list = []
+    cu_seqlens_k_list = []
+    max_doc_len_q = 0
+    max_doc_len_k = 0
+    for bi in range(batch_size):
+        change_idx = np.nonzero(diffs[bi])[0].astype(np.int32) + 1
+        boundaries = np.concatenate([
+            np.zeros(1, dtype=np.int32),
+            change_idx,
+            np.array([seqlen_kv], dtype=np.int32),
+        ])
+        real_end = int(real_ends_np[bi])
+
+        if real_end < seqlen_kv:
+            # Has padding: only include real documents, then add two
+            # padding documents at tail.
+            # Find the boundary index where padding starts
+            real_boundaries = boundaries[boundaries <= real_end]
+            if real_boundaries[-1] != real_end:
+                real_boundaries = np.concatenate([
+                    real_boundaries, np.array([real_end], dtype=np.int32)
+                ])
+
+            doc_lens = real_boundaries[1:] - real_boundaries[:-1]
+            max_doc_len_q = max(max_doc_len_q, int(doc_lens.max()))
+            max_doc_len_k = max(max_doc_len_k, int(doc_lens.max()))
+
+            pad_len = seqlen_kv - real_end
+
+            # cu_seqlens_q: [...real_doc_starts, real_end, real_end, real_end+pad_len]
+            #   -> docs: real docs, then (0 seqlen_q, pad_len seqlen_k), then (pad_len seqlen_q, 0 seqlen_k)
+            # cu_seqlens_k: [...real_doc_starts, real_end, real_end+pad_len, real_end+pad_len]
+            offset = np.int32(bi * seqlen_kv)
+            cu_seqlens_q_list.append(np.concatenate([
+                real_boundaries[:-1] + offset,
+                np.array([real_end, real_end], dtype=np.int32) + offset,
+            ]))
+            cu_seqlens_k_list.append(np.concatenate([
+                real_boundaries[:-1] + offset,
+                np.array([real_end, real_end + pad_len], dtype=np.int32) + offset,
+            ]))
+
+            max_doc_len_k = max(max_doc_len_k, pad_len)
+            max_doc_len_q = max(max_doc_len_q, pad_len)
+        else:
+            # No padding
+            doc_lens = boundaries[1:] - boundaries[:-1]
+            max_doc_len_q = max(max_doc_len_q, int(doc_lens.max()))
+            max_doc_len_k = max(max_doc_len_k, int(doc_lens.max()))
+            cu_seqlens_q_list.append(boundaries[:-1] + np.int32(bi * seqlen_kv))
+            cu_seqlens_k_list.append(boundaries[:-1] + np.int32(bi * seqlen_kv))
+
+    # Build cu_seqlens: one numpy concat, one paddle tensor creation
+    cu_seqlens_q_np = np.concatenate(
+        cu_seqlens_q_list + [np.array([batch_size * seqlen_kv], dtype=np.int32)]
+    )
+    cu_seqlens_k_np = np.concatenate(
+        cu_seqlens_k_list + [np.array([batch_size * seqlen_kv], dtype=np.int32)]
+    )
+
+    # ── Detect simulated causal masks (numpy) ────────────────────────
+    varlen_causal = causal
+    if not causal and bound_num == 2:
+        lts_all = s_np  # (batch_size, seqlen_kv), already extracted
+        ute_all = startend_row_indices[:, 0, :, 1]  # (batch_size, seqlen_kv)
+        arange_ref = np.arange(seqlen_kv, dtype=np.int32).reshape(1, seqlen_kv)
+        expected_causal_ute = np.minimum(arange_ref, lts_all)
+        if np.array_equal(ute_all, expected_causal_ute):
+            varlen_causal = True
+
+    result = {
+        "cu_seqlens_q": cu_seqlens_q_np,
+        "cu_seqlens_k": cu_seqlens_k_np,
+        "max_seqlen_q": max_doc_len_q,
+        "max_seqlen_k": max_doc_len_k,
+        "causal": varlen_causal,
+    }
+
+    return result
+
 def convert_to_varlen(
-    query: paddle.Tensor,
-    key: paddle.Tensor,
-    value: paddle.Tensor,
+    batch_size: int,
+    seqlen_q: int,
+    seqlen_kv: int,
     startend_row_indices: paddle.Tensor,
     causal: bool,
 ):
-    b, sq, hq, d = query.shape
-    _, skv, hkv, dv = value.shape
-    assert sq == skv
+    assert seqlen_q == seqlen_kv
 
     _, hfm, _, bound_num = startend_row_indices.shape
     assert hfm == 1
@@ -92,85 +195,23 @@ def convert_to_varlen(
 
     # ── Move startend_row_indices to numpy (single GPU→CPU transfer) ──
     sri_np = startend_row_indices.numpy()  # (batch, hfm, seqlen_k, bound_num)
-    s_np = sri_np[:, 0, :, 0]  # (batch, seqlen_k)
 
-    # ── Vectorised boundary detection in numpy ──
-    # Compare consecutive elements per batch: (b, skv-1)
-    diffs = s_np[:, 1:] != s_np[:, :-1]
-
-    # Real ends per batch
-    real_ends_np = s_np.max(axis=1)  # (b,)
-    real_ends = real_ends_np.tolist()
-    needs_padding_fixup = bool(np.any(real_ends_np < skv))
-
-    # Per-batch boundary extraction (b is typically 1-2, loop is trivial)
-    cu_seqlens_list = []
-    max_doc_len = 0
-    for bi in range(b):
-        change_idx = np.nonzero(diffs[bi])[0].astype(np.int32) + 1
-        boundaries = np.concatenate([
-            np.zeros(1, dtype=np.int32),
-            change_idx,
-            np.array([skv], dtype=np.int32),
-        ])
-        doc_lens = boundaries[1:] - boundaries[:-1]
-        max_doc_len = max(max_doc_len, int(doc_lens.max()))
-        cu_seqlens_list.append(boundaries[:-1] + np.int32(bi * skv))
-
-    # Build cu_seqlens: one numpy concat, one paddle tensor creation
-    cu_seqlens_np = np.concatenate(
-        cu_seqlens_list + [np.array([b * skv], dtype=np.int32)]
+    result = convert_to_varlen_np(
+        batch_size,
+        seqlen_q,
+        seqlen_kv,
+        sri_np,
+        causal,
     )
-    cu_seqlens = paddle.to_tensor(cu_seqlens_np)
 
-    # ── Flatten q, k, v: (batch, seqlen, heads, dim) -> (total, heads, dim)
-    q_varlen = query.reshape([b * sq, hq, d])
-    k_varlen = key.reshape([b * skv, hkv, d])
-    v_varlen = value.reshape([b * skv, hkv, dv])
+    cu_seqlens_q_np = result["cu_seqlens_q"]
+    cu_seqlens_k_np = result["cu_seqlens_k"]
 
-    # ── Detect simulated causal masks (numpy) ────────────────────────
-    varlen_causal = causal
-    if not causal and bound_num == 2:
-        lts_all = s_np  # (b, skv), already extracted
-        ute_all = sri_np[:, 0, :, 1]  # (b, skv)
-        arange_ref = np.arange(skv, dtype=np.int32).reshape(1, skv)
-        expected_causal_ute = np.minimum(arange_ref, lts_all)
-        if np.array_equal(ute_all, expected_causal_ute):
-            varlen_causal = True
+    cu_seqlens_q = paddle.to_tensor(cu_seqlens_q_np)
+    cu_seqlens_k = paddle.to_tensor(cu_seqlens_k_np)
 
-    result = {
-        "q": q_varlen,
-        "k": k_varlen,
-        "v": v_varlen,
-        "cu_seqlens_q": cu_seqlens,
-        "cu_seqlens_k": cu_seqlens,
-        "max_seqlen_q": max_doc_len,
-        "max_seqlen_k": max_doc_len,
-        "causal": varlen_causal,
-    }
-
-    # For non-causal masks with trailing padding: padding rows attend to
-    # nothing in flashmask (zero output), but varlen computes non-zero
-    # output for them.  Zero out padding rows per batch to match flashmask.
-    # Note: real_end can differ across batch items.
-    if needs_padding_fixup:
-        _b, _sq = b, sq
-        _real_ends = real_ends
-
-        def output_to_padded(out_varlen_pt):
-            nh = out_varlen_pt.shape[1]
-            dv_out = out_varlen_pt.shape[2]
-            out_padded = out_varlen_pt.reshape(_b, _sq, nh, dv_out)
-            # Vectorised per-batch zeroing
-            row_idx = paddle.arange(_sq)
-            real_end_t = paddle.to_tensor(
-                _real_ends, dtype=paddle.int64,
-            ).unsqueeze(1)
-            padding_mask = row_idx.unsqueeze(0) >= real_end_t  # (b, sq)
-            out_padded[padding_mask] = 0
-            return out_padded
-
-        result["output_to_padded"] = output_to_padded
+    result["cu_seqlens_q"] = cu_seqlens_q
+    result["cu_seqlens_k"] = cu_seqlens_k
 
     return result
 
@@ -210,10 +251,10 @@ def flashmask_attention(
         )
 
         batch_size, seqlen_q, nheads, d = query.shape
-        seqlen_k = key.shape[1]
-        assert seqlen_q == seqlen_k, (
-            f"use_varlen requires seqlen_q == seqlen_k, ",
-            f"currently seqlen_q={seqlen_q}, seqlen_k={seqlen_k}",
+        _, seqlen_kv, nheads_kv, dv = value.shape
+        assert seqlen_q == seqlen_kv, (
+            f"use_varlen requires seqlen_q == seqlen_kv, ",
+            f"currently seqlen_q={seqlen_q}, seqlen_kv={seqlen_kv}",
         )
 
         dv = value.shape[-1]
@@ -225,15 +266,15 @@ def flashmask_attention(
             )
 
         varlen_args = convert_to_varlen(
-            query=query,
-            key=key,
-            value=value,
+            batch_size=batch_size,
+            seqlen_q=seqlen_q,
+            seqlen_kv=seqlen_kv,
             startend_row_indices=startend_row_indices,
             causal=causal)
         out, lse = flash_attn_varlen_func(
-            q=varlen_args["q"],
-            k=varlen_args["k"],
-            v=varlen_args["v"],
+            q=query.reshape(batch_size * seqlen_q, nheads, d),
+            k=key.reshape(batch_size * seqlen_kv, nheads_kv, d),
+            v=value.reshape(batch_size * seqlen_kv, nheads_kv, dv),
             cu_seqlens_q=varlen_args["cu_seqlens_q"],
             cu_seqlens_k=varlen_args["cu_seqlens_k"],
             max_seqlen_q=varlen_args["max_seqlen_q"],
@@ -243,10 +284,7 @@ def flashmask_attention(
             return_lse=return_softmax_lse,
         )
 
-        if "output_to_padded" in varlen_args:
-            out = varlen_args["output_to_padded"](out)
-        else:
-            out = out.reshape([batch_size, seqlen_q, nheads, dv])
+        out = out.reshape([batch_size, seqlen_q, nheads, dv])
 
         if return_softmax_lse:
             return [out, lse]

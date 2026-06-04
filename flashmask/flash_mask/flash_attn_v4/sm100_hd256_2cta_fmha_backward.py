@@ -23,6 +23,8 @@ from flash_mask.flash_attn_v4.sm100_hd256_2cta_fmha_backward_dqkernel import (
 from flash_mask.flash_attn_v4.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
     BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
 )
+from flash_mask.flash_attn_v4.cute_dsl_utils import assume_tensor_aligned
+
 
 def _as_bshkrd_tensor(
     tensor: cute.Tensor,
@@ -251,6 +253,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
             b = cumulative_s_k.shape[0] - 1
         else:
             b = Q.shape[0]
+
+        Q, K, V, dQ, dK, dV, dO = [assume_tensor_aligned(t) for t in (Q, K, V, dQ, dK, dV, dO)]
 
         Q = _as_bshkrd_tensor(Q, h_k, h_r, varlen)
         K = _as_bshkrd_tensor(K, h_k, 1, varlen)

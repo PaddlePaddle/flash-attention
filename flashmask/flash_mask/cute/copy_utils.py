@@ -1,7 +1,8 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
-from typing import Optional, Type, Callable
+from typing import Optional, Type, Tuple, Callable, Sequence
+
 
 import cutlass
 import cutlass.cute as cute
@@ -11,25 +12,30 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 import cutlass.pipeline
+from cutlass.base_dsl.arch import Arch
+from cutlass.cute.nvgpu import warp
 
 
 @dsl_user_op
 def cvt_copy(
-    atom: cute.CopyAtom,
+    tiled_copy: cute.TiledCopy,
     src: cute.Tensor,
     dst: cute.Tensor,
     *,
     pred: Optional[cute.Tensor] = None,
+    retile: bool = False,
     loc=None,
     ip=None,
     **kwargs,
 ) -> None:
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
     if const_expr(src.element_type != dst.element_type):
-        src_cvt = cute.make_fragment_like(src, dst.element_type, loc=loc, ip=ip)
+        src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
         src_cvt.store(src.load().to(dst.element_type))
         src = src_cvt
-    cute.copy(atom, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
+    if const_expr(retile):
+        src = tiled_copy.retile(src)
+    cute.copy(tiled_copy, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
 
 
 @dsl_user_op
@@ -68,12 +74,12 @@ def copy(
     dst: cute.Tensor,
     *,
     pred: Optional[cute.Tensor] = None,
-    num_copy_elems: int = 1,
     is_async: bool = False,
     loc=None,
     ip=None,
     **kwargs,
 ) -> None:
+    num_copy_elems = src.shape[0][0]
     copy_atom = get_copy_atom(src.element_type, num_copy_elems, is_async)
     cute.copy(copy_atom, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
 
@@ -88,21 +94,38 @@ def tiled_copy_1d(
     val_layout = cute.make_layout(num_copy_elems)
     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
+# def tiled_copy_2d(
+#     dtype: Type[cutlass.Numeric], major_mode_size: int, num_threads: int, is_async: bool = False
+# ) -> cute.TiledCopy:
+#     num_copy_bits = math.gcd(major_mode_size, 128 // dtype.width) * dtype.width
+#     copy_elems = num_copy_bits // dtype.width
+#     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+#     copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
+#     gmem_threads_per_row = major_mode_size // copy_elems
+#     assert num_threads % gmem_threads_per_row == 0
+#     thr_layout = cute.make_ordered_layout(
+#         (num_threads // gmem_threads_per_row, gmem_threads_per_row),
+#         order=(1, 0),
+#     )
+#     val_layout = cute.make_layout((1, copy_elems))
+#     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
 def tiled_copy_2d(
-    dtype: Type[cutlass.Numeric], major_mode_size: int, num_threads: int, is_async: bool = False
+    dtype: Type[cutlass.Numeric],
+    threads_per_row: int,
+    num_threads: int,
+    num_copy_elems: int = 1,
+    is_async: bool = False,
 ) -> cute.TiledCopy:
-    num_copy_bits = math.gcd(major_mode_size, 128 // dtype.width) * dtype.width
-    copy_elems = num_copy_bits // dtype.width
+    num_copy_bits = num_copy_elems * dtype.width
     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
     copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
-    gmem_threads_per_row = major_mode_size // copy_elems
-    assert num_threads % gmem_threads_per_row == 0
+    assert num_threads % threads_per_row == 0
     thr_layout = cute.make_ordered_layout(
-        (num_threads // gmem_threads_per_row, gmem_threads_per_row),
+        (num_threads // threads_per_row, threads_per_row),
         order=(1, 0),
     )
-    val_layout = cute.make_layout((1, copy_elems))
+    val_layout = cute.make_layout((1, num_copy_elems))
     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
 
@@ -288,35 +311,37 @@ def cpasync_reduce_bulk_add_f32(
     )
 
 
+
+
+
 def cpasync_bulk_get_copy_fn(
     src_tensor: cute.Tensor,
     dst_tensor: cute.Tensor,
     single_stage: bool = False,
     **kwargs,
 ) -> Callable:
-    # src_is_smem = const_expr(
-    #     isinstance(src_tensor.iterator, cute.Pointer)
-    #     and src_tensor.memspace == cute.AddressSpace.smem
-    # )
     group_rank_src = const_expr(cute.rank(src_tensor) - (1 if not single_stage else 0))
     group_rank_dst = const_expr(cute.rank(dst_tensor) - (1 if not single_stage else 0))
     # ((atom_v, rest_v), STAGE), ((atom_v, rest_v), RestK)
     src = cute.group_modes(src_tensor, 0, group_rank_src)
     dst = cute.group_modes(dst_tensor, 0, group_rank_dst)
 
-    def copy_bulk(src_idx, dst_idx, **new_kwargs):
-        size = const_expr(cute.size(src.shape[:-1]) * src.element_type.width // 8)
-        cpasync_bulk_g2s(
-            src[None, src_idx].iterator,
-            dst[None, dst_idx].iterator,
-            size=size,
-            **new_kwargs,
-            **kwargs,
-        )
+    def copy_bulk(src_idx, dst_idx, tma_bar_ptr: cute.Pointer, **new_kwargs):
+        atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
+        with cute.arch.elect_one():
+            cute.copy(
+                atom,
+                src[None, src_idx],
+                dst[None, dst_idx],
+                mbar_ptr=tma_bar_ptr,
+                **new_kwargs,
+                **kwargs,
+            )
 
-    def copy_bulk_single_stage(**new_kwargs):
-        size = const_expr(cute.size(src.shape) * src.element_type.width // 8)
-        cpasync_bulk_g2s(src.iterator, dst.iterator, size=size, **new_kwargs, **kwargs)
+    def copy_bulk_single_stage(tma_bar_ptr: cute.Pointer, **new_kwargs):
+        atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
+        with cute.arch.elect_one():
+            cute.copy(atom, src, dst, mbar_ptr=tma_bar_ptr, **new_kwargs, **kwargs)
 
     return copy_bulk if const_expr(not single_stage) else copy_bulk_single_stage
 
@@ -370,3 +395,83 @@ def tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsyn
         )
 
     return copy_fn
+
+def swizzle_int(ptr_int: Int32, b: int, m: int, s: int) -> Int32:
+    bit_msk = (1 << b) - 1
+    yyy_msk = bit_msk << (m + s)
+    return ptr_int ^ ((ptr_int & yyy_msk) >> s)
+
+
+def swizzle_ptr(ptr: cute.Pointer):
+    swz = ptr.type.swizzle_type
+    ptr_int = swizzle_int(ptr.toint(), swz.num_bits, swz.num_base, swz.num_shift)
+    return cute.make_ptr(ptr.dtype, ptr_int, ptr.memspace, assumed_align=ptr.alignment)
+
+def as_position_independent_swizzle_tensor(tensor: cute.Tensor) -> cute.Tensor:
+    outer = tensor.layout
+    width = tensor.element_type.width
+    swizzle_type = tensor.iterator.type.swizzle_type
+    inner = cute.make_swizzle(swizzle_type.num_bits, swizzle_type.num_base, swizzle_type.num_shift)
+    # Need to recast the swizzle from byte (e.g. <3, 4, 3> to element units (e.g. <3, 3, 3> for
+    # for 16 bits and <3, 2, 3> for 32 bits)
+    new_layout = cute.recast_layout(
+        width, 8, cute.make_composed_layout(inner, 0, cute.recast_layout(8, width, outer))
+    )
+    # recast_ptr to remove the pointer swizzle
+    return cute.make_tensor(cute.recast_ptr(tensor.iterator, dtype=tensor.element_type), new_layout)
+
+
+def partition_D_position_independent(
+    thr_copy: cute.core.ThrCopy, tensor: cute.Tensor
+) -> cute.Tensor:
+    return cute.make_tensor(
+        swizzle_ptr(thr_copy.partition_D(tensor).iterator),
+        thr_copy.partition_D(as_position_independent_swizzle_tensor(tensor)).layout,
+    )
+    
+def _get_smem_store_atom(
+    element_type: Type[cute.Numeric],
+    transpose: bool = False,
+    major_mode_size: Optional[int] = None,
+) -> cute.CopyAtom:
+    arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+    if const_expr(arch < Arch.sm_90 or element_type.width != 16):
+        return cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            element_type,
+            num_bits_per_copy=(2 if not transpose else 1) * element_type.width,
+        )
+    else:
+        num_matrices = (
+            4
+            if major_mode_size is None or major_mode_size % 16 == 0
+            else (2 if major_mode_size % 8 == 0 else 1)
+        )
+        return cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(transpose=transpose, num_matrices=num_matrices),
+            element_type,
+        )
+
+def get_smem_store_C(
+    tiled_mma: cute.TiledMma,
+    sC: cute.Tensor,
+    tidx: Int32,
+    transpose: bool = False,
+    position_independent=False,
+    major_mode_size: Optional[int] = None,
+) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
+    dtype = sC.element_type
+    copy_atom = _get_smem_store_atom(dtype, transpose, major_mode_size=major_mode_size)
+    tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
+    thr_copy = tiled_copy.get_slice(tidx)
+    if const_expr(not position_independent):
+        tRS_sC = thr_copy.partition_D(sC)
+    else:
+        tRS_sC = partition_D_position_independent(thr_copy, sC)
+
+    def copy_fn(src: cute.Tensor, dst_idx: Optional[Int32] = None, **new_kwargs):
+        dst_tensor = tRS_sC if const_expr(dst_idx is None) else tRS_sC[None, None, None, dst_idx]
+        cvt_copy(tiled_copy, src, dst_tensor, retile=True, **new_kwargs)
+
+    return copy_fn, thr_copy, tRS_sC
+

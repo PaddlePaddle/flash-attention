@@ -17,7 +17,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.typing import JitArgument
 from cutlass.cutlass_dsl import NumericMeta
-
+from typing import Optional
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
 
@@ -140,3 +140,19 @@ def assume_tensor_aligned(t):
     if t is None:
         return None
     return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t)))
+
+
+def make_fake_tensor(dtype, shape, divisibility=1, leading_dim=-1) -> Optional[cute.Tensor]:
+    """Build a fake cute tensor with sym_int strides. Used to compile kernels
+    without allocating real GPU tensors."""
+    if dtype is None:
+        return None
+    if leading_dim < 0:
+        leading_dim = len(shape) + leading_dim
+    stride = tuple(
+        cute.sym_int64(divisibility=divisibility) if i != leading_dim else 1
+        for i in range(len(shape))
+    )
+    return cute.runtime.make_fake_tensor(
+        dtype, shape, stride=stride, assumed_align=divisibility * dtype.width // 8
+    )

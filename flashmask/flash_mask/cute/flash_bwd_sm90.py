@@ -24,8 +24,8 @@ from flash_mask.cute.mask import AttentionMask
 from flash_mask.cute.seqlen_info import SeqlenInfoQK
 from flash_mask.cute.block_info import BlockInfo
 from flash_mask.cute import pipeline
-from flash_mask.cute.cute_dsl_utils import ParamsBase
 from flash_mask.cute.tile_scheduler import (
+    ParamsBase,
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTBwdScheduler,
@@ -35,6 +35,7 @@ from flash_mask.cute import barrier
 from flash_mask.cute.named_barrier import NamedBarrierBwd
 from flash_mask.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from flash_mask.cute.block_sparsity import BlockSparseTensors
+from flash_mask.cute.flashmask_utils import FlashMaskInfo
 from flash_mask.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
     produce_block_sparse_q_loads_bwd_sm90,
@@ -96,6 +97,7 @@ class FlashAttentionBackwardSm90:
         self.dO_stage = dO_stage
         self.PdS_stage = PdS_stage
         assert self.dO_stage in [1, self.Q_stage]
+        print("PdS_stage", self.PdS_stage, "Q_stage", self.Q_stage)
         assert self.PdS_stage in [1, self.Q_stage]
         self.SdP_swapAB = SdP_swapAB
         self.dKV_swapAB = dKV_swapAB
@@ -358,6 +360,7 @@ class FlashAttentionBackwardSm90:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        flashmask_info: Optional[FlashMaskInfo] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -536,7 +539,7 @@ class FlashAttentionBackwardSm90:
             element_size=self.dtype.width // 8,
             is_persistent=False,
             lpt=self.spt,
-            head_swizzle=self.deterministic,
+            # head_swizzle=self.deterministic,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -743,13 +746,19 @@ class FlashAttentionBackwardSm90:
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
+        # AttentionMaskCls = partial(
+        #     AttentionMask,
+        #     self.tile_m,
+        #     self.tile_n,
+        #     window_size_left=window_size_left,
+        #     window_size_right=window_size_right,
+        #     swap_AB=self.SdP_swapAB,
+        # )
         AttentionMaskCls = partial(
             AttentionMask,
             self.tile_m,
             self.tile_n,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            swap_AB=self.SdP_swapAB,
+            swap_AB=True,
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
@@ -1305,7 +1314,8 @@ class FlashAttentionBackwardSm90:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            mask = AttentionMaskCls(seqlen)
+            # mask = AttentionMaskCls(seqlen)
+            mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             score_mod_fn_cur = partial(
                 score_mod_fn,
                 batch_idx=batch_idx,

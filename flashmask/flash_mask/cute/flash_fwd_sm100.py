@@ -302,7 +302,6 @@ class FlashAttentionForwardSm100:
         mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
         mLSE: Optional[cute.Tensor],
         softmax_scale: Float32,
-        stream: cuda.CUstream,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
@@ -314,6 +313,7 @@ class FlashAttentionForwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
         flashmask_info: Optional[FlashMaskInfo] = None,
+        stream: cuda.CUstream = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -393,12 +393,16 @@ class FlashAttentionForwardSm100:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
         self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
-        # This can be tuned
-        self.e2e_freq = 16
+        # This can be tuned. New apply_exp2_convert interface:
+        #   ex2_emu_freq=0 ⇒ all-hardware exp2 (equivalent to old e2e=True without emulation).
+        #   ex2_emu_freq>0 ⇒ emulate exp2 every N fragments, starting at ex2_emu_start_frg.
+        self.ex2_emu_freq = 16
+        self.ex2_emu_start_frg = 0
         if const_expr(
             self.head_dim_padded > 64 and not self.is_causal and not self.is_local and self.pack_gqa
         ):
-            self.e2e_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
+            self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
+            self.ex2_emu_start_frg = 1
 
         cta_group = tcgen05.CtaGroup.ONE
         # the intermediate tensor p is from tmem & mK-major
@@ -2874,11 +2878,16 @@ class FlashAttentionForwardSm100:
             tSrS_t2r.layout,
         )
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
+        # Preserve old `e2e=mask_fn is None and head_dim_padded<=128` semantics:
+        # when that condition was False, old code went pure-hardware exp2 ⇒ ex2_emu_freq=0.
+        ex2_emu_freq = (
+            self.ex2_emu_freq if (mask_fn is None and self.head_dim_padded <= 128) else 0
+        )
         softmax.apply_exp2_convert(
             tSrS_t2r,
             tSrP_r2t,
-            e2e=mask_fn is None and self.head_dim_padded <= 128,
-            e2e_freq=self.e2e_freq,
+            ex2_emu_freq=ex2_emu_freq,
+            ex2_emu_start_frg=self.ex2_emu_start_frg,
         )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):

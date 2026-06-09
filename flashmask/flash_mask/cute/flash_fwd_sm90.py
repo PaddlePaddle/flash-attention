@@ -37,19 +37,20 @@ from flash_mask.cute import pipeline as pipeline_custom
 from flash_mask.cute.pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
 from flash_mask.cute.paged_kv import PagedKVManager
 from flash_mask.cute.named_barrier import NamedBarrierFwd
-from flash_mask.cute.cute_dsl_utils import ParamsBase
 from flash_mask.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
+    ParamsBase,
 )
 from cutlass.cute import FastDivmodDivisor
 
 from flash_mask.cute.flash_fwd import FlashAttentionForwardBase
-
+from flash_mask.cute.flashmask_utils import FlashMaskInfo
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
+    arch = 90
     def __init__(
         self,
         *args,
@@ -58,6 +59,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         paged_kv_non_tma: bool = False,
         **kwargs,
     ):
+        print("bqw_debug bwd sm90")
         super().__init__(*args, **kwargs)
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
@@ -173,7 +175,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
-        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        flashmask_info: Optional[FlashMaskInfo] = None,
         stream: cuda.CUstream = None,
     ):
         """Configures and launches the flash attention kernel.
@@ -181,7 +183,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
-
         self._check_type(
             *(
                 t.element_type if t is not None else None
@@ -1053,18 +1054,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             recompute_fastdiv_mods_k = cutlass.const_expr(
                 aux_tensors is not None and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
             )
-            if cutlass.const_expr(fastdiv_mods is not None):
-                seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
-                fastdiv_mods = (
-                    seqlen_q_divmod
-                    if not recompute_fastdiv_mods_q
-                    else FastDivmodDivisor(seqlen.seqlen_q),
-                    seqlen_k_divmod
-                    if not recompute_fastdiv_mods_k
-                    else FastDivmodDivisor(seqlen.seqlen_k),
+            # bqw_debug
+            fastdiv_mods = None
+            if cutlass.const_expr(aux_tensors is not None):
+                seqlen_q = cute.size(mQ.shape[0]) // (
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
                 )
+                seqlen_k = cute.size(mK.shape[0])
+                seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
+                seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
+                fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
 
-            mask = AttentionMaskCls(seqlen)
+            mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
                 mask.apply_mask,
                 batch_idx=batch_idx,

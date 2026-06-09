@@ -474,7 +474,6 @@ class FlashAttentionBackwardSm100:
         mdK: cute.Tensor,
         mdV: cute.Tensor,
         softmax_scale: Float32,
-        stream: cuda.CUstream,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
@@ -486,6 +485,7 @@ class FlashAttentionBackwardSm100:
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
         flashmask_info: Optional[FlashMaskInfo] = None,
+        stream: cuda.CUstream = None,
     ):
         assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
             "Variable sequence length is not supported yet in FlashAttentionBackwardSm100"

@@ -659,7 +659,9 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
 
-        is_split_d_bwd = head_dim > 192 and head_dim == head_dim_v
+        is_split_d_bwd = (head_dim > 192 and head_dim == head_dim_v) or (
+            head_dim == 192 and head_dim_v == 128
+        )
         need_large_cluster = (head_dim > 128) or (head_dim == 128 and flashmask_info is None)
         cluster_size = 1 if is_split_d_bwd else (2 if need_large_cluster else 1)
         use_2cta_instrs = cluster_size == 2
@@ -1100,7 +1102,11 @@ def _flash_attn_bwd(
 
     if is_split_d_bwd:
         half_hdim = head_dim // 2
-        half_hdim_v = head_dim_v // 2
+        # split_d_v: whether dV is split across MMAs in TMEM. For
+        # d=192/dv=128 (only-d mode), dV is single-tile; for d=dv=256,
+        # both are split.
+        split_d_v_bwd = head_dim_v > 128
+        half_hdim_v = head_dim_v // 2 if split_d_v_bwd else head_dim_v
 
         def _slice_accum(t):
             n = t.shape[-1] // 2
@@ -1138,16 +1144,24 @@ def _flash_attn_bwd(
                 False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "dk_split",
             )
 
-        # dV split [low | high] postprocess
-        dv_accum_low, dv_accum_high = _slice_accum(dv_accum)
-        for accum_part, out_part in (
-            (dv_accum_low, dv[..., :half_hdim_v]),
-            (dv_accum_high, dv[..., half_hdim_v:]),
-        ):
+        # dV postprocess: split [low | high] when dV is split in TMEM,
+        # otherwise (only-d mode) a single full-d call.
+        if split_d_v_bwd:
+            dv_accum_low, dv_accum_high = _slice_accum(dv_accum)
+            for accum_part, out_part in (
+                (dv_accum_low, dv[..., :half_hdim_v]),
+                (dv_accum_high, dv[..., half_hdim_v:]),
+            ):
+                _postprocess_run(
+                    _to_cute(accum_part), _to_cute(out_part), cutlass.Float32(1.0),
+                    half_hdim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                    False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "dv_split",
+                )
+        else:
             _postprocess_run(
-                _to_cute(accum_part), _to_cute(out_part), cutlass.Float32(1.0),
-                half_hdim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
-                False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "dv_split",
+                dv_accum_tensor, dv_tensor, cutlass.Float32(1.0),
+                head_dim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "dv",
             )
     else:
         # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16

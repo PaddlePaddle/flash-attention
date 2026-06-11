@@ -637,6 +637,7 @@ def _flash_attn_bwd(
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
     is_split_d_bwd = False
+    is_split_dv_bwd = False
 
     if compute_capability == 9:
         m_block_size = 80 if not causal else 64
@@ -660,8 +661,9 @@ def _flash_attn_bwd(
         AtomLayoutNdKV = 1
 
         is_split_d_bwd = head_dim > 192 and head_dim == head_dim_v
+        is_split_dv_bwd = head_dim == 192 and head_dim_v == 128 and not is_split_d_bwd
         need_large_cluster = (head_dim > 128) or (head_dim == 128 and flashmask_info is None)
-        cluster_size = 1 if is_split_d_bwd else (2 if need_large_cluster else 1)
+        cluster_size = 1 if (is_split_d_bwd or is_split_dv_bwd) else (2 if need_large_cluster else 1)
         use_2cta_instrs = cluster_size == 2
 
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
@@ -752,7 +754,7 @@ def _flash_attn_bwd(
     # GQA-ratio==1 + not-split-d path the main bwd kernel writes dk/dv directly, and
     # FlashMask can skip whole n_blocks (no Q rows attend) — those rows would stay
     # garbage with empty_like and break correctness. Fall back to zeros_like there.
-    kv_postprocess_full = (qhead_per_kvhead > 1) or is_split_d_bwd
+    kv_postprocess_full = (qhead_per_kvhead > 1) or is_split_d_bwd or is_split_dv_bwd
     fixed_seqlen = cu_seqlens_q is None and cu_seqlens_k is None
     if fixed_seqlen:
         dq = paddle.empty_like(q)
@@ -779,7 +781,7 @@ def _flash_attn_bwd(
     dpsum = paddle.empty(shape=dpsum_shape, dtype=paddle.float32)
     lse_log2 = paddle.empty(shape=dpsum_shape, dtype=paddle.float32)
 
-    need_kv_accum = qhead_per_kvhead > 1 or is_split_d_bwd
+    need_kv_accum = qhead_per_kvhead > 1 or is_split_d_bwd or is_split_dv_bwd
     if need_kv_accum:
         if cu_seqlens_k is None:
             seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
@@ -850,7 +852,7 @@ def _flash_attn_bwd(
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
         for t in (dq_accum, dpsum, lse_log2)
     ]
-    if qhead_per_kvhead > 1 or is_split_d_bwd:
+    if qhead_per_kvhead > 1 or is_split_d_bwd or is_split_dv_bwd:
         dk_accum_tensor, dv_accum_tensor = [
             from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
             for t in (dk_accum, dv_accum)
@@ -868,7 +870,7 @@ def _flash_attn_bwd(
     else:
         dQ_semaphore = None
 
-    if deterministic and (qhead_per_kvhead > 1 or is_split_d_bwd):
+    if deterministic and (qhead_per_kvhead > 1 or is_split_d_bwd or is_split_dv_bwd):
         dK_semaphore = paddle.zeros(
             shape=[batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2], dtype=paddle.int32
         )
@@ -974,6 +976,7 @@ def _flash_attn_bwd(
             cluster_size,
             deterministic,
             is_split_d_bwd if compute_capability == 10 else False,
+            is_split_dv_bwd if compute_capability == 10 else False,
         )
     num_threads = 384
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -1030,6 +1033,7 @@ def _flash_attn_bwd(
                 use_2cta_instrs=use_2cta_instrs,
                 deterministic=deterministic,
                 is_split_d=is_split_d_bwd,
+                is_split_dv=is_split_dv_bwd,
             )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
@@ -1041,8 +1045,8 @@ def _flash_attn_bwd(
             lse_log2_tensor,
             dpsum_tensor,
             dq_accum_tensor,
-            dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd) else dk_accum_tensor,
-            dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd) else dv_accum_tensor,
+            dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dk_accum_tensor,
+            dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dv_accum_tensor,
             softmax_scale,
             current_stream,
             cu_seqlens_q_tensor,
@@ -1062,8 +1066,8 @@ def _flash_attn_bwd(
         lse_log2_tensor,
         dpsum_tensor,
         dq_accum_tensor,
-        dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd) else dk_accum_tensor,
-        dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd) else dv_accum_tensor,
+        dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dk_accum_tensor,
+        dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dv_accum_tensor,
         softmax_scale,
         current_stream,
         cu_seqlens_q_tensor,
@@ -1140,6 +1144,66 @@ def _flash_attn_bwd(
 
         # dV split [low | high] postprocess
         dv_accum_low, dv_accum_high = _slice_accum(dv_accum)
+        try:
+            print(f"[DBG-DVPP] is_split_dv: dv.shape={tuple(dv.shape)} dv.stride={dv.strides if hasattr(dv,'strides') else 'na'} "
+                  f"dv_accum.shape={tuple(dv_accum.shape)} "
+                  f"dv_accum_low.shape={tuple(dv_accum_low.shape)} dv_accum_high.shape={tuple(dv_accum_high.shape)} "
+                  f"half_hdim_v={half_hdim_v} n_block_size={n_block_size}",
+                  flush=True)
+            print(f"[DBG-DVPP] dv_accum.data_ptr={dv_accum.data_ptr()} "
+                  f"low.data_ptr={dv_accum_low.data_ptr()} high.data_ptr={dv_accum_high.data_ptr()} "
+                  f"diff_bytes_low_high={dv_accum_high.data_ptr() - dv_accum_low.data_ptr()}",
+                  flush=True)
+        except Exception as _e:
+            print(f"[DBG-DVPP] print failed: {_e}", flush=True)
+        for accum_part, out_part in (
+            (dv_accum_low, dv[..., :half_hdim_v]),
+            (dv_accum_high, dv[..., half_hdim_v:]),
+        ):
+            _postprocess_run(
+                _to_cute(accum_part), _to_cute(out_part), cutlass.Float32(1.0),
+                half_hdim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "dv_split",
+            )
+    elif is_split_dv_bwd:
+        half_hdim_v = head_dim_v // 2
+
+        def _slice_accum(t):
+            n = t.shape[-1] // 2
+            return t[..., :n], t[..., n:]
+
+        def _to_cute(t):
+            return from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(
+                leading_dim=t.ndim - 1
+            )
+
+        _postprocess_run(
+            dq_accum_tensor, dq_tensor, softmax_scale,
+            head_dim, m_block_size, AtomLayoutMdQ, dQ_swapAB,
+            use_2cta_instrs, 1, cu_seqlens_q_tensor, seqused_q_tensor, "dq",
+        )
+
+        _postprocess_run(
+            dk_accum_tensor, dk_tensor, softmax_scale,
+            head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+            False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dk",
+        )
+
+        # dV split [low | high] postprocess
+        dv_accum_low, dv_accum_high = _slice_accum(dv_accum)
+        try:
+            print(f"[DBG-DVPP] is_split_dv: dv.shape={tuple(dv.shape)} "
+                  f"dv_accum.shape={tuple(dv_accum.shape)} "
+                  f"dv_accum_low.shape={tuple(dv_accum_low.shape)} dv_accum_high.shape={tuple(dv_accum_high.shape)} "
+                  f"half_hdim_v={half_hdim_v} n_block_size={n_block_size} "
+                  f"dv_accum.dtype={dv_accum.dtype} dv.dtype={dv.dtype}",
+                  flush=True)
+            print(f"[DBG-DVPP] dv_accum.data_ptr={dv_accum.data_ptr()} "
+                  f"low.data_ptr={dv_accum_low.data_ptr()} high.data_ptr={dv_accum_high.data_ptr()} "
+                  f"diff_bytes_low_high={dv_accum_high.data_ptr() - dv_accum_low.data_ptr()}",
+                  flush=True)
+        except Exception as _e:
+            print(f"[DBG-DVPP] print failed: {_e}", flush=True)
         for accum_part, out_part in (
             (dv_accum_low, dv[..., :half_hdim_v]),
             (dv_accum_high, dv[..., half_hdim_v:]),

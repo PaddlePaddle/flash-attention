@@ -79,7 +79,6 @@ void ReducedKdVKernel(
         *reinterpret_cast<bf16x4*>(dst_accum + b_offset_accum + task_offset) = result;
     };
 
-    // TODO(heqianyue): batch = 1 the following seems correct, what about batch > 1 ?
     for (int task_idx = blockIdx.x; task_idx < num_tasks_per_batch; task_idx += gridDim.x) {
         const int task_offset = task_idx * elem_per_block + 4 * threadIdx.x;
 

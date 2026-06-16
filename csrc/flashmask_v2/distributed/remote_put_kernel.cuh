@@ -22,8 +22,7 @@ namespace flashmask {
  * to notify that specific remote consumer immediately — no blocking quiet or group commit needed.
 */
 template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32,
-    int num_chunk=4, bool has_local_chunk=false, bool per_stage_buffer=false,
-    bool use_hierarchical=false>
+    int num_chunk=4, bool has_local_chunk=false, bool use_hierarchical=false>
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkRemotePutKernel(
     const T* const __restrict__ k_send,                 // K src addr (local)
     const T* const __restrict__ v_send,                 // V src addr (local)
@@ -40,7 +39,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int S_stride,                 // H * D
     int64_t* const __restrict__ semaphores,
     const int num_segments = 4,
-    const int gpus_per_node = 1         // hierarchical only
+    const int gpus_per_node = 1,        // hierarchical only
+    const bool per_stage_buffer = false
 ) {
 #ifdef NVSHMEM_DEBUG
     if (threadIdx.x == 0) {
@@ -121,7 +121,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                 semaphores[target_rank] = 0;
                 nvshmem_fence();
                 // P2P notify: same semantics as ProducerNotifyFull but for one rank only
-                if constexpr (per_stage_buffer) {
+                if (per_stage_buffer) {
                     nvshmem_long_atomic_add(semaphores + target_rank, 1, target_rank);
                 } else {
                     nvshmem_long_atomic_add(semaphores + target_rank, -(1LL << my_pe), target_rank);

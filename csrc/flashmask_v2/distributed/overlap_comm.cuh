@@ -4,6 +4,7 @@
 #include "sr_buffer.cuh"
 #include "sep_sr_buffer.cuh"
 #include "hierarchical_rank_map.cuh"
+#include "overlap_feature_flags.cuh"
 #include "cutlass/bfloat16.h"
 
 namespace flashmask {
@@ -197,10 +198,13 @@ public:
         return _num_nodes;
     }
     bool use_hierarchical() const {
-        return _use_hierarchical;
+        return _flags.use_hierarchical;
     }
     bool use_bhsd_layout() const {
-        return _use_bhsd_layout;
+        return _flags.use_bhsd_layout;
+    }
+    bool per_stage_buffer() const {
+        return _flags.per_stage_buffer;
     }
 
     // this function is only called in the bwd
@@ -293,8 +297,7 @@ private:
     int _gpus_per_node;     // Number of GPUs per node (from nvshmem_n_pes_node)
     int _my_pe_node;        // This PE's index within its node (from nvshmem_team_my_pe)
     int _num_nodes;         // Number of nodes (= _total_n_pes / _gpus_per_node)
-    bool _use_hierarchical; // Whether to use hierarchical overlap (from USE_HIERARCHICAL_OVERLAP env)
-    bool _use_bhsd_layout;  // SR buffer uses (B,H,S,D) layout (from FLASHMASK_USE_BHSD_LAYOUT env)
+    OverlapFeatureFlags _flags;  // runtime feature switches (effective values after fallbacks)
     int _sema_inter_size;   // num_nodes for hierarchical, 0 otherwise (offset into semaphore array)
 
     // Configuration tracking for dynamic reconfiguration

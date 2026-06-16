@@ -153,15 +153,15 @@ static __global__ void SpinWaitAndReplaceKernel(int64_t* ptr, int64_t target) {
  * @param my_pe the id of semaphore to wait for
  * @param stream waiting stream. This API is therefore async on stream (if non-blocking)
 */
-template <bool use_per_stage_buffer = false>
 void consumer_wait_full(
     int64_t* const __restrict__ semaphores,
     int my_pe,
     int wait_value,
-    cudaStream_t comm_stream
+    cudaStream_t comm_stream,
+    bool use_per_stage_buffer = false
 ) {
     WARN_PRINT("Consumer wait full ...\n");
-    if constexpr (use_per_stage_buffer) {
+    if (use_per_stage_buffer) {
         SpinWaitAndReplaceKernel<<<1, 1, 0, comm_stream>>>(
             semaphores + my_pe, wait_value
         );

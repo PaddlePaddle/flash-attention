@@ -38,7 +38,7 @@ std::vector<uint8_t> get_nvshmem_unique_id() {
 }
 
 inline int get_num_chunks_per_stage(int local_seqlen_k, int nranks, int kv_head) {
-    return 0;
+    return 1;
 }
 #endif
 

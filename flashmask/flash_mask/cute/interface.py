@@ -29,6 +29,7 @@ from flash_mask.cute import utils
 from flash_mask.cute.flash_fwd import FlashAttentionForwardSm90
 from flash_mask.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_mask.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+from flash_mask.cute.flash_bwd_sink import FlashAttentionBackwardDsink
 from flash_mask.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_mask.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_mask.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
@@ -613,8 +614,9 @@ def _flash_attn_bwd(
     cu_seqlens_k: Optional[paddle.Tensor] = None,
     seqused_q: Optional[paddle.Tensor] = None,
     seqused_k: Optional[paddle.Tensor] = None,
+    learnable_sink: Optional[paddle.Tensor] = None,
     deterministic: bool = False,
-) -> Tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor]:
+) -> Tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor, Optional[paddle.Tensor]]:
     compute_capability = paddle.device.cuda.get_device_capability()[0]
     assert compute_capability in [10], "Unsupported compute capability. Supported: 10.x"
     assert cu_seqlens_q is None, "cu_seqlens_q must be None (varlen is not supported in flashmask)"
@@ -629,7 +631,7 @@ def _flash_attn_bwd(
         )
     if flashmask_info is not None:
         assert isinstance(flashmask_info, FlashMaskInfoPaddle)
-        prepare_block_maxmin(flashmask_info)  
+        prepare_block_maxmin(flashmask_info)
         cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
         num_flashmask_tensors = 2 * flashmask_info.startend_row_indices.shape[-1]
 
@@ -1169,12 +1171,50 @@ def _flash_attn_bwd(
                 False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dv",
             )
 
-    return dq, dk, dv
+    # ---- learnable_sink gradient ----
+    # dsink[h] = -sum_{b,s} exp2(sink[h]*log2e - lse_log2[b,h,s]) * delta[b,h,s]
+    # where delta == dpsum and lse_log2 == lse * log2e are both already produced by
+    # the preprocess kernel above. Padded rows have dpsum == 0 (lse_log2 is 0.0 there,
+    # not +inf), so the product exp2(...) * dpsum == 0 and they contribute nothing. A
+    # standalone cute-dsl reduction kernel (one block per head, no atomics ->
+    # deterministic) consumes the existing preprocess outputs instead of launching
+    # multiple Paddle ops.
+    dsink = None
+    if learnable_sink is not None:
+        assert cu_seqlens_q is None, "learnable_sink gradient does not support varlen"
+        sink_dtype = learnable_sink.dtype
+        dsink = paddle.empty(shape=[num_head], dtype=paddle.float32)
+        sink_tensor, dsink_tensor = [
+            from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=t.ndim - 1)
+            for t in (learnable_sink, dsink)
+        ]
+        compile_key_dsink = (compute_capability, paddle2cute_dtype_map[sink_dtype], num_threads)
+        if compile_key_dsink not in _flash_attn_bwd.compile_cache_dsink:
+            fa_bwd_dsink = FlashAttentionBackwardDsink(num_threads=num_threads)
+            _flash_attn_bwd.compile_cache_dsink[compile_key_dsink] = cute.compile(
+                fa_bwd_dsink,
+                dpsum_tensor,
+                lse_log2_tensor,
+                sink_tensor,
+                dsink_tensor,
+                current_stream,
+            )
+        _flash_attn_bwd.compile_cache_dsink[compile_key_dsink](
+            dpsum_tensor,
+            lse_log2_tensor,
+            sink_tensor,
+            dsink_tensor,
+            current_stream,
+        )
+        dsink = dsink.astype(sink_dtype)
+
+    return dq, dk, dv, dsink
 
 
 _flash_attn_bwd.compile_cache_pre = {}
 _flash_attn_bwd.compile_cache = {}
 _flash_attn_bwd.compile_cache_post = {}
+_flash_attn_bwd.compile_cache_dsink = {}
 
 
 class FlashAttnFunc(paddle.autograd.PyLayer):
@@ -1235,7 +1275,7 @@ class FlashAttnFunc(paddle.autograd.PyLayer):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, lse = ctx.saved_tensor()
-        dq, dk, dv = _flash_attn_bwd(
+        dq, dk, dv, _ = _flash_attn_bwd(
             q,
             k,
             v,
@@ -1304,7 +1344,7 @@ class FlashAttnVarlenFunc(paddle.autograd.PyLayer):
         assert seqused_q is None
         assert seqused_k is None
         assert ctx.softcap == 0.0
-        dq, dk, dv = _flash_attn_bwd(
+        dq, dk, dv, _ = _flash_attn_bwd(
             q,
             k,
             v,
@@ -1684,6 +1724,7 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
         value: paddle.Tensor,
         causal: bool = False,
         softmax_scale: float | None = None,
+        learnable_sink: paddle.Tensor | None = None,
         startend_row_indices: paddle.Tensor | None = None,
         block_mask: paddle.Tensor | None = None,
     ) -> paddle.Tensor | Tuple[paddle.Tensor, paddle.Tensor]:
@@ -1693,18 +1734,19 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
             value,
             causal=causal,
             softmax_scale=softmax_scale,
+            learnable_sink=learnable_sink,
             return_lse=True,
             startend_row_indices=startend_row_indices,
             pack_gqa=False,
         )
-        ctx.save_for_backward(query, key, value, startend_row_indices, out, lse)
+        ctx.save_for_backward(query, key, value, startend_row_indices, out, lse, learnable_sink)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         return [out, lse]
 
     @staticmethod
-    def backward(ctx, dout, *args) -> Tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor]:
-        query, key, value, startend_row_indices, out, lse = ctx.saved_tensor()
+    def backward(ctx, dout, *args) -> Tuple[paddle.Tensor, ...]:
+        query, key, value, startend_row_indices, out, lse, learnable_sink = ctx.saved_tensor()
         if startend_row_indices is not None:
             flashmask_info = FlashMaskInfoPaddle(
                 startend_row_indices=startend_row_indices,
@@ -1712,7 +1754,7 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
             )
         else:
             flashmask_info = None
-        dq, dk, dv = _flash_attn_bwd(
+        dq, dk, dv, dsink = _flash_attn_bwd(
             query,
             key,
             value,
@@ -1723,8 +1765,11 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
             softmax_scale=ctx.softmax_scale,
             causal=ctx.causal,
             deterministic=paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"],
+            learnable_sink=learnable_sink,
         )
-        return dq, dk, dv
+        if learnable_sink is None:
+            return dq, dk, dv
+        return dq, dk, dv, dsink
 
 # TODO(wusiming): should we align the parameters with those of paddle.nn.functional.flashmask_attention?
 def flashmask_attention(
@@ -1744,6 +1789,7 @@ def flashmask_attention(
     name: str | None = None,
     softmax_scale: float | None = None,
     block_mask: paddle.Tensor | None = None,
+    learnable_sink: paddle.Tensor | None = None,
 ):
     if (
         paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"] == 4
@@ -1832,6 +1878,7 @@ def flashmask_attention(
             value,
             causal=causal,
             softmax_scale=softmax_scale,
+            learnable_sink=learnable_sink,
             startend_row_indices=startend_row_indices,
         )
         if return_softmax_lse:
@@ -1839,6 +1886,9 @@ def flashmask_attention(
         else:
             return out
     else:
+        assert learnable_sink is None, (
+            "learnable_sink is only supported on the flashmask v4 (cute) path"
+        )
         original_flash_attn_version = paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"]
         if original_flash_attn_version == 4:
             paddle.set_flags({"FLAGS_flash_attn_version": 2})
@@ -1904,7 +1954,7 @@ def flash_attention(
         assert not return_softmax, (
             "flash attention 4 does not support return_softmax"
         )
-        assert fixed_seed_offset is None , (
+        assert fixed_seed_offset is None, (
             "flash attention 4 does not support setting seed_offset"
         )
         assert rng_name == "", (

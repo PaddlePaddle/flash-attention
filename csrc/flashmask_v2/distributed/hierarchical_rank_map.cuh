@@ -228,19 +228,4 @@ __device__ __host__ inline int hier_local_refcount(int total_n_pes, int gpus_per
     return total_n_pes / gpus_per_node - 1 + gpus_per_node - 1;
 }
 
-/** After fetching a congruence partner, (gpus_per_node-1) same-node ranks will read it. */
-__device__ __host__ inline int hier_congruence_refcount(int gpus_per_node) {
-    return gpus_per_node - 1;
-}
-
-/** Number of Phase 1 chunks (cross-node congruence group, excluding local). */
-__device__ __host__ inline int hier_phase1_chunk_count(int total_n_pes, int gpus_per_node) {
-    return total_n_pes / gpus_per_node - 1;
-}
-
-/** Number of Phase 2 chunks (intra-node redistribution). */
-__device__ __host__ inline int hier_phase2_chunk_count(int total_n_pes, int gpus_per_node) {
-    return total_n_pes - total_n_pes / gpus_per_node;
-}
-
 } // namespace flashmask::hier

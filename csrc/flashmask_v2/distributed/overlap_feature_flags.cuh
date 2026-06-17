@@ -26,7 +26,9 @@ namespace flashmask {
  */
 struct OverlapFeatureFlags {
     // FLASHMASK_USE_HIERARCHICAL: multi-node hierarchical AG/RS rank mapping.
-    bool use_hierarchical = true;
+    // Hierarchical communication defaults to false. Since using hierarchical communication
+    // requires the code modification on Python end (context_parallel_utils.py)
+    bool use_hierarchical = false;
     // FLASHMASK_USE_BHSD_LAYOUT: SR buffer uses (B,H,S,D) instead of (B,S,H,D).
     bool use_bhsd_layout = false;
     // FLASHMASK_PER_STAGE_BUFFER: one RS buffer slot per segment (vs. a single shared slot).

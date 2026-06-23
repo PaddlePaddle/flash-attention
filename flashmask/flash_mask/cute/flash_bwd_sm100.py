@@ -91,8 +91,6 @@ class FlashAttentionBackwardSm100:
         # D-only split (is_split_d=True, is_split_dv=False) is not yet supported.
         # Several sites still lack a D-only branch and would fall through to the
         # wrong path; they are tagged with "TODO(split_d_only)" (search that string)
-        # — TMEM layout (~193-241), pipeline stages (~269-291),
-        # delay_semaphore_release (~5260), and num_reduces (~5570).
         assert not self.is_split_d_only, \
             "is_split_d without is_split_dv (D-only split) is not yet supported"
 
@@ -100,9 +98,8 @@ class FlashAttentionBackwardSm100:
         self.tile_n = tile_n
         self.debug_print = False
 
-
         # D  axis (tile_hdim)  may exceed 128 only if it is physically split (is_split_d)
-        #   or it is the 2CTA / dv-only d=192,dv=128 layout.
+        #                      or it is the 2CTA / dv-only d=192,dv=128 layout.
         # DV axis (tile_hdimv) may exceed 128 only if it is physically split (is_split_dv).
         assert self.tile_hdim <= 128 or (self.tile_hdim == 192 and self.tile_hdimv == 128) or self.is_split_d
         assert self.tile_hdimv <= 128 or self.is_split_dv
@@ -125,15 +122,7 @@ class FlashAttentionBackwardSm100:
                 assert (self.tile_hdim <= 128 and self.tile_hdimv <= 128) or (self.tile_hdim == 192 and self.tile_hdimv == 128)
             else:
                 assert self.tile_hdim <= 128 and self.tile_hdimv <= 128
-        
-        # dK_as_reduce: dK is materialized via a per-m-block global reduce
-        # (cp.reduce.async.bulk.add.f32 into mdK) instead of being accumulated
-        # persistently in TMEM. Note is_split_dv enters this condition NOT because
-        # dK is a DV-side quantity (it is a D-side quantity), but as a TMEM-capacity
-        # consequence: once EITHER axis is physically split, dK/dQ have to time-share
-        # the S/P TMEM offset (see the split TMEM layouts at lines ~193-217), so dK
-        # can no longer stay resident in TMEM across m-blocks and must be reduced
-        # through global memory. See the matching note at lines ~5234-5243.
+
         self.dK_as_reduce = True if (is_split_d or is_split_dv) else False
 
         # CTA tiler -- each axis is independently halved iff its switch is set.
@@ -1695,6 +1684,9 @@ class FlashAttentionBackwardSm100:
                 is_leader_cta,
             )
             cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
+
+        # Reduce
+        # (0, 1, 2, 3) - dQ
         if warp_idx >= self.reduce_warp_ids[0] and warp_idx <= self.reduce_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
             self.dQacc_reduce(
@@ -2963,7 +2955,7 @@ class FlashAttentionBackwardSm100:
 
                         # LTE region
                         if const_expr(flashmask_info.LTE_nblock_max is not None):
-                            # Align with the working split_d load (lines 2627-2634):
+                            # Align with the working split_d load:
                             # start the LTE loop at loop_start + 1 so the prologue's
                             # prefetch_m_block is not double-loaded in the prefetch_lte
                             # case (which over-produces by 1 block and hangs).

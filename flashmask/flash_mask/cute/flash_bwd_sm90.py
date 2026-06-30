@@ -97,7 +97,6 @@ class FlashAttentionBackwardSm90:
         self.dO_stage = dO_stage
         self.PdS_stage = PdS_stage
         assert self.dO_stage in [1, self.Q_stage]
-        print("PdS_stage", self.PdS_stage, "Q_stage", self.Q_stage)
         assert self.PdS_stage in [1, self.Q_stage]
         self.SdP_swapAB = SdP_swapAB
         self.dKV_swapAB = dKV_swapAB

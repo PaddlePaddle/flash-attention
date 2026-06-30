@@ -7,7 +7,7 @@ from cutlass.cute.nvgpu import warpgroup
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Numeric, dsl_user_op
 from cutlass.utils import LayoutEnum
-import cutlass.utils.hopper_helpers as sm90_utils_og
+import cutlass.utils.hopper_helpers as sm90_utils_basic
 
 
 @cute.jit
@@ -96,7 +96,7 @@ def make_smem_layout(
     if const_expr(major_mode_size is None):
         major_mode_size = shape[1] if layout.is_n_major_c() else shape[0]
     smem_layout_atom = warpgroup.make_smem_layout_atom(
-        sm90_utils_og.get_smem_layout_atom(layout, dtype, major_mode_size),
+        sm90_utils_basic.get_smem_layout_atom(layout, dtype, major_mode_size),
         dtype,
     )
     order = (1, 0, 2) if const_expr(layout.is_m_major_c()) else (0, 1, 2)

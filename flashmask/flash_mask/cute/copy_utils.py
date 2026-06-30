@@ -94,21 +94,6 @@ def tiled_copy_1d(
     val_layout = cute.make_layout(num_copy_elems)
     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
-# def tiled_copy_2d(
-#     dtype: Type[cutlass.Numeric], major_mode_size: int, num_threads: int, is_async: bool = False
-# ) -> cute.TiledCopy:
-#     num_copy_bits = math.gcd(major_mode_size, 128 // dtype.width) * dtype.width
-#     copy_elems = num_copy_bits // dtype.width
-#     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
-#     copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
-#     gmem_threads_per_row = major_mode_size // copy_elems
-#     assert num_threads % gmem_threads_per_row == 0
-#     thr_layout = cute.make_ordered_layout(
-#         (num_threads // gmem_threads_per_row, gmem_threads_per_row),
-#         order=(1, 0),
-#     )
-#     val_layout = cute.make_layout((1, copy_elems))
-#     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
 def tiled_copy_2d(
     dtype: Type[cutlass.Numeric],
@@ -311,9 +296,6 @@ def cpasync_reduce_bulk_add_f32(
     )
 
 
-
-
-
 def cpasync_bulk_get_copy_fn(
     src_tensor: cute.Tensor,
     dst_tensor: cute.Tensor,
@@ -474,4 +456,71 @@ def get_smem_store_C(
         cvt_copy(tiled_copy, src, dst_tensor, retile=True, **new_kwargs)
 
     return copy_fn, thr_copy, tRS_sC
+
+
+BIG_INT = 2**30
+MAX_INT = 2**31 - 1
+BIG_INT_INV = 2**64 // BIG_INT
+
+
+def create_ragged_tensor_for_tma(
+    T: cute.Tensor,
+    ragged_dim: int = 0,
+    ptr_shift: bool = False,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Tensor:
+    rank = cute.rank(T)
+    if ragged_dim < 0:
+        ragged_dim += rank
+    if ptr_shift:
+        assert rank <= 4, "ptr_shift ragged tensor only supports up to 4 dimensions"
+        new_shape = T.shape[:ragged_dim] + (BIG_INT,) + T.shape[ragged_dim + 1 :] + (MAX_INT,)
+        new_stride = T.stride + (T.stride[ragged_dim],)
+        ptr_offset = (None,) * ragged_dim + (-BIG_INT,) + (None,) * (rank - ragged_dim - 1)
+        new_ptr = cute.domain_offset(ptr_offset, T).iterator
+        return cute.make_tensor(new_ptr, cute.make_layout(new_shape, stride=new_stride))
+    else:
+        assert rank <= 3, "non-ptr_shift ragged tensor only supports up to 3 dimensions"
+        stride_r = T.stride[ragged_dim]
+        new_shape = (
+            T.shape[:ragged_dim] + (BIG_INT,) + T.shape[ragged_dim + 1 :] + (MAX_INT, MAX_INT)
+        )
+        new_stride = (
+            T.stride[:ragged_dim]
+            + (stride_r,)
+            + T.stride[ragged_dim + 1 :]
+            + (BIG_INT_INV - stride_r, stride_r)
+        )
+        return cute.make_tensor(T.iterator, cute.make_layout(new_shape, stride=new_stride))
+
+
+@dsl_user_op
+def offset_ragged_tensor(
+    T: cute.Tensor,
+    offset: Int32,
+    length: Int32,
+    ragged_dim: int = 0,
+    ptr_shift: bool = False,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Tensor:
+    rank = cute.rank(T)
+    if ragged_dim < 0:
+        ragged_dim += rank
+    big_int = cute.size(T, mode=[ragged_dim])
+    offset_val = big_int - length
+    if ptr_shift:
+        # 1-extra-dim: rank = original_rank + 1
+        assert rank >= ragged_dim + 2
+        offset_tuple = (None,) * ragged_dim + (offset_val,) + (None,) * (rank - ragged_dim - 2)
+        index_tuple = (None,) * (rank - 1) + (offset + length,)
+    else:
+        # 2-extra-dim: rank = original_rank + 2, last 2 modes are the wraparound dims
+        assert rank >= ragged_dim + 3
+        offset_tuple = (None,) * ragged_dim + (offset_val,) + (None,) * (rank - ragged_dim - 3)
+        index_tuple = (None,) * (rank - 2) + (big_int, offset + length)
+    return cute.domain_offset(offset_tuple, T[index_tuple])
 

@@ -44,6 +44,7 @@ class FlashAttentionBackwardPreprocess:
         tile_m: int = 128,
         num_threads: int = 256,
         use_padded_offsets: bool = True,
+        dq_head_dim: int = None,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -55,6 +56,9 @@ class FlashAttentionBackwardPreprocess:
         :type tile_m: int
         :param num_threads: number of threads
         :type num_threads: int
+        :param dq_head_dim: head dimension used for dQaccum allocation (e.g., 128 for SM100 with head_dim=80).
+            If None, defaults to head_dim_padded.
+        :type dq_head_dim: int or None
         """
         self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
         self.dtype = dtype
@@ -66,6 +70,11 @@ class FlashAttentionBackwardPreprocess:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.num_threads = num_threads
         self.use_padded_offsets = use_padded_offsets
+        # dQaccum may use a different head_dim_rounded (e.g., 128 for SM100 with head_dim=80)
+        if dq_head_dim is not None:
+            self.dq_head_dim_padded = int(math.ceil(dq_head_dim / hdim_multiple_of) * hdim_multiple_of)
+        else:
+            self.dq_head_dim_padded = self.head_dim_padded
 
     @staticmethod
     def can_implement(dtype, head_dim, tile_m, num_threads) -> bool:
@@ -117,7 +126,7 @@ class FlashAttentionBackwardPreprocess:
         universal_copy_bits = 128
         num_copy_elems_dQaccum = universal_copy_bits // Float32.width
         assert (
-            self.tile_m * self.head_dim_padded // num_copy_elems_dQaccum
+            self.tile_m * self.dq_head_dim_padded // num_copy_elems_dQaccum
         ) % self.num_threads == 0
         self.gmem_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
             Float32, self.num_threads, num_copy_elems_dQaccum
@@ -294,9 +303,7 @@ class FlashAttentionBackwardPreprocess:
             t0OcO = gmem_thr_copy_O.get_slice(0).partition_S(cO)
             tOpO = None
             if const_expr(self.check_hdim_v_oob):
-                tOpO = copy_utils.predicate_k(tOcO, limit=headdim_v)
-            # Each copy will use the same predicate
-            copy = partial(copy_utils.copy, pred=tOpO)
+                tOpO = utils.predicate_k(tOcO, limit=headdim_v)
 
             tOrO = cute.make_rmem_tensor_like(tOgO)
             tOrdO = cute.make_rmem_tensor_like(tOgdO)
@@ -308,8 +315,22 @@ class FlashAttentionBackwardPreprocess:
                 # Instead of using tOcO, we using t0OcO and subtract the offset from the limit.
                 # This is bc the entries of t0OcO are known at compile time.
                 if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
-                    copy(tOgO[None, m, None], tOrO[None, m, None])
-                    copy(tOgdO[None, m, None], tOrdO[None, m, None])
+                    cute.copy(
+                        gmem_thr_copy_O,
+                        tOgO[None, m, None],
+                        tOrO[None, m, None],
+                        pred=tOpO[None, m, None]
+                        if const_expr(self.check_hdim_v_oob)
+                        else None,
+                    )
+                    cute.copy(
+                        gmem_thr_copy_O,
+                        tOgdO[None, m, None],
+                        tOrdO[None, m, None],
+                        pred=tOpO[None, m, None]
+                        if const_expr(self.check_hdim_v_oob)
+                        else None,
+                    )
             # O and dO loads are done; signal that the next kernel can start.
             # Correctness is ensured by griddepcontrol_wait() in bwd_sm90 before it reads our outputs.
             if const_expr(self.use_pdl):
@@ -350,9 +371,9 @@ class FlashAttentionBackwardPreprocess:
                     batch_idx,
                     dim=2,
                     padded=True,
-                    multiple=self.head_dim_padded,
+                    multiple=self.dq_head_dim_padded,
                 )[None, head_idx]
-                blkdQaccum_shape = (self.tile_m * self.head_dim_padded,)
+                blkdQaccum_shape = (self.tile_m * self.dq_head_dim_padded,)
                 gdQaccum = cute.local_tile(mdQaccum_cur, blkdQaccum_shape, (m_block,))
                 gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
                 tdQgdQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)

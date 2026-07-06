@@ -120,7 +120,8 @@ VERSION = _get_version()
 # Packages: exclude modules not being built
 # ============================================================
 exclude_packages = ['build', 'build.*', 'tests', 'tests.*',
-                     'flash_mask.cp_balance.csrc', 'flash_mask.cp_balance.csrc.*']
+                     'flash_mask.cp_balance.csrc', 'flash_mask.cp_balance.csrc.*',
+                     'flash_mask.utils.csrc', 'flash_mask.utils.csrc.*']
 if not BUILD_FA3:
     exclude_packages += [
         'flash_mask.flashmask_attention_v3',
@@ -524,6 +525,16 @@ if BUILD_CPB:
         'CP Balance',
         csrc_dir=os.path.join(FLASH_MASK_DIR, 'cp_balance', 'csrc'),
         pkg_dir=os.path.join(FLASH_MASK_DIR, 'cp_balance'),
+    )
+    if _pkg:
+        _submodule_package_data[_pkg] = ['*.so']
+
+# --- utils: small CUDA helpers used by FA4 Python paths ---
+if BUILD_FA4:
+    _pkg = _build_cuda_submodule(
+        'FlashMask utils',
+        csrc_dir=os.path.join(FLASH_MASK_DIR, 'utils', 'csrc'),
+        pkg_dir=os.path.join(FLASH_MASK_DIR, 'utils'),
     )
     if _pkg:
         _submodule_package_data[_pkg] = ['*.so']

@@ -489,10 +489,6 @@ def _flash_attn_fwd(
     )
 
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
-    if compute_capability == 9:
-        assert startend_row_indices is None, (
-            "flashmask (startend_row_indices) is not yet supported on SM 9.0"
-        )
 
     sparse_tensors = None
     if block_sparse_tensors is not None:
@@ -531,7 +527,13 @@ def _flash_attn_fwd(
     current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
 
     if compute_capability == 9:  # TODO: tune block size according to hdim.
-        if head_dim == head_dim_v == 128 and not causal and not local and not use_block_sparsity:
+        if (
+            head_dim == head_dim_v == 128
+            and not causal
+            and not local
+            and not use_block_sparsity
+            and startend_row_indices is None
+        ):
             n_block_size = 192
     if compute_capability == 10:
         # TODO: fix the varlen case

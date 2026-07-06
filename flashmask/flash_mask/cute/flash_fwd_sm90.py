@@ -133,12 +133,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
         mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
         mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+        # flashmask: full + empty mbarriers (one each per stage) and per-stage
+        # staging buffer for the 4 startend_row_indices vectors (LTS/LTE/UTS/UTE).
+        rowidx_mbar_count = (2 * self.num_stages) if const_expr(self.enable_flashmask) else 0
+        rowidx_smem_count = (
+            (4 * self.tile_n * self.num_stages) if const_expr(self.enable_flashmask) else 0
+        )
+        mbar_ptr_rowidx_struct = cute.struct.MemRange[cutlass.Int64, rowidx_mbar_count]
+        s_rowidx_struct = cute.struct.MemRange[Int32, rowidx_smem_count]
 
         @cute.struct
         class SharedStorageQKV:
             mbar_ptr_Q: mbar_ptr_Q_struct
             mbar_ptr_K: mbar_ptr_K_struct
             mbar_ptr_V: mbar_ptr_V_struct
+            mbar_ptr_rowidx: mbar_ptr_rowidx_struct
+            s_rowidx: s_rowidx_struct
             sV: sV_struct
             sQ: sQ_struct
             sK: sK_struct
@@ -149,6 +159,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mbar_ptr_Q: mbar_ptr_Q_struct
             mbar_ptr_K: mbar_ptr_K_struct
             mbar_ptr_V: mbar_ptr_V_struct
+            mbar_ptr_rowidx: mbar_ptr_rowidx_struct
+            s_rowidx: s_rowidx_struct
             sQ: sQV_struct
             sK: sK_struct
             sP: sP_struct
@@ -216,6 +228,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.num_wg_mma
         ]
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
+
+        # flashmask (startend_row_indices) support. When enabled we stage the
+        # per-n_block row indices into smem and apply an extra mask on S.
+        self.enable_flashmask = const_expr(flashmask_info is not None)
+        self.has_lt_end = const_expr(
+            flashmask_info is not None and flashmask_info.LTE_nblock_max is not None
+        )
+        self.has_ut_start = const_expr(
+            flashmask_info is not None and flashmask_info.UTS_nblock_max is not None
+        )
+        self.has_ut_end = const_expr(
+            flashmask_info is not None and flashmask_info.UTE_nblock_max is not None
+        )
 
         self.use_scheduler_barrier = (
             (self.num_wg_mma >= 2 and self.tile_hdim <= 128)
@@ -391,6 +416,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             SharedStorage,
             aux_tensors,
             fastdiv_mods,
+            flashmask_info,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -437,6 +463,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr[Callable],
         aux_tensors=Optional[list[cute.Tensor]],
         fastdiv_mods=None,
+        flashmask_info: Optional[FlashMaskInfo] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
@@ -450,6 +477,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         # Mbarrier / pipeline init
         mbar_ptr_Q = storage.mbar_ptr_Q.data_ptr()
+
+        # flashmask: init the startend_row_indices staging mbarriers before any
+        # pipeline is created so their init is ordered by the pipeline init fence.
+        # Layout: [full[0..num_stages), empty[0..num_stages)].
+        mbar_ptr_rowidx = None
+        if const_expr(self.enable_flashmask):
+            mbar_ptr_rowidx = storage.mbar_ptr_rowidx.data_ptr()
+            if warp_idx == 0:
+                for j in cutlass.range_constexpr(self.num_stages):
+                    # full: written by the KV load warp (32 threads)
+                    cute.arch.mbarrier_init(mbar_ptr_rowidx + j, cute.arch.WARP_SIZE)
+                    # empty: released by all MMA/consumer threads
+                    cute.arch.mbarrier_init(
+                        mbar_ptr_rowidx + self.num_stages + j, self.num_mma_threads
+                    )
 
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
         tma_warp = ThreadCooperativeGroup(1)
@@ -534,6 +576,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # reuse sQ's data iterator
         sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
 
+        # flashmask staging buffer (flat): 4 vectors x tile_n x num_stages Int32.
+        s_rowidx = None
+        if const_expr(self.enable_flashmask):
+            s_rowidx = storage.s_rowidx.get_tensor(
+                cute.make_layout(4 * self.tile_n * self.num_stages)
+            )
+
         block_info = BlockInfo(
             self.tile_m,
             self.tile_n,
@@ -596,6 +645,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
+                flashmask_info,
+                s_rowidx,
+                mbar_ptr_rowidx,
             )
 
         else:  # Consumer
@@ -631,6 +683,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 blocksparse_tensors,
                 aux_tensors,
                 fastdiv_mods,
+                flashmask_info,
+                s_rowidx,
+                mbar_ptr_rowidx,
             )
 
     @cute.jit
@@ -654,6 +709,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
+        flashmask_info: Optional[FlashMaskInfo] = None,
+        s_rowidx: Optional[cute.Tensor] = None,
+        mbar_ptr_rowidx: Optional[cute.Pointer] = None,
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         tidx, _, _ = cute.arch.thread_idx()
@@ -669,6 +727,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             kv_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_stages
             )
+            num_heads = cute.size(mQ.shape[2])
             tile_scheduler = TileSchedulerCls()
             work_tile = tile_scheduler.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -762,7 +821,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
                 if const_expr(not self.use_block_sparsity):
                     n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-                    # if cute.arch.thread_idx()[0] == 0:
+                    # flashmask: skip fully-masked KV blocks by tightening the
+                    # [n_block_min, n_block_max) range from both ends. Producer and
+                    # consumer run the identical scan so they stay in lockstep.
+                    if const_expr(self.enable_flashmask):
+                        n_block_min, n_block_max = self.flashmask_n_block_min_max(
+                            flashmask_info,
+                            batch_idx,
+                            head_idx,
+                            m_block,
+                            seqlen.seqlen_q,
+                            num_heads,
+                            n_block_min,
+                            n_block_max,
+                        )
                     #     cute.printf("m_block = %d, n_block_min: %d, n_block_max: %d", m_block, n_block_min, n_block_max)
                     # Clamp n_block to 0 when n_block_max == 0 (can happen with causal
                     # + pack_gqa when seqlen_k < tile_n). TMA handles n_block=-1
@@ -785,6 +857,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         if const_expr(not self.use_tma_KV):
                             paged_kv_manager.load_page_table(n_block)
                         load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
+                        # flashmask: stage the first block's startend_row_indices at the
+                        # same pipeline stage as its K (before kv_producer_state advances).
+                        if const_expr(self.enable_flashmask):
+                            self.load_startend_row_indices(
+                                batch_idx,
+                                head_idx,
+                                n_block,
+                                num_heads,
+                                kv_producer_state,
+                                s_rowidx,
+                                flashmask_info,
+                                mbar_ptr_rowidx,
+                                seqlen.seqlen_k,
+                                m_block,
+                                seqlen.seqlen_q,
+                            )
                     if const_expr(self.use_tma_Q):
                         if warp_idx_in_wg == 0:
                             pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
@@ -827,6 +915,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                     producer_state=kv_producer_state,
                                     page_idx=page_idx,
                                 )
+                                if const_expr(self.enable_flashmask):
+                                    self.load_startend_row_indices(
+                                        batch_idx,
+                                        head_idx,
+                                        n_block,
+                                        num_heads,
+                                        kv_producer_state,
+                                        s_rowidx,
+                                        flashmask_info,
+                                        mbar_ptr_rowidx,
+                                        seqlen.seqlen_k,
+                                        m_block,
+                                        seqlen.seqlen_q,
+                                    )
                                 kv_producer_state.advance()
                         else:
                             for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
@@ -850,6 +952,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                     producer_state=kv_producer_state,
                                     page_idx=page_idx,
                                 )
+                                # flashmask: stage this block's indices at the same
+                                # pipeline stage as its K load.
+                                if const_expr(self.enable_flashmask):
+                                    self.load_startend_row_indices(
+                                        batch_idx,
+                                        head_idx,
+                                        n_block,
+                                        num_heads,
+                                        kv_producer_state,
+                                        s_rowidx,
+                                        flashmask_info,
+                                        mbar_ptr_rowidx,
+                                        seqlen.seqlen_k,
+                                        m_block,
+                                        seqlen.seqlen_q,
+                                    )
                                 pipeline_v.producer_acquire(kv_producer_state_prev)
                                 load_V(
                                     block=n_block_prev,
@@ -931,6 +1049,78 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_kv.producer_commit(producer_state)
 
     @cute.jit
+    def load_startend_row_indices(
+        self,
+        batch_idx: Int32,
+        head_idx: Int32,
+        n_block: Int32,
+        num_heads: Int32,
+        kv_producer_state: pipeline.PipelineState,
+        s_rowidx: cute.Tensor,
+        flashmask_info: FlashMaskInfo,
+        mbar_ptr_rowidx: cute.Pointer,
+        seqlen_k: Int32,
+        m_block: Int32,
+        seqlen_q: Int32,
+    ) -> None:
+        """Stage the per-n_block startend_row_indices vectors (LTS/LTE/UTS/UTE)
+        into shared memory for the consumer's flashmask application. Runs on the
+        KV load warp (32 threads). The staging buffer stage and pipeline phase are
+        taken from the KV producer state (flashmask advances in lockstep with KV),
+        so no separate pipeline state is needed. Must be called before the KV
+        producer state is advanced for this block. smem layout per stage: 4
+        vectors of tile_n Int32 at offsets [0, tile_n, 2*tile_n, 3*tile_n].
+
+        The actual gmem->smem copy is skipped for fully-visible blocks (no element
+        masked); the empty-wait / full-arrive stay unconditional so the staging
+        pipeline remains 1:1 with the KV pipeline."""
+        stage = kv_producer_state.index
+        # Wait until the consumer has finished reading this stage's buffer.
+        cute.arch.mbarrier_wait(
+            mbar_ptr_rowidx + self.num_stages + stage, kv_producer_state.phase
+        )
+        fm_heads = flashmask_info.startend_row_indices.shape[1]
+        h_h_flashmask_ratio = num_heads // fm_heads
+        fm_head_idx = head_idx // h_h_flashmask_ratio
+        m_start = m_block * self.tile_m
+        m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
+        partial = self._flashmask_block_partial(
+            flashmask_info, batch_idx, fm_head_idx, n_block, m_start, m_end
+        )
+        if partial:
+            base = stage * 4 * self.tile_n
+            s_cur = cute.make_tensor(
+                s_rowidx.iterator + base, cute.make_layout(4 * self.tile_n)
+            )
+            nb_mul_kBN = n_block * self.tile_n
+            loop_ub = cutlass.min(self.tile_n, seqlen_k - nb_mul_kBN)
+            idx = cute.arch.thread_idx()[0] % cute.arch.WARP_SIZE
+            srow = flashmask_info.startend_row_indices
+            if const_expr(self.has_ut_start):
+                while idx < loop_ub:
+                    s_cur[idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 0]
+                    s_cur[self.tile_n + idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 1]
+                    s_cur[self.tile_n * 2 + idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 2]
+                    s_cur[self.tile_n * 3 + idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 3]
+                    idx += cute.arch.WARP_SIZE
+            elif const_expr(self.has_lt_end):
+                while idx < loop_ub:
+                    s_cur[idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 0]
+                    s_cur[self.tile_n + idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 1]
+                    idx += cute.arch.WARP_SIZE
+            elif const_expr(self.has_ut_end):
+                while idx < loop_ub:
+                    s_cur[idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 0]
+                    s_cur[self.tile_n * 3 + idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 1]
+                    idx += cute.arch.WARP_SIZE
+            else:
+                while idx < loop_ub:
+                    s_cur[idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 0]
+                    idx += cute.arch.WARP_SIZE
+        # Signal the consumer that this stage's indices are ready (or skipped).
+        cute.arch.mbarrier_arrive(mbar_ptr_rowidx + stage)
+
+    @cute.jit
     def mma(
         self,
         tiled_mma_qk: cute.TiledMma,
@@ -958,6 +1148,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         blocksparse_tensors: Optional[BlockSparseTensors],
         aux_tensors: Optional[list],
         fastdiv_mods=None,
+        flashmask_info: Optional[FlashMaskInfo] = None,
+        s_rowidx: Optional[cute.Tensor] = None,
+        mbar_ptr_rowidx: Optional[cute.Pointer] = None,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
@@ -1088,10 +1281,42 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     aux_tensors=aux_tensors,
                     fastdiv_mods=fastdiv_mods,
                 )
+            flashmask_fn = None
+            if const_expr(self.enable_flashmask):
+                flashmask_fn = partial(
+                    self.apply_flashmask_block,
+                    m_block=m_block,
+                    thr_mma=thr_mma_qk,
+                    mask=mask,
+                    s_rowidx=s_rowidx,
+                    mbar_ptr_rowidx=mbar_ptr_rowidx,
+                    flashmask_info=flashmask_info,
+                    batch_idx=batch_idx,
+                    head_idx=head_idx,
+                    num_heads=cute.size(mO.shape[2]),
+                    seqlen_q=seqlen.seqlen_q,
+                )
             mma_one_n_block = partial(
-                mma_one_n_block_all, seqlen=seqlen, softmax=softmax, score_mod_fn=score_mod_fn
+                mma_one_n_block_all,
+                seqlen=seqlen,
+                softmax=softmax,
+                score_mod_fn=score_mod_fn,
+                flashmask_fn=flashmask_fn,
             )
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            # flashmask: identical block-skipping scan as the producer, so the
+            # consumer processes exactly the blocks that were loaded.
+            if const_expr(self.enable_flashmask):
+                n_block_min, n_block_max = self.flashmask_n_block_min_max(
+                    flashmask_info,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    seqlen.seqlen_q,
+                    cute.size(mO.shape[2]),
+                    n_block_min,
+                    n_block_max,
+                )
             pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
             # For performance reason, we separate out two kinds of iterations:
             # those that need masking on S, and those that don't.
@@ -1115,6 +1340,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         kv_consumer_state=kv_consumer_state,
                         mask_fn=partial(mask_fn, mask_mod=self.mask_mod),
                         score_mod_fn=score_mod_fn,
+                        flashmask_fn=flashmask_fn,
                         is_first_block=True,
                     )
                 else:
@@ -1277,6 +1503,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         acc_O: Optional[cute.Tensor] = None,
         mask_fn: Callable = None,
         score_mod_fn: Optional[Callable] = None,
+        flashmask_fn: Optional[Callable] = None,
         is_first_block: bool = False,
     ):
         """Processes the first half block when using intra-warpgroup-overlap"""
@@ -1293,6 +1520,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # Caveat: if full block further right than mask block, seqlen masking is redundant;
         # however, masking is being applied anyway, so essentially no perf hit
         mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
+        # flashmask: applied after causal/seqlen mask, on the first block's stage.
+        if const_expr(flashmask_fn is not None):
+            flashmask_fn(acc_S, kv_consumer_state, n_block)
 
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_block)
 
@@ -1342,6 +1572,166 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         return kv_consumer_state
 
     @cute.jit
+    def apply_flashmask_block(
+        self,
+        acc_S: cute.Tensor,
+        smem_pipe_read: pipeline.PipelineState,
+        n_block: Int32,
+        m_block: Int32,
+        thr_mma: cute.TiledMma,
+        mask: AttentionMask,
+        s_rowidx: cute.Tensor,
+        mbar_ptr_rowidx: cute.Pointer,
+        flashmask_info: FlashMaskInfo,
+        batch_idx: Int32,
+        head_idx: Int32,
+        num_heads: Int32,
+        seqlen_q: Int32,
+    ):
+        """Consumer-side flashmask application for one n_block. The staging buffer
+        stage and pipeline phase come from the KV consumer state (flashmask is in
+        lockstep with KV), so no separate pipeline state is needed. Must be called
+        before the KV consumer state is advanced for this block.
+
+        The per-element mask is only applied for blocks that actually overlap the
+        masked region (partially masked); fully-visible blocks skip it. The
+        full-wait / empty-arrive stay unconditional to keep the staging pipeline
+        1:1 with KV. The producer computes the identical predicate and skips the
+        gmem->smem copy for the same fully-visible blocks."""
+        stage = smem_pipe_read.index
+        cute.arch.mbarrier_wait(mbar_ptr_rowidx + stage, smem_pipe_read.phase)
+        fm_heads = flashmask_info.startend_row_indices.shape[1]
+        fm_head_idx = head_idx // (num_heads // fm_heads)
+        m_start = m_block * self.tile_m
+        m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
+        partial = self._flashmask_block_partial(
+            flashmask_info, batch_idx, fm_head_idx, n_block, m_start, m_end
+        )
+        if partial:
+            stage_base = stage * 4 * self.tile_n
+            s_cur = cute.make_tensor(
+                s_rowidx.iterator + stage_base, cute.make_layout(4 * self.tile_n)
+            )
+            mask.apply_flashmask_sm90(
+                acc_S,
+                m_block=m_block,
+                thr_mma=thr_mma,
+                s_startend_row_indices=s_cur,
+                has_lt_end=self.has_lt_end,
+                has_ut_start=self.has_ut_start,
+                has_ut_end=self.has_ut_end,
+            )
+        cute.arch.mbarrier_arrive(mbar_ptr_rowidx + self.num_stages + stage)
+
+    @cute.jit
+    def _flashmask_block_fully_masked(
+        self,
+        flashmask_info: FlashMaskInfo,
+        batch_idx: Int32,
+        fm_head_idx: Int32,
+        n_block: Int32,
+        m_start: Int32,
+        m_end: Int32,
+    ):
+        """Return True if KV block `n_block` is fully masked out for query rows
+        [m_start, m_end). Mirrors reduce_block_count_kernel's predicate."""
+        lts_max = flashmask_info.LTS_nblock_max[batch_idx, fm_head_idx, n_block]
+        if const_expr(self.has_ut_start):
+            lte_min = flashmask_info.LTE_nblock_min[batch_idx, fm_head_idx, n_block]
+            uts_max = flashmask_info.UTS_nblock_max[batch_idx, fm_head_idx, n_block]
+            ute_min = flashmask_info.UTE_nblock_min[batch_idx, fm_head_idx, n_block]
+            return ((m_start >= lts_max) & (m_end <= lte_min)) | (
+                (m_start >= uts_max) & (m_end <= ute_min)
+            )
+        elif const_expr(self.has_lt_end):
+            lte_min = flashmask_info.LTE_nblock_min[batch_idx, fm_head_idx, n_block]
+            return (m_start >= lts_max) & (m_end <= lte_min)
+        elif const_expr(self.has_ut_end):
+            ute_min = flashmask_info.UTE_nblock_min[batch_idx, fm_head_idx, n_block]
+            return (m_start >= lts_max) | (m_end <= ute_min)
+        else:
+            return m_start >= lts_max
+
+    @cute.jit
+    def _flashmask_block_partial(
+        self,
+        flashmask_info: FlashMaskInfo,
+        batch_idx: Int32,
+        fm_head_idx: Int32,
+        n_block: Int32,
+        m_start: Int32,
+        m_end: Int32,
+    ):
+        """Return True if KV block `n_block` overlaps the flashmask masked region
+        for query rows [m_start, m_end) (i.e. needs flashmask applied). Mirrors
+        generate_n_block's `partially_masked` predicate. Note this is a superset of
+        fully-masked, so gating flashmask application on it is correct; blocks for
+        which this is False are fully visible and need no flashmask."""
+        lts_min = flashmask_info.LTS_nblock_min[batch_idx, fm_head_idx, n_block]
+        if const_expr(self.has_ut_start):
+            lte_max = flashmask_info.LTE_nblock_max[batch_idx, fm_head_idx, n_block]
+            uts_min = flashmask_info.UTS_nblock_min[batch_idx, fm_head_idx, n_block]
+            ute_max = flashmask_info.UTE_nblock_max[batch_idx, fm_head_idx, n_block]
+            return ((m_start < lte_max) & (m_end > lts_min)) | (
+                (m_start < ute_max) & (m_end > uts_min)
+            )
+        elif const_expr(self.has_lt_end):
+            lte_max = flashmask_info.LTE_nblock_max[batch_idx, fm_head_idx, n_block]
+            return (m_start < lte_max) & (m_end > lts_min)
+        elif const_expr(self.has_ut_end):
+            ute_max = flashmask_info.UTE_nblock_max[batch_idx, fm_head_idx, n_block]
+            return (m_end > lts_min) | (m_start < ute_max)
+        else:
+            return m_end > lts_min
+
+    @cute.jit
+    def flashmask_n_block_min_max(
+        self,
+        flashmask_info: FlashMaskInfo,
+        batch_idx: Int32,
+        head_idx: Int32,
+        m_block: Int32,
+        seqlen_q: Int32,
+        num_heads: Int32,
+        n_block_min: Int32,
+        n_block_max: Int32,
+    ):
+        """Tighten [n_block_min, n_block_max) by skipping contiguous fully-masked
+        blocks at both ends. Deterministic from the flashmask nblock max/min, so
+        producer and consumer compute the same range and stay in lockstep."""
+        fm_heads = flashmask_info.startend_row_indices.shape[1]
+        h_h_flashmask_ratio = num_heads // fm_heads
+        fm_head_idx = head_idx // h_h_flashmask_ratio
+        m_start = m_block * self.tile_m
+        m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
+        orig_nonempty = n_block_max > n_block_min
+        lo = n_block_min
+        hi = n_block_max
+        # Trim fully-masked blocks from the high end.
+        active = hi > lo
+        while active:
+            fully = self._flashmask_block_fully_masked(
+                flashmask_info, batch_idx, fm_head_idx, hi - 1, m_start, m_end
+            )
+            hi = hi - 1 if fully else hi
+            active = fully & (hi > lo)
+        # Trim fully-masked blocks from the low end.
+        active = lo < hi
+        while active:
+            fully = self._flashmask_block_fully_masked(
+                flashmask_info, batch_idx, fm_head_idx, lo, m_start, m_end
+            )
+            lo = lo + 1 if fully else lo
+            active = fully & (lo < hi)
+        # If every block was masked but there was originally work, keep one block
+        # so the mainloop structure (which assumes >= 1 block) still holds; a fully
+        # masked block yields a zero row, matching the reference.
+        all_masked = orig_nonempty & (lo >= hi)
+        lo = n_block_min if all_masked else lo
+        hi = (n_block_min + 1) if all_masked else hi
+        return lo, hi
+
+    @cute.jit
     def mma_one_n_block(
         self,
         smem_pipe_read: pipeline.PipelineState | pipeline_custom.PipelineStateSimple,
@@ -1358,6 +1748,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         scores_scale: Optional[cute.Tensor] = None,  # not used
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
+        flashmask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
     ):
@@ -1373,6 +1764,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
         if const_expr(mask_fn is not None):
             mask_fn(acc_S=acc_S, n_block=n_block)
+        # flashmask (startend_row_indices): applied on every block, after the
+        # causal/seqlen mask, reading the producer-staged smem indices.
+        if const_expr(flashmask_fn is not None):
+            flashmask_fn(acc_S, smem_pipe_read, n_block)
 
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
         # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(layout_utils.reshape_acc_to_mn(acc_S))
@@ -1420,6 +1815,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         scores_scale: Optional[cute.Tensor] = None,
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
+        flashmask_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
     ):
         smem_pipe_read_v = smem_pipe_read.clone()
@@ -1443,6 +1839,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
         if const_expr(mask_fn is not None):
             mask_fn(acc_S=acc_S, n_block=n_block)
+        # flashmask: applied after causal/seqlen mask, on the current block's stage
+        # (smem_pipe_read points at the current block's K/V stage here).
+        if const_expr(flashmask_fn is not None):
+            flashmask_fn(acc_S, smem_pipe_read, n_block)
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(layout_utils.reshape_acc_to_mn(acc_S))
 
         row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)

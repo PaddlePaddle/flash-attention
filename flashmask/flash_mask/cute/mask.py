@@ -501,6 +501,64 @@ class AttentionMask:
         return load_startend_row_indices_consumer_state
 
     @cute.jit
+    def apply_flashmask_sm90(
+        self,
+        acc_S: cute.Tensor,
+        m_block: Int32,
+        thr_mma: cute.TiledMma,
+        s_startend_row_indices: cute.Tensor,
+        has_lt_end: cutlass.Constexpr[bool] = False,
+        has_ut_start: cutlass.Constexpr[bool] = False,
+        has_ut_end: cutlass.Constexpr[bool] = False,
+    ) -> None:
+        """SM90 flashmask (startend_row_indices) application on S.
+
+        s_startend_row_indices is the current pipeline stage's flat smem buffer
+        holding up to 4 vectors of tile_n Int32 at offsets
+        [0, tile_n, 2*tile_n, 3*tile_n] = [LTS, LTE, UTS, UTE].
+
+        Mirrors apply_mask_sm100's flashmask branch but operates on the SM90
+        (row, col) mn-view of the accumulator. The masked rows for a given kv
+        column are described relative to the query tile via `- m_block*tile_m`.
+        """
+        acc_S_mn = layout_utils.make_acc_tensor_mn_view(acc_S, transpose=self.swap_AB)
+        acc_shape = (self.tile_m, self.tile_n)
+        cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
+        tScS_mn = layout_utils.make_acc_tensor_mn_view(
+            thr_mma.partition_C(cS), transpose=self.swap_AB
+        )
+        ROW = 0 if const_expr(not self.swap_AB) else 1
+        COL = 1 if const_expr(not self.swap_AB) else 0
+        nrow = const_expr(cute.size(tScS_mn.shape[0]))
+        ncol = const_expr(cute.size(tScS_mn.shape[1]))
+        tile_n = const_expr(self.tile_n)
+        for r in cutlass.range(nrow, unroll_full=True):
+            for c in cutlass.range(ncol, unroll_full=True):
+                row = tScS_mn[r, c][ROW]
+                col = tScS_mn[r, c][COL]
+                if const_expr(has_ut_start):
+                    lts = s_startend_row_indices[col] - m_block * self.tile_m
+                    lte = s_startend_row_indices[tile_n + col] - m_block * self.tile_m
+                    uts = s_startend_row_indices[2 * tile_n + col] - m_block * self.tile_m
+                    ute = s_startend_row_indices[3 * tile_n + col] - m_block * self.tile_m
+                    if (row >= lts and row < lte) or (row >= uts and row < ute):
+                        acc_S_mn[r, c] = -Float32.inf
+                elif const_expr(has_lt_end):
+                    lts = s_startend_row_indices[col] - m_block * self.tile_m
+                    lte = s_startend_row_indices[tile_n + col] - m_block * self.tile_m
+                    if row >= lts and row < lte:
+                        acc_S_mn[r, c] = -Float32.inf
+                elif const_expr(has_ut_end):
+                    lts = s_startend_row_indices[col] - m_block * self.tile_m
+                    ute = s_startend_row_indices[3 * tile_n + col] - m_block * self.tile_m
+                    if row >= lts or row < ute:
+                        acc_S_mn[r, c] = -Float32.inf
+                else:
+                    lts = s_startend_row_indices[col] - m_block * self.tile_m
+                    if row >= lts:
+                        acc_S_mn[r, c] = -Float32.inf
+
+    @cute.jit
     def apply_mask_sm100_transposed(
         self,
         acc_S: cute.Tensor,

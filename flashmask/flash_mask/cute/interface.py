@@ -48,6 +48,11 @@ from flash_mask.cute.block_sparsity import (
     normalize_block_sparse_tensors,
 )
 
+try:
+    from flash_mask.utils import accum_zero_axis1_kv
+except ImportError:
+    accum_zero_axis1_kv = None
+
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.strides[-1] != 1 else x
@@ -950,10 +955,11 @@ def _flash_attn_bwd(
             n *= d
         return n
 
+    zero_kv_accum_range = kv_postprocess_enabled and need_kv_accum and accum_zero_axis1_kv is not None
     zero_specs = []  # list of (key, shape, numel)
     if is_split_d_bwd:
         zero_specs.append(("dq_accum", dq_accum_shape, _numel(dq_accum_shape)))
-    if need_kv_accum:
+    if need_kv_accum and not zero_kv_accum_range:
         zero_specs.append(("dk_accum", dk_accum_shape, _numel(dk_accum_shape)))
         zero_specs.append(("dv_accum", dv_accum_shape, _numel(dv_accum_shape)))
 
@@ -975,8 +981,32 @@ def _flash_attn_bwd(
     else:
         dq_accum = paddle.empty(shape=dq_accum_shape, dtype=paddle.float32)
     if need_kv_accum:
-        dk_accum = _accum_buffers["dk_accum"]
-        dv_accum = _accum_buffers["dv_accum"]
+        if zero_kv_accum_range:
+            # if start/end range is given, we can initialize only part of the accum buffer
+            dk_accum = paddle.empty(shape=dk_accum_shape, dtype=paddle.float32)
+            dv_accum = paddle.empty(shape=dv_accum_shape, dtype=paddle.float32)
+            if is_split_d_bwd:
+                dk_zero_hdim, dv_zero_hdim = head_dim // 2, head_dim_v // 2
+                dk_split, dv_split = True, True
+            elif is_split_dv_bwd:
+                dk_zero_hdim, dv_zero_hdim = head_dim_rounded, head_dim_v // 2
+                dk_split, dv_split = False, True
+            else:
+                dk_zero_hdim, dv_zero_hdim = head_dim_rounded, head_dim_v_rounded
+                dk_split, dv_split = False, False
+            accum_zero_axis1_kv(
+                dk_accum,
+                dv_accum,
+                kv_post_start,
+                kv_post_end - kv_post_start,
+                dk_zero_hdim,
+                dv_zero_hdim,
+                dk_split,
+                dv_split,
+            )
+        else:
+            dk_accum = _accum_buffers["dk_accum"]
+            dv_accum = _accum_buffers["dv_accum"]
 
     dtype = paddle2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [

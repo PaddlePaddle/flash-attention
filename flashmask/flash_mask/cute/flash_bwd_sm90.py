@@ -318,6 +318,12 @@ class FlashAttentionBackwardSm90:
         sdPsum_struct = cute.struct.Align[
             cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64) * self.dO_stage], 128
         ]
+        # flashmask: single staging buffer for the 4 startend_row_indices vectors
+        # (LTS/LTE/UTS/UTE) of the current n_block; layout [vec*tile_n + col].
+        rowidx_smem_count = (4 * self.tile_n) if const_expr(self.enable_flashmask) else 0
+        sRowidx_struct = cute.struct.Align[
+            cute.struct.MemRange[Int32, rowidx_smem_count], 128
+        ]
 
         @cute.struct
         class SharedStorageQKV:
@@ -325,6 +331,7 @@ class FlashAttentionBackwardSm90:
             mbar_ptr_dO: cute.struct.MemRange[cutlass.Int64, self.dO_stage * 2]
             sLSE: sLSE_struct
             sdPsum: sdPsum_struct
+            sRowidx: sRowidx_struct
             sQ: sQ_struct
             sV: sV_struct
             sK: sK_struct
@@ -440,6 +447,20 @@ class FlashAttentionBackwardSm90:
             self.num_mma_regs = 160
             self.num_producer_regs = 32
             assert self.num_mma_regs_wg0 * self.num_wg_mma + self.num_producer_regs <= REG_LIMIT
+
+        # flashmask (startend_row_indices) support. For bwd the per-KV-column
+        # indices are fixed for a whole n_block, so they are staged into smem once
+        # per n_block and reused across the inner m_block loop.
+        self.enable_flashmask = const_expr(flashmask_info is not None)
+        self.has_lt_end = const_expr(
+            flashmask_info is not None and flashmask_info.LTE_nblock_max is not None
+        )
+        self.has_ut_start = const_expr(
+            flashmask_info is not None and flashmask_info.UTS_nblock_max is not None
+        )
+        self.has_ut_end = const_expr(
+            flashmask_info is not None and flashmask_info.UTE_nblock_max is not None
+        )
 
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
@@ -614,6 +635,7 @@ class FlashAttentionBackwardSm90:
             mdV_semaphore,
             window_size_left,
             window_size_right,
+            flashmask_info,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -669,6 +691,7 @@ class FlashAttentionBackwardSm90:
         mdV_semaphore: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
+        flashmask_info: Optional[FlashMaskInfo] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -723,6 +746,10 @@ class FlashAttentionBackwardSm90:
             )
         )
         sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
+
+        s_rowidx = None
+        if const_expr(self.enable_flashmask):
+            s_rowidx = storage.sRowidx.get_tensor(cute.make_layout(4 * self.tile_n))
 
         block_info = BlockInfo(
             self.tile_m,
@@ -788,6 +815,8 @@ class FlashAttentionBackwardSm90:
                     TileSchedulerCls,
                     blocksparse_tensors,
                     qhead_per_kvhead_divmod,
+                    flashmask_info,
+                    cute.size(mQ.shape[2]),
                 )
             if warp_idx == 1:
                 self.dQaccum_store(
@@ -798,6 +827,8 @@ class FlashAttentionBackwardSm90:
                     SeqlenInfoCls,
                     blocksparse_tensors,
                     mdQ_semaphore,
+                    flashmask_info,
+                    cute.size(mQ.shape[2]),
                 )
         else:
             tidx, _, _ = cute.arch.thread_idx()
@@ -837,6 +868,9 @@ class FlashAttentionBackwardSm90:
                 fastdiv_mods,
                 blocksparse_tensors,
                 qhead_per_kvhead_divmod,
+                flashmask_info,
+                s_rowidx,
+                cute.size(mQ.shape[2]),
             )
             if const_expr(self.num_wg_dQ == self.num_wg_mma):
                 # Both WGs compute dQ
@@ -878,6 +912,8 @@ class FlashAttentionBackwardSm90:
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        flashmask_info: Optional[FlashMaskInfo] = None,
+        num_heads: Int32 = None,
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
@@ -937,7 +973,22 @@ class FlashAttentionBackwardSm90:
 
                 m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
 
-                if const_expr(not self.use_block_sparsity):
+                if const_expr(self.enable_flashmask and not self.deterministic):
+                    # Must match the MMA/dQ-store warps' flashmask skip range so the
+                    # Q/dO TMA pipeline producer/consumer counts stay in lockstep.
+                    m_block_min, m_block_max = self.flashmask_m_block_min_max(
+                        flashmask_info,
+                        batch_idx,
+                        head_idx,
+                        n_block,
+                        seqlen.seqlen_q,
+                        num_heads,
+                        m_block_min,
+                        m_block_max,
+                    )
+                    total_m_block_cnt = m_block_max - m_block_min
+                    process_tile = m_block_min < m_block_max
+                elif const_expr(not self.use_block_sparsity):
                     total_m_block_cnt = m_block_max - m_block_min
                     process_tile = (
                         const_expr(not self.is_local and not self.is_varlen_q)
@@ -1144,6 +1195,9 @@ class FlashAttentionBackwardSm90:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        flashmask_info: Optional[FlashMaskInfo] = None,
+        s_rowidx: Optional[cute.Tensor] = None,
+        num_heads: Int32 = None,
         is_dQ_wg: cutlass.Constexpr[bool] = True,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -1265,6 +1319,11 @@ class FlashAttentionBackwardSm90:
         PdS_barrier = cutlass.pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwd.PdS), num_threads=self.num_mma_threads
         )
+        flashmask_barrier = None
+        if const_expr(self.enable_flashmask):
+            flashmask_barrier = cutlass.pipeline.NamedBarrier(
+                barrier_id=int(NamedBarrierBwd.FlashMask), num_threads=self.num_mma_threads
+            )
         score_mod_fn = partial(
             self.apply_score_mod,
             thr_mma_SdP=thr_mma_SdP,
@@ -1331,7 +1390,22 @@ class FlashAttentionBackwardSm90:
             )
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
 
-            if const_expr(not self.use_block_sparsity):
+            if const_expr(self.enable_flashmask and not self.deterministic):
+                # flashmask skip: drop fully-masked query blocks at both ends of
+                # this KV block. Non-deterministic only, so dQ is atomic-accumulated
+                # and skipping n/m pairs cannot break the dQ semaphore protocol.
+                m_block_min, m_block_max = self.flashmask_m_block_min_max(
+                    flashmask_info,
+                    batch_idx,
+                    head_idx,
+                    n_block,
+                    seqlen.seqlen_q,
+                    num_heads,
+                    m_block_min,
+                    m_block_max,
+                )
+                process_tile = m_block_min < m_block_max
+            elif const_expr(not self.use_block_sparsity):
                 process_tile = (
                     const_expr(not self.is_local and not self.is_varlen_q)
                     or m_block_min < m_block_max
@@ -1363,12 +1437,38 @@ class FlashAttentionBackwardSm90:
                         fastdiv_mods=fastdiv_mods,
                     )
                     dKV_accumulate = False
+                    # flashmask: stage this n_block's startend_row_indices into smem
+                    # once (fixed across the whole m loop), and build the apply fn.
+                    flashmask_fn = None
+                    if const_expr(self.enable_flashmask):
+                        # Ensure any prior n_block's reads of s_rowidx are done.
+                        flashmask_barrier.arrive_and_wait()
+                        self.load_flashmask_n_block(
+                            flashmask_info,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            num_heads,
+                            s_rowidx,
+                            seqlen.seqlen_k,
+                            tidx,
+                        )
+                        flashmask_barrier.arrive_and_wait()
+                        flashmask_fn = partial(
+                            mask.apply_flashmask_sm90,
+                            thr_mma=thr_mma_SdP,
+                            s_startend_row_indices=s_rowidx,
+                            has_lt_end=self.has_lt_end,
+                            has_ut_start=self.has_ut_start,
+                            has_ut_end=self.has_ut_end,
+                        )
                     for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
                         consumer_state_Q, consumer_state_dO = mma_one_m_block_all(
                             m_block,
                             consumer_state_Q,
                             consumer_state_dO,
                             mask_fn=mask_fn,
+                            flashmask_fn=flashmask_fn,
                             score_mod_fn=score_mod_fn_cur,
                             score_mod_bwd_fn=score_mod_bwd_fn_cur,
                             dKV_accumulate=dKV_accumulate,
@@ -1420,7 +1520,12 @@ class FlashAttentionBackwardSm90:
                 )
             else:
                 # KV tile with zero Q blocks produces no dK/dV; write zeros.
-                if const_expr(self.use_block_sparsity or self.is_local or self.is_varlen_q):
+                if const_expr(
+                    self.use_block_sparsity
+                    or self.is_local
+                    or self.is_varlen_q
+                    or (self.enable_flashmask and not self.deterministic)
+                ):
                     acc_dK.fill(0.0)
                     acc_dV.fill(0.0)
                     self.epilogue_dKV(
@@ -1450,6 +1555,124 @@ class FlashAttentionBackwardSm90:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 4:
             cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+    @cute.jit
+    def load_flashmask_n_block(
+        self,
+        flashmask_info: FlashMaskInfo,
+        batch_idx: Int32,
+        head_idx: Int32,
+        n_block: Int32,
+        num_heads: Int32,
+        s_rowidx: cute.Tensor,
+        seqlen_k: Int32,
+        tidx: Int32,
+    ) -> None:
+        """Stage the current n_block's startend_row_indices (LTS/LTE/UTS/UTE) into
+        smem, once per n_block, cooperatively across all MMA/consumer threads.
+        smem layout: 4 vectors of tile_n Int32 at [0, tile_n, 2*tile_n, 3*tile_n].
+        Caller must barrier after this so all threads see the staged indices."""
+        fm_heads = flashmask_info.startend_row_indices.shape[1]
+        fm_head_idx = head_idx // (num_heads // fm_heads)
+        nb_mul_kBN = n_block * self.tile_n
+        loop_ub = cutlass.min(self.tile_n, seqlen_k - nb_mul_kBN)
+        srow = flashmask_info.startend_row_indices
+        idx = tidx
+        if const_expr(self.has_ut_start):
+            while idx < loop_ub:
+                s_rowidx[idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 0]
+                s_rowidx[self.tile_n + idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 1]
+                s_rowidx[self.tile_n * 2 + idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 2]
+                s_rowidx[self.tile_n * 3 + idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 3]
+                idx += self.num_mma_threads
+        elif const_expr(self.has_lt_end):
+            while idx < loop_ub:
+                s_rowidx[idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 0]
+                s_rowidx[self.tile_n + idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 1]
+                idx += self.num_mma_threads
+        elif const_expr(self.has_ut_end):
+            while idx < loop_ub:
+                s_rowidx[idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 0]
+                s_rowidx[self.tile_n * 3 + idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 1]
+                idx += self.num_mma_threads
+        else:
+            while idx < loop_ub:
+                s_rowidx[idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 0]
+                idx += self.num_mma_threads
+
+    @cute.jit
+    def _flashmask_block_fully_masked(
+        self,
+        flashmask_info: FlashMaskInfo,
+        batch_idx: Int32,
+        fm_head_idx: Int32,
+        n_block: Int32,
+        m_start: Int32,
+        m_end: Int32,
+    ):
+        """Return True if KV block `n_block` is fully masked out for query rows
+        [m_start, m_end). Mirrors reduce_block_count_kernel's predicate (same
+        logic as the fwd kernel)."""
+        lts_max = flashmask_info.LTS_nblock_max[batch_idx, fm_head_idx, n_block]
+        if const_expr(self.has_ut_start):
+            lte_min = flashmask_info.LTE_nblock_min[batch_idx, fm_head_idx, n_block]
+            uts_max = flashmask_info.UTS_nblock_max[batch_idx, fm_head_idx, n_block]
+            ute_min = flashmask_info.UTE_nblock_min[batch_idx, fm_head_idx, n_block]
+            return ((m_start >= lts_max) & (m_end <= lte_min)) | (
+                (m_start >= uts_max) & (m_end <= ute_min)
+            )
+        elif const_expr(self.has_lt_end):
+            lte_min = flashmask_info.LTE_nblock_min[batch_idx, fm_head_idx, n_block]
+            return (m_start >= lts_max) & (m_end <= lte_min)
+        elif const_expr(self.has_ut_end):
+            ute_min = flashmask_info.UTE_nblock_min[batch_idx, fm_head_idx, n_block]
+            return (m_start >= lts_max) | (m_end <= ute_min)
+        else:
+            return m_start >= lts_max
+
+    @cute.jit
+    def flashmask_m_block_min_max(
+        self,
+        flashmask_info: FlashMaskInfo,
+        batch_idx: Int32,
+        head_idx: Int32,
+        n_block: Int32,
+        seqlen_q: Int32,
+        num_heads: Int32,
+        m_block_min: Int32,
+        m_block_max: Int32,
+    ):
+        """Tighten [m_block_min, m_block_max) by skipping contiguous fully-masked
+        query blocks at both ends for this fixed KV block `n_block`. Deterministic
+        from the flashmask nblock max/min, so the MMA warps and the dQaccum_store
+        warp compute the same range and stay in lockstep. Returns an empty range
+        (min == max) when every query block is fully masked; the caller writes
+        zero dK/dV in that case."""
+        fm_heads = flashmask_info.startend_row_indices.shape[1]
+        fm_head_idx = head_idx // (num_heads // fm_heads)
+        lo = m_block_min
+        hi = m_block_max
+        # Trim fully-masked blocks from the high end.
+        active = hi > lo
+        while active:
+            m_start = (hi - 1) * self.tile_m
+            m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
+            fully = self._flashmask_block_fully_masked(
+                flashmask_info, batch_idx, fm_head_idx, n_block, m_start, m_end
+            )
+            hi = hi - 1 if fully else hi
+            active = fully & (hi > lo)
+        # Trim fully-masked blocks from the low end.
+        active = lo < hi
+        while active:
+            m_start = lo * self.tile_m
+            m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
+            fully = self._flashmask_block_fully_masked(
+                flashmask_info, batch_idx, fm_head_idx, n_block, m_start, m_end
+            )
+            lo = lo + 1 if fully else lo
+            active = fully & (lo < hi)
+        return lo, hi
 
     @staticmethod
     @cute.jit
@@ -1490,6 +1713,7 @@ class FlashAttentionBackwardSm90:
         PdS_barrier: cutlass.pipeline.NamedBarrier,
         is_dQ_wg: cutlass.Constexpr[bool] = True,
         mask_fn: Optional[Callable] = None,
+        flashmask_fn: Optional[Callable] = None,
         score_mod_fn: Optional[Callable] = None,
         score_mod_bwd_fn: Optional[Callable] = None,
         dKV_accumulate: Boolean = True,
@@ -1521,6 +1745,10 @@ class FlashAttentionBackwardSm90:
         # (3) [Pointwise 1] P = exp(S - LSE)
         if cutlass.const_expr(mask_fn is not None):
             mask_fn(acc_S, m_block=m_block)
+        # flashmask (startend_row_indices): applied after causal/seqlen mask, on
+        # this n_block's staged smem indices (fixed across the m loop).
+        if cutlass.const_expr(flashmask_fn is not None):
+            flashmask_fn(acc_S, m_block=m_block)
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.SdP_swapAB)
         lane_idx = cute.arch.lane_idx()
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
@@ -1788,6 +2016,8 @@ class FlashAttentionBackwardSm90:
         SeqlenInfoCls: cutlass.Constexpr[Callable],
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
+        flashmask_info: Optional[FlashMaskInfo] = None,
+        num_heads: Int32 = None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         # warp-local thread index (dQaccum_store runs on warp 1, global tidx 32-63)
@@ -1821,7 +2051,22 @@ class FlashAttentionBackwardSm90:
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
-            if const_expr(not self.use_block_sparsity):
+            if const_expr(self.enable_flashmask and not self.deterministic):
+                # Must match the MMA warps' flashmask skip range exactly so the
+                # per-m_block dQ producer/consumer barrier handshake stays in sync.
+                m_block_min, m_block_max = self.flashmask_m_block_min_max(
+                    flashmask_info,
+                    batch_idx,
+                    head_idx,
+                    n_block,
+                    seqlen.seqlen_q,
+                    num_heads,
+                    m_block_min,
+                    m_block_max,
+                )
+                process_tile = m_block_min < m_block_max
+                loop_count = m_block_max - m_block_min
+            elif const_expr(not self.use_block_sparsity):
                 process_tile = (
                     const_expr(not self.is_local and not self.is_varlen_q)
                     or m_block_min < m_block_max

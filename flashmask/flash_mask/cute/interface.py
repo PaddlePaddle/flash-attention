@@ -168,7 +168,7 @@ class BwdConfig:
     num_wg: int = 2  # MMA warp groups (total threads = (num_wg + 1) * 128)
     dQ_single_wg: bool = False
 
-def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None):
+def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None, flashmask=False):
     """Return BwdConfig for SM90.
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
@@ -195,6 +195,10 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
         # C++ FA3: causal/local: 64, 128; non-causal: 80, 128 with dQ_swapAB
         is_causal_or_local = causal or local
         m_block_size = 64 if is_causal_or_local else 80
+        # flashmask stages per-n_block startend_row_indices in extra smem; the
+        # non-causal m=80 tile has no headroom for it, so fall back to m=64.
+        if flashmask:
+            m_block_size = 64
         if sparse_block_size_q is not None and sparse_block_size_q % m_block_size != 0:
             m_block_size = 64
         return BwdConfig(
@@ -822,10 +826,6 @@ def _flash_attn_bwd(
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
     assert cu_seqlens_q is None, "cu_seqlens_q must be None (varlen is not supported in flashmask)"
     assert cu_seqlens_k is None, "cu_seqlens_k must be None (varlen is not supported in flashmask)"
-    if compute_capability == 9:
-        assert flashmask_info is None, (
-            "flashmask is not yet supported on SM 9.0"
-        )
 
     num_head, head_dim = q.shape[-2:]
     num_head_kv = k.shape[-2]
@@ -884,6 +884,7 @@ def _flash_attn_bwd(
             causal,
             local,
             sparse_block_size_q=sparse_q,
+            flashmask=cute_flashmask_info is not None,
         )
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size
@@ -1348,8 +1349,9 @@ def _flash_attn_bwd(
 
             # TODO: check @can_implement
             # Compile with FA4-style fake tensors (fully-symbolic dims with stride
-            # divisibility hints). flashmask_info=None at compile per user instruction;
-            # launch below still passes real cute_flashmask_info.
+            # divisibility hints). Pass the real cute_flashmask_info at compile so
+            # the flashmask code path (const_expr enable flags) is generated; its
+            # tensors are marked layout-dynamic so the kernel stays shape-generic.
             (
                 f_mQ, f_mK, f_mV, f_mO_unused, f_mdO,
                 f_mdQ_unused, f_mdK, f_mdV,
@@ -1379,7 +1381,7 @@ def _flash_attn_bwd(
                 None,  # mdV_semaphore
                 None,  # aux_tensors
                 None,  # blocksparse_tensors
-                None,  # flashmask_info
+                cute_flashmask_info,  # flashmask_info
                 current_stream,
             )
         else:

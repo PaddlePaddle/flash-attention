@@ -921,12 +921,29 @@ def _flash_attn_bwd(
             dk_accum_shape = [num_head_kv, total_k_rounded_padded * head_dim_rounded]
             dv_accum_shape = [num_head_kv, total_k_rounded_padded * head_dim_v_rounded]
 
-    # ---- Consolidate fp32 zero-fill workspaces into a single zeros() launch ----
-    # In Split-D BWD dq_accum must be zero-initialized (preprocess does not fully zero
-    # the [low | high] split layout, see PR #2447). dk_accum/dv_accum need zeros for
-    # bulk reduce-add accumulation. Folding multiple zeros() into one large zeros()
-    # cuts host-side bf16/fp32 fill overhead from 3 launches to 1 (~2/3 of fp32 fill
-    # time, ~567us/bwd in 4k benchmark).
+    kv_postprocess_enabled = kv_postprocess_start is not None or kv_postprocess_end is not None
+
+    def _kv_postprocess_range():
+        if not kv_postprocess_enabled:
+            return 0, seqlen_k
+        assert fixed_seqlen, "kv_postprocess range only supports fixed seqlen"
+        start = 0 if kv_postprocess_start is None else int(kv_postprocess_start)
+        end = seqlen_k if kv_postprocess_end is None else int(kv_postprocess_end)
+        assert 0 <= start <= end <= seqlen_k, (
+            f"invalid kv_postprocess range [{start}, {end}) for seqlen_k={seqlen_k}"
+        )
+        assert start % n_block_size == 0, (
+            f"kv_postprocess_start must be aligned to n_block_size={n_block_size}, got {start}"
+        )
+        assert end % n_block_size == 0, (
+            f"kv_postprocess_end must be aligned to n_block_size={n_block_size}, got {end}"
+        )
+        return start, end
+
+    kv_post_start, kv_post_end = _kv_postprocess_range()
+
+
+    # ---- Compute shapes for fp32 accum workspaces ----
     def _numel(shape):
         n = 1
         for d in shape:
@@ -1237,6 +1254,12 @@ def _flash_attn_bwd(
             leading_dim=t.ndim - 1
         )
 
+    def _kv_out_cute(t, tensor):
+        return _to_cute(_slice_kv_out(t)) if kv_postprocess_enabled else tensor
+
+    def _kv_accum_cute(t, tensor, accum_hdim):
+        return _to_cute(_slice_kv_accum(t, accum_hdim)) if kv_postprocess_enabled else tensor
+
     def _postprocess_run(d_accum_t, d_out_t, scale, hd, block_size, atom_layout, swapAB,
                          use_2cta, cluster, cu_seqlens_t, seqused_t, cache_tag):
         compile_key_post = (dtype, hd, arch, block_size, num_threads, atom_layout, swapAB,
@@ -1322,8 +1345,8 @@ def _flash_attn_bwd(
         )
 
         _postprocess_run(
-            _to_cute(_slice_kv_accum(dk_accum, head_dim_rounded)),
-            _to_cute(_slice_kv_out(dk)),
+            _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),
+            _kv_out_cute(dk, dk_tensor),
             softmax_scale,
             head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
             False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dk",
@@ -1353,15 +1376,15 @@ def _flash_attn_bwd(
 
         if qhead_per_kvhead > 1:
             _postprocess_run(
-                _to_cute(_slice_kv_accum(dk_accum, head_dim_rounded)),
-                _to_cute(_slice_kv_out(dk)),
+                _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),
+                _kv_out_cute(dk, dk_tensor),
                 softmax_scale,
                 head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
                 False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dk",
             )
             _postprocess_run(
-                _to_cute(_slice_kv_accum(dv_accum, head_dim_v_rounded)),
-                _to_cute(_slice_kv_out(dv)),
+                _kv_accum_cute(dv_accum, dv_accum_tensor, head_dim_v_rounded),
+                _kv_out_cute(dv, dv_tensor),
                 cutlass.Float32(1.0),
                 head_dim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
                 False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dv",

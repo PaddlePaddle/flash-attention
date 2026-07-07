@@ -92,8 +92,15 @@ class AttentionMask:
     seqlen_k: Int32
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
+    q_start_offset: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
     swap_AB: cutlass.Constexpr[bool] = False
+
+    @cute.jit
+    def _q_offset(self) -> Int32:
+        if const_expr(self.q_start_offset is not None):
+            return self.q_start_offset
+        return self.seqlen_k - self.seqlen_q
 
     @cute.jit
     def apply_mask(
@@ -210,9 +217,7 @@ class AttentionMask:
                     mma_m_idx = (
                         m_block * self.tile_m + tScS_mn[tidx % threads_per_row, 0][0]
                     ) // self.qhead_per_kvhead_packgqa
-                causal_row_offset = (
-                    1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q - thr_col_offset
-                )
+                causal_row_offset = 1 + self._q_offset() - n_block * self.tile_n - thr_col_offset
                 if const_expr(mask_causal):
                     r2p = const_expr(not self.swap_AB)  # R2P trick, see apply_mask_sm100
                     for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
@@ -276,7 +281,7 @@ class AttentionMask:
                 assert self.qhead_per_kvhead_packgqa == 1
                 thr_row_offset = tScS_mn[0][ROW]
                 causal_row_offset = (
-                    seqlenk_col_limit - self.seqlen_q + m_block * self.tile_m + thr_row_offset
+                    self._q_offset() - n_block * self.tile_n - thr_col_offset + m_block * self.tile_m + thr_row_offset
                 )
                 if const_expr(mask_causal):
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
@@ -413,7 +418,7 @@ class AttentionMask:
                     acc_S[i] = -Float32.inf if out_of_bounds else acc_S[i]
 
         else:  # Causal or local
-            causal_row_offset = 1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q
+            causal_row_offset = 1 + self._q_offset() - n_block * self.tile_n
             row_idx = tScS_t2r[0][0] + m_block * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa != 1):
                 row_idx = row_idx // self.qhead_per_kvhead_packgqa
@@ -549,8 +554,13 @@ class AttentionMask:
 
         else:  # Causal or local
             thr_row_offset = tScS_t2r[0][ROW]
-            seqlenq_row_limit = self.seqlen_q - m_block * self.tile_m - thr_row_offset
-            causal_offset = seqlenq_row_limit - seqlenk_col_limit
+            causal_offset = (
+                n_block * self.tile_n
+                + thr_col_offset
+                - m_block * self.tile_m
+                - thr_row_offset
+                - self._q_offset()
+            )
             if const_expr(mask_causal):
                 # tidx = cute.arch.thread_idx()[0] % 256
                 # if tidx < 32:
@@ -586,4 +596,26 @@ class AttentionMask:
                             -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts and tScS_t2r[i][ROW] < lte else acc_S[i]
                         )
             else:
-                assert False, "Local masking isn't supported yet"
+                row_limit_top = causal_offset - self.window_size_right
+                row_limit_bot = causal_offset + self.window_size_left
+                if const_expr(mask_seqlen):
+                    if seqlenk_col_limit <= 0:
+                        row_limit_top = self.tile_m
+                for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                    row_idx = t0ScS_t2r[i][ROW]
+                    acc_S[i] = (
+                        -cutlass.Float32.inf
+                        if row_idx < row_limit_top or row_idx > row_limit_bot
+                        else acc_S[i]
+                    )
+                if partially_masked:
+                    _fm_tile_n = per_cta_tile_n if const_expr(per_cta_tile_n > 0) else self.tile_n
+                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                        col_local = tScS_t2r[i][COL] % _fm_tile_n
+                        lts = sStartEndRowIndices[col_local, 0] - m_block * self.tile_m
+                        lte = sStartEndRowIndices[col_local, 1] - m_block * self.tile_m
+                        acc_S[i] = (
+                            -cutlass.Float32.inf
+                            if tScS_t2r[i][ROW] >= lts and tScS_t2r[i][ROW] < lte
+                            else acc_S[i]
+                        )

@@ -365,6 +365,9 @@ def reduce_block_count_kernel(
     kBlockN: cutlass.Int32,
     seqlen_q: cutlass.Int32,
     seqlen_k: cutlass.Int32,
+    window_size_left: Optional[cutlass.Int32],
+    window_size_right: Optional[cutlass.Int32],
+    q_start_offset: Optional[cutlass.Int32],
 ):
     # one warp per block row
     tidx = cute.arch.thread_idx()[0]
@@ -388,15 +391,21 @@ def reduce_block_count_kernel(
     if global_block_row_idx < total_num_blocks_row:
         row_idx_start = block_row_idx * kBlockM
         row_idx_end = min(row_idx_start + kBlockM, seqlen_q)
+        q_offset = q_start_offset if cutlass.const_expr(q_start_offset is not None) else seqlen_k - seqlen_q
+        n_block_min = cutlass.Int32(0)
         n_block_max = num_blocks_col
-        if is_causal:
-            # Note(wusiming): make sure window_size_right is 0
-            n_idx_right = row_idx_end + seqlen_k - seqlen_q
+        if cutlass.const_expr(is_causal or window_size_right is not None):
+            n_idx_right = row_idx_end + q_offset
+            if cutlass.const_expr(not is_causal):
+                n_idx_right = n_idx_right + window_size_right
             n_block_max = min(n_block_max, (n_idx_right + kBlockN - 1) // kBlockN)
-        loop_num = (n_block_max + 31) >> 5
+        if cutlass.const_expr(window_size_left is not None):
+            n_idx_left = row_idx_start + q_offset - window_size_left
+            n_block_min = cutlass.max(n_idx_left // kBlockN, 0)
+        loop_num = (n_block_max - n_block_min + 31) >> 5
         local_sum = 0
         for i in cutlass.range(loop_num):
-            block_col_idx = i * 32 + lane_id
+            block_col_idx = n_block_min + i * 32 + lane_id
             if block_col_idx < n_block_max:
                 if cutlass.const_expr(has_uts):
                     if not ((row_idx_start >= LTS_nblock_max[batch_idx, head_idx, block_col_idx] and row_idx_end <= LTE_nblock_min[batch_idx, head_idx, block_col_idx]) or (row_idx_start >= UTS_nblock_max[batch_idx, head_idx, block_col_idx] and row_idx_end <= UTE_nblock_min[batch_idx, head_idx, block_col_idx])):
@@ -434,6 +443,9 @@ def reduce_block_count_cute(
     kBlockN: cutlass.Int32,
     seqlen_q: cutlass.Int32,
     seqlen_k: cutlass.Int32,
+    window_size_left: Optional[cutlass.Int32],
+    window_size_right: Optional[cutlass.Int32],
+    q_start_offset: Optional[cutlass.Int32],
     stream: cuda.CUstream,
 ):
     reduce_block_count_kernel(
@@ -453,7 +465,10 @@ def reduce_block_count_cute(
         kBlockM,
         kBlockN,
         seqlen_q,
-        seqlen_k
+        seqlen_k,
+        window_size_left,
+        window_size_right,
+        q_start_offset
     ).launch(
         grid=[(num_blocks_row * batch_size * h_flashmask + 3) >> 2, 1, 1],
         block=[32 * 4, 1, 1],
@@ -467,6 +482,9 @@ def reduce_block_count(
     kBlockM: int,
     kBlockN: int,
     seqlen_q: int,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    q_start_offset: Optional[int] = None,
 ):
     batch, heads, seqlen_k, num_vecs = flashmask_info.startend_row_indices.shape
     num_blocks_row = (seqlen_q + kBlockM - 1) // kBlockM
@@ -490,9 +508,22 @@ def reduce_block_count(
         has_ute = False
 
     current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
+    window_size_left_arg = cutlass.Int32(window_size_left) if window_size_left is not None else None
+    window_size_right_arg = cutlass.Int32(window_size_right) if window_size_right is not None else None
+    q_start_offset_arg = cutlass.Int32(q_start_offset) if q_start_offset is not None else None
 
     # TODO(wusiming): Are all of these compile keys necessary?
-    compile_key = (is_causal, kBlockM, kBlockN, has_lte, has_uts, has_ute)
+    compile_key = (
+        is_causal,
+        kBlockM,
+        kBlockN,
+        has_lte,
+        has_uts,
+        has_ute,
+        window_size_left is not None,
+        window_size_right is not None,
+        q_start_offset is not None,
+    )
     if compile_key not in reduce_block_count.compile_cache:
         reduce_block_count.compile_cache[compile_key] = cute.compile(
             reduce_block_count_cute,
@@ -513,6 +544,9 @@ def reduce_block_count(
             kBlockN,
             seqlen_q,
             seqlen_k,
+            window_size_left_arg,
+            window_size_right_arg,
+            q_start_offset_arg,
             current_stream
         )
     reduce_block_count.compile_cache[compile_key](
@@ -532,6 +566,9 @@ def reduce_block_count(
         kBlockN,
         seqlen_q,
         seqlen_k,
+        window_size_left_arg,
+        window_size_right_arg,
+        q_start_offset_arg,
         current_stream
     )
 

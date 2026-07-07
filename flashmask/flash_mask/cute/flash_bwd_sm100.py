@@ -148,7 +148,7 @@ class FlashAttentionBackwardSm100:
         self.cluster_shape_mn = (cluster_size, 1)
         self.is_persistent = is_persistent
         self.is_causal = is_causal
-        self.is_local = False
+        self.is_local = is_local
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = False
         self.dKV_postprocess = self.qhead_per_kvhead > 1 or self.is_split_d or self.is_split_dv
@@ -539,7 +539,7 @@ class FlashAttentionBackwardSm100:
         mSeqUsedK: Optional[cute.Tensor] = None,
         softcap: Float32 | float | None = None,
         window_size_left: Int32 | int | None = None,
-        window_size_right: Int32 | int | None = None,
+        q_start_offset: Int32 | int | None = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
@@ -998,6 +998,11 @@ class FlashAttentionBackwardSm100:
         LOG2_E = math.log2(math.e)
         softmax_scale_log2 = softmax_scale * LOG2_E
 
+        if const_expr(window_size_left is not None):
+            window_size_left = Int32(window_size_left)
+        if const_expr(q_start_offset is not None):
+            q_start_offset = Int32(q_start_offset)
+
         self.kernel(
             tma_tensor_Q,
             tma_tensor_Qt,
@@ -1053,6 +1058,8 @@ class FlashAttentionBackwardSm100:
             softmax_scale,
             softmax_scale_log2,
             tile_sched_params,
+            window_size_left,
+            q_start_offset,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1119,6 +1126,8 @@ class FlashAttentionBackwardSm100:
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
         tile_sched_params: ParamsBase,
+        window_size_left: Optional[Int32],
+        q_start_offset: Optional[Int32],
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
@@ -1460,6 +1469,7 @@ class FlashAttentionBackwardSm100:
         tdQtdQ = thr_mma_dQ.make_fragment_C(dQacc_shape)
         tdQtdQ = cute.make_tensor(tmem_ptr + self.tmem_dQ_offset, tdQtdQ.layout)
 
+        window_size_right = Int32(0) if const_expr(window_size_left is not None) else None
         block_info = BlockInfo(
             self.tile_m,
             # self.tile_n,
@@ -1467,8 +1477,9 @@ class FlashAttentionBackwardSm100:
             self.is_causal,
             self.is_local,
             False,  # is_split_kv
-            None,
-            None,
+            window_size_left,
+            window_size_right,
+            q_start_offset,
             qhead_per_kvhead_packgqa=1,
         )
         SeqlenInfoCls = partial(
@@ -1482,11 +1493,13 @@ class FlashAttentionBackwardSm100:
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
-        # TODO: support local
         AttentionMaskCls = partial(
             AttentionMask,
             self.tile_m,
             self.tile_n * self.cta_group_size,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            q_start_offset=q_start_offset,
             swap_AB=True,
         )
 
@@ -2335,7 +2348,7 @@ class FlashAttentionBackwardSm100:
                     )
                     cute.arch.mbarrier_arrive(flashmask_loaded_mbar_ptr)
 
-                    if const_expr(not self.is_causal):
+                    if const_expr(not self.is_causal and not self.is_local):
                         has_uts = const_expr(
                             flashmask_info.UTS_nblock_max is not None
                         )
@@ -2427,7 +2440,7 @@ class FlashAttentionBackwardSm100:
                     # ---- Main loop ----
                     if const_expr(self.enable_flashmask):
                         loop_start = m_block_min
-                        if const_expr(not self.is_causal):
+                        if const_expr(not self.is_causal and not self.is_local):
                             has_uts = const_expr(
                                 flashmask_info.UTS_nblock_max is not None
                             )
@@ -2770,7 +2783,7 @@ class FlashAttentionBackwardSm100:
                     )
                     cute.arch.mbarrier_arrive(flashmask_loaded_mbar_ptr)
 
-                    if const_expr(not self.is_causal):
+                    if const_expr(not self.is_causal and not self.is_local):
                         has_uts = const_expr(
                             flashmask_info.UTS_nblock_max is not None
                         )
@@ -2846,7 +2859,7 @@ class FlashAttentionBackwardSm100:
                     # ---- Main loop ----
                     if const_expr(self.enable_flashmask):
                         loop_start = m_block_min
-                        if const_expr(not self.is_causal):
+                        if const_expr(not self.is_causal and not self.is_local):
                             has_uts = const_expr(
                                 flashmask_info.UTS_nblock_max is not None
                             )
@@ -3074,7 +3087,7 @@ class FlashAttentionBackwardSm100:
                 zero_block = False
                 prefetch_m_block = m_block_min
                 prefetch_lte = False
-                if const_expr(not self.is_causal):
+                if const_expr(not self.is_causal and not self.is_local):
                     has_uts = const_expr(flashmask_info.UTS_nblock_max is not None)
                     if not has_uts or prefetch_m_block > sFM_max_min[4]:
                         prefetch_m_block = sFM_max_min[7]
@@ -3144,7 +3157,7 @@ class FlashAttentionBackwardSm100:
                 if const_expr(self.use_2cta_instrs) or not zero_block:
                     loop_start = m_block_min
                     loop_end = m_block_max
-                    if const_expr(not self.is_causal):
+                    if const_expr(not self.is_causal and not self.is_local):
                         has_uts = const_expr(flashmask_info.UTS_nblock_max is not None)
                         if has_uts and prefetch_m_block <= sFM_max_min[4]:
                             loop_end = sFM_max_min[4] + 1
@@ -3226,7 +3239,7 @@ class FlashAttentionBackwardSm100:
                     if not zero_block and should_load_dO:
                         pipeline_dO.producer_tail(producer_state_dO_dPsum.clone())
                         pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
-                    
+                
             else:
                 # First iteration: load K together w Q & LSE, then V together w dO & dPsum
                 if const_expr(should_load_Q):
@@ -3624,7 +3637,7 @@ class FlashAttentionBackwardSm100:
                     num_blocks = 0
                     loop_start = m_block_min
                     loop_end = m_block_max
-                    if const_expr(not self.is_causal):
+                    if const_expr(not self.is_causal and not self.is_local):
                         has_uts = const_expr(flashmask_info.UTS_nblock_max is not None)
                         if has_uts:
                             loop_end = min(m_block_max, sFM_max_min[4] + 1)
@@ -4226,8 +4239,6 @@ class FlashAttentionBackwardSm100:
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
-            if tidx == 0 and self.debug_print:
-                cute.printf('n_block: %d, EEEEEEEEEEEEEEEEEEEE after mma EEEEEEEEEEEEEEEEEEEE', n_block)
 
         # Currently it hangs if we have this S_P.producer_tail, will need to understand why
         # pipeline_S_P.producer_tail(producer_state_S_P)
@@ -4545,7 +4556,7 @@ class FlashAttentionBackwardSm100:
                         # 4: LTS_min ~ LTS_max, partially mask
                         # 5: LTE_min ~ LTE_max, partially mask
                         # 6: LTE_max ~ max_seq_k, no mask
-                        if const_expr(not self.is_causal):
+                        if const_expr(not self.is_causal and not self.is_local):
                             has_uts = const_expr(flashmask_info.UTS_nblock_max is not None)
                             if has_uts:
                                 # 0 ~ UTS
@@ -4808,8 +4819,6 @@ class FlashAttentionBackwardSm100:
                 if const_expr(self.enable_flashmask):
                     flashmask_phase ^= 1
 
-            if tidx == 0 and self.debug_print:
-                cute.printf('n_block: %d, EEEEEEEEEEEEEEEEEEEE after compute_loop EEEEEEEEEEEEEEEEEEEE', n_block)
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
@@ -4894,7 +4903,7 @@ class FlashAttentionBackwardSm100:
 
         #### APPLY MASK
         mask_fn(tSrS_t2r, m_block=m_block, partially_masked=partially_masked)
-    
+
         num_stages = cute.size(tScS_t2r, mode=[1])
     
         # ---------------------------------------------
@@ -5337,7 +5346,7 @@ class FlashAttentionBackwardSm100:
                     loop_end = m_block_max
                     for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
                         full_mask = False
-                        if const_expr(not self.is_causal):
+                        if const_expr(not self.is_causal and not self.is_local):
                             UTS_max = -1
                             if const_expr(flashmask_info.UTS_nblock_max is not None):
                                 UTS_max = sFM_max_min[4]
@@ -5366,14 +5375,16 @@ class FlashAttentionBackwardSm100:
 
                         if const_expr(self.deterministic):
                             if full_mask:
-                                if tidx == 0 and self.debug_print:
-                                    cute.printf('n_block: %d, m_block: %d, before reduce_step SKIPPPPPPP', n_block, m_block)
-
                                 if const_expr(self.spt):
                                     _, n_block_max_for_m_block = block_info.get_n_block_min_max(
                                         seqlen, m_block
                                     )
                                     lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
+                                elif const_expr(self.is_local):
+                                    n_block_min_for_m_block, _ = block_info.get_n_block_min_max(
+                                        seqlen, m_block
+                                    )
+                                    lock_value = n_block_cta_group - n_block_min_for_m_block
                                 else:
                                     lock_value = n_block_cta_group
                                 barrier.wait_eq(
@@ -5388,9 +5399,6 @@ class FlashAttentionBackwardSm100:
                                 else:
                                     barrier.arrive_inc(mdQ_semaphore_cur[m_block, None].iterator, tidx, cta_rank_in_cluster, 1)
 
-                                if tidx == 0 and self.debug_print:
-                                    cute.printf('n_block: %d, m_block: %d, after reduce_step SKIPPPPPPP', n_block, m_block)
-
             else:
                 for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
                     dQ_consumer_state, dQ_tma_store_producer_state = dQacc_reduce_step(
@@ -5404,7 +5412,8 @@ class FlashAttentionBackwardSm100:
             self.reduce_sync_barrier.arrive_and_wait()
             # final semaphore release
             if const_expr(self.deterministic and delay_semaphore_release):
-                barrier.arrive_inc(mdQ_semaphore_cur[(m_block_max - 1, None)].iterator, tidx, cta_rank_in_cluster, 1)
+                if m_block_min < m_block_max:
+                    barrier.arrive_inc(mdQ_semaphore_cur[(m_block_max - 1, None)].iterator, tidx, cta_rank_in_cluster, 1)
 
             # Release dK cross-Q-head-CTA semaphore: all dK_high/dK_low bulk reduce adds
             # for this (n_block, head_kv, batch) by this Q-head are guaranteed visible
@@ -5419,8 +5428,6 @@ class FlashAttentionBackwardSm100:
             if const_expr(self.enable_flashmask):
                 flashmask_phase ^= 1
 
-            if tidx == 0 and self.debug_print:
-                cute.printf('n_block: %d, EEEEEEEEEEEEEEEEEEEE after reduce EEEEEEEEEEEEEEEEEEEE', n_block)
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
@@ -5522,6 +5529,11 @@ class FlashAttentionBackwardSm100:
                                 seqlen, m_block
                             )
                             lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
+                        elif const_expr(self.is_local):
+                            n_block_min_for_m_block, _ = block_info.get_n_block_min_max(
+                                seqlen, m_block
+                            )
+                            lock_value = n_block_cta_group - n_block_min_for_m_block
                         else:
                             lock_value = n_block_cta_group
                         barrier.wait_eq(
@@ -5644,6 +5656,11 @@ class FlashAttentionBackwardSm100:
                                 seqlen, m_block
                             )
                             lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
+                        elif const_expr(self.is_local):
+                            n_block_min_for_m_block, _ = block_info.get_n_block_min_max(
+                                seqlen, m_block
+                            )
+                            lock_value = n_block_cta_group - n_block_min_for_m_block
                         else:
                             lock_value = n_block_cta_group
                         barrier.wait_eq(

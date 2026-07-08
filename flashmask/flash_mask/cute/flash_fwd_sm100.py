@@ -310,6 +310,7 @@ class FlashAttentionForwardSm100:
         mPageTable: Optional[cute.Tensor] = None,  # (b_k, max_num_pages_per_seq)
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
+        q_start_offset: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
@@ -766,6 +767,8 @@ class FlashAttentionForwardSm100:
             window_size_left = Int32(window_size_left)
         if const_expr(window_size_right is not None):
             window_size_right = Int32(window_size_right)
+        if const_expr(q_start_offset is not None):
+            q_start_offset = Int32(q_start_offset)
 
         fastdiv_mods = None
         if cutlass.const_expr(aux_tensors is not None):
@@ -811,6 +814,7 @@ class FlashAttentionForwardSm100:
             softmax_scale,
             window_size_left,
             window_size_right,
+            q_start_offset,
             learnable_sink,
             blocksparse_tensors,
             sQ_layout,
@@ -857,6 +861,7 @@ class FlashAttentionForwardSm100:
         softmax_scale: Float32 | None,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        q_start_offset: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
         blocksparse_tensors: Optional[BlockSparseTensors],
         sQ_layout: cute.ComposedLayout,
@@ -1053,6 +1058,7 @@ class FlashAttentionForwardSm100:
             self.is_split_kv,
             window_size_left,
             window_size_right,
+            q_start_offset,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         SeqlenInfoCls = partial(
@@ -1072,6 +1078,7 @@ class FlashAttentionForwardSm100:
             self.n_block_size,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
+            q_start_offset=q_start_offset,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)

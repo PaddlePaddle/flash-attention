@@ -166,6 +166,7 @@ def _flash_attn_fwd(
     softcap: Optional[float] = None,
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
+    q_start_offset: Optional[int] = None,
     learnable_sink: Optional[paddle.Tensor] = None,
     # m_block_size: int = 128,
     # n_block_size: int = 64,
@@ -212,21 +213,6 @@ def _flash_attn_fwd(
         total_q = q.shape[0]
 
     cute_flashmask_info = None
-    if startend_row_indices is not None:
-        fm_batch_size = startend_row_indices.shape[0]
-        fm_heads = startend_row_indices.shape[1]
-        # Note(wusiming): FA4 is so weird, but each cta process q_stage * m_block_size rows
-        # Split-D (d>192, d==dv) uses q_stage=1 to fit TMEM budget
-        q_stage = 1 if (head_dim > 192 and head_dim == v.shape[-1]) else 2
-        num_m_blocks = (seqlen_q + (q_stage * m_block_size) - 1) // (q_stage * m_block_size)
-        flashmask_info = FlashMaskInfoPaddle(
-            is_causal=causal,
-            startend_row_indices=startend_row_indices,
-        )
-        flashmask_info.valid_block_count = paddle.empty([fm_batch_size, fm_heads, num_m_blocks], dtype=paddle.int32)
-        prepare_block_maxmin(flashmask_info)
-        cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
-        reduce_block_count(cute_flashmask_info, causal, q_stage * m_block_size, n_block_size, seqlen_q)
 
     if page_table is not None:
         assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
@@ -239,6 +225,10 @@ def _flash_attn_fwd(
     else:
         num_pages, page_size = None, None
         seqlen_k = k.shape[-3]
+    if q_start_offset is not None:
+        assert 0 <= q_start_offset <= seqlen_k - seqlen_q, (
+            f"q_start_offset must be in [0, {seqlen_k - seqlen_q}], got {q_start_offset}"
+        )
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
     if cu_seqlens_k is None:
@@ -413,6 +403,29 @@ def _flash_attn_fwd(
     else:
         causal, local = False, False
 
+    if startend_row_indices is not None:
+        fm_batch_size = startend_row_indices.shape[0]
+        fm_heads = startend_row_indices.shape[1]
+        q_stage = 1 if (head_dim > 192 and head_dim == v.shape[-1]) else 2
+        num_m_blocks = (seqlen_q + (q_stage * m_block_size) - 1) // (q_stage * m_block_size)
+        flashmask_info = FlashMaskInfoPaddle(
+            is_causal=causal,
+            startend_row_indices=startend_row_indices,
+        )
+        flashmask_info.valid_block_count = paddle.empty([fm_batch_size, fm_heads, num_m_blocks], dtype=paddle.int32)
+        prepare_block_maxmin(flashmask_info)
+        cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
+        reduce_block_count(
+            cute_flashmask_info,
+            causal,
+            q_stage * m_block_size,
+            n_block_size,
+            seqlen_q,
+            window_size_left,
+            window_size_right,
+            q_start_offset,
+        )
+
     current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
 
     if compute_capability == 9:  # TODO: tune block size according to hdim.
@@ -547,6 +560,7 @@ def _flash_attn_fwd(
         page_table is not None,
         window_size_left is not None,
         window_size_right is not None,
+        q_start_offset is not None,
         learnable_sink is not None,
         m_block_size,
         n_block_size,
@@ -628,6 +642,7 @@ def _flash_attn_fwd(
             page_table_tensor,
             window_size_left,
             window_size_right,
+            q_start_offset,
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
@@ -648,6 +663,7 @@ def _flash_attn_fwd(
         page_table_tensor,
         window_size_left,
         window_size_right,
+        q_start_offset,
         learnable_sink_tensor,
         sparse_tensors,
         cute_aux_tensors,
@@ -679,6 +695,8 @@ def _flash_attn_bwd(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     softcap: float = 0.0,
+    window_size_left: Optional[int] = None,
+    q_start_offset: Optional[int] = None,
     m_block_size: int = 64,
     n_block_size: int = 128,
     num_threads: int = 256,
@@ -857,6 +875,17 @@ def _flash_attn_bwd(
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
+    fixed_seqlen = cu_seqlens_q is None and cu_seqlens_k is None
+    if q_start_offset is not None:
+        assert fixed_seqlen, "q_start_offset in backward only supports fixed seqlen"
+        assert 0 <= q_start_offset <= seqlen_k - seqlen_q, (
+            f"q_start_offset must be in [0, {seqlen_k - seqlen_q}], got {q_start_offset}"
+        )
+    if window_size_left is not None:
+        assert causal, "window_size_left in backward is only supported with causal=True"
+        causal, local = False, True
+    else:
+        local = False
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
@@ -881,7 +910,6 @@ def _flash_attn_bwd(
     # FlashMask can skip whole n_blocks (no Q rows attend) — those rows would stay
     # garbage with empty_like and break correctness. Fall back to zeros_like there.
     kv_postprocess_full = (qhead_per_kvhead > 1) or is_split_d_bwd or is_split_dv_bwd
-    fixed_seqlen = cu_seqlens_q is None and cu_seqlens_k is None
     if fixed_seqlen:
         dq = paddle.empty_like(q)
     else:
@@ -1143,6 +1171,9 @@ def _flash_attn_bwd(
             pack_gqa,
             cluster_size,
             deterministic,
+            local,
+            window_size_left is not None,
+            q_start_offset is not None,
             is_split_d_bwd if compute_capability == 10 else False,
             is_split_dv_bwd if compute_capability == 10 else False,
         )
@@ -1194,6 +1225,7 @@ def _flash_attn_bwd(
                 head_dim,
                 head_dim_v,
                 is_causal=causal,
+                is_local=local,
                 qhead_per_kvhead=qhead_per_kvhead,
                 # tile_m=m_block_size,
                 # tile_n=n_block_size,
@@ -1221,6 +1253,9 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
+            None if softcap == 0.0 else float(softcap),
+            window_size_left,
+            q_start_offset,
             mdQ_semaphore=dQ_semaphore_tensor,
             mdK_semaphore=dK_semaphore_tensor,
             mdV_semaphore=dV_semaphore_tensor,
@@ -1242,12 +1277,14 @@ def _flash_attn_bwd(
         cu_seqlens_k_tensor,
         seqused_q_tensor,
         seqused_k_tensor,
+        None if softcap == 0.0 else float(softcap),
+        window_size_left,
+        q_start_offset,
         mdQ_semaphore=dQ_semaphore_tensor,
         mdK_semaphore=dK_semaphore_tensor,
         mdV_semaphore=dV_semaphore_tensor,
         flashmask_info=cute_flashmask_info,
     )
-
     num_threads = 256 if compute_capability == 9 else 128
     arch = compute_capability * 10
 
@@ -1481,6 +1518,7 @@ class FlashAttnFunc(paddle.autograd.PyLayer):
         num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
+        q_start_offset: Optional[int] = None,
         mask_mod: Optional[Callable] = None,
         full_block_cnt: Optional[paddle.Tensor] = None,
         full_block_idx: Optional[paddle.Tensor] = None,
@@ -1506,6 +1544,7 @@ class FlashAttnFunc(paddle.autograd.PyLayer):
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
+            q_start_offset=q_start_offset,
             learnable_sink=learnable_sink,
             softcap=softcap,
             num_splits=num_splits,
@@ -1517,6 +1556,7 @@ class FlashAttnFunc(paddle.autograd.PyLayer):
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
+        ctx.q_start_offset = q_start_offset
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         return out, lse
@@ -1531,9 +1571,11 @@ class FlashAttnFunc(paddle.autograd.PyLayer):
             out,
             dout,
             lse,
-            ctx.softmax_scale,
-            ctx.causal,
-            ctx.softcap,
+            softmax_scale=ctx.softmax_scale,
+            causal=ctx.causal,
+            softcap=ctx.softcap,
+            window_size_left=ctx.window_size[0],
+            q_start_offset=ctx.q_start_offset,
             deterministic=ctx.deterministic,
         )
         # TODO(wusiming): do we need to return None for other fwd inputs?
@@ -1600,9 +1642,10 @@ class FlashAttnVarlenFunc(paddle.autograd.PyLayer):
             out,
             dout,
             lse,
-            ctx.softmax_scale,
-            ctx.causal,
-            ctx.softcap,
+            softmax_scale=ctx.softmax_scale,
+            causal=ctx.causal,
+            softcap=ctx.softcap,
+            window_size_left=ctx.window_size[0],
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             seqused_q=seqused_q,
@@ -1626,6 +1669,7 @@ def flash_attn_func(
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
+    q_start_offset: Optional[int] = None,
     mask_mod: Optional[Callable] = None,
     full_block_cnt: Optional[paddle.Tensor] = None,
     full_block_idx: Optional[paddle.Tensor] = None,
@@ -1644,6 +1688,7 @@ def flash_attn_func(
         num_splits,
         pack_gqa,
         deterministic,
+        q_start_offset,
         mask_mod,
         full_block_cnt,
         full_block_idx,

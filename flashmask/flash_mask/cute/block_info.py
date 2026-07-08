@@ -18,7 +18,14 @@ class BlockInfo:
     is_split_kv: cutlass.Constexpr[bool] = False
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
+    q_start_offset: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+
+    @cute.jit
+    def _q_offset(self, seqlen_info: SeqlenInfoQK) -> Int32:
+        if const_expr(self.q_start_offset is not None):
+            return self.q_start_offset
+        return seqlen_info.seqlen_k - seqlen_info.seqlen_q
 
     @cute.jit
     def get_n_block_min_max(
@@ -33,7 +40,7 @@ class BlockInfo:
             m_idx_max = (m_block + 1) * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa > 1):
                 m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
-            n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
+            n_idx = m_idx_max + self._q_offset(seqlen_info)
             n_idx_right = n_idx if const_expr(self.is_causal) else n_idx + self.window_size_right
             n_block_max = min(n_block_max, cute.ceil_div(n_idx_right, self.tile_n))
         n_block_min = 0
@@ -41,7 +48,7 @@ class BlockInfo:
             m_idx_min = m_block * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa > 1):
                 m_idx_min = m_idx_min // self.qhead_per_kvhead_packgqa
-            n_idx = m_idx_min + seqlen_info.seqlen_k - seqlen_info.seqlen_q
+            n_idx = m_idx_min + self._q_offset(seqlen_info)
             n_idx_left = n_idx - self.window_size_left
             n_block_min = cutlass.max(n_idx_left // self.tile_n, 0)
         if cutlass.const_expr(self.is_split_kv):
@@ -58,11 +65,18 @@ class BlockInfo:
     def get_m_block_min_max(self, seqlen_info: SeqlenInfoQK, n_block: Int32) -> Tuple[Int32, Int32]:
         m_block_max = cute.ceil_div(seqlen_info.seqlen_q, self.tile_m)
         m_block_min = 0
-        if const_expr(self.is_causal):
-            m_block_min = max(
-                m_block_min,
-                (n_block * self.tile_n + seqlen_info.seqlen_q - seqlen_info.seqlen_k)
-                // self.tile_m,
+        if const_expr(self.is_causal or (self.is_local and self.window_size_right is not None)):
+            n_idx = n_block * self.tile_n - self._q_offset(seqlen_info)
+            if const_expr(self.is_local):
+                n_idx = n_idx - self.window_size_right
+            m_block_min = max(m_block_min, n_idx // self.tile_m)
+        if const_expr(self.is_local and self.window_size_left is not None):
+            m_block_max = min(
+                m_block_max,
+                cute.ceil_div(
+                    (n_block + 1) * self.tile_n + self.window_size_left - self._q_offset(seqlen_info),
+                    self.tile_m,
+                ),
             )
         return m_block_min, m_block_max
 
@@ -77,7 +91,7 @@ class BlockInfo:
         m_idx_min = m_block * self.tile_m
         if const_expr(self.qhead_per_kvhead_packgqa > 1):
             m_idx_min = m_idx_min // self.qhead_per_kvhead_packgqa
-        n_idx = m_idx_min + seqlen_info.seqlen_k - seqlen_info.seqlen_q
+        n_idx = m_idx_min + self._q_offset(seqlen_info)
         n_idx_right = (
             n_idx
             if const_expr(not self.is_local or self.window_size_right is None)
@@ -99,6 +113,6 @@ class BlockInfo:
             m_idx_max = (m_block + 1) * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa > 1):
                 m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
-            n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
+            n_idx = m_idx_max + self._q_offset(seqlen_info)
             n_idx_left = n_idx - self.window_size_left
             return cutlass.max(n_block_min, cute.ceil_div(n_idx_left, self.tile_n))

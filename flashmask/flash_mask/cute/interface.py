@@ -49,7 +49,7 @@ from flash_mask.cute.block_sparsity import (
 )
 
 try:
-    from flash_mask.utils import accum_zero_axis1_kv
+    from ..utils import accum_zero_axis1_kv
 except ImportError:
     accum_zero_axis1_kv = None
 

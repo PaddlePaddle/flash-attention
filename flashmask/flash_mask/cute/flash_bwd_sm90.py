@@ -78,8 +78,14 @@ class FlashAttentionBackwardSm90:
         dQ_single_wg: bool = False,
     ):
         self.dtype = dtype
-        # padding head_dim to a multiple of 16 as k_block_size
-        hdim_multiple_of = 16
+        # Pad head_dim to a multiple of 32 (matching the SM100 bwd, the fp32
+        # dQaccum allocation in interface.py, the preprocess zero-fill, and the
+        # postprocess read). Using 16 here made the dQaccum per-m_block stride
+        # (tile_m * tile_hdim) disagree with those (which round to 32), so for
+        # head_dim that is a multiple of 16 but not 32 (e.g. 80) m_block>=1 landed
+        # at the wrong dQaccum offset -> wrong dQ. 32 keeps every stage consistent;
+        # the extra padding columns are zero-filled by TMA on the K/Q/dO/V loads.
+        hdim_multiple_of = 32
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         head_dim_v = head_dim_v if head_dim_v is not None else head_dim
         self.same_hdim_kv = head_dim == head_dim_v

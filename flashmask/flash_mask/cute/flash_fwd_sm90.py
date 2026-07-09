@@ -49,6 +49,19 @@ from cutlass.cute import FastDivmodDivisor
 from flash_mask.cute.flash_fwd import FlashAttentionForwardBase
 from flash_mask.cute.flashmask_utils import FlashMaskInfo
 
+# FlashMask SM90 forward runs on the block-sparse list-driven path (with
+# intra_wg_overlap): compute_flashmask_block_lists drops the fully-masked KV
+# blocks up front. Surviving blocks may still be PARTIAL (e.g. sliding-window /
+# document boundaries), so each one is masked element-wise via the per-block
+# startend_row_indices staged into smem (producer staging + consumer apply).
+#
+# When True this per-element apply (and its rowidx staging) is skipped, relying
+# only on the block list + causal/seqlen mask. That is INCORRECT for any mask
+# with genuine partial blocks (a sliding-window seqlen=32 case fails with
+# out max-diff ~4.375), so it must stay False for correctness. Kept as a flag
+# only to isolate the rowidx staging/apply cost during perf debugging.
+_FLASHMASK_SKIP_ROWIDX_APPLY = False
+
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     arch = 90
     def __init__(
@@ -894,6 +907,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 block=n_block, producer_state=kv_producer_state, page_idx=page_idx
                             )
                             kv_producer_state.advance()
+
                             for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                                 n_block = n_block_max - 1 - i - 1
                                 page_idx = (
@@ -901,27 +915,32 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                     if const_expr(mPageTable is not None and self.use_tma_KV)
                                     else None
                                 )
-                                if const_expr(not self.use_tma_KV):
-                                    paged_kv_manager.load_page_table(n_block)
-                                pipeline_k.producer_acquire(kv_producer_state)
-                                load_K(
-                                    block=n_block,
-                                    producer_state=kv_producer_state,
-                                    page_idx=page_idx,
-                                )
-                                pipeline_v.producer_acquire(kv_producer_state)
-                                load_V(
-                                    block=n_block,
-                                    producer_state=kv_producer_state,
-                                    page_idx=page_idx,
-                                )
+                                process = True
                                 if const_expr(self.enable_flashmask):
-                                    self.load_startend_row_indices(
+                                    # Skip fully-masked KV blocks (incl. mid-range);
+                                    # the consumer applies the identical predicate.
+                                    process = not self._flashmask_n_block_skip(
+                                        flashmask_info,
                                         batch_idx,
                                         head_idx,
+                                        m_block,
                                         n_block,
+                                        seqlen.seqlen_q,
                                         num_heads,
+                                    )
+                                if process:
+                                    kv_producer_state = self._produce_kv_block(
                                         kv_producer_state,
+                                        n_block,
+                                        page_idx,
+                                        pipeline_k,
+                                        pipeline_v,
+                                        load_K,
+                                        load_V,
+                                        paged_kv_manager,
+                                        batch_idx,
+                                        head_idx,
+                                        num_heads,
                                         s_rowidx,
                                         flashmask_info,
                                         mbar_ptr_rowidx,
@@ -929,7 +948,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                         m_block,
                                         seqlen.seqlen_q,
                                     )
-                                kv_producer_state.advance()
                         else:
                             for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                                 n_block_prev = n_block_max - i - 1
@@ -1002,20 +1020,39 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         pipeline_q.producer_commit_w_index(0)
                         q_producer_phase ^= 1
                     if is_kv_load_warp:
-                        kv_producer_state = produce_block_sparse_loads(
-                            blocksparse_tensors,
-                            batch_idx,
-                            head_idx,
-                            m_block,
-                            kv_producer_state,
-                            tma_load_K_fn,
-                            tma_load_V_fn,
-                            pipeline_k,
-                            pipeline_v,
-                            self.intra_wg_overlap,
-                            self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                            self.q_subtile_factor if self.q_subtile_factor is not None else 1,
-                        )
+                        if const_expr(self.enable_flashmask):
+                            kv_producer_state = self._produce_flashmask_bs(
+                                blocksparse_tensors,
+                                batch_idx,
+                                head_idx,
+                                m_block,
+                                kv_producer_state,
+                                tma_load_K_fn,
+                                tma_load_V_fn,
+                                pipeline_k,
+                                pipeline_v,
+                                num_heads,
+                                s_rowidx,
+                                flashmask_info,
+                                mbar_ptr_rowidx,
+                                seqlen.seqlen_k,
+                                seqlen.seqlen_q,
+                            )
+                        else:
+                            kv_producer_state = produce_block_sparse_loads(
+                                blocksparse_tensors,
+                                batch_idx,
+                                head_idx,
+                                m_block,
+                                kv_producer_state,
+                                tma_load_K_fn,
+                                tma_load_V_fn,
+                                pipeline_k,
+                                pipeline_v,
+                                self.intra_wg_overlap,
+                                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                                self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                            )
 
                 tile_scheduler.prefetch_next_work()
                 tile_scheduler.advance_to_next_work()
@@ -1027,6 +1064,170 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # need it for Q (no cluster) and K.
             if is_kv_load_warp:
                 pipeline_v.producer_tail(kv_producer_state)
+
+    @cute.jit
+    def _produce_flashmask_bs(
+        self,
+        blocksparse_tensors: BlockSparseTensors,
+        batch_idx: Int32,
+        head_idx: Int32,
+        m_block: Int32,
+        kv_producer_state: pipeline.PipelineState,
+        tma_load_K_fn: Callable,
+        tma_load_V_fn: Callable,
+        pipeline_k: pipeline.PipelineAsync,
+        pipeline_v: pipeline.PipelineAsync,
+        num_heads: Int32,
+        s_rowidx: cute.Tensor,
+        flashmask_info: FlashMaskInfo,
+        mbar_ptr_rowidx: cute.Pointer,
+        seqlen_k: Int32,
+        seqlen_q: Int32,
+    ):
+        """flashmask block-sparse producer. Loads K/V for the surviving KV blocks
+        in the same order the consumer (consume_block_sparse_loads) walks them:
+        the partially-masked `mask` list first (processed high-n -> low-n), then the
+        fully-visible `full` list. startend_row_indices are staged into smem only
+        for the mask-list prefix (the full list needs no per-element mask), keyed to
+        the KV pipeline stage so apply_flashmask_block reads them via the rowidx
+        mbar. Because the partial blocks are a contiguous prefix, the rowidx pipeline
+        stays in lockstep with the KV pipeline over that prefix, so kv_producer_state
+        phase is a valid expected-phase for the rowidx mbar. Mirrors
+        load_block_list + finish_overlap_v_load with the intra_wg_overlap staggering
+        (self.load_startend_row_indices / self._bs_block_at are methods, not captured
+        closures, so they are legal under this loop)."""
+        (
+            mask_block_cnt,
+            mask_block_idx,
+            full_block_cnt,
+            full_block_idx,
+            *_,
+        ) = blocksparse_tensors
+        mask_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
+        full_cnt = full_block_cnt[batch_idx, head_idx, m_block]
+        mask_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
+        full_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+        total = mask_cnt + full_cnt
+        if total > 0:
+            if const_expr(self.intra_wg_overlap):
+                n_block_prev = self._bs_block_at(mask_idx, full_idx, mask_cnt, full_cnt, Int32(0))
+                pipeline_k.producer_acquire(kv_producer_state)
+                tma_load_K_fn(src_idx=n_block_prev, producer_state=kv_producer_state)
+                if const_expr(not _FLASHMASK_SKIP_ROWIDX_APPLY):
+                    if mask_cnt > 0:
+                        self.load_startend_row_indices(
+                            batch_idx, head_idx, n_block_prev, num_heads, kv_producer_state,
+                            s_rowidx, flashmask_info, mbar_ptr_rowidx, seqlen_k, m_block, seqlen_q,
+                        )
+                for p in cutlass.range(1, total, unroll=1):
+                    n_block = self._bs_block_at(mask_idx, full_idx, mask_cnt, full_cnt, p)
+                    n_block_prev = self._bs_block_at(
+                        mask_idx, full_idx, mask_cnt, full_cnt, p - 1
+                    )
+                    kv_producer_state_prev = kv_producer_state.clone()
+                    kv_producer_state.advance()
+                    pipeline_k.producer_acquire(kv_producer_state)
+                    tma_load_K_fn(src_idx=n_block, producer_state=kv_producer_state)
+                    if const_expr(not _FLASHMASK_SKIP_ROWIDX_APPLY):
+                        if p < mask_cnt:
+                            self.load_startend_row_indices(
+                                batch_idx, head_idx, n_block, num_heads, kv_producer_state,
+                                s_rowidx, flashmask_info, mbar_ptr_rowidx, seqlen_k, m_block, seqlen_q,
+                            )
+                    pipeline_v.producer_acquire(kv_producer_state_prev)
+                    tma_load_V_fn(src_idx=n_block_prev, producer_state=kv_producer_state_prev)
+                n_block_last = self._bs_block_at(
+                    mask_idx, full_idx, mask_cnt, full_cnt, total - 1
+                )
+                pipeline_v.producer_acquire(kv_producer_state)
+                tma_load_V_fn(src_idx=n_block_last, producer_state=kv_producer_state)
+                kv_producer_state.advance()
+            else:
+                for p in cutlass.range(total, unroll=1):
+                    n_block = self._bs_block_at(mask_idx, full_idx, mask_cnt, full_cnt, p)
+                    pipeline_k.producer_acquire(kv_producer_state)
+                    tma_load_K_fn(src_idx=n_block, producer_state=kv_producer_state)
+                    if const_expr(not _FLASHMASK_SKIP_ROWIDX_APPLY):
+                        if p < mask_cnt:
+                            self.load_startend_row_indices(
+                                batch_idx, head_idx, n_block, num_heads, kv_producer_state,
+                                s_rowidx, flashmask_info, mbar_ptr_rowidx, seqlen_k, m_block, seqlen_q,
+                            )
+                    pipeline_v.producer_acquire(kv_producer_state)
+                    tma_load_V_fn(src_idx=n_block, producer_state=kv_producer_state)
+                    kv_producer_state.advance()
+        return kv_producer_state
+
+    @cute.jit
+    def _bs_block_at(
+        self,
+        mask_idx: cute.Tensor,
+        full_idx: cute.Tensor,
+        mask_cnt: Int32,
+        full_cnt: Int32,
+        p: Int32,
+    ) -> Int32:
+        """Return the KV block index at processing position `p` of the combined
+        (mask ++ full) sequence: positions [0, mask_cnt) map to the mask list
+        (reversed, high-n first), positions [mask_cnt, total) to the full list
+        (reversed). Indices are clamped to >= 0 so the not-taken branch never reads
+        a negative offset (its value is discarded)."""
+        in_mask = p < mask_cnt
+        mi = cutlass.max(mask_cnt - 1 - p, Int32(0))
+        fi = cutlass.max(full_cnt - 1 - (p - mask_cnt), Int32(0))
+        n = full_idx[fi]
+        if in_mask:
+            n = mask_idx[mi]
+        return n
+
+    @cute.jit
+    def _produce_kv_block(
+        self,
+        kv_producer_state: pipeline.PipelineState,
+        n_block: Int32,
+        page_idx,
+        pipeline_k: pipeline.PipelineAsync,
+        pipeline_v: pipeline.PipelineAsync,
+        load_K: Callable,
+        load_V: Callable,
+        paged_kv_manager,
+        batch_idx: Int32,
+        head_idx: Int32,
+        num_heads: Int32,
+        s_rowidx: cute.Tensor,
+        flashmask_info: FlashMaskInfo,
+        mbar_ptr_rowidx: cute.Pointer,
+        seqlen_k: Int32,
+        m_block: Int32,
+        seqlen_q: Int32,
+    ):
+        """Load K and V (and stage flashmask indices) for one KV block, then
+        advance and return the pipeline state. Passed as an explicit-arg method
+        (not a capturing closure) so it can be called under the dynamic flashmask
+        skip branch; the caller reassigns kv_producer_state to keep the
+        loop-carried state correct (mirrors load_block_list)."""
+        if const_expr(not self.use_tma_KV):
+            paged_kv_manager.load_page_table(n_block)
+        pipeline_k.producer_acquire(kv_producer_state)
+        load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
+        pipeline_v.producer_acquire(kv_producer_state)
+        load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
+        if const_expr(self.enable_flashmask):
+            self.load_startend_row_indices(
+                batch_idx,
+                head_idx,
+                n_block,
+                num_heads,
+                kv_producer_state,
+                s_rowidx,
+                flashmask_info,
+                mbar_ptr_rowidx,
+                seqlen_k,
+                m_block,
+                seqlen_q,
+            )
+        kv_producer_state.advance()
+        return kv_producer_state
 
     @cute.jit
     def load_KV(
@@ -1282,7 +1483,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     fastdiv_mods=fastdiv_mods,
                 )
             flashmask_fn = None
-            if const_expr(self.enable_flashmask):
+            if const_expr(self.enable_flashmask and not _FLASHMASK_SKIP_ROWIDX_APPLY):
                 flashmask_fn = partial(
                     self.apply_flashmask_block,
                     m_block=m_block,
@@ -1302,6 +1503,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 softmax=softmax,
                 score_mod_fn=score_mod_fn,
                 flashmask_fn=flashmask_fn,
+            )
+            # Fully-visible (full-list) blocks need no per-element flashmask apply
+            # and have no rowidx staged by the producer, so use a flashmask-free
+            # variant to keep the rowidx mbarrier balanced.
+            mma_one_n_block_full = partial(
+                mma_one_n_block_all,
+                seqlen=seqlen,
+                softmax=softmax,
+                score_mod_fn=score_mod_fn,
+                flashmask_fn=None,
             )
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             # flashmask: identical block-skipping scan as the producer, so the
@@ -1365,14 +1576,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     for n_tile in cutlass.range(
                         n_block_max - n_block_min_causal_local_mask, unroll=1
                     ):
-                        kv_consumer_state = mma_one_n_block(
-                            kv_consumer_state,
-                            n_block=n_block_max - 1 - n_tile,
-                            seqlen=seqlen,
-                            mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                            mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
-                        )
-                        O_should_accumulate = True
+                        n_block = n_block_max - 1 - n_tile
+                        process = True
+                        if const_expr(self.enable_flashmask):
+                            process = not self._flashmask_n_block_skip(
+                                flashmask_info, batch_idx, head_idx, m_block,
+                                n_block, seqlen.seqlen_q, cute.size(mO.shape[2]),
+                            )
+                        if process:
+                            kv_consumer_state = mma_one_n_block(
+                                kv_consumer_state,
+                                n_block=n_block,
+                                seqlen=seqlen,
+                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
+                            )
+                            O_should_accumulate = True
                     n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
                 # The remaining iterations have no masking
                 n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
@@ -1380,26 +1599,42 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 )
                 # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block_min_before_local_mask = {}, n_block_min = {}", n_block_min_before_local_mask, n_block_min)
                 for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
-                    kv_consumer_state = mma_one_n_block(
-                        kv_consumer_state,
-                        n_block=n_block_max - 1 - n_tile,
-                        seqlen=seqlen,
-                        mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
-                    )
-                    O_should_accumulate = True
-                # Separate iterations with local masking on the left
-                if const_expr(self.is_local and block_info.window_size_left is not None):
-                    n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
-                    for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
+                    n_block = n_block_max - 1 - n_tile
+                    process = True
+                    if const_expr(self.enable_flashmask):
+                        process = not self._flashmask_n_block_skip(
+                            flashmask_info, batch_idx, head_idx, m_block,
+                            n_block, seqlen.seqlen_q, cute.size(mO.shape[2]),
+                        )
+                    if process:
                         kv_consumer_state = mma_one_n_block(
                             kv_consumer_state,
-                            n_block=n_block_max - 1 - n_tile,
+                            n_block=n_block,
                             seqlen=seqlen,
                             mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                             mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
                         )
                         O_should_accumulate = True
+                # Separate iterations with local masking on the left
+                if const_expr(self.is_local and block_info.window_size_left is not None):
+                    n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
+                    for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
+                        n_block = n_block_max - 1 - n_tile
+                        process = True
+                        if const_expr(self.enable_flashmask):
+                            process = not self._flashmask_n_block_skip(
+                                flashmask_info, batch_idx, head_idx, m_block,
+                                n_block, seqlen.seqlen_q, cute.size(mO.shape[2]),
+                            )
+                        if process:
+                            kv_consumer_state = mma_one_n_block(
+                                kv_consumer_state,
+                                n_block=n_block,
+                                seqlen=seqlen,
+                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
+                            )
+                            O_should_accumulate = True
                 # Release Q pipeline so the producer can load the next tile's Q
                 pipeline_q.consumer_release_w_index(0)
                 # Last "half" iteration
@@ -1437,6 +1672,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.warp_scheduler_barrier_arrive,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    flashmask_fn=flashmask_fn,
+                    mma_one_n_block_full=mma_one_n_block_full,
                 )
 
                 # Release Q pipeline so the producer can load the next tile's Q
@@ -1730,6 +1967,32 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         lo = n_block_min if all_masked else lo
         hi = (n_block_min + 1) if all_masked else hi
         return lo, hi
+
+    @cute.jit
+    def _flashmask_n_block_skip(
+        self,
+        flashmask_info: FlashMaskInfo,
+        batch_idx: Int32,
+        head_idx: Int32,
+        m_block: Int32,
+        n_block: Int32,
+        seqlen_q: Int32,
+        num_heads: Int32,
+    ):
+        """Return True if KV block `n_block` is fully masked for this query block
+        `m_block` and should be skipped entirely (loads + compute). Enables
+        arbitrary (mid-range) block skipping that the both-end trim
+        (flashmask_n_block_min_max) cannot do for masks whose visible KV region
+        is non-contiguous (e.g. share-question). Deterministic from gmem, so the
+        producer and consumer skip the identical set of blocks and stay in
+        lockstep."""
+        fm_heads = flashmask_info.startend_row_indices.shape[1]
+        fm_head_idx = head_idx // (num_heads // fm_heads)
+        m_start = m_block * self.tile_m
+        m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
+        return self._flashmask_block_fully_masked(
+            flashmask_info, batch_idx, fm_head_idx, n_block, m_start, m_end
+        )
 
     @cute.jit
     def mma_one_n_block(

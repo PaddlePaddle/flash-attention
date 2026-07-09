@@ -41,6 +41,7 @@ from flash_mask.cute.block_sparse_utils import (
     produce_block_sparse_q_loads_bwd_sm90,
     consume_block_sparse_mma_bwd_sm90,
     dQaccum_store_block_sparse_bwd_sm90,
+    _load_q_do_block_sm90,
 )
 
 
@@ -1031,19 +1032,53 @@ class FlashAttentionBackwardSm90:
                         producer_state_dO.advance()
 
                         for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
-                            pipeline_Q.producer_acquire(producer_state_Q)
-                            load_Q(m_block, producer_state=producer_state_Q)
-                            load_LSE(m_block, producer_state=producer_state_Q)
-                            producer_state_dO_cur = (
-                                producer_state_dO
-                                if const_expr(self.Q_stage != self.dO_stage)
-                                else producer_state_Q
-                            )
-                            pipeline_dO.producer_acquire(producer_state_dO_cur)
-                            load_dO(m_block, producer_state=producer_state_dO_cur)
-                            load_dPsum(m_block, producer_state=producer_state_dO_cur)
-                            producer_state_Q.advance()
-                            producer_state_dO.advance()
+                            if const_expr(self.enable_flashmask and not self.deterministic):
+                                # Skip loading query blocks fully masked for this KV
+                                # block (same predicate the mma/dQ warps use), so the
+                                # producer/consumer pipeline stays in lockstep. Uses
+                                # the reassign-return advance style (load_kv=False) to
+                                # keep the pipeline state as a proper loop-carried
+                                # value under the dynamic skip branch.
+                                if not self._flashmask_m_block_skip(
+                                    flashmask_info,
+                                    batch_idx,
+                                    head_idx,
+                                    n_block,
+                                    m_block,
+                                    seqlen.seqlen_q,
+                                    num_heads,
+                                ):
+                                    producer_state_Q, producer_state_dO = _load_q_do_block_sm90(
+                                        m_block,
+                                        producer_state_Q,
+                                        producer_state_dO,
+                                        pipeline_Q,
+                                        pipeline_dO,
+                                        load_K,
+                                        load_V,
+                                        load_Q,
+                                        load_dO,
+                                        load_LSE,
+                                        load_dPsum,
+                                        self.tma_copy_bytes["K"],
+                                        self.tma_copy_bytes["V"],
+                                        self.Q_stage == self.dO_stage,
+                                        load_kv=False,
+                                    )
+                            else:
+                                pipeline_Q.producer_acquire(producer_state_Q)
+                                load_Q(m_block, producer_state=producer_state_Q)
+                                load_LSE(m_block, producer_state=producer_state_Q)
+                                producer_state_dO_cur = (
+                                    producer_state_dO
+                                    if const_expr(self.Q_stage != self.dO_stage)
+                                    else producer_state_Q
+                                )
+                                pipeline_dO.producer_acquire(producer_state_dO_cur)
+                                load_dO(m_block, producer_state=producer_state_dO_cur)
+                                load_dPsum(m_block, producer_state=producer_state_dO_cur)
+                                producer_state_Q.advance()
+                                producer_state_dO.advance()
                     else:
                         producer_state_Q, producer_state_dO = produce_block_sparse_q_loads_bwd_sm90(
                             blocksparse_tensors,
@@ -1463,17 +1498,44 @@ class FlashAttentionBackwardSm90:
                             has_ut_end=self.has_ut_end,
                         )
                     for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
-                        consumer_state_Q, consumer_state_dO = mma_one_m_block_all(
-                            m_block,
-                            consumer_state_Q,
-                            consumer_state_dO,
-                            mask_fn=mask_fn,
-                            flashmask_fn=flashmask_fn,
-                            score_mod_fn=score_mod_fn_cur,
-                            score_mod_bwd_fn=score_mod_bwd_fn_cur,
-                            dKV_accumulate=dKV_accumulate,
-                        )
-                        dKV_accumulate = True
+                        if const_expr(self.enable_flashmask and not self.deterministic):
+                            # Skip query blocks fully masked for this KV block,
+                            # including the mid-range band that the both-end trim
+                            # (flashmask_m_block_min_max) cannot remove. The load
+                            # and dQaccum_store warps apply the identical predicate
+                            # so the pipeline / dQ barriers stay in lockstep.
+                            if not self._flashmask_m_block_skip(
+                                flashmask_info,
+                                batch_idx,
+                                head_idx,
+                                n_block,
+                                m_block,
+                                seqlen.seqlen_q,
+                                num_heads,
+                            ):
+                                consumer_state_Q, consumer_state_dO = mma_one_m_block_all(
+                                    m_block,
+                                    consumer_state_Q,
+                                    consumer_state_dO,
+                                    mask_fn=mask_fn,
+                                    flashmask_fn=flashmask_fn,
+                                    score_mod_fn=score_mod_fn_cur,
+                                    score_mod_bwd_fn=score_mod_bwd_fn_cur,
+                                    dKV_accumulate=dKV_accumulate,
+                                )
+                                dKV_accumulate = True
+                        else:
+                            consumer_state_Q, consumer_state_dO = mma_one_m_block_all(
+                                m_block,
+                                consumer_state_Q,
+                                consumer_state_dO,
+                                mask_fn=mask_fn,
+                                flashmask_fn=flashmask_fn,
+                                score_mod_fn=score_mod_fn_cur,
+                                score_mod_bwd_fn=score_mod_bwd_fn_cur,
+                                dKV_accumulate=dKV_accumulate,
+                            )
+                            dKV_accumulate = True
                 else:
                     consumer_state_Q, consumer_state_dO = consume_block_sparse_mma_bwd_sm90(
                         blocksparse_tensors,
@@ -1673,6 +1735,32 @@ class FlashAttentionBackwardSm90:
             lo = lo + 1 if fully else lo
             active = fully & (lo < hi)
         return lo, hi
+
+    @cute.jit
+    def _flashmask_m_block_skip(
+        self,
+        flashmask_info: FlashMaskInfo,
+        batch_idx: Int32,
+        head_idx: Int32,
+        n_block: Int32,
+        m_block: Int32,
+        seqlen_q: Int32,
+        num_heads: Int32,
+    ):
+        """Return True if query block `m_block` is fully masked for this KV block
+        `n_block` and should be skipped. Used for arbitrary (mid-range) block
+        skipping: masks like causal-blockwise leave the visible query blocks in
+        two disjoint intervals with a fully-masked band in the middle, which the
+        both-end trim (flashmask_m_block_min_max) cannot remove. Deterministic
+        from gmem, so the load / mma / dQaccum_store warps skip the identical set
+        of blocks and stay in lockstep."""
+        fm_heads = flashmask_info.startend_row_indices.shape[1]
+        fm_head_idx = head_idx // (num_heads // fm_heads)
+        m_start = m_block * self.tile_m
+        m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
+        return self._flashmask_block_fully_masked(
+            flashmask_info, batch_idx, fm_head_idx, n_block, m_start, m_end
+        )
 
     @staticmethod
     @cute.jit
@@ -2089,58 +2177,99 @@ class FlashAttentionBackwardSm90:
                         m_block = m_block_min + iter_idx
                         m_block_safe = m_block
 
-                        num_dQ_chunks = self.num_wg_dQ
-                        for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
-                            if const_expr(not self.deterministic):
-                                # If deterministic, we already waited at the end of the prev iter
-                                cute.arch.cp_async_bulk_wait_group(
-                                    num_dQ_chunks - 1 - warp_group_idx, read=read_flag
+                        if const_expr(self.enable_flashmask and not self.deterministic):
+                            # Skip the dQ handshake for query blocks fully masked
+                            # for this KV block. Must match the load/mma warps'
+                            # skip set exactly so the per-m_block dQEmpty/dQFull
+                            # barrier handshake stays paired 1:1.
+                            skip_block = self._flashmask_m_block_skip(
+                                flashmask_info,
+                                batch_idx,
+                                head_idx,
+                                n_block,
+                                m_block,
+                                seqlen.seqlen_q,
+                                num_heads,
+                            )
+                            if not skip_block:
+                                num_dQ_chunks = self.num_wg_dQ
+                                for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
+                                    cute.arch.cp_async_bulk_wait_group(
+                                        num_dQ_chunks - 1 - warp_group_idx, read=read_flag
+                                    )
+                                    cute.arch.barrier_arrive(
+                                        barrier_id=int(NamedBarrierBwd.dQEmptyWG0)
+                                        + warp_group_idx,
+                                        number_of_threads=self.num_threads_per_warp_group
+                                        + cute.arch.WARP_SIZE,
+                                    )
+                                for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
+                                    cute.arch.barrier(
+                                        barrier_id=int(NamedBarrierBwd.dQFullWG0)
+                                        + warp_group_idx,
+                                        number_of_threads=self.num_threads_per_warp_group
+                                        + cute.arch.WARP_SIZE,
+                                    )
+                                    with cute.arch.elect_one():
+                                        copy_utils.cpasync_reduce_bulk_add_f32(
+                                            sdQaccum[None, warp_group_idx].iterator,
+                                            gdQaccum[(None, warp_group_idx), m_block_safe].iterator,
+                                            self.tma_copy_bytes["dQ"],
+                                        )
+                                    cute.arch.cp_async_bulk_commit_group()
+                        else:
+                            num_dQ_chunks = self.num_wg_dQ
+                            for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
+                                if const_expr(not self.deterministic):
+                                    # If deterministic, we already waited at the end of the prev iter
+                                    cute.arch.cp_async_bulk_wait_group(
+                                        num_dQ_chunks - 1 - warp_group_idx, read=read_flag
+                                    )
+                                cute.arch.barrier_arrive(
+                                    barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
+                                    number_of_threads=self.num_threads_per_warp_group
+                                    + cute.arch.WARP_SIZE,
                                 )
-                            cute.arch.barrier_arrive(
-                                barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
-                                number_of_threads=self.num_threads_per_warp_group
-                                + cute.arch.WARP_SIZE,
-                            )
 
-                        # Semaphore acquire: wait for prior n_blocks to finish writing this m_block
-                        if const_expr(self.deterministic):
-                            if const_expr(self.spt):
-                                _, n_block_max_for_m_block = block_info.get_n_block_min_max(
-                                    seqlen, m_block_safe
+                            # Semaphore acquire: wait for prior n_blocks to finish writing this m_block
+                            if const_expr(self.deterministic):
+                                if const_expr(self.spt):
+                                    _, n_block_max_for_m_block = block_info.get_n_block_min_max(
+                                        seqlen, m_block_safe
+                                    )
+                                    lock_value = n_block_max_for_m_block - 1 - n_block
+                                else:
+                                    lock_value = n_block
+                                barrier.wait_eq(
+                                    mdQ_semaphore_cur[(m_block_safe, None)].iterator,
+                                    warp_local_tidx,
+                                    0,  # flag_offset
+                                    lock_value,
                                 )
-                                lock_value = n_block_max_for_m_block - 1 - n_block
-                            else:
-                                lock_value = n_block
-                            barrier.wait_eq(
-                                mdQ_semaphore_cur[(m_block_safe, None)].iterator,
-                                warp_local_tidx,
-                                0,  # flag_offset
-                                lock_value,
-                            )
 
-                        for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
-                            cute.arch.barrier(
-                                barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
-                                number_of_threads=self.num_threads_per_warp_group
-                                + cute.arch.WARP_SIZE,
-                            )
-                            with cute.arch.elect_one():
-                                copy_utils.cpasync_reduce_bulk_add_f32(
-                                    sdQaccum[None, warp_group_idx].iterator,
-                                    gdQaccum[(None, warp_group_idx), m_block_safe].iterator,
-                                    self.tma_copy_bytes["dQ"],
+                            for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
+                                cute.arch.barrier(
+                                    barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
+                                    number_of_threads=self.num_threads_per_warp_group
+                                    + cute.arch.WARP_SIZE,
                                 )
-                            cute.arch.cp_async_bulk_commit_group()
+                                with cute.arch.elect_one():
+                                    copy_utils.cpasync_reduce_bulk_add_f32(
+                                        sdQaccum[None, warp_group_idx].iterator,
+                                        gdQaccum[(None, warp_group_idx), m_block_safe].iterator,
+                                        self.tma_copy_bytes["dQ"],
+                                    )
+                                cute.arch.cp_async_bulk_commit_group()
 
-                        # Semaphore release: signal that this n_block is done with this m_block
-                        if const_expr(self.deterministic):
-                            cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-                            barrier.arrive_inc(
-                                mdQ_semaphore_cur[(m_block_safe, None)].iterator,
-                                warp_local_tidx,
-                                0,  # flag_offset
-                                1,
-                            )
+                            # Semaphore release: signal that this n_block is done with this m_block
+                            if const_expr(self.deterministic):
+                                cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                                barrier.arrive_inc(
+                                    mdQ_semaphore_cur[(m_block_safe, None)].iterator,
+                                    warp_local_tidx,
+                                    0,  # flag_offset
+                                    1,
+                                )
                 else:
                     assert not self.deterministic, (
                         "Deterministic not implemented for block-sparse backward"

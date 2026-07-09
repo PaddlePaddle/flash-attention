@@ -383,6 +383,8 @@ def consume_block_sparse_loads(
     warp_scheduler_barrier_arrive: Callable,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
+    flashmask_fn: Optional[Callable] = None,
+    mma_one_n_block_full: Optional[Callable] = None,
 ):
     """Consume the mask and full block lists for a single tile on the consumer side.
 
@@ -409,6 +411,11 @@ def consume_block_sparse_loads(
     )
 
     processed_any = curr_mask_block_cnt + curr_full_block_cnt > 0
+
+    # Fully-visible (full-list) blocks use a flashmask-free mma when provided;
+    # otherwise fall back to the same mma (non-flashmask callers pass nothing).
+    if const_expr(mma_one_n_block_full is None):
+        mma_one_n_block_full = mma_one_n_block
 
     if const_expr(not intra_wg_overlap):
         if curr_mask_block_cnt > 0:
@@ -444,7 +451,7 @@ def consume_block_sparse_loads(
             full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
             if curr_mask_block_cnt == 0:
                 warp_scheduler_barrier_sync()
-                kv_consumer_state = mma_one_n_block(
+                kv_consumer_state = mma_one_n_block_full(
                     kv_consumer_state,
                     n_block=full_n_block,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
@@ -454,7 +461,7 @@ def consume_block_sparse_loads(
                 O_should_accumulate = True
                 for i in cutlass.range(1, curr_full_block_cnt):
                     full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
-                    kv_consumer_state = mma_one_n_block(
+                    kv_consumer_state = mma_one_n_block_full(
                         kv_consumer_state,
                         n_block=full_n_block,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
@@ -463,7 +470,7 @@ def consume_block_sparse_loads(
                     )
                     O_should_accumulate = True
             else:
-                kv_consumer_state = mma_one_n_block(
+                kv_consumer_state = mma_one_n_block_full(
                     kv_consumer_state,
                     n_block=full_n_block,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
@@ -473,7 +480,7 @@ def consume_block_sparse_loads(
                 O_should_accumulate = True
                 for i in cutlass.range(1, curr_full_block_cnt):
                     full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
-                    kv_consumer_state = mma_one_n_block(
+                    kv_consumer_state = mma_one_n_block_full(
                         kv_consumer_state,
                         n_block=full_n_block,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
@@ -496,6 +503,7 @@ def consume_block_sparse_loads(
                     fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
                 ),
                 score_mod_fn=score_mod_fn,
+                flashmask_fn=flashmask_fn,
                 is_first_block=True,
             )
             for i in cutlass.range(1, curr_mask_block_cnt):
@@ -521,7 +529,7 @@ def consume_block_sparse_loads(
                     is_first_block=True,
                 )
             else:
-                kv_consumer_state = mma_one_n_block(
+                kv_consumer_state = mma_one_n_block_full(
                     kv_consumer_state,
                     n_block=full_n_block,
                     seqlen=seqlen_info,
@@ -531,7 +539,7 @@ def consume_block_sparse_loads(
                 O_should_accumulate = True
             for i in cutlass.range(1, curr_full_block_cnt):
                 full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
-                kv_consumer_state = mma_one_n_block(
+                kv_consumer_state = mma_one_n_block_full(
                     kv_consumer_state,
                     n_block=full_n_block,
                     seqlen=seqlen_info,

@@ -41,6 +41,7 @@ from flash_mask.cute.flashmask_utils import (
     prepare_block_maxmin,
     to_cute_flashmask_info,
     reduce_block_count,
+    compute_flashmask_block_lists,
 )
 
 from flash_mask.cute.block_sparsity import (
@@ -494,6 +495,50 @@ def _flash_attn_fwd(
 
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
 
+    # Head dims > 128 (e.g. 192 / 256): the default n_block_size=128 with
+    # num_stages=2 makes the K/V smem staging exceed Hopper's ~227KB per-block
+    # shared-memory limit (e.g. hdim=256 needs ~320KB), so cuLaunchKernel fails
+    # with CUDA_ERROR_INVALID_VALUE. Shrink the N tile to 64 so it fits while
+    # keeping num_stages=2 and intra_wg_overlap. Must be set BEFORE the flashmask
+    # block-list generation below so the lists and the kernel agree on n_block_size.
+    if compute_capability == 9 and head_dim > 128:
+        n_block_size = 64
+
+    # flashmask (SM90): route through the block-sparse list-driven path so the
+    # kernel iterates only surviving KV blocks (arbitrary/mid-range skip) while
+    # keeping intra_wg_overlap. Build per-(b,h,m_block) surviving-block lists from
+    # the flashmask nblock max/min (kBlockM=m_block_size, kBlockN=n_block_size).
+    # split_full=True: partially-masked blocks go to the mask list (they get the
+    # per-element flashmask apply + rowidx staging), fully-visible blocks go to the
+    # full list (no rowidx pipeline / no element mask). This keeps correctness for
+    # partial masks (sliding-window etc.) while avoiding the per-block rowidx
+    # mbarrier sync on the fully-visible blocks (perf).
+    if (
+        compute_capability == 9
+        and cute_flashmask_info is not None
+        and block_sparse_tensors is None
+        and seqlen_q is not None
+    ):
+        fm_full_cnt, fm_full_idx, fm_mask_cnt, fm_mask_idx = compute_flashmask_block_lists(
+            flashmask_info,
+            causal,
+            m_block_size,
+            n_block_size,
+            seqlen_q,
+            seqlen_k,
+            num_head,
+            split_full=True,
+        )
+        # mask list = partial blocks (element-masked), full list = fully-visible
+        # blocks (no element mask). Both are consumed; the producer stages rowidx
+        # only for the (contiguous, processed-first) mask-list prefix.
+        block_sparse_tensors = BlockSparseTensorsPaddle(
+            mask_block_cnt=fm_mask_cnt,
+            mask_block_idx=fm_mask_idx,
+            full_block_cnt=fm_full_cnt,
+            full_block_idx=fm_full_idx,
+        )
+
     sparse_tensors = None
     if block_sparse_tensors is not None:
         if seqlen_q is None:
@@ -699,6 +744,10 @@ def _flash_attn_fwd(
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
+                # flashmask routes through the block-sparse list-driven path with
+                # intra_wg_overlap enabled; the per-element startend_row_indices
+                # staging/apply is skipped (see _FLASHMASK_SKIP_ROWIDX_APPLY in
+                # flash_fwd_sm90).
                 intra_wg_overlap=True,
                 mma_pv_is_rs=True,
                 mask_mod=mask_mod,

@@ -102,6 +102,8 @@ class FlashAttentionForwardSm100:
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
         is_split_d: bool = False,
+        has_block_logit: cutlass.Constexpr = False,
+        block_size: cutlass.Constexpr[int] = 64,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -151,6 +153,16 @@ class FlashAttentionForwardSm100:
             assert not self.pack_gqa, "Split-D does not support pack_gqa"
         self.score_mod = score_mod
         self.mask_mod = mask_mod
+        # HySparse block-score fusion: emit per-(query, key-block) max raw logit.
+        self.has_block_logit = has_block_logit
+        self.block_size = block_size
+        if cutlass.const_expr(has_block_logit):
+            assert n_block_size % block_size == 0, (
+                "block_size must divide n_block_size for the fused block-score"
+            )
+            self.blocks_per_ntile: cutlass.Constexpr = n_block_size // block_size
+        else:
+            self.blocks_per_ntile: cutlass.Constexpr = 1
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
         else:
@@ -314,6 +326,7 @@ class FlashAttentionForwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
         flashmask_info: Optional[FlashMaskInfo] = None,
+        mBlockLogit: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -370,6 +383,13 @@ class FlashAttentionForwardSm100:
             if const_expr(mLSE is not None)
             else None
         )
+        # HySparse block-score: (b, h, s_q, nblocks) -> (s_q, h, b, nblocks) so
+        # the per-(q_row, head, batch) write mirrors the LSE addressing.
+        if const_expr(self.has_block_logit):
+            assert not self.is_split_kv, "block-score fusion assumes not split_kv"
+            mBlockLogit = cute.make_tensor(
+                mBlockLogit.iterator, cute.select(mBlockLogit.layout, mode=[2, 1, 0, 3])
+            )
         # (s, d, h, b) -> (d, s, h, b)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
@@ -826,6 +846,7 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             flashmask_info,
+            mBlockLogit if const_expr(self.has_block_logit) else None,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -872,6 +893,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         flashmask_info: Optional[FlashMaskInfo] = None,
+        mBlockLogit: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1254,6 +1276,7 @@ class FlashAttentionForwardSm100:
                 s_n_block=s_n_block,
                 s_extra_flags=s_extra_flags,
                 s_startend_row_indices=s_startend_row_indices,
+                mBlockLogit=mBlockLogit,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -2297,6 +2320,7 @@ class FlashAttentionForwardSm100:
         s_n_block: Optional[cute.Tensor] = None,
         s_extra_flags: Optional[cute.Tensor] = None,
         s_startend_row_indices: Optional[cute.Tensor] = None,
+        mBlockLogit: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -2465,6 +2489,7 @@ class FlashAttentionForwardSm100:
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
+                mBlockLogit=mBlockLogit,
             )
 
             if has_work:
@@ -2798,6 +2823,7 @@ class FlashAttentionForwardSm100:
         fastdiv_mods=(None, None),
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
+        mBlockLogit: Optional[cute.Tensor] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32, Optional[cutlass.pipeline.PipelineState]]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -2844,6 +2870,48 @@ class FlashAttentionForwardSm100:
             load_startend_row_indices_consumer_state = mask_fn(tSrS_t2r, n_block=n_block)
         else:
             load_startend_row_indices_consumer_state = None
+
+        # --- Fused block-max score (HySparse) ---------------------------------
+        # tSrS_t2r currently holds the RAW (unscaled) q.k logit for this n-tile,
+        # with masked-out columns set to -Float32.inf (mask_fn above ran, but the
+        # softmax scale/exp has not yet touched it). On sm100 each softmax thread
+        # owns ONE complete query row (all n_block_size columns) -- SoftmaxSm100.
+        # _compute_row_max is a pure within-fragment fmax_reduce with NO cross-lane
+        # shuffle -- so we can reduce this thread's fragment straight into per-block
+        # maxes by bucketing columns into `blocks_per_ntile` sub-blocks of
+        # `block_size`, with no warp reduce. The result is written to gmem
+        # mirroring the LSE write (thr_idx -> row within the m-tile). This adds no
+        # MMA / smem / cross-warp traffic, so the score rides the fast FA4 path.
+        if const_expr(self.has_block_logit):
+            tScS_t2r_blk = thr_tmem_load.partition_D(tScS)
+            blk_max = cute.make_fragment(self.blocks_per_ntile, Float32)
+            for b in cutlass.range_constexpr(self.blocks_per_ntile):
+                blk_max[b] = -Float32.inf
+            n_elems = const_expr(cute.size(tScS_t2r_blk.shape))
+            for i in cutlass.range_constexpr(n_elems):
+                sub = tScS_t2r_blk[i][1] // self.block_size
+                for b in cutlass.range_constexpr(self.blocks_per_ntile):
+                    if sub == b:
+                        blk_max[b] = cute.arch.fmax(blk_max[b], tSrS_t2r[i])
+            # `m_block` here is already the per-stage query m-tile index
+            # (m_block_for_mask = q_stage*m_block_raw + stage, bound by the
+            # softmax_step partial), so it maps 1:1 to the query rows this stage
+            # owns. Split-D (q_stage=1) folds both stages onto the same rows, so
+            # write only from stage 0; non-split-D (q_stage=2) has each stage own
+            # a distinct m-tile and both must write.
+            if const_expr(not self.is_split_d) or stage == 0:
+                blk_tidx = thr_tmem_load.thr_idx
+                if blk_tidx < seqlen.seqlen_q - m_block * self.m_block_size:
+                    row = m_block * self.m_block_size + blk_tidx
+                    mBL_cur = mBlockLogit[None, head_idx, batch_idx, None]
+                    for b in cutlass.range_constexpr(self.blocks_per_ntile):
+                        # Skip sub-blocks whose first key column is past seqlen_k:
+                        # mBlockLogit has exactly ceil(seqlen_k / block_size) columns,
+                        # so a sub-block lying entirely in the n-tile padding region
+                        # would index out of bounds (it is all -inf anyway).
+                        if n_block * self.n_block_size + b * self.block_size < seqlen.seqlen_k:
+                            mBL_cur[row, n_block * self.blocks_per_ntile + b] = blk_max[b]
+        # ----------------------------------------------------------------------
 
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 

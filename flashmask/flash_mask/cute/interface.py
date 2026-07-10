@@ -184,6 +184,8 @@ def _flash_attn_fwd(
     lse: Optional[paddle.Tensor] = None,
     aux_tensors: Optional[list[paddle.Tensor]] = None,
     startend_row_indices: Optional[paddle.Tensor] = None,
+    block_logit: Optional[paddle.Tensor] = None,
+    block_size: int = 64,
 ) -> Tuple[paddle.Tensor, paddle.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -196,6 +198,13 @@ def _flash_attn_fwd(
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+        block_logit: Optional pre-allocated fp32 tensor [batch, num_heads, seqlen_q, num_blocks] that,
+            when provided, receives the fused per-(query, key-block) max of the RAW (pre-scale, post-mask)
+            q*k^T logit computed in the softmax epilogue. Written in place; kept out of the returned tuple.
+            num_blocks must be >= ceil(seqlen_k / block_size). Fused reduction respects the same causal /
+            flashmask masking applied to the attention. Only supported on SM 10.x (non split-KV).
+        block_size: Key-block width (in tokens) used to bucket the fused block-logit reduction. Must divide
+            the kernel's n_block_size. Ignored when block_logit is None.
     """
 
     assert cu_seqlens_q is None, "cu_seqlens_q must be None (varlen is not supported in flashmask)"
@@ -481,6 +490,17 @@ def _flash_attn_fwd(
     else:
         lse_tensor = None
 
+    if block_logit is not None:
+        assert block_logit.dtype == paddle.float32, (
+            f"block_logit must be float32; got {block_logit.dtype}"
+        )
+        assert block_logit.place.is_gpu_place(), "block_logit must be on CUDA"
+        block_logit_tensor = from_dlpack(
+            block_logit.detach(), assumed_align=4
+        ).mark_layout_dynamic(leading_dim=block_logit.ndim - 1)
+    else:
+        block_logit_tensor = None
+
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
@@ -558,6 +578,8 @@ def _flash_attn_fwd(
         # flashmask
         startend_row_indices.shape[3] if startend_row_indices is not None else None,
         is_split_d if compute_capability == 10 else False,
+        block_logit is None,
+        block_size,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
@@ -606,6 +628,8 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, 128],
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 is_split_d=is_split_d,
+                has_block_logit=block_logit is not None,
+                block_size=block_size,
             )
         else:
             raise ValueError(
@@ -632,6 +656,7 @@ def _flash_attn_fwd(
             sparse_tensors,
             cute_aux_tensors,
             cute_flashmask_info,
+            block_logit_tensor,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor,
@@ -652,6 +677,7 @@ def _flash_attn_fwd(
         sparse_tensors,
         cute_aux_tensors,
         cute_flashmask_info,
+        block_logit_tensor,
     )
     if is_split_kv:
         _flash_attn_fwd_combine(

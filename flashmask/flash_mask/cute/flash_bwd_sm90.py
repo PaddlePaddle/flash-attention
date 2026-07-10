@@ -779,19 +779,16 @@ class FlashAttentionBackwardSm90:
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
-        # AttentionMaskCls = partial(
-        #     AttentionMask,
-        #     self.tile_m,
-        #     self.tile_n,
-        #     window_size_left=window_size_left,
-        #     window_size_right=window_size_right,
-        #     swap_AB=self.SdP_swapAB,
-        # )
+        # The mask's swap_AB MUST match the SdP MMA layout (acc_S is produced with
+        # swap_AB=self.SdP_swapAB). Hardcoding True only worked for the head_dim<=128
+        # configs (SdP_swapAB=True); for SdP_swapAB=False configs (e.g. head_dim=256,
+        # 192) it transposed the causal/seqlen mask axes -> mask applied to the wrong
+        # positions -> hugely wrong dQ/dK/dV.
         AttentionMaskCls = partial(
             AttentionMask,
             self.tile_m,
             self.tile_n,
-            swap_AB=True,
+            swap_AB=self.SdP_swapAB,
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 

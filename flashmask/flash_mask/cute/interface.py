@@ -327,6 +327,23 @@ def _flash_attn_fwd(
         seqlen_q = None
         total_q = q.shape[0]
 
+    compute_capability = (
+        paddle.device.cuda.get_device_capability()[0]
+        if _compute_capability is None
+        else _compute_capability
+    )
+    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+
+    # Head dims > 128 (e.g. 192 / 256): the default n_block_size=128 with
+    # num_stages=2 exceeds Hopper's ~227KB per-block shared-memory limit
+    # (e.g. hdim=256 needs ~320KB -> cuLaunchKernel CUDA_ERROR_INVALID_VALUE), so
+    # shrink the N tile to 64. Set BEFORE the flashmask nblock max/min + block-list
+    # generation below so prepare_block_maxmin / reduce_block_count /
+    # compute_flashmask_block_lists and the kernel all agree on n_block_size
+    # (otherwise the per-n_block arrays disagree in length -> reshape error).
+    if compute_capability == 9 and head_dim > 128:
+        n_block_size = 64
+
     cute_flashmask_info = None
     if startend_row_indices is not None:
         fm_batch_size = startend_row_indices.shape[0]
@@ -340,7 +357,7 @@ def _flash_attn_fwd(
             startend_row_indices=startend_row_indices,
         )
         flashmask_info.valid_block_count = paddle.empty([fm_batch_size, fm_heads, num_m_blocks], dtype=paddle.int32)
-        prepare_block_maxmin(flashmask_info)
+        prepare_block_maxmin(flashmask_info, kBlockN=n_block_size)
         cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
         reduce_block_count(cute_flashmask_info, causal, q_stage * m_block_size, n_block_size, seqlen_q)
 
@@ -487,22 +504,6 @@ def _flash_attn_fwd(
         if page_table is not None
         else None
     )
-    compute_capability = (
-        paddle.device.cuda.get_device_capability()[0]
-        if _compute_capability is None
-        else _compute_capability
-    )
-
-    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
-
-    # Head dims > 128 (e.g. 192 / 256): the default n_block_size=128 with
-    # num_stages=2 makes the K/V smem staging exceed Hopper's ~227KB per-block
-    # shared-memory limit (e.g. hdim=256 needs ~320KB), so cuLaunchKernel fails
-    # with CUDA_ERROR_INVALID_VALUE. Shrink the N tile to 64 so it fits while
-    # keeping num_stages=2 and intra_wg_overlap. Must be set BEFORE the flashmask
-    # block-list generation below so the lists and the kernel agree on n_block_size.
-    if compute_capability == 9 and head_dim > 128:
-        n_block_size = 64
 
     # flashmask (SM90): route through the block-sparse list-driven path so the
     # kernel iterates only surviving KV blocks (arbitrary/mid-range skip) while
@@ -885,6 +886,23 @@ def _flash_attn_bwd(
     m_block_size = 128
     n_block_size = 128
 
+    # SM90: finalize n_block_size (the head_dim-dependent bwd N tile from
+    # _tile_size_bwd_sm90, e.g. 64 for head_dim=256) BEFORE prepare_block_maxmin /
+    # the block-list generation below, so they all agree with the actual kernel's N
+    # tile (same class of bug as the fwd n_block_size fix: otherwise the flashmask
+    # per-n_block max/min arrays are sized/scanned with kBlockN=128 while the kernel
+    # and any block-list consumer expect the real n_block_size -> wrong blocks used
+    # -> wrong dQ/dK/dV, or a shape mismatch if list-driven).
+    if compute_capability == 9:
+        n_block_size = _tile_size_bwd_sm90(
+            head_dim,
+            head_dim_v,
+            causal,
+            False,
+            sparse_block_size_q=None,
+            flashmask=flashmask_info is not None,
+        ).n_block_size
+
     cute_flashmask_info = None
     num_flashmask_tensors = 0
     bwd_192x128_use_2cta = True
@@ -905,7 +923,7 @@ def _flash_attn_bwd(
             flashmask_info.valid_block_count = paddle.empty(
                 [fm_b, fm_h, num_m_blocks], dtype=paddle.int32
             )
-        prepare_block_maxmin(flashmask_info)
+        prepare_block_maxmin(flashmask_info, kBlockN=n_block_size)
         cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
         num_flashmask_tensors = 2 * flashmask_info.startend_row_indices.shape[-1]
         if compute_density:

@@ -215,7 +215,14 @@ class AttentionMask:
                     1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q - thr_col_offset
                 )
                 if const_expr(mask_causal):
-                    r2p = const_expr(not self.swap_AB)  # R2P trick, see apply_mask_sm100
+                    # R2P (mask_r2p) assumes a specific per-thread column layout
+                    # (0,1,8,9,16,17,...) via col_limit//8*2+min(col_limit%8,2). That
+                    # holds for some MMA configs but NOT e.g. the head_dim=256 bwd
+                    # (swap_AB=False, 64x64 tile), where it mis-masked near the causal
+                    # diagonal -> residual dQ/dK/dV error. Use the layout-agnostic
+                    # direct loop (with the real column indices) instead. (The
+                    # seqlen-only path above already disables R2P for the same reason.)
+                    r2p = const_expr(False)
                     for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                         # get the column index limit based on current row. Only consider the row index, so the column index sets to 0.
                         if const_expr(self.qhead_per_kvhead_packgqa == 1):

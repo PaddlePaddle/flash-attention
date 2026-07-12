@@ -199,10 +199,18 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         block_logit: Optional pre-allocated fp32 tensor [batch, num_heads, seqlen_q, num_blocks] that,
-            when provided, receives the fused per-(query, key-block) max of the RAW (pre-scale, post-mask)
-            q*k^T logit computed in the softmax epilogue. Written in place; kept out of the returned tuple.
-            num_blocks must be >= ceil(seqlen_k / block_size). Fused reduction respects the same causal /
-            flashmask masking applied to the attention. Only supported on SM 10.x (non split-KV).
+            when provided, receives the fused per-(query, key-block) max of the post-score_mod, post-mask
+            q*k^T logit (i.e. the actual pre-softmax-scale attention score, INCLUDING any score_mod bias --
+            an "attention-importance" proxy for downstream block selection, NOT the pure raw q*k^T). When no
+            score_mod is set this equals the raw q*k^T. Computed in the softmax epilogue and written in place;
+            kept out of the returned tuple. num_blocks must be >= ceil(seqlen_k / block_size). The fused
+            reduction respects the same causal / flashmask masking applied to the attention. Only supported on
+            SM 10.x (non split-KV).
+            IMPORTANT: the kernel only writes key-blocks that the attention loop actually visits. Key-blocks
+            that are entirely skipped by masking (e.g. fully-future blocks under causal / flashmask, or blocks
+            past seqlen_k when num_blocks*block_size > seqlen_k) are NEVER written. The caller MUST
+            pre-initialize block_logit to -inf so those entries read as -inf (masked) rather than stale
+            garbage; do not pass an uninitialized / reused buffer.
         block_size: Key-block width (in tokens) used to bucket the fused block-logit reduction. Must divide
             the kernel's n_block_size. Ignored when block_logit is None.
     """
@@ -491,10 +499,21 @@ def _flash_attn_fwd(
         lse_tensor = None
 
     if block_logit is not None:
+        assert compute_capability == 10, (
+            "block_logit (fused block-score) is only supported on SM 10.x"
+        )
+        assert not is_split_kv, "block_logit is not supported with split-KV"
         assert block_logit.dtype == paddle.float32, (
             f"block_logit must be float32; got {block_logit.dtype}"
         )
         assert block_logit.place.is_gpu_place(), "block_logit must be on CUDA"
+        assert block_logit.ndim == 4, (
+            f"block_logit must be [batch, num_heads, seqlen_q, num_blocks]; got ndim={block_logit.ndim}"
+        )
+        _nb_min = (k.shape[1] + block_size - 1) // block_size
+        assert block_logit.shape[-1] >= _nb_min, (
+            f"block_logit num_blocks={block_logit.shape[-1]} < ceil(seqlen_k/block_size)={_nb_min}"
+        )
         block_logit_tensor = from_dlpack(
             block_logit.detach(), assumed_align=4
         ).mark_layout_dynamic(leading_dim=block_logit.ndim - 1)

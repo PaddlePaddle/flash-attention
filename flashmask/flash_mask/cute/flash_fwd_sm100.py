@@ -2872,10 +2872,14 @@ class FlashAttentionForwardSm100:
             load_startend_row_indices_consumer_state = None
 
         # --- Fused block-max score (HySparse) ---------------------------------
-        # tSrS_t2r currently holds the RAW (unscaled) q.k logit for this n-tile,
-        # with masked-out columns set to -Float32.inf (mask_fn above ran, but the
-        # softmax scale/exp has not yet touched it). On sm100 each softmax thread
-        # owns ONE complete query row (all n_block_size columns) -- SoftmaxSm100.
+        # tSrS_t2r currently holds the post-score_mod, post-mask, still-UNSCALED
+        # q.k logit for this n-tile: apply_score_mod (if any) and mask_fn have run,
+        # but the softmax scale/exp have not yet touched it. So this is the actual
+        # pre-softmax-scale attention score INCLUDING any score_mod bias -- an
+        # "attention-importance" proxy for block selection, not the pure raw q.k
+        # (when no score_mod is set the two coincide). Masked-out columns are
+        # -Float32.inf and never win a block max. On sm100 each softmax thread owns
+        # ONE complete query row (all n_block_size columns) -- SoftmaxSm100.
         # _compute_row_max is a pure within-fragment fmax_reduce with NO cross-lane
         # shuffle -- so we can reduce this thread's fragment straight into per-block
         # maxes by bucketing columns into `blocks_per_ntile` sub-blocks of

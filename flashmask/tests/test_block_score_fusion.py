@@ -2,10 +2,13 @@
 FlashAttention forward kernel.
 
 When ``_flash_attn_fwd`` is called with a preallocated ``block_logit`` tensor it
-additionally writes, for every (query, key-block) pair, the maximum of the RAW
-(pre-softmax-scale, post-mask) ``q @ k^T`` logit -- computed inside the softmax
-epilogue at (nearly) zero extra cost. Downstream this feeds a non-differentiable
-Top-K block selection (HySparse sparse attention), so it must:
+additionally writes, for every (query, key-block) pair, the maximum of the
+post-score_mod, post-mask (but still pre-softmax-scale) ``q @ k^T`` logit --
+i.e. the actual attention score INCLUDING any score_mod bias (an
+"attention-importance" proxy), which reduces to the raw ``q @ k^T`` when no
+score_mod is set. It is computed inside the softmax epilogue at (nearly) zero
+extra cost. Downstream this feeds a non-differentiable Top-K block selection
+(HySparse sparse attention), so it must:
 
   * respect exactly the same causal / flashmask masking as the attention itself
     (masked positions contribute ``-inf`` and never leak into a block max);
@@ -252,6 +255,131 @@ def test_block_logit_does_not_change_output(causal, d):
     assert np.allclose(l0, l1, atol=0, rtol=0), (
         f"lse changed by fusion: max|diff|={np.abs(l0 - l1).max():.3e}"
     )
+
+
+# ---------------------------------------------------------------------------
+# GQA: qhead_per_kvhead > 1. block_logit is indexed by the QUERY head, and each
+# query head must see its own kv head broadcast. Reference repeats kv heads.
+# ---------------------------------------------------------------------------
+def ref_block_logit_gqa(q, k, causal, block_size, num_blocks):
+    b, s, hq, d = q.shape
+    sk, hkv = k.shape[1], k.shape[2]
+    qf = q.astype("float32").transpose([0, 2, 1, 3])   # [B,Hq,S,D]
+    kf = k.astype("float32").transpose([0, 2, 1, 3])   # [B,Hkv,Sk,D]
+    kf = paddle.repeat_interleave(kf, hq // hkv, axis=1)
+    scores = paddle.matmul(qf, kf, transpose_y=True)
+    if causal:
+        row = paddle.arange(s).reshape([s, 1])
+        col = paddle.arange(sk).reshape([1, sk])
+        masked = (col > row + (sk - s)).reshape([1, 1, s, sk])
+        scores = paddle.where(masked, paddle.full_like(scores, _NEG_INF), scores)
+    pad = num_blocks * block_size - sk
+    if pad > 0:
+        scores = paddle.concat(
+            [scores, paddle.full([b, hq, s, pad], _NEG_INF, dtype="float32")], axis=-1
+        )
+    scores = scores.reshape([b, hq, s, num_blocks, block_size])
+    return scores.max(axis=-1)
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("hq, hkv", [(8, 2), (8, 1), (4, 2)])
+def test_block_logit_gqa(hq, hkv, causal):
+    _sm100_or_skip()
+    b, s, sk, d = 1, 512, 512, 128
+    block_size = 64
+    paddle.seed(5)
+    q = paddle.randn([b, s, hq, d], dtype="bfloat16")
+    k = paddle.randn([b, sk, hkv, d], dtype="bfloat16")
+    v = paddle.randn([b, sk, hkv, d], dtype="bfloat16")
+    nb = _num_blocks(sk, block_size)
+    block_logit = paddle.full([b, hq, s, nb], _NEG_INF, dtype="float32")
+    _flash_attn_fwd(
+        q, k, v, softmax_scale=1.0 / math.sqrt(d), causal=causal,
+        return_lse=True, block_logit=block_logit, block_size=block_size, pack_gqa=False,
+    )
+    ref = ref_block_logit_gqa(q, k, causal, block_size, nb)
+    ref_bf16 = ref  # inputs are bf16 already; fp32 matmul of bf16 values
+    _assert_block_logit(block_logit, ref, ref_bf16, tol=0.06 * math.sqrt(d))
+
+
+# ---------------------------------------------------------------------------
+# Large multi-n-tile (sk >> n_block_size=128): exercises cross-tile column
+# addressing (block idx = n_block * blocks_per_ntile + b) and confirms that for
+# NON-causal every block is written (no reliance on the -inf pre-fill).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+def test_block_logit_large_multitile_noncausal(block_size):
+    _sm100_or_skip()
+    import numpy as np
+
+    b, s, sk, h, d = 1, 2048, 2048, 2, 128
+    paddle.seed(7)
+    q = paddle.randn([b, s, h, d], dtype="bfloat16")
+    k = paddle.randn([b, sk, h, d], dtype="bfloat16")
+    v = paddle.randn([b, sk, h, d], dtype="bfloat16")
+    nb = _num_blocks(sk, block_size)
+    sentinel = 987654.0
+    block_logit = paddle.full([b, h, s, nb], sentinel, dtype="float32")
+    _flash_attn_fwd(
+        q, k, v, softmax_scale=1.0 / math.sqrt(d), causal=False,
+        return_lse=True, block_logit=block_logit, block_size=block_size, pack_gqa=False,
+    )
+    got = block_logit.numpy()
+    # Non-causal, sk a multiple of block_size => every block visited & written.
+    n_unwritten = int((got == sentinel).sum())
+    assert n_unwritten == 0, f"{n_unwritten} blocks left unwritten in a full non-causal run"
+    ref = ref_block_logit(q, k, False, block_size, nb).numpy()
+    maxdiff = float(np.abs(got - ref).max())
+    assert maxdiff <= 0.06 * math.sqrt(d), f"large multitile max|diff|={maxdiff:.4e}"
+
+
+# ---------------------------------------------------------------------------
+# Contract: the kernel only writes key-blocks the attention loop VISITS. Under
+# causal, fully-future n-tiles are skipped entirely, so their block_logit
+# entries are NEVER written and keep whatever the caller put there. This test
+# pins that contract (init with a poison value): reachable blocks must be
+# overwritten (no poison), and the masked/finite pattern must match the -inf
+# reference on the entries the kernel is responsible for. A regression that
+# starts writing future blocks -- or stops writing reachable ones -- is caught.
+# ---------------------------------------------------------------------------
+def test_block_logit_unvisited_future_blocks_untouched_causal():
+    _sm100_or_skip()
+    import numpy as np
+
+    b, s, sk, h, d = 1, 512, 512, 2, 128
+    block_size = 64
+    paddle.seed(8)
+    q = paddle.randn([b, s, h, d], dtype="bfloat16")
+    k = paddle.randn([b, sk, h, d], dtype="bfloat16")
+    v = paddle.randn([b, sk, h, d], dtype="bfloat16")
+    nb = _num_blocks(sk, block_size)
+    poison = 987654.0
+
+    # Run twice: once with the correct -inf init (functional), once with poison
+    # to observe exactly which entries the kernel writes.
+    bl_inf = paddle.full([b, h, s, nb], _NEG_INF, dtype="float32")
+    _flash_attn_fwd(q, k, v, softmax_scale=1.0 / math.sqrt(d), causal=True,
+                    return_lse=True, block_logit=bl_inf, block_size=block_size, pack_gqa=False)
+    bl_poison = paddle.full([b, h, s, nb], poison, dtype="float32")
+    _flash_attn_fwd(q, k, v, softmax_scale=1.0 / math.sqrt(d), causal=True,
+                    return_lse=True, block_logit=bl_poison, block_size=block_size, pack_gqa=False)
+
+    inf_np = bl_inf.astype("float32").numpy()
+    poison_np = bl_poison.astype("float32").numpy()
+
+    written = poison_np != poison            # entries the kernel actually wrote
+    # (1) Wherever the kernel wrote, both runs must agree bit-for-bit.
+    assert np.array_equal(inf_np[written], poison_np[written]), "written entries differ across inits"
+    # (2) The -inf run must equal the reference everywhere (masked + finite).
+    ref = ref_block_logit(q, k, True, block_size, nb).numpy()
+    _assert_block_logit(bl_inf, paddle.to_tensor(ref), paddle.to_tensor(ref),
+                        tol=0.06 * math.sqrt(d))
+    # (3) There MUST exist future blocks the kernel skipped -> proves the caller
+    #     is responsible for pre-filling them (documents the API contract).
+    assert (~written).any(), "expected some fully-future blocks to be left unwritten under causal"
+    # Every skipped entry is a masked (-inf) entry in the correct reference.
+    assert (ref[~written] <= -1e30).all(), "an unwritten entry was NOT a masked block in the reference"
 
 
 if __name__ == "__main__":

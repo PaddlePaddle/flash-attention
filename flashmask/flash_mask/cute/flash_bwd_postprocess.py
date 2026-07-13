@@ -105,6 +105,13 @@ class FlashAttentionBackwardPostprocess:
             num_wg_mma = self.num_threads // 128
             atom_layout_dQ = (self.AtomLayoutMdQ, num_wg_mma // self.AtomLayoutMdQ)
             tiler_mn_dQ = (self.tile_m // atom_layout_dQ[0], self.tile_hdim // atom_layout_dQ[1])
+            # Hopper wgmma's hardware M-mode is fixed at 64 regardless of swapAB -
+            # only pick which precomputed size (tiler_mn_dQ[1] normally, or
+            # tiler_mn_dQ[0] when swapped) lands in the N slot. A full tuple
+            # reversal here would put tile_hdim (e.g. 192) into the M slot when
+            # swapAB and tile_hdim > 64, which the MMA op rejects. Matches the
+            # dK/dV tiled_mma construction in flash_bwd_sm90.py.
+            tiler_mn = (64, tiler_mn_dQ[1] if not self.dQ_swapAB else tiler_mn_dQ[0])
             tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
                 self.dtype,
@@ -113,7 +120,7 @@ class FlashAttentionBackwardPostprocess:
                 Float32,
                 atom_layout_mnk=(atom_layout_dQ if not self.dQ_swapAB else atom_layout_dQ[::-1])
                 + (1,),
-                tiler_mn=tiler_mn_dQ if not self.dQ_swapAB else tiler_mn_dQ[::-1],
+                tiler_mn=tiler_mn,
             )
         else:
             cta_group = tcgen05.CtaGroup.ONE

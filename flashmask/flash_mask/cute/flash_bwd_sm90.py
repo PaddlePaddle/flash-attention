@@ -121,7 +121,6 @@ class FlashAttentionBackwardSm90:
         self.V_in_regs = V_in_regs
         # May be overridden in __call__ for varlen inputs.
         if qhead_per_kvhead > 1:
-            assert self.same_hdim_kv, "GQA backward requires head_dim == head_dim_v"
             assert self.num_wg_mma == 2, "GQA backward assumes 2 warp groups"
         # These are tuned for speed
         # Do we keep the LSE and dPsum in each thread, or split them across 8 threads that share
@@ -316,6 +315,27 @@ class FlashAttentionBackwardSm90:
                 (self.sdQaccum_layout, Float32),
             ]
         ]
+        # For GQA, the epilogue recasts sV's bytes (extending into the
+        # immediately-following sK field - see SharedStorageQKV field order
+        # below: sV comes right before sK, both 1024B-aligned) to fp32, to
+        # stage dK-accum/dV-accum (see epilogue_dKV). K/V bf16 data and the
+        # accum staging are never live at the same time, so they can share
+        # bytes. When tile_hdim == tile_hdimv (e.g. the hdim=256 config),
+        # cosize(sV_layout) + cosize(sK_layout) (in dtype elements) already
+        # happens to equal the fp32 accum element count on the nose. When
+        # tile_hdim != tile_hdimv (e.g. 192/128), that equality breaks
+        # (dK-accum needs more bytes than sV+sK combined provide today), so
+        # we pad sK here to make up the difference - this only grows the
+        # allocation by the (small) shortfall, not by a whole new buffer.
+        if const_expr(self.qhead_per_kvhead > 1):
+            dK_accum_elems = self.tile_n * self.tile_hdim * 2  # fp32 = 2x dtype-sized elements
+            dV_accum_elems = self.tile_n * self.tile_hdimv * 2
+            accum_elems_needed = max(dK_accum_elems, dV_accum_elems)
+            extra_elems_needed = accum_elems_needed - cute.cosize(self.sV_layout)
+            cosize_sK = max(cute.cosize(self.sK_layout), extra_elems_needed)
+            sK_struct = cute.struct.Align[
+                cute.struct.MemRange[self.dtype, cosize_sK], self.buffer_align_bytes
+            ]
 
         cosize_sdS = cute.cosize(self.sPdS_layout)
         cosize_sP = cute.cosize(self.sPdS_layout) if const_expr(not self.mma_dkv_is_rs) else 0
@@ -2043,7 +2063,16 @@ class FlashAttentionBackwardSm90:
             gdKaccum = cute.flat_divide(gdKaccum_, (sdKaccum_shape0,))
             gdVaccum_ = cute.local_tile(mdVaccum_cur, (self.tile_n * self.tile_hdimv,), (n_block,))
             gdVaccum = cute.flat_divide(gdVaccum_, (sdVaccum_shape0,))
-            # These two overlap each other
+            # dK-accum/dV-accum staging overlaps the (no-longer-needed) K/V
+            # bf16 smem. sV comes immediately before sK in SharedStorageQKV
+            # (both 1024B-aligned, and cosize(sV_layout) is itself a multiple
+            # of 1024B so there's no gap between them), so the fp32 view
+            # starting at sV's address spans contiguously into sK's bytes.
+            # When tile_hdim == tile_hdimv this combined region exactly
+            # matches the accum size; when it doesn't (e.g. 192/128),
+            # _get_shared_storage_cls pads sK so the combined region is still
+            # big enough for both dK-accum (tile_hdim-wide) and dV-accum
+            # (tile_hdimv-wide) - these two overlap each other in turn.
             sVaccum_ptr = cute.recast_ptr(sV.iterator, dtype=Float32)
             sdKaccum = cute.make_tensor(sVaccum_ptr, sdKaccum_layout)
             sdVaccum = cute.make_tensor(sVaccum_ptr, sdVaccum_layout)

@@ -3,11 +3,12 @@ FlashAttention forward kernel.
 
 When ``_flash_attn_fwd`` is called with a preallocated ``block_logit`` tensor it
 additionally writes, for every (query, key-block) pair, the maximum of the
-post-score_mod, post-mask (but still pre-softmax-scale) ``q @ k^T`` logit --
-i.e. the actual attention score INCLUDING any score_mod bias (an
-"attention-importance" proxy), which reduces to the raw ``q @ k^T`` when no
-score_mod is set. It is computed inside the softmax epilogue at (nearly) zero
-extra cost. Downstream this feeds a non-differentiable Top-K block selection
+post-score_mod, post-mask, SCALED ``softmax_scale * q @ k^T`` logit -- i.e. the
+exact value fed into softmax, INCLUDING any score_mod bias. Storing the scaled
+value (rather than the raw ``q @ k^T``) puts every head on one head-independent
+scale, so a downstream ``block_logit - LSE`` gives log(max attention weight in
+the block), which is comparable across heads. It is computed inside the softmax
+epilogue at (nearly) zero extra cost. Downstream this feeds a Top-K block selection
 (HySparse sparse attention), so it must:
 
   * respect exactly the same causal / flashmask masking as the attention itself
@@ -43,8 +44,8 @@ def _num_blocks(seqlen_k, block_size):
     return (seqlen_k + block_size - 1) // block_size
 
 
-def ref_block_logit(q, k, causal, block_size, num_blocks):
-    """Reference: per-(query, key-block) max of the RAW (unscaled) q@k^T logit,
+def ref_block_logit(q, k, causal, block_size, num_blocks, scale=1.0):
+    """Reference: per-(query, key-block) max of the SCALED ``scale * q@k^T`` logit,
     with the same causal masking the kernel applies (bottom-right aligned).
 
     q: [B, S, H, D]  k: [B, Sk, H, D]  ->  [B, H, S, num_blocks] (fp32)
@@ -53,7 +54,7 @@ def ref_block_logit(q, k, causal, block_size, num_blocks):
     sk = k.shape[1]
     qf = q.astype("float32").transpose([0, 2, 1, 3])   # [B,H,S,D]
     kf = k.astype("float32").transpose([0, 2, 1, 3])   # [B,H,Sk,D]
-    scores = paddle.matmul(qf, kf, transpose_y=True)    # [B,H,S,Sk] raw logit
+    scores = paddle.matmul(qf, kf, transpose_y=True) * scale  # [B,H,S,Sk] scaled logit
     if causal:
         row = paddle.arange(s).reshape([s, 1])
         col = paddle.arange(sk).reshape([1, sk])
@@ -69,14 +70,14 @@ def ref_block_logit(q, k, causal, block_size, num_blocks):
     return scores.max(axis=-1)  # [B,H,S,num_blocks]
 
 
-def ref_block_logit_bf16(q, k, causal, block_size, num_blocks):
+def ref_block_logit_bf16(q, k, causal, block_size, num_blocks, scale=1.0):
     """Same as ref_block_logit but with a bf16-precision matmul, to bound the
     finite-value error against the kernel's bf16 tensor-core MMA."""
     b, s, h, d = q.shape
     sk = k.shape[1]
     qf = q.transpose([0, 2, 1, 3])
     kf = k.transpose([0, 2, 1, 3])
-    scores = paddle.matmul(qf, kf, transpose_y=True).astype("float32")
+    scores = paddle.matmul(qf, kf, transpose_y=True).astype("float32") * scale
     if causal:
         row = paddle.arange(s).reshape([s, 1])
         col = paddle.arange(sk).reshape([1, sk])
@@ -161,12 +162,13 @@ def test_block_logit_multi_dim(b, s, sk, h, d, dv, causal, block_size):
     k = paddle.randn([b, sk, h, d], dtype="bfloat16")
     v = paddle.randn([b, sk, h, dv], dtype="bfloat16")
 
-    _, _, block_logit, _ = _run_fwd(q, k, v, causal, block_size)
+    _, _, block_logit, sm_scale = _run_fwd(q, k, v, causal, block_size)
     nb = _num_blocks(sk, block_size)
-    ref = ref_block_logit(q, k, causal, block_size, nb)
-    ref_bf16 = ref_block_logit_bf16(q, k, causal, block_size, nb)
-    # Logit magnitude scales ~ sqrt(D); allow a bf16-scale absolute tolerance.
-    tol = 0.06 * math.sqrt(d)
+    ref = ref_block_logit(q, k, causal, block_size, nb, scale=sm_scale)
+    ref_bf16 = ref_block_logit_bf16(q, k, causal, block_size, nb, scale=sm_scale)
+    # block_logit now stores the SCALED logit (~O(1)); tol tracks the bf16 MMA
+    # error scaled by softmax_scale (raw tol 0.06*sqrt(d) times sm_scale=1/sqrt(d)).
+    tol = 0.06 * math.sqrt(d) * sm_scale
     _assert_block_logit(block_logit, ref, ref_bf16, tol)
 
 
@@ -183,12 +185,12 @@ def test_block_logit_block_sizes(block_size, causal):
     k = paddle.randn([b, sk, h, d], dtype="bfloat16")
     v = paddle.randn([b, sk, h, dv], dtype="bfloat16")
 
-    _, _, block_logit, _ = _run_fwd(q, k, v, causal, block_size)
+    _, _, block_logit, sm_scale = _run_fwd(q, k, v, causal, block_size)
     nb = _num_blocks(sk, block_size)
     assert block_logit.shape == [b, h, s, nb]
-    ref = ref_block_logit(q, k, causal, block_size, nb)
-    ref_bf16 = ref_block_logit_bf16(q, k, causal, block_size, nb)
-    _assert_block_logit(block_logit, ref, ref_bf16, tol=0.06 * math.sqrt(d))
+    ref = ref_block_logit(q, k, causal, block_size, nb, scale=sm_scale)
+    ref_bf16 = ref_block_logit_bf16(q, k, causal, block_size, nb, scale=sm_scale)
+    _assert_block_logit(block_logit, ref, ref_bf16, tol=0.06 * math.sqrt(d) * sm_scale)
 
 
 # ---------------------------------------------------------------------------
@@ -215,12 +217,12 @@ def test_block_logit_corner_cases(b, s, sk, h, d, dv, block_size, causal):
     k = paddle.randn([b, sk, h, d], dtype="bfloat16")
     v = paddle.randn([b, sk, h, dv], dtype="bfloat16")
 
-    _, _, block_logit, _ = _run_fwd(q, k, v, causal, block_size)
+    _, _, block_logit, sm_scale = _run_fwd(q, k, v, causal, block_size)
     nb = _num_blocks(sk, block_size)
     assert block_logit.shape == [b, h, s, nb]
-    ref = ref_block_logit(q, k, causal, block_size, nb)
-    ref_bf16 = ref_block_logit_bf16(q, k, causal, block_size, nb)
-    _assert_block_logit(block_logit, ref, ref_bf16, tol=0.06 * math.sqrt(d))
+    ref = ref_block_logit(q, k, causal, block_size, nb, scale=sm_scale)
+    ref_bf16 = ref_block_logit_bf16(q, k, causal, block_size, nb, scale=sm_scale)
+    _assert_block_logit(block_logit, ref, ref_bf16, tol=0.06 * math.sqrt(d) * sm_scale)
 
 
 # ---------------------------------------------------------------------------
@@ -261,13 +263,13 @@ def test_block_logit_does_not_change_output(causal, d):
 # GQA: qhead_per_kvhead > 1. block_logit is indexed by the QUERY head, and each
 # query head must see its own kv head broadcast. Reference repeats kv heads.
 # ---------------------------------------------------------------------------
-def ref_block_logit_gqa(q, k, causal, block_size, num_blocks):
+def ref_block_logit_gqa(q, k, causal, block_size, num_blocks, scale=1.0):
     b, s, hq, d = q.shape
     sk, hkv = k.shape[1], k.shape[2]
     qf = q.astype("float32").transpose([0, 2, 1, 3])   # [B,Hq,S,D]
     kf = k.astype("float32").transpose([0, 2, 1, 3])   # [B,Hkv,Sk,D]
     kf = paddle.repeat_interleave(kf, hq // hkv, axis=1)
-    scores = paddle.matmul(qf, kf, transpose_y=True)
+    scores = paddle.matmul(qf, kf, transpose_y=True) * scale
     if causal:
         row = paddle.arange(s).reshape([s, 1])
         col = paddle.arange(sk).reshape([1, sk])
@@ -294,13 +296,43 @@ def test_block_logit_gqa(hq, hkv, causal):
     v = paddle.randn([b, sk, hkv, d], dtype="bfloat16")
     nb = _num_blocks(sk, block_size)
     block_logit = paddle.full([b, hq, s, nb], _NEG_INF, dtype="float32")
+    sm_scale = 1.0 / math.sqrt(d)
     _flash_attn_fwd(
-        q, k, v, softmax_scale=1.0 / math.sqrt(d), causal=causal,
+        q, k, v, softmax_scale=sm_scale, causal=causal,
         return_lse=True, block_logit=block_logit, block_size=block_size, pack_gqa=False,
     )
-    ref = ref_block_logit_gqa(q, k, causal, block_size, nb)
+    ref = ref_block_logit_gqa(q, k, causal, block_size, nb, scale=sm_scale)
     ref_bf16 = ref  # inputs are bf16 already; fp32 matmul of bf16 values
-    _assert_block_logit(block_logit, ref, ref_bf16, tol=0.06 * math.sqrt(d))
+    _assert_block_logit(block_logit, ref, ref_bf16, tol=0.06 * math.sqrt(d) * sm_scale)
+
+
+# ---------------------------------------------------------------------------
+# Negative: block_logit is indexed by the QUERY head and the query row. Under
+# pack_gqa=True the query heads are packed into the M/row dim and head_idx is
+# the KV head, so the write would target wrong locations. The interface MUST
+# reject block_logit + pack_gqa=True. pack_gqa also DEFAULTS to
+# (qhead_per_kvhead > 1), so a GQA caller who forgets to pass pack_gqa=False
+# must still be rejected (not silently produce garbage).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("pack_gqa", [True, None])
+def test_block_logit_rejects_pack_gqa(pack_gqa):
+    _sm100_or_skip()
+    b, s, sk, hq, hkv, d = 1, 512, 512, 8, 2, 128
+    block_size = 64
+    paddle.seed(6)
+    q = paddle.randn([b, s, hq, d], dtype="bfloat16")
+    k = paddle.randn([b, sk, hkv, d], dtype="bfloat16")
+    v = paddle.randn([b, sk, hkv, d], dtype="bfloat16")
+    nb = _num_blocks(sk, block_size)
+    block_logit = paddle.full([b, hq, s, nb], _NEG_INF, dtype="float32")
+    sm_scale = 1.0 / math.sqrt(d)
+    # pack_gqa=None -> defaults to (qhead_per_kvhead=4 > 1) -> True -> must reject.
+    with pytest.raises(AssertionError, match="pack_gqa"):
+        _flash_attn_fwd(
+            q, k, v, softmax_scale=sm_scale, causal=False,
+            return_lse=True, block_logit=block_logit, block_size=block_size,
+            pack_gqa=pack_gqa,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -321,17 +353,18 @@ def test_block_logit_large_multitile_noncausal(block_size):
     nb = _num_blocks(sk, block_size)
     sentinel = 987654.0
     block_logit = paddle.full([b, h, s, nb], sentinel, dtype="float32")
+    sm_scale = 1.0 / math.sqrt(d)
     _flash_attn_fwd(
-        q, k, v, softmax_scale=1.0 / math.sqrt(d), causal=False,
+        q, k, v, softmax_scale=sm_scale, causal=False,
         return_lse=True, block_logit=block_logit, block_size=block_size, pack_gqa=False,
     )
     got = block_logit.numpy()
     # Non-causal, sk a multiple of block_size => every block visited & written.
     n_unwritten = int((got == sentinel).sum())
     assert n_unwritten == 0, f"{n_unwritten} blocks left unwritten in a full non-causal run"
-    ref = ref_block_logit(q, k, False, block_size, nb).numpy()
+    ref = ref_block_logit(q, k, False, block_size, nb, scale=sm_scale).numpy()
     maxdiff = float(np.abs(got - ref).max())
-    assert maxdiff <= 0.06 * math.sqrt(d), f"large multitile max|diff|={maxdiff:.4e}"
+    assert maxdiff <= 0.06 * math.sqrt(d) * sm_scale, f"large multitile max|diff|={maxdiff:.4e}"
 
 
 # ---------------------------------------------------------------------------
@@ -355,14 +388,15 @@ def test_block_logit_unvisited_future_blocks_untouched_causal():
     v = paddle.randn([b, sk, h, d], dtype="bfloat16")
     nb = _num_blocks(sk, block_size)
     poison = 987654.0
+    sm_scale = 1.0 / math.sqrt(d)
 
     # Run twice: once with the correct -inf init (functional), once with poison
     # to observe exactly which entries the kernel writes.
     bl_inf = paddle.full([b, h, s, nb], _NEG_INF, dtype="float32")
-    _flash_attn_fwd(q, k, v, softmax_scale=1.0 / math.sqrt(d), causal=True,
+    _flash_attn_fwd(q, k, v, softmax_scale=sm_scale, causal=True,
                     return_lse=True, block_logit=bl_inf, block_size=block_size, pack_gqa=False)
     bl_poison = paddle.full([b, h, s, nb], poison, dtype="float32")
-    _flash_attn_fwd(q, k, v, softmax_scale=1.0 / math.sqrt(d), causal=True,
+    _flash_attn_fwd(q, k, v, softmax_scale=sm_scale, causal=True,
                     return_lse=True, block_logit=bl_poison, block_size=block_size, pack_gqa=False)
 
     inf_np = bl_inf.astype("float32").numpy()
@@ -372,9 +406,9 @@ def test_block_logit_unvisited_future_blocks_untouched_causal():
     # (1) Wherever the kernel wrote, both runs must agree bit-for-bit.
     assert np.array_equal(inf_np[written], poison_np[written]), "written entries differ across inits"
     # (2) The -inf run must equal the reference everywhere (masked + finite).
-    ref = ref_block_logit(q, k, True, block_size, nb).numpy()
+    ref = ref_block_logit(q, k, True, block_size, nb, scale=sm_scale).numpy()
     _assert_block_logit(bl_inf, paddle.to_tensor(ref), paddle.to_tensor(ref),
-                        tol=0.06 * math.sqrt(d))
+                        tol=0.06 * math.sqrt(d) * sm_scale)
     # (3) There MUST exist future blocks the kernel skipped -> proves the caller
     #     is responsible for pre-filling them (documents the API contract).
     assert (~written).any(), "expected some fully-future blocks to be left unwritten under causal"

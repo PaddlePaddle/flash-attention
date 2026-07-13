@@ -199,11 +199,12 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         block_logit: Optional pre-allocated fp32 tensor [batch, num_heads, seqlen_q, num_blocks] that,
-            when provided, receives the fused per-(query, key-block) max of the post-score_mod, post-mask
-            q*k^T logit (i.e. the actual pre-softmax-scale attention score, INCLUDING any score_mod bias --
-            an "attention-importance" proxy for downstream block selection, NOT the pure raw q*k^T). When no
-            score_mod is set this equals the raw q*k^T. Computed in the softmax epilogue and written in place;
-            kept out of the returned tuple. num_blocks must be >= ceil(seqlen_k / block_size). The fused
+            when provided, receives the fused per-(query, key-block) max of the post-score_mod, post-mask,
+            SCALED logit `softmax_scale * q*k^T` (INCLUDING any score_mod bias) -- i.e. the exact value fed
+            into softmax. Storing the scaled logit puts every head on one head-independent scale, so a
+            downstream `block_logit - LSE` yields log(max attention weight in the block), which is comparable
+            across heads for cross-head Top-K block selection. Computed in the softmax epilogue and written in
+            place; kept out of the returned tuple. num_blocks must be >= ceil(seqlen_k / block_size). The fused
             reduction respects the same causal / flashmask masking applied to the attention. Only supported on
             SM 10.x (non split-KV).
             IMPORTANT: the kernel only writes key-blocks that the attention loop actually visits. Key-blocks
@@ -503,6 +504,14 @@ def _flash_attn_fwd(
             "block_logit (fused block-score) is only supported on SM 10.x"
         )
         assert not is_split_kv, "block_logit is not supported with split-KV"
+        assert not pack_gqa, (
+            "block_logit requires pack_gqa=False. block_logit is indexed by the "
+            "query head (head_idx) and the query row (m_block*m_block_size+tidx); "
+            "under pack_gqa=True the query heads are packed into the M/row dim and "
+            "head_idx is the KV head, so the block-score write would target wrong "
+            "locations. NOTE: pack_gqa defaults to (qhead_per_kvhead > 1), so GQA "
+            "callers MUST pass pack_gqa=False explicitly when requesting block_logit."
+        )
         assert block_logit.dtype == paddle.float32, (
             f"block_logit must be float32; got {block_logit.dtype}"
         )

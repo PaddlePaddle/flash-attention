@@ -2872,20 +2872,30 @@ class FlashAttentionForwardSm100:
             load_startend_row_indices_consumer_state = None
 
         # --- Fused block-max score (HySparse) ---------------------------------
-        # tSrS_t2r currently holds the post-score_mod, post-mask, still-UNSCALED
-        # q.k logit for this n-tile: apply_score_mod (if any) and mask_fn have run,
-        # but the softmax scale/exp have not yet touched it. So this is the actual
-        # pre-softmax-scale attention score INCLUDING any score_mod bias -- an
-        # "attention-importance" proxy for block selection, not the pure raw q.k
-        # (when no score_mod is set the two coincide). Masked-out columns are
-        # -Float32.inf and never win a block max. On sm100 each softmax thread owns
-        # ONE complete query row (all n_block_size columns) -- SoftmaxSm100.
-        # _compute_row_max is a pure within-fragment fmax_reduce with NO cross-lane
-        # shuffle -- so we can reduce this thread's fragment straight into per-block
-        # maxes by bucketing columns into `blocks_per_ntile` sub-blocks of
-        # `block_size`, with no warp reduce. The result is written to gmem
-        # mirroring the LSE write (thr_idx -> row within the m-tile). This adds no
-        # MMA / smem / cross-warp traffic, so the score rides the fast FA4 path.
+        # tSrS_t2r currently holds the post-score_mod, post-mask q.k logit for this
+        # n-tile: apply_score_mod (if any) and mask_fn have run, but the exp has not
+        # yet touched it. We take the per-block max here and store the SCALED
+        # attention logit `softmax_scale * q.k (+ score_mod bias)` -- i.e. the exact
+        # value that feeds softmax. Storing the scaled value keeps block_logit on a
+        # single, head-independent scale so a downstream `block_logit - LSE` yields
+        # log(max attention weight in the block), which IS comparable across heads.
+        #
+        # NB on where the scale lives: in the score_mod path apply_score_mod_inner
+        # already multiplied the logit by softmax_scale (softmax.py), and scale_log2
+        # is hijacked to just the change-of-base LOG2_E; in the no-score_mod path the
+        # scale is folded into scale_log2 (= softmax_scale * LOG2_E) and applied only
+        # later in exp2, so tSrS_t2r here is still UNSCALED. To emit the scaled logit
+        # uniformly we therefore multiply by softmax_scale (== scale_log2 * ln2) ONLY
+        # on the no-score_mod path; the score_mod path is already scaled.
+        #
+        # Masked-out columns are -Float32.inf and never win a block max. On sm100
+        # each softmax thread owns ONE complete query row (all n_block_size columns)
+        # -- SoftmaxSm100._compute_row_max is a pure within-fragment fmax_reduce with
+        # NO cross-lane shuffle -- so we reduce this thread's fragment straight into
+        # per-block maxes by bucketing columns into `blocks_per_ntile` sub-blocks of
+        # `block_size`, with no warp reduce. The result is written to gmem mirroring
+        # the LSE write (thr_idx -> row within the m-tile). This adds no MMA / smem /
+        # cross-warp traffic, so the score rides the fast FA4 path.
         if const_expr(self.has_block_logit):
             tScS_t2r_blk = thr_tmem_load.partition_D(tScS)
             blk_max = cute.make_fragment(self.blocks_per_ntile, Float32)
@@ -2897,6 +2907,15 @@ class FlashAttentionForwardSm100:
                 for b in cutlass.range_constexpr(self.blocks_per_ntile):
                     if sub == b:
                         blk_max[b] = cute.arch.fmax(blk_max[b], tSrS_t2r[i])
+            # Unify units: emit the SCALED attention logit. The no-score_mod path
+            # still carries the raw q.k here, so multiply by the raw softmax_scale,
+            # recovered from scale_log2 (= softmax_scale * log2(e)) as
+            # scale_log2 * ln(2). -inf * (finite > 0) stays -inf, so masked blocks
+            # are untouched. The score_mod path already baked the scale in.
+            if const_expr(self.score_mod is None):
+                blk_logit_scale = softmax.scale_log2 * math.log(2.0)
+                for b in cutlass.range_constexpr(self.blocks_per_ntile):
+                    blk_max[b] = blk_max[b] * blk_logit_scale
             # `m_block` here is already the per-stage query m-tile index
             # (m_block_for_mask = q_stage*m_block_raw + stage, bound by the
             # softmax_step partial), so it maps 1:1 to the query rows this stage

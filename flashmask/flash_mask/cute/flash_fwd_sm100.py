@@ -104,6 +104,7 @@ class FlashAttentionForwardSm100:
         is_split_d: bool = False,
         has_block_logit: cutlass.Constexpr = False,
         block_size: cutlass.Constexpr[int] = 64,
+        has_block_bos: cutlass.Constexpr = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -156,13 +157,28 @@ class FlashAttentionForwardSm100:
         # HySparse block-score fusion: emit per-(query, key-block) max raw logit.
         self.has_block_logit = has_block_logit
         self.block_size = block_size
+        # Per-row document-start (bos) input for document-RELATIVE block bucketing
+        # (pack-equivalence). When absent we fall back to bos=0, i.e. the original
+        # absolute (packed-sequence) bucketing.
+        self.has_block_bos = has_block_bos
         if cutlass.const_expr(has_block_logit):
             assert n_block_size % block_size == 0, (
                 "block_size must divide n_block_size for the fused block-score"
             )
+            # Relative bucketing floor-divides (abs_col - bos) by block_size via an
+            # arithmetic right shift, so block_size must be a power of two.
+            assert (block_size & (block_size - 1)) == 0, (
+                "block_size must be a power of two for relative block bucketing"
+            )
+            self.block_size_log2: cutlass.Constexpr = block_size.bit_length() - 1
             self.blocks_per_ntile: cutlass.Constexpr = n_block_size // block_size
+            # A document-relative bos offset (unaligned to block_size) shifts the
+            # 64-wide grid, so one n-tile (blocks_per_ntile blocks) can straddle one
+            # extra relative block: allocate blocks_per_ntile + 1 accumulator slots.
+            self.n_block_slots: cutlass.Constexpr = self.blocks_per_ntile + 1
         else:
             self.blocks_per_ntile: cutlass.Constexpr = 1
+            self.n_block_slots: cutlass.Constexpr = 1
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
         else:
@@ -327,6 +343,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         flashmask_info: Optional[FlashMaskInfo] = None,
         mBlockLogit: Optional[cute.Tensor] = None,
+        mBlockBos: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -847,6 +864,7 @@ class FlashAttentionForwardSm100:
             fastdiv_mods,
             flashmask_info,
             mBlockLogit if const_expr(self.has_block_logit) else None,
+            mBlockBos if const_expr(self.has_block_bos) else None,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -894,6 +912,7 @@ class FlashAttentionForwardSm100:
         fastdiv_mods=(None, None),
         flashmask_info: Optional[FlashMaskInfo] = None,
         mBlockLogit: Optional[cute.Tensor] = None,
+        mBlockBos: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1277,6 +1296,7 @@ class FlashAttentionForwardSm100:
                 s_extra_flags=s_extra_flags,
                 s_startend_row_indices=s_startend_row_indices,
                 mBlockLogit=mBlockLogit,
+                mBlockBos=mBlockBos,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -2321,6 +2341,7 @@ class FlashAttentionForwardSm100:
         s_extra_flags: Optional[cute.Tensor] = None,
         s_startend_row_indices: Optional[cute.Tensor] = None,
         mBlockLogit: Optional[cute.Tensor] = None,
+        mBlockBos: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -2490,6 +2511,7 @@ class FlashAttentionForwardSm100:
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 mBlockLogit=mBlockLogit,
+                mBlockBos=mBlockBos,
             )
 
             if has_work:
@@ -2824,6 +2846,7 @@ class FlashAttentionForwardSm100:
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
         mBlockLogit: Optional[cute.Tensor] = None,
+        mBlockBos: Optional[cute.Tensor] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32, Optional[cutlass.pipeline.PipelineState]]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -2898,15 +2921,73 @@ class FlashAttentionForwardSm100:
         # cross-warp traffic, so the score rides the fast FA4 path.
         if const_expr(self.has_block_logit):
             tScS_t2r_blk = thr_tmem_load.partition_D(tScS)
-            blk_max = cute.make_fragment(self.blocks_per_ntile, Float32)
-            for b in cutlass.range_constexpr(self.blocks_per_ntile):
+            blk_tidx = thr_tmem_load.thr_idx
+            row = m_block * self.m_block_size + blk_tidx
+            # DOCUMENT-RELATIVE bucketing (pack-equivalence, Bug 2 fix).
+            # The downstream HySparse pipeline interprets block ids relative to
+            # each document's start (bos): block j covers key columns
+            # [bos + j*block_size, bos + (j+1)*block_size). To make packed
+            # (bos>0) selection bit-identical to running the document alone
+            # (bos=0), we bucket each column by its DOCUMENT-relative block
+            #   rel = floor((abs_col - bos) / block_size)
+            # rather than the absolute packed-sequence block abs_col//block_size.
+            # bos is per query row; masked-out (cross-document / future) columns
+            # are already -Float32.inf here so they never win an fmax. When
+            # has_block_bos is False we fall back to bos=0, i.e. the original
+            # absolute (single-document) bucketing.
+            bos = Int32(0)
+            if const_expr(self.has_block_bos):
+                # Padding threads (row >= seqlen_q) never write below, but must
+                # still index in-bounds for the load; clamp the row.
+                safe_row = cutlass.min(row, seqlen.seqlen_q - 1)
+                bos = Int32(mBlockBos[batch_idx, safe_row])
+            # floor-div by the power-of-two block_size via arithmetic shift, which
+            # rounds toward -inf for the (abs_col - bos) < 0 (pre-document) columns.
+            base_blk = (n_block * self.n_block_size - bos) >> self.block_size_log2
+            blk_max = cute.make_fragment(self.n_block_slots, Float32)
+            for b in cutlass.range_constexpr(self.n_block_slots):
                 blk_max[b] = -Float32.inf
             n_elems = const_expr(cute.size(tScS_t2r_blk.shape))
-            for i in cutlass.range_constexpr(n_elems):
-                sub = tScS_t2r_blk[i][1] // self.block_size
-                for b in cutlass.range_constexpr(self.blocks_per_ntile):
-                    if sub == b:
-                        blk_max[b] = cute.arch.fmax(blk_max[b], tSrS_t2r[i])
+            if const_expr(self.has_block_bos):
+                # DOCUMENT-RELATIVE bucketing (bos may be > 0). col_i is a
+                # COMPILE-TIME column coordinate within the n-tile, so qi (which
+                # absolute block_size sub-block it is in) and mi (its offset inside
+                # that sub-block) are constexpr; only the relative carry uses the
+                # runtime bos. With r = (n_block*N - bos) mod block_size in
+                # [0, block_size), the element's relative slot is
+                #   qi + carry,   carry = (r + mi) >> block_size_log2  in {0, 1}
+                # i.e. it lands in one of only TWO ADJACENT slots, both indexed by
+                # a constexpr (qi, qi+1). The carry is 1 IFF r + mi >= block_size,
+                # i.e. mi >= (block_size - r). With the runtime threshold
+                # t = block_size - r computed ONCE per n-tile, each element needs
+                # only a single runtime compare (mi >= t; mi is constexpr) driving
+                # a complementary-predicate if/else into constexpr slots qi (low) /
+                # qi+1 (high). Exactly one branch fires, so a masked-out (-inf)
+                # column still cannot win either slot's fmax.
+                t = self.block_size - (
+                    (n_block * self.n_block_size - bos) & (self.block_size - 1)
+                )
+                for i in cutlass.range_constexpr(n_elems):
+                    col_i = const_expr(tScS_t2r_blk[i][1])
+                    qi = const_expr(col_i >> self.block_size_log2)
+                    mi = const_expr(col_i & (self.block_size - 1))
+                    if mi >= t:
+                        blk_max[qi + 1] = cute.arch.fmax(
+                            blk_max[qi + 1], tSrS_t2r[i]
+                        )
+                    else:
+                        blk_max[qi] = cute.arch.fmax(
+                            blk_max[qi], tSrS_t2r[i]
+                        )
+            else:
+                # ABSOLUTE bucketing (bos == 0): the relative slot degenerates to
+                # the constexpr absolute sub-block qi = col_i // block_size, which
+                # folds at compile time to a single static fmax per element (the
+                # fast path; kept byte-identical to the pre-relative kernel).
+                for i in cutlass.range_constexpr(n_elems):
+                    col_i = const_expr(tScS_t2r_blk[i][1])
+                    qi = const_expr(col_i >> self.block_size_log2)
+                    blk_max[qi] = cute.arch.fmax(blk_max[qi], tSrS_t2r[i])
             # Unify units: emit the SCALED attention logit. The no-score_mod path
             # still carries the raw q.k here, so multiply by the raw softmax_scale,
             # recovered from scale_log2 (= softmax_scale * log2(e)) as
@@ -2914,7 +2995,7 @@ class FlashAttentionForwardSm100:
             # are untouched. The score_mod path already baked the scale in.
             if const_expr(self.score_mod is None):
                 blk_logit_scale = softmax.scale_log2 * math.log(2.0)
-                for b in cutlass.range_constexpr(self.blocks_per_ntile):
+                for b in cutlass.range_constexpr(self.n_block_slots):
                     blk_max[b] = blk_max[b] * blk_logit_scale
             # `m_block` here is already the per-stage query m-tile index
             # (m_block_for_mask = q_stage*m_block_raw + stage, bound by the
@@ -2923,17 +3004,21 @@ class FlashAttentionForwardSm100:
             # write only from stage 0; non-split-D (q_stage=2) has each stage own
             # a distinct m-tile and both must write.
             if const_expr(not self.is_split_d) or stage == 0:
-                blk_tidx = thr_tmem_load.thr_idx
                 if blk_tidx < seqlen.seqlen_q - m_block * self.m_block_size:
-                    row = m_block * self.m_block_size + blk_tidx
                     mBL_cur = mBlockLogit[None, head_idx, batch_idx, None]
-                    for b in cutlass.range_constexpr(self.blocks_per_ntile):
-                        # Skip sub-blocks whose first key column is past seqlen_k:
-                        # mBlockLogit has exactly ceil(seqlen_k / block_size) columns,
-                        # so a sub-block lying entirely in the n-tile padding region
-                        # would index out of bounds (it is all -inf anyway).
-                        if n_block * self.n_block_size + b * self.block_size < seqlen.seqlen_k:
-                            mBL_cur[row, n_block * self.blocks_per_ntile + b] = blk_max[b]
+                    # mBlockLogit has exactly ceil(seqlen_k / block_size) columns.
+                    num_cols = (seqlen.seqlen_k + self.block_size - 1) >> self.block_size_log2
+                    for b in cutlass.range_constexpr(self.n_block_slots):
+                        rb = base_blk + b
+                        # A relative block can straddle two adjacent n-tiles (the
+                        # bos shift is unaligned), so each row's thread combines
+                        # this n-tile's partial into any prior write with fmax.
+                        # This is a same-thread, same-address RMW across the n_block
+                        # loop (one thread owns one query row for all n-tiles), so
+                        # no cross-thread race. Guard columns outside [0, num_cols)
+                        # (pre-document rb<0 or padding rb>=num_cols; both -inf).
+                        if rb >= 0 and rb < num_cols:
+                            mBL_cur[row, rb] = cute.arch.fmax(mBL_cur[row, rb], blk_max[b])
         # ----------------------------------------------------------------------
 
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)

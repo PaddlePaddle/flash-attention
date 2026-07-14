@@ -186,6 +186,7 @@ def _flash_attn_fwd(
     startend_row_indices: Optional[paddle.Tensor] = None,
     block_logit: Optional[paddle.Tensor] = None,
     block_size: int = 64,
+    block_bos: Optional[paddle.Tensor] = None,
 ) -> Tuple[paddle.Tensor, paddle.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -529,6 +530,30 @@ def _flash_attn_fwd(
     else:
         block_logit_tensor = None
 
+    # Optional per-query document start (bos) for DOCUMENT-relative block
+    # bucketing (pack-equivalence). Without it the kernel buckets by absolute
+    # packed-sequence block, which is only correct for single-document (bos==0)
+    # inputs. Shape [B, S] int32, aligned with block_logit's query dim.
+    if block_bos is not None:
+        assert block_logit is not None, (
+            "block_bos requires block_logit (it drives its relative bucketing)"
+        )
+        assert block_bos.dtype == paddle.int32, (
+            f"block_bos must be int32; got {block_bos.dtype}"
+        )
+        assert block_bos.place.is_gpu_place(), "block_bos must be on CUDA"
+        assert block_bos.ndim == 2, (
+            f"block_bos must be [B, S]; got ndim={block_bos.ndim}"
+        )
+        assert list(block_bos.shape) == [batch_size, seqlen_q], (
+            f"block_bos must be [B={batch_size}, S={seqlen_q}]; got {block_bos.shape}"
+        )
+        block_bos_tensor = from_dlpack(
+            block_bos.detach(), assumed_align=4
+        ).mark_layout_dynamic(leading_dim=block_bos.ndim - 1)
+    else:
+        block_bos_tensor = None
+
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
@@ -608,6 +633,7 @@ def _flash_attn_fwd(
         is_split_d if compute_capability == 10 else False,
         block_logit is None,
         block_size,
+        block_bos is None,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
@@ -658,6 +684,7 @@ def _flash_attn_fwd(
                 is_split_d=is_split_d,
                 has_block_logit=block_logit is not None,
                 block_size=block_size,
+                has_block_bos=block_bos is not None,
             )
         else:
             raise ValueError(
@@ -685,6 +712,7 @@ def _flash_attn_fwd(
             cute_aux_tensors,
             cute_flashmask_info,
             block_logit_tensor,
+            block_bos_tensor,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor,
@@ -706,6 +734,7 @@ def _flash_attn_fwd(
         cute_aux_tensors,
         cute_flashmask_info,
         block_logit_tensor,
+        block_bos_tensor,
     )
     if is_split_kv:
         _flash_attn_fwd_combine(

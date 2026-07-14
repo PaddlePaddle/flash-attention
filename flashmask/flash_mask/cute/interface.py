@@ -238,7 +238,7 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
         )
 
 
-def _make_fake_bwd_tensors(dtype, has_gqa):
+def _make_fake_bwd_tensors(dtype, has_gqa, deterministic=False, cluster_size=1):
     """FA4-style fake bwd tensors with all dims as cute.sym_int and stride
     divisibility hints (so 128-bit alignment is guaranteed at compile time).
     Non-varlen only (flashmask does not support varlen)."""
@@ -265,7 +265,28 @@ def _make_fake_bwd_tensors(dtype, has_gqa):
     else:
         mdKaccum = make_fake_tensor(cutlass.Float32, (b, h_kv, seqlen_k_rounded), divisibility=4)
         mdVaccum = make_fake_tensor(cutlass.Float32, (b, h_kv, seqlen_k_dv_rounded), divisibility=4)
-    return mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum
+    if not deterministic:
+        mdQ_semaphore = None
+        mdK_semaphore, mdV_semaphore = None, None
+    else:
+        num_m_blocks = sym()
+        mdQ_semaphore = make_fake_tensor(
+            cutlass.Int32, (b, h_q, num_m_blocks, cluster_size), divisibility=1
+        )
+        if not has_gqa:
+            mdK_semaphore, mdV_semaphore = None, None
+        else:
+            num_n_blocks = sym()
+            mdK_semaphore = make_fake_tensor(
+                cutlass.Int32, (b, h_kv, num_n_blocks, 2), divisibility=1
+            )
+            mdV_semaphore = make_fake_tensor(
+                cutlass.Int32, (b, h_kv, num_n_blocks, 2), divisibility=1
+            )
+    return (
+        mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum,
+        mdQaccum, mdKaccum, mdVaccum, mdQ_semaphore, mdK_semaphore, mdV_semaphore,
+    )
 
 
 def _flash_attn_fwd(
@@ -1067,8 +1088,6 @@ def _flash_attn_bwd(
         pack_gqa = qhead_per_kvhead > 1
     if compute_capability == 10:
         pack_gqa = False  # override for now
-    if compute_capability != 10:
-        assert deterministic is False, "bwd deterministic only supported for sm100 for now"
 
     place = q.place
     # TODO: check if this is the right rounding
@@ -1261,10 +1280,14 @@ def _flash_attn_bwd(
         assert dK_semaphore.is_contiguous()
     if dV_semaphore is not None:
         assert dV_semaphore.is_contiguous()
+    # Must match the compile-time fake semaphore layout (make_fake_tensor in
+    # _make_fake_bwd_tensors: leading_dim = ndim-1, other strides sym_int64/dynamic),
+    # exactly like every other bwd tensor above. Using convert_from_dlpack_leading_static
+    # here (compact_shape_dynamic) mismatched the traced fake layout, so at runtime the
+    # kernel read shape values as strides -> garbage semaphore address -> the dQ
+    # deterministic wait_eq spun on uninitialized memory and hung for n_block >= 2.
     dQ_semaphore_tensor, dK_semaphore_tensor, dV_semaphore_tensor = [
-        utils.convert_from_dlpack_leading_static(
-            t.detach(), leading_dim=3, alignment=4, stride_order=tuple(range(t.ndim))
-        )
+        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=t.ndim - 1)
         if t is not None
         else None
         for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
@@ -1286,6 +1309,7 @@ def _flash_attn_bwd(
         (
             f_mQ, f_mK, f_mV, f_mO, f_mdO, f_mdQ, f_mdK, f_mdV,
             f_mLSE, f_mLSElog2, f_mPdPsum, f_mdQaccum, f_mdKaccum, f_mdVaccum,
+            _f_mdQ_semaphore, _f_mdK_semaphore, _f_mdV_semaphore,
         ) = _make_fake_bwd_tensors(dtype, has_gqa=qhead_per_kvhead > 1)
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_pre[compile_key_pre] = cute.compile(
@@ -1338,6 +1362,7 @@ def _flash_attn_bwd(
             AtomLayoutNdKV,
             AtomLayoutMdQ,
             V_in_regs,
+            deterministic,
         )
     else:
         compile_key = (
@@ -1392,7 +1417,7 @@ def _flash_attn_bwd(
                 qhead_per_kvhead,
                 causal,
                 is_local=False,
-                deterministic=False,
+                deterministic=deterministic,
                 tile_m=m_block_size,
                 tile_n=n_block_size,
                 Q_stage=num_stages_Q,
@@ -1424,7 +1449,10 @@ def _flash_attn_bwd(
                 f_mdQ_unused, f_mdK, f_mdV,
                 f_mLSE_unused, f_mLSElog2, f_mPdPsum,
                 f_mdQaccum, f_mdKaccum, f_mdVaccum,
-            ) = _make_fake_bwd_tensors(dtype, has_gqa=qhead_per_kvhead > 1)
+                f_mdQ_semaphore, f_mdK_semaphore, f_mdV_semaphore,
+            ) = _make_fake_bwd_tensors(
+                dtype, has_gqa=qhead_per_kvhead > 1, deterministic=deterministic, cluster_size=1
+            )
             _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
                 fa_bwd_obj,
                 f_mQ,
@@ -1443,9 +1471,9 @@ def _flash_attn_bwd(
                 None,  # mSeqUsedK
                 None,  # window_size_left
                 None,  # window_size_right
-                None,  # mdQ_semaphore
-                None,  # mdK_semaphore
-                None,  # mdV_semaphore
+                f_mdQ_semaphore,  # mdQ_semaphore
+                f_mdK_semaphore,  # mdK_semaphore
+                f_mdV_semaphore,  # mdV_semaphore
                 None,  # aux_tensors
                 None,  # blocksparse_tensors
                 cute_flashmask_info,  # flashmask_info

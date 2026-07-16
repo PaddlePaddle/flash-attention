@@ -580,7 +580,6 @@ def compute_flashmask_block_lists(
     """
     srow = flashmask_info.startend_row_indices
     b, h_fm, _, num_vecs = srow.shape
-    dev = srow.place
     nq = (seqlen_q + kBlockM - 1) // kBlockM
     nk = (seqlen_k + kBlockN - 1) // kBlockN
     has_lte, has_uts, has_ute = _flashmask_config_flags(num_vecs, is_causal)

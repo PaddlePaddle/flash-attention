@@ -67,6 +67,33 @@ paddle2cute_dtype_map = {
 }
 
 
+def _get_fa_version():
+    return paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"]
+
+
+def _is_valid_flash_dims(query, key, value):
+    q_headdim, k_headdim, v_headdim = query.shape[-1], key.shape[-1], value.shape[-1]
+    return (
+        (q_headdim <= 128 and k_headdim <= 128 and v_headdim <= 128) or
+        (q_headdim == 192 and k_headdim == 192 and v_headdim == 128) or
+        (q_headdim == 256 and k_headdim == 256 and v_headdim == 256)
+    )
+
+
+def _is_non_4vec_startend(startend_row_indices):
+    return startend_row_indices is None or startend_row_indices.shape[-1] != 4
+
+
+def _is_cutedsl_kernel_supported(query, key, value, startend_row_indices=None):
+    if not _is_valid_flash_dims(query, key, value):
+        return False
+    fa_version = _get_fa_version()
+    if fa_version == 3:                       # SM90
+        return True
+    if fa_version == 4:                       # SM100
+        return _is_non_4vec_startend(startend_row_indices)
+    return False
+
 # FA4 backward, head_dim=192 / head_dim_v=128: pick 2cta vs 1cta-split-dv per mask.
 #
 # Each N-block of an M-row falls into one of three categories:
@@ -365,13 +392,17 @@ def _flash_attn_fwd(
     if compute_capability == 9 and head_dim > 128:
         n_block_size = 64
 
+    # Each SM100 CTA processes q_stage * m_block_size query rows; Split-D
+    # (d>192, d==dv) uses q_stage=1 to fit the TMEM budget. Must match
+    # FlashAttentionForwardSm100.q_stage (= 1 if is_split_d else 2). Computed
+    # once here so the flashmask valid_block_count and the block-sparse M-block
+    # normalization below share the identical M granularity.
+    q_stage = 1 if (head_dim > 192 and head_dim == v.shape[-1]) else 2
+
     cute_flashmask_info = None
     if startend_row_indices is not None:
         fm_batch_size = startend_row_indices.shape[0]
         fm_heads = startend_row_indices.shape[1]
-        # Note(wusiming): FA4 is so weird, but each cta process q_stage * m_block_size rows
-        # Split-D (d>192, d==dv) uses q_stage=1 to fit TMEM budget
-        q_stage = 1 if (head_dim > 192 and head_dim == v.shape[-1]) else 2
         num_m_blocks = (seqlen_q + (q_stage * m_block_size) - 1) // (q_stage * m_block_size)
         flashmask_info = FlashMaskInfoPaddle(
             is_causal=causal,
@@ -569,9 +600,9 @@ def _flash_attn_fwd(
             )
         m_block_size_block = m_block_size
         if compute_capability == 10:
-            # TODO: This multiplier should really be q_stage, wire up in later PR
-            # 1 cta handles 2*tile_m row
-            m_block_size_block = 2 * m_block_size
+            # One SM100 CTA handles q_stage * tile_m rows; keep this in lockstep
+            # with the flashmask valid_block_count granularity above.
+            m_block_size_block = q_stage * m_block_size
         expected_m_blocks = (seqlen_q + m_block_size_block - 1) // m_block_size_block
         expected_n_blocks = (seqlen_k + n_block_size - 1) // n_block_size
         block_sparse_tensors = normalize_block_sparse_tensors(
@@ -766,10 +797,6 @@ def _flash_attn_fwd(
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
-                # flashmask routes through the block-sparse list-driven path with
-                # intra_wg_overlap enabled; the per-element startend_row_indices
-                # staging/apply is skipped (see _FLASHMASK_SKIP_ROWIDX_APPLY in
-                # flash_fwd_sm90).
                 intra_wg_overlap=True,
                 mma_pv_is_rs=True,
                 mask_mod=mask_mod,
@@ -2098,7 +2125,6 @@ def _flash_attn_fwd_combine(
     )
 
     current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
-    # current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Create combine kernel configuration
     dtype = paddle2cute_dtype_map[out.dtype]
@@ -2342,17 +2368,7 @@ def flashmask_attention(
     block_mask: paddle.Tensor | None = None,
     learnable_sink: paddle.Tensor | None = None,
 ):
-    if (
-        paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"] in (3, 4)
-        and (
-            (query.shape[-1] <= 128 and key.shape[-1] <= 128 and value.shape[-1] <= 128)
-            or
-            (query.shape[-1] == 192 and key.shape[-1] == 192 and value.shape[-1] == 128)
-            or
-            (query.shape[-1] == 256 and key.shape[-1] == 256 and value.shape[-1] == 256)
-        )
-        and (startend_row_indices is None or startend_row_indices.shape[-1] != 4)
-    ):
+    if _is_cutedsl_kernel_supported(query, key, value, startend_row_indices):
         assert dropout == 0.0, (
             "flashmask v4 does not support dropout"
         )
@@ -2478,23 +2494,14 @@ def flash_attention(
     dropout=0.0,
     causal=False,
     return_softmax=False,
-    *,   
+    *,
     fixed_seed_offset=None,
     rng_name="",
     training=True,
     name=None,
     softmax_scale=None,
 ):
-    if (
-        paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"] in (3, 4)
-        and (
-            (query.shape[-1] <= 128 and key.shape[-1] <= 128 and value.shape[-1] <= 128)
-            or
-            (query.shape[-1] == 192 and key.shape[-1] == 192 and value.shape[-1] == 128)
-            or
-            (query.shape[-1] == 256 and key.shape[-1] == 256 and value.shape[-1] == 256)
-        )
-    ):
+    if _is_cutedsl_kernel_supported(query, key, value):
         assert dropout == 0.0, (
             "flash attention 4 does not support dropout"
         )

@@ -49,18 +49,6 @@ from cutlass.cute import FastDivmodDivisor
 from flash_mask.cute.flash_fwd import FlashAttentionForwardBase
 from flash_mask.cute.flashmask_utils import FlashMaskInfo
 
-# FlashMask SM90 forward runs on the block-sparse list-driven path (with
-# intra_wg_overlap): compute_flashmask_block_lists drops the fully-masked KV
-# blocks up front. Surviving blocks may still be PARTIAL (e.g. sliding-window /
-# document boundaries), so each one is masked element-wise via the per-block
-# startend_row_indices staged into smem (producer staging + consumer apply).
-#
-# When True this per-element apply (and its rowidx staging) is skipped, relying
-# only on the block list + causal/seqlen mask. That is INCORRECT for any mask
-# with genuine partial blocks (a sliding-window seqlen=32 case fails with
-# out max-diff ~4.375), so it must stay False for correctness. Kept as a flag
-# only to isolate the rowidx staging/apply cost during perf debugging.
-_FLASHMASK_SKIP_ROWIDX_APPLY = False
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     arch = 90
@@ -1113,12 +1101,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 n_block_prev = self._bs_block_at(mask_idx, full_idx, mask_cnt, full_cnt, Int32(0))
                 pipeline_k.producer_acquire(kv_producer_state)
                 tma_load_K_fn(src_idx=n_block_prev, producer_state=kv_producer_state)
-                if const_expr(not _FLASHMASK_SKIP_ROWIDX_APPLY):
-                    if mask_cnt > 0:
-                        self.load_startend_row_indices(
-                            batch_idx, head_idx, n_block_prev, num_heads, kv_producer_state,
-                            s_rowidx, flashmask_info, mbar_ptr_rowidx, seqlen_k, m_block, seqlen_q,
-                        )
+                if mask_cnt > 0:
+                    self.load_startend_row_indices(
+                        batch_idx, head_idx, n_block_prev, num_heads, kv_producer_state,
+                        s_rowidx, flashmask_info, mbar_ptr_rowidx, seqlen_k, m_block, seqlen_q,
+                    )
                 for p in cutlass.range(1, total, unroll=1):
                     n_block = self._bs_block_at(mask_idx, full_idx, mask_cnt, full_cnt, p)
                     n_block_prev = self._bs_block_at(
@@ -1128,12 +1115,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     kv_producer_state.advance()
                     pipeline_k.producer_acquire(kv_producer_state)
                     tma_load_K_fn(src_idx=n_block, producer_state=kv_producer_state)
-                    if const_expr(not _FLASHMASK_SKIP_ROWIDX_APPLY):
-                        if p < mask_cnt:
-                            self.load_startend_row_indices(
-                                batch_idx, head_idx, n_block, num_heads, kv_producer_state,
-                                s_rowidx, flashmask_info, mbar_ptr_rowidx, seqlen_k, m_block, seqlen_q,
-                            )
+                    if p < mask_cnt:
+                        self.load_startend_row_indices(
+                            batch_idx, head_idx, n_block, num_heads, kv_producer_state,
+                            s_rowidx, flashmask_info, mbar_ptr_rowidx, seqlen_k, m_block, seqlen_q,
+                        )
                     pipeline_v.producer_acquire(kv_producer_state_prev)
                     tma_load_V_fn(src_idx=n_block_prev, producer_state=kv_producer_state_prev)
                 n_block_last = self._bs_block_at(
@@ -1147,12 +1133,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     n_block = self._bs_block_at(mask_idx, full_idx, mask_cnt, full_cnt, p)
                     pipeline_k.producer_acquire(kv_producer_state)
                     tma_load_K_fn(src_idx=n_block, producer_state=kv_producer_state)
-                    if const_expr(not _FLASHMASK_SKIP_ROWIDX_APPLY):
-                        if p < mask_cnt:
-                            self.load_startend_row_indices(
-                                batch_idx, head_idx, n_block, num_heads, kv_producer_state,
-                                s_rowidx, flashmask_info, mbar_ptr_rowidx, seqlen_k, m_block, seqlen_q,
-                            )
+                    if p < mask_cnt:
+                        self.load_startend_row_indices(
+                            batch_idx, head_idx, n_block, num_heads, kv_producer_state,
+                            s_rowidx, flashmask_info, mbar_ptr_rowidx, seqlen_k, m_block, seqlen_q,
+                        )
                     pipeline_v.producer_acquire(kv_producer_state)
                     tma_load_V_fn(src_idx=n_block, producer_state=kv_producer_state)
                     kv_producer_state.advance()
@@ -1440,24 +1425,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
 
-            # Recompute fastdiv_mods if necessary for varlen with aux_tensors
-            recompute_fastdiv_mods_q = cutlass.const_expr(
-                aux_tensors is not None and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
-            )
-            recompute_fastdiv_mods_k = cutlass.const_expr(
-                aux_tensors is not None and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
-            )
-            # bqw_debug
-            fastdiv_mods = None
-            if cutlass.const_expr(aux_tensors is not None):
-                seqlen_q = cute.size(mQ.shape[0]) // (
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
-                )
-                seqlen_k = cute.size(mK.shape[0])
-                seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
-                seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
-                fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
-
+            # fastdiv_mods is computed once in __call__ (including the paged-KV
+            # page-table factor) and threaded in as the `fastdiv_mods` parameter;
+            # use it directly instead of recomputing a page-table-less version here.
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
                 mask.apply_mask,
@@ -1483,7 +1453,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     fastdiv_mods=fastdiv_mods,
                 )
             flashmask_fn = None
-            if const_expr(self.enable_flashmask and not _FLASHMASK_SKIP_ROWIDX_APPLY):
+            if const_expr(self.enable_flashmask):
                 flashmask_fn = partial(
                     self.apply_flashmask_block,
                     m_block=m_block,
@@ -2171,7 +2141,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             batch_idx,
             head_idx,
             softmax_scale,
-            self.vec_size,
+            self.score_vec_size,
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,

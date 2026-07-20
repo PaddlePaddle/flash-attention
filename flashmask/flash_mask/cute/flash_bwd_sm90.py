@@ -998,20 +998,22 @@ class FlashAttentionBackwardSm90:
                 m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
 
                 if const_expr(self.enable_flashmask and not self.deterministic):
-                    # Must match the MMA/dQ-store warps' flashmask skip range so the
-                    # Q/dO TMA pipeline producer/consumer counts stay in lockstep.
-                    m_block_min, m_block_max = self.flashmask_m_block_min_max(
+                    # O(1) segment jump (must match the MMA/dQ-store warps'
+                    # segments exactly so the Q/dO TMA pipeline producer/consumer
+                    # counts stay in lockstep).
+                    flashmask_segments = self.flashmask_m_block_segments(
                         flashmask_info,
                         batch_idx,
                         head_idx,
                         n_block,
-                        seqlen.seqlen_q,
                         num_heads,
                         m_block_min,
                         m_block_max,
                     )
-                    total_m_block_cnt = m_block_max - m_block_min
-                    process_tile = m_block_min < m_block_max
+                    total_m_block_cnt = Int32(0)
+                    for seg_lo, seg_hi in flashmask_segments:
+                        total_m_block_cnt = total_m_block_cnt + (seg_hi - seg_lo)
+                    process_tile = total_m_block_cnt > Int32(0)
                 elif const_expr(not self.use_block_sparsity):
                     total_m_block_cnt = m_block_max - m_block_min
                     process_tile = (
@@ -1031,46 +1033,17 @@ class FlashAttentionBackwardSm90:
 
                 if process_tile:
                     if const_expr(not self.use_block_sparsity):
-                        first_m_block = m_block_min
-                        pipeline_Q.producer_acquire(
-                            producer_state_Q, extra_tx_count=self.tma_copy_bytes["K"]
-                        )
-                        load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q))
-                        load_Q(first_m_block, producer_state=producer_state_Q)
-                        # Wait for bwd preprocess to finish writing LSE and dPsum
-                        cute.arch.griddepcontrol_wait()
-                        load_LSE(first_m_block, producer_state=producer_state_Q)
-                        producer_state_dO_cur = (
-                            producer_state_dO
-                            if const_expr(self.Q_stage != self.dO_stage)
-                            else producer_state_Q
-                        )
-                        pipeline_dO.producer_acquire(
-                            producer_state_dO_cur, extra_tx_count=self.tma_copy_bytes["V"]
-                        )
-                        load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_cur))
-                        load_dO(first_m_block, producer_state=producer_state_dO_cur)
-                        load_dPsum(first_m_block, producer_state=producer_state_dO_cur)
-                        producer_state_Q.advance()
-                        producer_state_dO.advance()
-
-                        for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
-                            if const_expr(self.enable_flashmask and not self.deterministic):
-                                # Skip loading query blocks fully masked for this KV
-                                # block (same predicate the mma/dQ warps use), so the
-                                # producer/consumer pipeline stays in lockstep. Uses
-                                # the reassign-return advance style (load_kv=False) to
-                                # keep the pipeline state as a proper loop-carried
-                                # value under the dynamic skip branch.
-                                if not self._flashmask_m_block_skip(
-                                    flashmask_info,
-                                    batch_idx,
-                                    head_idx,
-                                    n_block,
-                                    m_block,
-                                    seqlen.seqlen_q,
-                                    num_heads,
-                                ):
+                        if const_expr(self.enable_flashmask and not self.deterministic):
+                            # Segment-based load: iterate only the non-masked
+                            # m_block segments (cpp-equivalent), loading K/V once
+                            # on the first visited block (kv_loaded flag, same as
+                            # the block-sparse producer). No per-block gmem skip.
+                            # Wait for bwd preprocess to finish writing LSE/dPsum
+                            # before the first LSE/dPsum load.
+                            cute.arch.griddepcontrol_wait()
+                            kv_loaded = False
+                            for seg_lo, seg_hi in flashmask_segments:
+                                for m_block in cutlass.range(seg_lo, seg_hi, unroll=1):
                                     producer_state_Q, producer_state_dO = _load_q_do_block_sm90(
                                         m_block,
                                         producer_state_Q,
@@ -1086,9 +1059,34 @@ class FlashAttentionBackwardSm90:
                                         self.tma_copy_bytes["K"],
                                         self.tma_copy_bytes["V"],
                                         self.Q_stage == self.dO_stage,
-                                        load_kv=False,
+                                        load_kv=not kv_loaded,
                                     )
-                            else:
+                                    kv_loaded = True
+                        else:
+                            first_m_block = m_block_min
+                            pipeline_Q.producer_acquire(
+                                producer_state_Q, extra_tx_count=self.tma_copy_bytes["K"]
+                            )
+                            load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q))
+                            load_Q(first_m_block, producer_state=producer_state_Q)
+                            # Wait for bwd preprocess to finish writing LSE and dPsum
+                            cute.arch.griddepcontrol_wait()
+                            load_LSE(first_m_block, producer_state=producer_state_Q)
+                            producer_state_dO_cur = (
+                                producer_state_dO
+                                if const_expr(self.Q_stage != self.dO_stage)
+                                else producer_state_Q
+                            )
+                            pipeline_dO.producer_acquire(
+                                producer_state_dO_cur, extra_tx_count=self.tma_copy_bytes["V"]
+                            )
+                            load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_cur))
+                            load_dO(first_m_block, producer_state=producer_state_dO_cur)
+                            load_dPsum(first_m_block, producer_state=producer_state_dO_cur)
+                            producer_state_Q.advance()
+                            producer_state_dO.advance()
+
+                            for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
                                 pipeline_Q.producer_acquire(producer_state_Q)
                                 load_Q(m_block, producer_state=producer_state_Q)
                                 load_LSE(m_block, producer_state=producer_state_Q)
@@ -1449,20 +1447,23 @@ class FlashAttentionBackwardSm90:
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
 
             if const_expr(self.enable_flashmask and not self.deterministic):
-                # flashmask skip: drop fully-masked query blocks at both ends of
-                # this KV block. Non-deterministic only, so dQ is atomic-accumulated
-                # and skipping n/m pairs cannot break the dQ semaphore protocol.
-                m_block_min, m_block_max = self.flashmask_m_block_min_max(
+                # flashmask O(1) segment jump: the non-masked query blocks form
+                # up to 3 contiguous segments (cpp-equivalent). Non-deterministic
+                # only, so dQ is atomic-accumulated and skipping n/m pairs cannot
+                # break the dQ semaphore protocol.
+                flashmask_segments = self.flashmask_m_block_segments(
                     flashmask_info,
                     batch_idx,
                     head_idx,
                     n_block,
-                    seqlen.seqlen_q,
                     num_heads,
                     m_block_min,
                     m_block_max,
                 )
-                process_tile = m_block_min < m_block_max
+                total_m_block_cnt = Int32(0)
+                for seg_lo, seg_hi in flashmask_segments:
+                    total_m_block_cnt = total_m_block_cnt + (seg_hi - seg_lo)
+                process_tile = total_m_block_cnt > Int32(0)
             elif const_expr(not self.use_block_sparsity):
                 process_tile = (
                     const_expr(not self.is_local and not self.is_varlen_q)
@@ -1520,34 +1521,58 @@ class FlashAttentionBackwardSm90:
                             has_ut_start=self.has_ut_start,
                             has_ut_end=self.has_ut_end,
                         )
-                    for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
-                        if const_expr(self.enable_flashmask and not self.deterministic):
-                            # Skip query blocks fully masked for this KV block,
-                            # including the mid-range band that the both-end trim
-                            # (flashmask_m_block_min_max) cannot remove. The load
-                            # and dQaccum_store warps apply the identical predicate
-                            # so the pipeline / dQ barriers stay in lockstep.
-                            if not self._flashmask_m_block_skip(
-                                flashmask_info,
-                                batch_idx,
-                                head_idx,
-                                n_block,
-                                m_block,
-                                seqlen.seqlen_q,
-                                num_heads,
-                            ):
+                    if const_expr(self.enable_flashmask and not self.deterministic):
+                        # Iterate only the non-masked segments; all three warps
+                        # walk the identical segment list in the same order to
+                        # stay in lockstep. The element mask is applied only on
+                        # partially-masked blocks (full/partial split, cpp-equivalent):
+                        # fully-visible interior blocks skip the per-element
+                        # comparison, which is the dominant remaining cost on
+                        # dense masks at long seqlen. Gating flashmask_fn does not
+                        # change which blocks are visited, so lockstep is preserved.
+                        (
+                            p_lts_min,
+                            p_lte_max,
+                            p_uts_min,
+                            p_ute_max,
+                        ) = self.flashmask_m_block_partial_bounds(
+                            flashmask_info,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            num_heads,
+                        )
+                        for seg_lo, seg_hi in flashmask_segments:
+                            for m_block in cutlass.range(seg_lo, seg_hi, unroll=1):
+                                if const_expr(self.has_ut_start):
+                                    partially_masked = (
+                                        ((m_block < p_lte_max) & (m_block >= p_lts_min))
+                                        | ((m_block < p_ute_max) & (m_block >= p_uts_min))
+                                    )
+                                elif const_expr(self.has_lt_end):
+                                    partially_masked = (m_block < p_lte_max) & (
+                                        m_block >= p_lts_min
+                                    )
+                                elif const_expr(self.has_ut_end):
+                                    partially_masked = (m_block >= p_lts_min) | (
+                                        m_block < p_ute_max
+                                    )
+                                else:
+                                    partially_masked = m_block >= p_lts_min
                                 consumer_state_Q, consumer_state_dO = mma_one_m_block_all(
                                     m_block,
                                     consumer_state_Q,
                                     consumer_state_dO,
                                     mask_fn=mask_fn,
                                     flashmask_fn=flashmask_fn,
+                                    partially_masked=partially_masked,
                                     score_mod_fn=score_mod_fn_cur,
                                     score_mod_bwd_fn=score_mod_bwd_fn_cur,
                                     dKV_accumulate=dKV_accumulate,
                                 )
                                 dKV_accumulate = True
-                        else:
+                    else:
+                        for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
                             consumer_state_Q, consumer_state_dO = mma_one_m_block_all(
                                 m_block,
                                 consumer_state_Q,
@@ -1685,105 +1710,123 @@ class FlashAttentionBackwardSm90:
                 s_rowidx[idx] = srow[batch_idx, fm_head_idx, nb_mul_kBN + idx, 0]
                 idx += self.num_mma_threads
 
-    @cute.jit
-    def _flashmask_block_fully_masked(
-        self,
-        flashmask_info: FlashMaskInfo,
-        batch_idx: Int32,
-        fm_head_idx: Int32,
-        n_block: Int32,
-        m_start: Int32,
-        m_end: Int32,
-    ):
-        """Return True if KV block `n_block` is fully masked out for query rows
-        [m_start, m_end). Mirrors reduce_block_count_kernel's predicate (same
-        logic as the fwd kernel)."""
-        lts_max = flashmask_info.LTS_nblock_max[batch_idx, fm_head_idx, n_block]
-        if const_expr(self.has_ut_start):
-            lte_min = flashmask_info.LTE_nblock_min[batch_idx, fm_head_idx, n_block]
-            uts_max = flashmask_info.UTS_nblock_max[batch_idx, fm_head_idx, n_block]
-            ute_min = flashmask_info.UTE_nblock_min[batch_idx, fm_head_idx, n_block]
-            return ((m_start >= lts_max) & (m_end <= lte_min)) | (
-                (m_start >= uts_max) & (m_end <= ute_min)
-            )
-        elif const_expr(self.has_lt_end):
-            lte_min = flashmask_info.LTE_nblock_min[batch_idx, fm_head_idx, n_block]
-            return (m_start >= lts_max) & (m_end <= lte_min)
-        elif const_expr(self.has_ut_end):
-            ute_min = flashmask_info.UTE_nblock_min[batch_idx, fm_head_idx, n_block]
-            return (m_start >= lts_max) | (m_end <= ute_min)
-        else:
-            return m_start >= lts_max
-
-    @cute.jit
-    def flashmask_m_block_min_max(
+    def flashmask_m_block_segments(
         self,
         flashmask_info: FlashMaskInfo,
         batch_idx: Int32,
         head_idx: Int32,
         n_block: Int32,
-        seqlen_q: Int32,
         num_heads: Int32,
         m_block_min: Int32,
         m_block_max: Int32,
     ):
-        """Tighten [m_block_min, m_block_max) by skipping contiguous fully-masked
-        query blocks at both ends for this fixed KV block `n_block`. Deterministic
-        from the flashmask nblock max/min, so the MMA warps and the dQaccum_store
-        warp compute the same range and stay in lockstep. Returns an empty range
-        (min == max) when every query block is fully masked; the caller writes
-        zero dK/dV in that case."""
+        """O(1) replacement for the per-block flashmask trim/skip.
+
+        Reads the 1-4 precomputed ``*_nblock`` max/min scalars for this KV block
+        once into registers and derives the (up to 3) contiguous m_block
+        segments that are NOT fully masked, mirroring the cpp mainloop's fm_mem
+        segment jumps (csrc/flashmask_v2/mainloop_bwd_sm90_tma_gmma_ws.hpp,
+        ``load()`` / ``store_dq()``). This replaces the old both-end ``while``
+        trim plus the per-m_block predicate, which for seqlen=128k issued
+        O(m_block) serial gmem scalar reads per KV block (the dominant bwd
+        overhead vs the cpp version).
+
+        The complement of the returned segments is exactly the union of the two
+        fully-masked bands (lt band ``[p0+1, p3)`` and ut band ``[p4+1, p7)``);
+        boundaries use floor/ceil the same way the cpp reference does, so they
+        err toward over-visiting (a fully-masked block still yields zero once
+        the element mask is applied) and never under-visit.
+
+        Returns a Python list (length fixed at trace time by the mask config)
+        of ``(lo, hi)`` Int32 half-open ranges. The producer, MMA-consumer and
+        dQ-store warps all call this with identical arguments and iterate the
+        identical list in the same order, so the Q/dO pipeline and per-m_block
+        dQ handshake stay in lockstep.
+        """
+        T = self.tile_m
         fm_heads = flashmask_info.startend_row_indices.shape[1]
         fm_head_idx = head_idx // (num_heads // fm_heads)
-        lo = m_block_min
-        hi = m_block_max
-        # Trim fully-masked blocks from the high end.
-        active = hi > lo
-        while active:
-            m_start = (hi - 1) * self.tile_m
-            m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
-            fully = self._flashmask_block_fully_masked(
-                flashmask_info, batch_idx, fm_head_idx, n_block, m_start, m_end
-            )
-            hi = hi - 1 if fully else hi
-            active = fully & (hi > lo)
-        # Trim fully-masked blocks from the low end.
-        active = lo < hi
-        while active:
-            m_start = lo * self.tile_m
-            m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
-            fully = self._flashmask_block_fully_masked(
-                flashmask_info, batch_idx, fm_head_idx, n_block, m_start, m_end
-            )
-            lo = lo + 1 if fully else lo
-            active = fully & (lo < hi)
-        return lo, hi
+        lts_max = flashmask_info.LTS_nblock_max[batch_idx, fm_head_idx, n_block]
+        # p0: largest m_block whose m_start (= m*tile_m) is still < lts_max, i.e.
+        # the last visible block of the lt_start bottom band (cpp fm_mem[0]).
+        p0 = (lts_max - 1) // T
+        segments = []
+        m_block = m_block_min
+        # Upper-triangle start band (num_vecs == 4 only): segment [m_block, p4].
+        if const_expr(self.has_ut_start):
+            uts_max = flashmask_info.UTS_nblock_max[batch_idx, fm_head_idx, n_block]
+            p4 = (uts_max - 1) // T
+            a_lo = m_block
+            a_hi = cutlass.min(m_block_max, cutlass.max(p4 + 1, a_lo))
+            segments.append((a_lo, a_hi))
+            m_block = a_hi
+        # Skip the upper-triangle masked band by jumping to ute_min. Runs for all
+        # non-causal configs, i.e. whenever ut_end exists (cpp: m_block =
+        # max(m_block, fm_mem[7])).
+        if const_expr(self.has_ut_end):
+            ute_min = flashmask_info.UTE_nblock_min[batch_idx, fm_head_idx, n_block]
+            p7 = ute_min // T
+            m_block = cutlass.max(m_block, p7)
+        # lt_start bottom band: segment [m_block, min(m_block_max - 1, p0)].
+        b_lo = m_block
+        b_hi = cutlass.max(b_lo, cutlass.min(m_block_max, p0 + 1))
+        segments.append((b_lo, b_hi))
+        m_block = b_hi
+        # lt_end top band (LTE present): jump past the lt masked middle band to
+        # lte_min, then run to m_block_max (cpp: m_block = max(m_block,
+        # fm_mem[3])).
+        if const_expr(self.has_lt_end):
+            lte_min = flashmask_info.LTE_nblock_min[batch_idx, fm_head_idx, n_block]
+            p3 = lte_min // T
+            c_lo = cutlass.max(m_block, p3)
+            c_hi = cutlass.max(m_block_max, c_lo)
+            segments.append((c_lo, c_hi))
+        return segments
 
-    @cute.jit
-    def _flashmask_m_block_skip(
+    def flashmask_m_block_partial_bounds(
         self,
         flashmask_info: FlashMaskInfo,
         batch_idx: Int32,
         head_idx: Int32,
         n_block: Int32,
-        m_block: Int32,
-        seqlen_q: Int32,
         num_heads: Int32,
     ):
-        """Return True if query block `m_block` is fully masked for this KV block
-        `n_block` and should be skipped. Used for arbitrary (mid-range) block
-        skipping: masks like causal-blockwise leave the visible query blocks in
-        two disjoint intervals with a fully-masked band in the middle, which the
-        both-end trim (flashmask_m_block_min_max) cannot remove. Deterministic
-        from gmem, so the load / mma / dQaccum_store warps skip the identical set
-        of blocks and stay in lockstep."""
+        """Compute the m_block thresholds that decide, per visited query block,
+        whether the flashmask element mask must be applied (partial block) or
+        can be skipped (fully-visible block). Mirrors the cpp bwd_step
+        `partially_masked` flag (mainloop_bwd_sm90_tma_gmma_ws.hpp) and the
+        forward `split_full` classification in flashmask_utils.compute_flashmask_block_lists.
+
+        Reads only the "inner" boundary scalars once into registers (LTS min,
+        LTE max, UTS min, UTE max; 1-4 depending on config) and converts them
+        to m_block space:
+          `m_end   > Y` (needs mask, low side)  <=> m_block >= Y // tile_m
+          `m_start < X` (needs mask, high side) <=> m_block < ceil_div(X, tile_m)
+        The block-level max/min aggregate is a superset of the true per-column
+        partial set, and the m_end -> (m+1)*tile_m rounding over-includes at the
+        seqlen edge, so the predicate never skips a block that needs masking
+        (over-applying the element mask is a no-op). Returns
+        (p_lts_min, p_lte_max, p_uts_min, p_ute_max); the caller selects the
+        relevant subset per config via const_expr.
+        """
+        T = self.tile_m
         fm_heads = flashmask_info.startend_row_indices.shape[1]
         fm_head_idx = head_idx // (num_heads // fm_heads)
-        m_start = m_block * self.tile_m
-        m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
-        return self._flashmask_block_fully_masked(
-            flashmask_info, batch_idx, fm_head_idx, n_block, m_start, m_end
-        )
+        lts_min = flashmask_info.LTS_nblock_min[batch_idx, fm_head_idx, n_block]
+        p_lts_min = lts_min // T
+        p_lte_max = Int32(0)
+        p_uts_min = Int32(0)
+        p_ute_max = Int32(0)
+        if const_expr(self.has_lt_end):
+            lte_max = flashmask_info.LTE_nblock_max[batch_idx, fm_head_idx, n_block]
+            p_lte_max = (lte_max + T - 1) // T
+        if const_expr(self.has_ut_start):
+            uts_min = flashmask_info.UTS_nblock_min[batch_idx, fm_head_idx, n_block]
+            p_uts_min = uts_min // T
+        if const_expr(self.has_ut_end):
+            ute_max = flashmask_info.UTE_nblock_max[batch_idx, fm_head_idx, n_block]
+            p_ute_max = (ute_max + T - 1) // T
+        return p_lts_min, p_lte_max, p_uts_min, p_ute_max
 
     @staticmethod
     @cute.jit
@@ -1828,6 +1871,7 @@ class FlashAttentionBackwardSm90:
         score_mod_fn: Optional[Callable] = None,
         score_mod_bwd_fn: Optional[Callable] = None,
         dKV_accumulate: Boolean = True,
+        partially_masked: Boolean = True,
     ):
         consumer_state_dO_cur = (
             consumer_state_Q if const_expr(self.Q_stage == self.dO_stage) else consumer_state_dO
@@ -1857,9 +1901,12 @@ class FlashAttentionBackwardSm90:
         if cutlass.const_expr(mask_fn is not None):
             mask_fn(acc_S, m_block=m_block)
         # flashmask (startend_row_indices): applied after causal/seqlen mask, on
-        # this n_block's staged smem indices (fixed across the m loop).
+        # this n_block's staged smem indices (fixed across the m loop). Only run
+        # the per-element comparison on partially-masked blocks; fully-visible
+        # blocks are a no-op (matches cpp bwd_step partially_masked gating).
         if cutlass.const_expr(flashmask_fn is not None):
-            flashmask_fn(acc_S, m_block=m_block)
+            if partially_masked:
+                flashmask_fn(acc_S, m_block=m_block)
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.SdP_swapAB)
         lane_idx = cute.arch.lane_idx()
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
@@ -2172,20 +2219,21 @@ class FlashAttentionBackwardSm90:
 
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
             if const_expr(self.enable_flashmask and not self.deterministic):
-                # Must match the MMA warps' flashmask skip range exactly so the
+                # Must match the MMA warps' flashmask segments exactly so the
                 # per-m_block dQ producer/consumer barrier handshake stays in sync.
-                m_block_min, m_block_max = self.flashmask_m_block_min_max(
+                flashmask_segments = self.flashmask_m_block_segments(
                     flashmask_info,
                     batch_idx,
                     head_idx,
                     n_block,
-                    seqlen.seqlen_q,
                     num_heads,
                     m_block_min,
                     m_block_max,
                 )
-                process_tile = m_block_min < m_block_max
-                loop_count = m_block_max - m_block_min
+                total_block_cnt = Int32(0)
+                for seg_lo, seg_hi in flashmask_segments:
+                    total_block_cnt = total_block_cnt + (seg_hi - seg_lo)
+                process_tile = total_block_cnt > Int32(0)
             elif const_expr(not self.use_block_sparsity):
                 process_tile = (
                     const_expr(not self.is_local and not self.is_varlen_q)
@@ -2205,25 +2253,14 @@ class FlashAttentionBackwardSm90:
 
             if process_tile:
                 if const_expr(not self.use_block_sparsity):
-                    for iter_idx in cutlass.range(loop_count, unroll=1):
-                        m_block = m_block_min + iter_idx
-                        m_block_safe = m_block
-
-                        if const_expr(self.enable_flashmask and not self.deterministic):
-                            # Skip the dQ handshake for query blocks fully masked
-                            # for this KV block. Must match the load/mma warps'
-                            # skip set exactly so the per-m_block dQEmpty/dQFull
-                            # barrier handshake stays paired 1:1.
-                            skip_block = self._flashmask_m_block_skip(
-                                flashmask_info,
-                                batch_idx,
-                                head_idx,
-                                n_block,
-                                m_block,
-                                seqlen.seqlen_q,
-                                num_heads,
-                            )
-                            if not skip_block:
+                    if const_expr(self.enable_flashmask and not self.deterministic):
+                        # Do the dQ handshake only for the non-masked segments.
+                        # Must walk the identical segment list (same order) as the
+                        # load/mma warps so the per-m_block dQEmpty/dQFull barrier
+                        # handshake stays paired 1:1.
+                        for seg_lo, seg_hi in flashmask_segments:
+                            for m_block in cutlass.range(seg_lo, seg_hi, unroll=1):
+                                m_block_safe = m_block
                                 num_dQ_chunks = self.num_wg_dQ
                                 for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
                                     cute.arch.cp_async_bulk_wait_group(
@@ -2249,7 +2286,11 @@ class FlashAttentionBackwardSm90:
                                             self.tma_copy_bytes["dQ"],
                                         )
                                     cute.arch.cp_async_bulk_commit_group()
-                        else:
+                    else:
+                        for iter_idx in cutlass.range(loop_count, unroll=1):
+                            m_block = m_block_min + iter_idx
+                            m_block_safe = m_block
+
                             num_dQ_chunks = self.num_wg_dQ
                             for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
                                 if const_expr(not self.deterministic):

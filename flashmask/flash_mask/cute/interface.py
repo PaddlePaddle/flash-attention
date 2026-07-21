@@ -42,6 +42,7 @@ from flash_mask.cute.flashmask_utils import (
     to_cute_flashmask_info,
     reduce_block_count,
     compute_flashmask_block_lists,
+    build_flashmask_block_lists,
 )
 
 from flash_mask.cute.block_sparsity import (
@@ -572,7 +573,7 @@ def _flash_attn_fwd(
         and block_sparse_tensors is None
         and seqlen_q is not None
     ):
-        fm_full_cnt, fm_full_idx, fm_mask_cnt, fm_mask_idx = compute_flashmask_block_lists(
+        fm_full_cnt, fm_full_idx, fm_mask_cnt, fm_mask_idx = build_flashmask_block_lists(
             flashmask_info,
             causal,
             m_block_size,

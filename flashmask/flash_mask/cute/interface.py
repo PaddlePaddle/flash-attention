@@ -409,10 +409,18 @@ def _flash_attn_fwd(
             is_causal=causal,
             startend_row_indices=startend_row_indices,
         )
-        flashmask_info.valid_block_count = paddle.empty([fm_batch_size, fm_heads, num_m_blocks], dtype=paddle.int32)
+        # valid_block_count (produced by reduce_block_count) feeds only the SM100
+        # path and the bwd 2CTA density heuristic. The SM90 fwd kernel iterates the
+        # block-sparse lists built below (build_flashmask_block_lists) and never
+        # reads valid_block_count, so skip both the extra [b,h,num_m_blocks] alloc
+        # and the reduce_block_count kernel launch there. Per-call fixed overhead
+        # dominates the high-sparsity / short-seq configs, so this is pure win.
+        if compute_capability != 9:
+            flashmask_info.valid_block_count = paddle.empty([fm_batch_size, fm_heads, num_m_blocks], dtype=paddle.int32)
         prepare_block_maxmin(flashmask_info, kBlockN=n_block_size)
         cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
-        reduce_block_count(cute_flashmask_info, causal, q_stage * m_block_size, n_block_size, seqlen_q)
+        if compute_capability != 9:
+            reduce_block_count(cute_flashmask_info, causal, q_stage * m_block_size, n_block_size, seqlen_q)
 
     if page_table is not None:
         assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
@@ -509,7 +517,11 @@ def _flash_attn_fwd(
     requires_grad = not (q.stop_gradient and k.stop_gradient and v.stop_gradient)
 
     if out is None:
-        out = paddle.zeros(
+        # Every scheduled (m_block, head, batch) tile writes its full O tile in the
+        # epilogue unconditionally (fully-masked rows get O=0, LSE=-inf written by
+        # the kernel), so an uninitialized buffer is safe and avoids the ~1GB
+        # zero-fill that otherwise dominates short-seq / high-sparsity calls.
+        out = paddle.empty(
             shape=[*q_batch_seqlen_shape, num_head, head_dim_v], dtype=out_paddle_dtype
         )
     else:
@@ -526,7 +538,9 @@ def _flash_attn_fwd(
 
     if lse is None:
         lse = (
-            paddle.full(shape=lse_shape, fill_value=float('-inf'), dtype=paddle.float32)
+            # The epilogue writes LSE for every row (‑inf for fully-masked rows), so
+            # an uninitialized buffer is safe; skip the full(-inf) fill.
+            paddle.empty(shape=lse_shape, dtype=paddle.float32)
             if requires_grad or return_lse
             else None
         )

@@ -170,20 +170,31 @@ if BUILD_FA4:
 # ============================================================
 def _ensure_deps(deps):
     """pip install missing dependencies before build."""
+    # pip package name -> actual import name
+    _IMPORT_MAP = {
+        'nvidia-cutlass': 'cutlass',
+        'nvidia-cutlass-dsl': 'cutlass.dsl',
+        'apache-tvm-ffi': 'tvm.ffi',
+        'typing_extensions': 'typing_extensions',
+    }
     missing = []
     for dep in deps:
-        pkg_name = dep.split('==')[0].split('>=')[0].split('<=')[0].strip()
-        # pip package name -> import name mapping
-        import_name = pkg_name.replace('-', '_')
+        # strip version specifiers and extras
+        pkg_name = dep.split('[')[0]  # remove extras like [cu13]
+        pkg_name = pkg_name.split('==')[0].split('>=')[0].split('<=')[0].strip()
+        import_name = _IMPORT_MAP.get(pkg_name, pkg_name.replace('-', '_'))
         try:
             __import__(import_name)
         except ImportError:
             missing.append(dep)
     if missing:
         print(f"[flashmask] Installing missing dependencies: {missing}")
-        subprocess.check_call(
-            [sys.executable, '-m', 'pip', 'install'] + missing,
-        )
+        try:
+            subprocess.check_call(
+                [sys.executable, '-m', 'pip', 'install'] + missing,
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"[flashmask] WARNING: pip install failed ({e}), continuing...")
 
 _ensure_deps(install_requires)
 

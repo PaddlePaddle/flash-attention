@@ -23,10 +23,18 @@ class BlockSparseTensors(NamedTuple):
     mask_block_idx: cute.Tensor
     full_block_cnt: Optional[cute.Tensor]
     full_block_idx: Optional[cute.Tensor]
+    # Varlen-scheduler tensors; None for fixed-length (incl. flashmask reuse).
+    cu_total_m_blocks: Optional[cute.Tensor] = None
+    cu_block_idx_offsets: Optional[cute.Tensor] = None
 
     def __new_from_mlir_values__(self, values):
+        values = list(values)
+        # Pad missing trailing optional fields (full_* and cu_* are None for the
+        # fixed-length / flashmask cases, so they don't appear as MLIR values).
         if len(values) == 2:
-            values = (*values, None, None)
+            values = values + [None, None, None, None]
+        elif len(values) == 4:
+            values = values + [None, None]
         return BlockSparseTensors(*values)
 
 
@@ -35,6 +43,8 @@ class BlockSparseTensorsPaddle(NamedTuple):
     mask_block_idx: paddle.Tensor
     full_block_cnt: Optional[paddle.Tensor] = None
     full_block_idx: Optional[paddle.Tensor] = None
+    cu_total_m_blocks: Optional[paddle.Tensor] = None
+    cu_block_idx_offsets: Optional[paddle.Tensor] = None
 
 
 def _expand_sparsity_tensor(
@@ -144,11 +154,24 @@ def to_cute_block_sparse_tensors(tensors: BlockSparseTensorsPaddle) -> Optional[
         else None
     )
 
+    cu_total_m_blocks_tensor = (
+        from_dlpack(tensors.cu_total_m_blocks.detach(), assumed_align=4).mark_layout_dynamic()
+        if tensors.cu_total_m_blocks is not None
+        else None
+    )
+    cu_block_idx_offsets_tensor = (
+        from_dlpack(tensors.cu_block_idx_offsets.detach(), assumed_align=4).mark_layout_dynamic()
+        if tensors.cu_block_idx_offsets is not None
+        else None
+    )
+
     return BlockSparseTensors(
         mask_block_cnt_tensor,
         mask_block_idx_tensor,
         full_block_cnt_tensor,
         full_block_idx_tensor,
+        cu_total_m_blocks_tensor,
+        cu_block_idx_offsets_tensor,
     )
 
 

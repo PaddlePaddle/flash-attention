@@ -536,3 +536,148 @@ def reduce_block_count(
     )
 
 reduce_block_count.compile_cache = {}
+
+
+def _flashmask_config_flags(num_vecs: int, is_causal: bool):
+    """Map (num_vecs, is_causal) to the has_lte/has_uts/has_ute flags used by the
+    fully-masked / partial predicates (mirrors reduce_block_count_kernel)."""
+    if num_vecs == 4:
+        return True, True, True  # has_lte, has_uts, has_ute
+    elif num_vecs == 2:
+        if is_causal:
+            return True, False, False
+        else:
+            return False, False, True
+    else:
+        return False, False, False
+
+
+def compute_flashmask_block_lists(
+    flashmask_info: "FlashMaskInfoPaddle",
+    is_causal: bool,
+    kBlockM: int,
+    kBlockN: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    num_heads: int,
+    split_full: bool = False,
+):
+    """Host-side generation of the per-(batch, head, m_block) compact list of
+    surviving KV blocks for flashmask, split into `full` (fully visible, no
+    element mask needed) and `mask` (partial, needs the flashmask element mask
+    and/or causal/seqlen mask) lists. Fully-masked KV blocks are skipped (absent
+    from both lists). This mirrors the v3 forward "n_block index list" so the
+    kernel iterates only surviving blocks (arbitrary/mid-range skipping) instead
+    of a contiguous [n_block_min, n_block_max) range.
+
+    Predicates replicate reduce_block_count_kernel (fully-masked) and
+    _flashmask_block_partial (partial), combined with the causal / seqlen block
+    geometry. Returns a BlockSparseTensorsPaddle-compatible tuple:
+        (full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx)
+    with cnt shape (b, num_heads, nq) and idx shape (b, num_heads, nq, nk),
+    int32, on the same device as startend_row_indices. Indices are stored in
+    ascending KV-block order (the consumer walks them high->low).
+    """
+    srow = flashmask_info.startend_row_indices
+    b, h_fm, _, num_vecs = srow.shape
+    nq = (seqlen_q + kBlockM - 1) // kBlockM
+    nk = (seqlen_k + kBlockN - 1) // kBlockN
+    has_lte, has_uts, has_ute = _flashmask_config_flags(num_vecs, is_causal)
+
+    def _sl(t):
+        # (b, h_fm, padded_nblocks) -> (b, h_fm, 1, nk)
+        return t[:, :, :nk].reshape([b, h_fm, 1, nk]).astype("int32")
+
+    lts_max = _sl(flashmask_info.LTS_nblock_max)
+    lts_min = _sl(flashmask_info.LTS_nblock_min)
+    lte_max = _sl(flashmask_info.LTE_nblock_max) if has_lte or has_uts else None
+    lte_min = _sl(flashmask_info.LTE_nblock_min) if has_lte or has_uts else None
+    uts_max = _sl(flashmask_info.UTS_nblock_max) if has_uts else None
+    uts_min = _sl(flashmask_info.UTS_nblock_min) if has_uts else None
+    ute_max = _sl(flashmask_info.UTE_nblock_max) if has_uts or has_ute else None
+    ute_min = _sl(flashmask_info.UTE_nblock_min) if has_uts or has_ute else None
+
+    m_idx = paddle.arange(nq, dtype="int32").reshape([1, 1, nq, 1])
+    m_start = m_idx * kBlockM
+    m_end = paddle.minimum(m_start + kBlockM, paddle.to_tensor(seqlen_q, dtype="int32"))
+
+    n_idx = paddle.arange(nk, dtype="int32").reshape([1, 1, 1, nk])
+    n_start = n_idx * kBlockN
+    n_end = paddle.minimum(n_start + kBlockN, paddle.to_tensor(seqlen_k, dtype="int32"))
+
+    # ---- flashmask fully-masked (skip) ----
+    if has_uts:
+        fm_fully = ((m_start >= lts_max) & (m_end <= lte_min)) | (
+            (m_start >= uts_max) & (m_end <= ute_min)
+        )
+    elif has_lte:
+        fm_fully = (m_start >= lts_max) & (m_end <= lte_min)
+    elif has_ute:
+        fm_fully = (m_start >= lts_max) | (m_end <= ute_min)
+    else:
+        fm_fully = m_start >= lts_max
+
+    # ---- flashmask partial (needs element mask) ----
+    if has_uts:
+        fm_partial = ((m_start < lte_max) & (m_end > lts_min)) | (
+            (m_start < ute_max) & (m_end > uts_min)
+        )
+    elif has_lte:
+        fm_partial = (m_start < lte_max) & (m_end > lts_min)
+    elif has_ute:
+        fm_partial = (m_end > lts_min) | (m_start < ute_max)
+    else:
+        fm_partial = m_end > lts_min
+
+    # ---- causal / seqlen geometry ----
+    offset = seqlen_k - seqlen_q
+    if is_causal:
+        causal_empty = n_start > (m_end - 1 + offset)  # entirely in the future
+        causal_full = (n_end - 1) <= (m_start + offset)  # entirely below diagonal
+        causal_partial = (~causal_empty) & (~causal_full)
+    else:
+        causal_empty = paddle.zeros([1, 1, nq, nk], dtype="bool")
+        causal_partial = paddle.zeros([1, 1, nq, nk], dtype="bool")
+    # last KV block may be shorter than kBlockN -> needs seqlen masking
+    seqlen_boundary = n_end < (n_start + kBlockN)
+
+    # ---- classify ----
+    skip = causal_empty | fm_fully
+    needs_mask = causal_partial | seqlen_boundary | fm_partial
+    if split_full:
+        # Optimization: fully-visible blocks go to the `full` list (no element
+        # mask applied). Correct only if the split predicate is exact.
+        is_mask = (~skip) & needs_mask
+        is_full = (~skip) & (~needs_mask)
+    else:
+        # Correctness-first: route every surviving block through the `mask` list.
+        # The causal/seqlen/flashmask masks applied on a fully-visible block are
+        # no-ops, so this is always correct (just skips fewer mask evaluations).
+        is_mask = ~skip
+        is_full = paddle.zeros([1, 1, nq, nk], dtype="bool") & skip
+
+    # broadcast (b, h_fm, nq, nk)
+    is_mask = paddle.broadcast_to(is_mask, [b, h_fm, nq, nk])
+    is_full = paddle.broadcast_to(is_full, [b, h_fm, nq, nk])
+    n_full = paddle.broadcast_to(n_idx, [b, h_fm, nq, nk])
+
+    def _pack(sel):
+        # ascending packed indices via sort of key = n where selected else nk
+        key = paddle.where(sel, n_full, paddle.full_like(n_full, nk))
+        sorted_key = paddle.sort(key, axis=-1)
+        idx = paddle.where(sorted_key < nk, sorted_key, paddle.zeros_like(sorted_key))
+        cnt = paddle.sum(sel.astype("int32"), axis=-1)
+        return cnt.astype("int32"), idx.astype("int32")
+
+    full_cnt, full_idx = _pack(is_full)
+    mask_cnt, mask_idx = _pack(is_mask)
+
+    # broadcast flashmask heads (h_fm) -> num_heads (GQA / shared flashmask head)
+    if h_fm != num_heads:
+        rep = num_heads // h_fm
+        full_cnt = paddle.repeat_interleave(full_cnt, rep, axis=1)
+        full_idx = paddle.repeat_interleave(full_idx, rep, axis=1)
+        mask_cnt = paddle.repeat_interleave(mask_cnt, rep, axis=1)
+        mask_idx = paddle.repeat_interleave(mask_idx, rep, axis=1)
+
+    return full_cnt, full_idx, mask_cnt, mask_idx

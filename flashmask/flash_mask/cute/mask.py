@@ -22,6 +22,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
 import flash_mask.cute.utils as utils
+from flash_mask.cute import layout_utils
 
 
 @cute.jit
@@ -112,13 +113,13 @@ class AttentionMask:
         fastdiv_mods=(None, None),
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
-        acc_S_mn = utils.make_acc_tensor_mn_view(acc_S, transpose=self.swap_AB)
+        acc_S_mn = layout_utils.make_acc_tensor_mn_view(acc_S, transpose=self.swap_AB)
         acc_shape = (self.tile_m, self.tile_n)
         cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
-        tScS_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS), transpose=self.swap_AB)
+        tScS_mn = layout_utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS), transpose=self.swap_AB)
         # We use t0ScS as these indices are known at compile time. We then must subtract the
         # column limit by the thread column offset.
-        t0ScS_mn = utils.make_acc_tensor_mn_view(
+        t0ScS_mn = layout_utils.make_acc_tensor_mn_view(
             thr_mma.get_slice(0).partition_C(cS), transpose=self.swap_AB
         )
         ROW = 0 if const_expr(not self.swap_AB) else 1
@@ -214,7 +215,14 @@ class AttentionMask:
                     1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q - thr_col_offset
                 )
                 if const_expr(mask_causal):
-                    r2p = const_expr(not self.swap_AB)  # R2P trick, see apply_mask_sm100
+                    # R2P (mask_r2p) assumes a specific per-thread column layout
+                    # (0,1,8,9,16,17,...) via col_limit//8*2+min(col_limit%8,2). That
+                    # holds for some MMA configs but NOT e.g. the head_dim=256 bwd
+                    # (swap_AB=False, 64x64 tile), where it mis-masked near the causal
+                    # diagonal -> residual dQ/dK/dV error. Use the layout-agnostic
+                    # direct loop (with the real column indices) instead. (The
+                    # seqlen-only path above already disables R2P for the same reason.)
+                    r2p = const_expr(False)
                     for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                         # get the column index limit based on current row. Only consider the row index, so the column index sets to 0.
                         if const_expr(self.qhead_per_kvhead_packgqa == 1):
@@ -498,6 +506,64 @@ class AttentionMask:
                 mbar_ptr + mbar_load_startend_row_indices_empty_offset + stage * kv_stage + load_startend_row_indices_consumer_state.index)
             load_startend_row_indices_consumer_state.advance()
         return load_startend_row_indices_consumer_state
+
+    @cute.jit
+    def apply_flashmask_sm90(
+        self,
+        acc_S: cute.Tensor,
+        m_block: Int32,
+        thr_mma: cute.TiledMma,
+        s_startend_row_indices: cute.Tensor,
+        has_lt_end: cutlass.Constexpr[bool] = False,
+        has_ut_start: cutlass.Constexpr[bool] = False,
+        has_ut_end: cutlass.Constexpr[bool] = False,
+    ) -> None:
+        """SM90 flashmask (startend_row_indices) application on S.
+
+        s_startend_row_indices is the current pipeline stage's flat smem buffer
+        holding up to 4 vectors of tile_n Int32 at offsets
+        [0, tile_n, 2*tile_n, 3*tile_n] = [LTS, LTE, UTS, UTE].
+
+        Mirrors apply_mask_sm100's flashmask branch but operates on the SM90
+        (row, col) mn-view of the accumulator. The masked rows for a given kv
+        column are described relative to the query tile via `- m_block*tile_m`.
+        """
+        acc_S_mn = layout_utils.make_acc_tensor_mn_view(acc_S, transpose=self.swap_AB)
+        acc_shape = (self.tile_m, self.tile_n)
+        cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
+        tScS_mn = layout_utils.make_acc_tensor_mn_view(
+            thr_mma.partition_C(cS), transpose=self.swap_AB
+        )
+        ROW = 0 if const_expr(not self.swap_AB) else 1
+        COL = 1 if const_expr(not self.swap_AB) else 0
+        nrow = const_expr(cute.size(tScS_mn.shape[0]))
+        ncol = const_expr(cute.size(tScS_mn.shape[1]))
+        tile_n = const_expr(self.tile_n)
+        for r in cutlass.range(nrow, unroll_full=True):
+            for c in cutlass.range(ncol, unroll_full=True):
+                row = tScS_mn[r, c][ROW]
+                col = tScS_mn[r, c][COL]
+                if const_expr(has_ut_start):
+                    lts = s_startend_row_indices[col] - m_block * self.tile_m
+                    lte = s_startend_row_indices[tile_n + col] - m_block * self.tile_m
+                    uts = s_startend_row_indices[2 * tile_n + col] - m_block * self.tile_m
+                    ute = s_startend_row_indices[3 * tile_n + col] - m_block * self.tile_m
+                    if (row >= lts and row < lte) or (row >= uts and row < ute):
+                        acc_S_mn[r, c] = -Float32.inf
+                elif const_expr(has_lt_end):
+                    lts = s_startend_row_indices[col] - m_block * self.tile_m
+                    lte = s_startend_row_indices[tile_n + col] - m_block * self.tile_m
+                    if row >= lts and row < lte:
+                        acc_S_mn[r, c] = -Float32.inf
+                elif const_expr(has_ut_end):
+                    lts = s_startend_row_indices[col] - m_block * self.tile_m
+                    ute = s_startend_row_indices[3 * tile_n + col] - m_block * self.tile_m
+                    if row >= lts or row < ute:
+                        acc_S_mn[r, c] = -Float32.inf
+                else:
+                    lts = s_startend_row_indices[col] - m_block * self.tile_m
+                    if row >= lts:
+                        acc_S_mn[r, c] = -Float32.inf
 
     @cute.jit
     def apply_mask_sm100_transposed(

@@ -14,6 +14,7 @@ from cutlass import Float32, Int32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cute import FastDivmodDivisor
 
 
 # cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default
@@ -148,98 +149,6 @@ def warp_reduce(
         for i in cutlass.range_constexpr(int(math.log2(width))):
             val = op(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
     return val
-
-
-def convert_layout_acc_mn(acc_layout: cute.Layout, transpose: bool = False) -> cute.Layout:
-    """
-    For Sm80, convert ((2, 2), MMA_M, MMA_N, ...) to ((2, MMA_M), (2, MMA_N), ...).
-    For Sm90, convert ((2, 2, V), MMA_M, MMA_N, ...) to ((2, MMA_M), (2, V, MMA_N), ...).
-    """
-    acc_layout_col_major = cute.make_layout(acc_layout.shape)
-    shape = (
-        (acc_layout_col_major.shape[0][1], acc_layout_col_major.shape[1]),  # MMA_M
-        (
-            acc_layout_col_major.shape[0][0],
-            *acc_layout_col_major.shape[0][2:],
-            acc_layout_col_major.shape[2],
-        ),  # MMA_N
-        *acc_layout_col_major.shape[3:],
-    )
-    stride = (
-        (acc_layout_col_major.stride[0][1], acc_layout_col_major.stride[1]),  # MMA_M
-        (
-            acc_layout_col_major.stride[0][0],
-            *acc_layout_col_major.stride[0][2:],
-            acc_layout_col_major.stride[2],
-        ),  # MMA_N
-        *acc_layout_col_major.stride[3:],
-    )
-    if const_expr(transpose):
-        shape = (shape[1], shape[0], *shape[2:])
-        stride = (stride[1], stride[0], *stride[2:])
-    acc_layout_mn = cute.make_layout(shape, stride=stride)
-    return cute.composition(acc_layout, acc_layout_mn)
-
-
-def make_acc_tensor_mn_view(acc: cute.Tensor, transpose: bool = False) -> cute.Tensor:
-    return cute.make_tensor(acc.iterator, convert_layout_acc_mn(acc.layout, transpose=transpose))
-
-
-@cute.jit
-def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
-    # For back to back gemm, convert layout of acc0 to gemm 1 accept layout.
-    # For Sm80, as the mma instruction shape is 16x8x16, we need to convert from (4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
-    # For Sm90, FP16/BF16, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2), MMA_M, (N / 16, MMA_N))
-    # TODO: Sm90 FP8
-    if const_expr(cute.rank(acc_layout.shape[0]) == 3):  # Sm90
-        l = cute.logical_divide(
-            acc_layout, ((None, None, 2), None, None)
-        )  # ((2, 2, (2, N / 16)), MMA_M, MMA_N)
-        rA_mma_view = cute.make_layout(
-            (
-                (l.shape[0][0], l.shape[0][1], l.shape[0][2][0]),
-                l.shape[1],
-                (l.shape[0][2][1], l.shape[2]),
-            ),
-            stride=(
-                (l.stride[0][0], l.stride[0][1], l.stride[0][2][0]),
-                l.stride[1],
-                (l.stride[0][2][1], l.stride[2]),
-            ),
-        )
-    else:  # Sm80
-        # (4, MMA_M, MMA_N) -> (4, MMA_M, (2, MMA_N / 2))
-        l = cute.logical_divide(acc_layout, (None, None, 2))
-        rA_mma_view = cute.make_layout(
-            (
-                (l.shape[0], l.shape[2][0]),
-                l.shape[1],
-                l.shape[2][1],
-            ),
-            stride=(
-                (l.stride[0], l.stride[2][0]),
-                l.stride[1],
-                l.stride[2][1],
-            ),
-        )
-    return rA_mma_view
-
-
-def make_acc_tensor_frgA_view(acc: cute.Tensor) -> cute.Tensor:
-    return cute.make_tensor(acc.iterator, convert_layout_acc_frgA(acc.layout))
-
-
-def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
-    return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
-
-
-def transpose_view(a: cute.Tensor) -> cute.Tensor:
-    """Transpose the first two dimensions of a tensor on smem."""
-    shape = (a.shape[1], a.shape[0], *a.shape[2:])
-    order = (1, 0, *range(2, cute.rank(a)))
-    return cute.composition(a, cute.make_ordered_layout(shape, order=order))
-    # stride = (a.layout.stride[1], a.layout.stride[0], *a.layout.stride[2:])
-    # return cute.make_tensor(a.iterator, cute.make_layout(shape, stride=stride))
 
 
 def parse_swizzle_from_pointer(ptr: cute.Pointer) -> cute.Swizzle:
@@ -810,3 +719,35 @@ def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
 def ssa_to_scalar(val):
     """ Could inline but nice for reflecting the above api """
     return val[0]
+
+
+LOG2_E = math.log2(math.e)
+
+def compute_softmax_scale_log2(softmax_scale, score_mod):
+    """Compute softmax_scale_log2 and adjusted softmax_scale based on whether score_mod is used.
+
+    When score_mod is None, fold the log2(e) factor into softmax_scale_log2 and set softmax_scale
+    to None. When score_mod is present, keep softmax_scale separate so it can be applied before
+    the score_mod, and set softmax_scale_log2 to just the change-of-base constant.
+
+    Returns (softmax_scale_log2, softmax_scale).
+    """
+    if const_expr(score_mod is None):
+        return softmax_scale * LOG2_E, None
+    else:
+        return LOG2_E, softmax_scale
+
+def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None):
+    """Compute FastDivmodDivisor pairs for aux_tensors index computation.
+
+    Returns a (seqlen_q_divmod, seqlen_k_divmod) tuple, or None if aux_tensors is None.
+    """
+    if const_expr(aux_tensors is None):
+        return None
+    seqlen_q = cute.size(mQ.shape[0]) // (qhead_per_kvhead if const_expr(pack_gqa) else 1)
+    seqlen_k = (
+        cute.size(mK.shape[0])
+        if const_expr(mPageTable is None)
+        else mK.shape[0] * mPageTable.shape[1]
+    )
+    return (FastDivmodDivisor(seqlen_q), FastDivmodDivisor(seqlen_k))

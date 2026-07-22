@@ -643,15 +643,11 @@ def _flash_attn_fwd(
 
     current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
 
-    if compute_capability == 9:  # TODO: tune block size according to hdim.
-        if (
-            head_dim == head_dim_v == 128
-            and not causal
-            and not local
-            and not use_block_sparsity
-            and startend_row_indices is None
-        ):
-            n_block_size = 192
+    # NOTE: do NOT bump n_block_size to 192 for the dense d=128 (non-causal,
+    # non-flashmask) case. tile_n=192 with num_stages=2 needs ~225 KiB smem, which
+    # hits Hopper's ~228 KiB ceiling -> 1 block/SM and near-zero L1, making Full
+    # ~6% slower than tile_n=128 (FA4 uses 128 and reaches ~647 vs ~613 TFLOP/s
+    # here). Keep the default 128 to match FA4's dense config.
     if compute_capability == 10:
         # TODO: fix the varlen case
         if (

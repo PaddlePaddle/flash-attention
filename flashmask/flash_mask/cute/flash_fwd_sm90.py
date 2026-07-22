@@ -1105,6 +1105,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.load_startend_row_indices(
                         batch_idx, head_idx, n_block_prev, num_heads, kv_producer_state,
                         s_rowidx, flashmask_info, mbar_ptr_rowidx, seqlen_k, m_block, seqlen_q,
+                        is_partial=self._mask_partial_at(mask_idx, mask_cnt, Int32(0)),
                     )
                 for p in cutlass.range(1, total, unroll=1):
                     n_block = self._bs_block_at(mask_idx, full_idx, mask_cnt, full_cnt, p)
@@ -1119,6 +1120,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         self.load_startend_row_indices(
                             batch_idx, head_idx, n_block, num_heads, kv_producer_state,
                             s_rowidx, flashmask_info, mbar_ptr_rowidx, seqlen_k, m_block, seqlen_q,
+                            is_partial=self._mask_partial_at(mask_idx, mask_cnt, p),
                         )
                     pipeline_v.producer_acquire(kv_producer_state_prev)
                     tma_load_V_fn(src_idx=n_block_prev, producer_state=kv_producer_state_prev)
@@ -1137,6 +1139,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         self.load_startend_row_indices(
                             batch_idx, head_idx, n_block, num_heads, kv_producer_state,
                             s_rowidx, flashmask_info, mbar_ptr_rowidx, seqlen_k, m_block, seqlen_q,
+                            is_partial=self._mask_partial_at(mask_idx, mask_cnt, p),
                         )
                     pipeline_v.producer_acquire(kv_producer_state)
                     tma_load_V_fn(src_idx=n_block, producer_state=kv_producer_state)
@@ -1162,8 +1165,25 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         fi = cutlass.max(full_cnt - 1 - (p - mask_cnt), Int32(0))
         n = full_idx[fi]
         if in_mask:
-            n = mask_idx[mi]
+            # mask-list entries carry the fm_partial flag in bit 30 (see
+            # build_flashmask_block_lists_kernel); strip it for the KV block index.
+            n = mask_idx[mi] & 0x3FFFFFFF
         return n
+
+    @cute.jit
+    def _mask_partial_at(
+        self,
+        mask_idx: cute.Tensor,
+        mask_cnt: Int32,
+        p: Int32,
+    ) -> Int32:
+        """Return the fm_partial flag (0/1) for mask-list processing position `p`
+        (reversed, high-n first), decoded from bit 30 of the stored index. Lets the
+        producer/consumer skip the rowidx copy / per-element apply for mask-list
+        blocks that only need causal/seqlen masking (not flashmask) without the
+        per-block gmem read that _flashmask_block_partial would do."""
+        mi = cutlass.max(mask_cnt - 1 - p, Int32(0))
+        return (mask_idx[mi] >> 30) & 1
 
     @cute.jit
     def _produce_kv_block(
@@ -1248,6 +1268,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         seqlen_k: Int32,
         m_block: Int32,
         seqlen_q: Int32,
+        is_partial: Optional[Int32] = None,
     ) -> None:
         """Stage the per-n_block startend_row_indices vectors (LTS/LTE/UTS/UTE)
         into shared memory for the consumer's flashmask application. Runs on the
@@ -1268,11 +1289,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         fm_heads = flashmask_info.startend_row_indices.shape[1]
         h_h_flashmask_ratio = num_heads // fm_heads
         fm_head_idx = head_idx // h_h_flashmask_ratio
-        m_start = m_block * self.tile_m
-        m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
-        partial = self._flashmask_block_partial(
-            flashmask_info, batch_idx, fm_head_idx, n_block, m_start, m_end
-        )
+        # Prefer the precomputed fm_partial flag (decoded from the block-list index
+        # by the caller); fall back to the per-block gmem predicate only when the
+        # caller doesn't provide it (non-block-sparse path).
+        if const_expr(is_partial is None):
+            m_start = m_block * self.tile_m
+            m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
+            partial = self._flashmask_block_partial(
+                flashmask_info, batch_idx, fm_head_idx, n_block, m_start, m_end
+            )
+        else:
+            partial = is_partial != 0
         if partial:
             base = stage * 4 * self.tile_n
             s_cur = cute.make_tensor(
@@ -1711,6 +1738,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn: Callable = None,
         score_mod_fn: Optional[Callable] = None,
         flashmask_fn: Optional[Callable] = None,
+        flashmask_is_partial: Optional[Int32] = None,
         is_first_block: bool = False,
     ):
         """Processes the first half block when using intra-warpgroup-overlap"""
@@ -1729,7 +1757,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
         # flashmask: applied after causal/seqlen mask, on the first block's stage.
         if const_expr(flashmask_fn is not None):
-            flashmask_fn(acc_S, kv_consumer_state, n_block)
+            flashmask_fn(acc_S, kv_consumer_state, n_block, is_partial=flashmask_is_partial)
 
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_block)
 
@@ -1794,6 +1822,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         head_idx: Int32,
         num_heads: Int32,
         seqlen_q: Int32,
+        is_partial: Optional[Int32] = None,
     ):
         """Consumer-side flashmask application for one n_block. The staging buffer
         stage and pipeline phase come from the KV consumer state (flashmask is in
@@ -1807,13 +1836,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         gmem->smem copy for the same fully-visible blocks."""
         stage = smem_pipe_read.index
         cute.arch.mbarrier_wait(mbar_ptr_rowidx + stage, smem_pipe_read.phase)
-        fm_heads = flashmask_info.startend_row_indices.shape[1]
-        fm_head_idx = head_idx // (num_heads // fm_heads)
-        m_start = m_block * self.tile_m
-        m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
-        partial = self._flashmask_block_partial(
-            flashmask_info, batch_idx, fm_head_idx, n_block, m_start, m_end
-        )
+        # Prefer the precomputed fm_partial flag (decoded from the block-list index
+        # by the caller); fall back to the per-block gmem predicate only when the
+        # caller doesn't provide it (non-block-sparse path).
+        if const_expr(is_partial is None):
+            fm_heads = flashmask_info.startend_row_indices.shape[1]
+            fm_head_idx = head_idx // (num_heads // fm_heads)
+            m_start = m_block * self.tile_m
+            m_end = cutlass.min(m_start + self.tile_m, seqlen_q)
+            partial = self._flashmask_block_partial(
+                flashmask_info, batch_idx, fm_head_idx, n_block, m_start, m_end
+            )
+        else:
+            partial = is_partial != 0
         if partial:
             stage_base = stage * 4 * self.tile_n
             s_cur = cute.make_tensor(
@@ -1982,6 +2017,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
         flashmask_fn: Optional[Callable] = None,
+        flashmask_is_partial: Optional[Int32] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
     ):
@@ -2000,7 +2036,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # flashmask (startend_row_indices): applied on every block, after the
         # causal/seqlen mask, reading the producer-staged smem indices.
         if const_expr(flashmask_fn is not None):
-            flashmask_fn(acc_S, smem_pipe_read, n_block)
+            flashmask_fn(acc_S, smem_pipe_read, n_block, is_partial=flashmask_is_partial)
 
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
         # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(layout_utils.reshape_acc_to_mn(acc_S))
@@ -2049,6 +2085,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
         flashmask_fn: Optional[Callable] = None,
+        flashmask_is_partial: Optional[Int32] = None,
         check_inf: cutlass.Constexpr = True,
     ):
         smem_pipe_read_v = smem_pipe_read.clone()
@@ -2075,7 +2112,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # flashmask: applied after causal/seqlen mask, on the current block's stage
         # (smem_pipe_read points at the current block's K/V stage here).
         if const_expr(flashmask_fn is not None):
-            flashmask_fn(acc_S, smem_pipe_read, n_block)
+            flashmask_fn(acc_S, smem_pipe_read, n_block, is_partial=flashmask_is_partial)
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(layout_utils.reshape_acc_to_mn(acc_S))
 
         row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)

@@ -419,7 +419,12 @@ def consume_block_sparse_loads(
 
     if const_expr(not intra_wg_overlap):
         if curr_mask_block_cnt > 0:
-            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
+            # Mask-list indices carry the fm_partial flag in bit 30: strip it for
+            # the KV block index and forward it so mma skips the per-element
+            # flashmask apply on causal/seqlen-only mask blocks.
+            mask_raw = curr_mask_block_idx[curr_mask_block_cnt - 1]
+            mask_n_block = mask_raw & 0x3FFFFFFF
+            mask_is_partial = (mask_raw >> 30) & 1
             warp_scheduler_barrier_sync()
             kv_consumer_state = mma_one_n_block(
                 kv_consumer_state,
@@ -431,16 +436,20 @@ def consume_block_sparse_loads(
                     mask_seqlen=True,
                     fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
                 ),
+                flashmask_is_partial=mask_is_partial,
                 is_first_n_block=True,
             )
             O_should_accumulate = True
             for i in cutlass.range(1, curr_mask_block_cnt):
-                mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+                mask_raw = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+                mask_n_block = mask_raw & 0x3FFFFFFF
+                mask_is_partial = (mask_raw >> 30) & 1
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=mask_n_block,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                     mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False),
+                    flashmask_is_partial=mask_is_partial,
                     is_first_n_block=False,
                 )
                 O_should_accumulate = True
@@ -491,7 +500,12 @@ def consume_block_sparse_loads(
             warp_scheduler_barrier_arrive()
     else:
         if curr_mask_block_cnt > 0:
-            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
+            # Mask-list indices carry the fm_partial flag in bit 30: strip it for
+            # the KV block index and forward it so the flashmask apply is skipped
+            # on causal/seqlen-only mask blocks (no per-block gmem predicate).
+            mask_raw = curr_mask_block_idx[curr_mask_block_cnt - 1]
+            mask_n_block = mask_raw & 0x3FFFFFFF
+            mask_is_partial = (mask_raw >> 30) & 1
             kv_consumer_state = process_first_half_block(
                 n_block=mask_n_block,
                 seqlen=seqlen_info,
@@ -504,16 +518,20 @@ def consume_block_sparse_loads(
                 ),
                 score_mod_fn=score_mod_fn,
                 flashmask_fn=flashmask_fn,
+                flashmask_is_partial=mask_is_partial,
                 is_first_block=True,
             )
             for i in cutlass.range(1, curr_mask_block_cnt):
-                mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+                mask_raw = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+                mask_n_block = mask_raw & 0x3FFFFFFF
+                mask_is_partial = (mask_raw >> 30) & 1
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=mask_n_block,
                     seqlen=seqlen_info,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                     mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False),
+                    flashmask_is_partial=mask_is_partial,
                 )
                 O_should_accumulate = True
 

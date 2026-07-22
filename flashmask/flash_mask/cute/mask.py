@@ -539,29 +539,37 @@ class AttentionMask:
         nrow = const_expr(cute.size(tScS_mn.shape[0]))
         ncol = const_expr(cute.size(tScS_mn.shape[1]))
         tile_n = const_expr(self.tile_n)
-        for r in cutlass.range(nrow, unroll_full=True):
-            for c in cutlass.range(ncol, unroll_full=True):
+        # In the mn view a thread's column coordinate depends only on c and its
+        # row coordinate only on r, so hoist the (up to 4) smem index loads and
+        # the m_block*tile_m rebase out of the row loop: one set of loads per
+        # column instead of per element.
+        m_offset = m_block * self.tile_m
+        for c in cutlass.range(ncol, unroll_full=True):
+            col = tScS_mn[0, c][COL]
+            lts = s_startend_row_indices[col] - m_offset
+            lte = Int32(0)
+            uts = Int32(0)
+            ute = Int32(0)
+            if const_expr(has_ut_start):
+                lte = s_startend_row_indices[tile_n + col] - m_offset
+                uts = s_startend_row_indices[2 * tile_n + col] - m_offset
+                ute = s_startend_row_indices[3 * tile_n + col] - m_offset
+            elif const_expr(has_lt_end):
+                lte = s_startend_row_indices[tile_n + col] - m_offset
+            elif const_expr(has_ut_end):
+                ute = s_startend_row_indices[3 * tile_n + col] - m_offset
+            for r in cutlass.range(nrow, unroll_full=True):
                 row = tScS_mn[r, c][ROW]
-                col = tScS_mn[r, c][COL]
                 if const_expr(has_ut_start):
-                    lts = s_startend_row_indices[col] - m_block * self.tile_m
-                    lte = s_startend_row_indices[tile_n + col] - m_block * self.tile_m
-                    uts = s_startend_row_indices[2 * tile_n + col] - m_block * self.tile_m
-                    ute = s_startend_row_indices[3 * tile_n + col] - m_block * self.tile_m
                     if (row >= lts and row < lte) or (row >= uts and row < ute):
                         acc_S_mn[r, c] = -Float32.inf
                 elif const_expr(has_lt_end):
-                    lts = s_startend_row_indices[col] - m_block * self.tile_m
-                    lte = s_startend_row_indices[tile_n + col] - m_block * self.tile_m
                     if row >= lts and row < lte:
                         acc_S_mn[r, c] = -Float32.inf
                 elif const_expr(has_ut_end):
-                    lts = s_startend_row_indices[col] - m_block * self.tile_m
-                    ute = s_startend_row_indices[3 * tile_n + col] - m_block * self.tile_m
                     if row >= lts or row < ute:
                         acc_S_mn[r, c] = -Float32.inf
                 else:
-                    lts = s_startend_row_indices[col] - m_block * self.tile_m
                     if row >= lts:
                         acc_S_mn[r, c] = -Float32.inf
 

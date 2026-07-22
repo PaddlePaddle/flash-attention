@@ -757,6 +757,11 @@ def build_flashmask_block_lists_kernel(
             block_col_idx = i * 32 + lane_id
             is_mask = cutlass.Int32(0)
             is_full = cutlass.Int32(0)
+            # fm_partial flag for mask-list blocks: encoded into the high bit of
+            # the stored index so the fwd producer/consumer can decide whether a
+            # per-element flashmask apply is needed without recomputing the
+            # (gmem-read) partial predicate per block.
+            mask_is_fm_partial = cutlass.Int32(0)
             if block_col_idx < num_blocks_col:
                 n_start = block_col_idx * kBlockN
                 n_end = cutlass.min(n_start + kBlockN, seqlen_k)
@@ -802,11 +807,15 @@ def build_flashmask_block_lists_kernel(
                 if cutlass.const_expr(split_full):
                     if (not skip) and needs_mask:
                         is_mask = cutlass.Int32(1)
+                        if fm_partial:
+                            mask_is_fm_partial = cutlass.Int32(1)
                     elif not skip:
                         is_full = cutlass.Int32(1)
                 else:
                     if not skip:
                         is_mask = cutlass.Int32(1)
+                        if fm_partial:
+                            mask_is_fm_partial = cutlass.Int32(1)
 
             # Warp-compact the surviving indices (ascending) with a prefix sum.
             incl_mask = utils.warp_prefix_sum(is_mask, lane_id)
@@ -816,7 +825,12 @@ def build_flashmask_block_lists_kernel(
             tot_mask = cute.arch.shuffle_sync(incl_mask, cute.arch.WARP_SIZE - 1)
             tot_full = cute.arch.shuffle_sync(incl_full, cute.arch.WARP_SIZE - 1)
             if is_mask != 0:
-                mask_idx[batch_idx, head_idx, block_row_idx, run_mask + excl_mask] = block_col_idx
+                # High bit (1<<30) marks blocks that actually overlap the flashmask
+                # region (need per-element apply). nk << 2^30 so bit 30 is free.
+                encoded_idx = block_col_idx
+                if mask_is_fm_partial != 0:
+                    encoded_idx = block_col_idx | (cutlass.Int32(1) << 30)
+                mask_idx[batch_idx, head_idx, block_row_idx, run_mask + excl_mask] = encoded_idx
             if is_full != 0:
                 full_idx[batch_idx, head_idx, block_row_idx, run_full + excl_full] = block_col_idx
             run_mask = run_mask + tot_mask

@@ -257,11 +257,14 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 num_wg=2,
             )
     else:
-        # hdim 256
+        # hdim 256: mirror C++ FA3 run_mha_bwd_hdim256 (Arch>=90). The dQ
+        # accumulator is atomicAdd'd straight to gmem (dQacc_use_TMA=False in the
+        # kernel), so no 64KB smem staging buffer is needed and we can afford a
+        # 2-stage Q pipeline (num_stages_Q=2). dKV/dQ MMAs use swapAB.
         return BwdConfig(
             m_block_size=64, n_block_size=64,
-            num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
-            SdP_swapAB=False, dKV_swapAB=False, dQ_swapAB=False,
+            num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
+            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=True,
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
         )
 

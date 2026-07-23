@@ -149,6 +149,17 @@ class FlashAttentionBackwardSm90:
             assert self.num_wg_mma == 2, "dQ_single_wg only supports 2 warp groups"
         self.num_wg_dQ = 1 if dQ_single_wg else self.num_wg_mma
 
+        # dQaccum accumulation strategy (mirrors C++ FA3 hopper bwd):
+        #   - head_dim < 256: stage dQ in a smem buffer, then TMA bulk-reduce-add
+        #     it to gmem from the dedicated store warp (dQacc_use_TMA=True).
+        #   - head_dim == 256: the 64KB smem staging buffer would force
+        #     num_stages_Q=1 (no Q/dO prefetch). Instead atomicAdd the dQ
+        #     accumulator registers straight to gmem, freeing the smem for a
+        #     2-stage Q pipeline.
+        # Deterministic mode requires an ordered accumulation (semaphore-gated
+        # smem+TMA path); atomicAdd order is non-deterministic, so force TMA.
+        self.dQacc_use_TMA = const_expr(self.tile_hdim < 256 or deterministic)
+
     @staticmethod
     def can_implement(
         dtype,
@@ -305,15 +316,21 @@ class FlashAttentionBackwardSm90:
         return tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ
 
     def _get_shared_storage_cls(self):
-        sQ_struct, sK_struct, sV_struct, sdO_struct, sdQaccum_struct = [
+        sQ_struct, sK_struct, sV_struct, sdO_struct = [
             cute.struct.Align[cute.struct.MemRange[t, cute.cosize(layout)], self.buffer_align_bytes]
             for (layout, t) in [
                 (self.sQ_layout, self.dtype),
                 (self.sK_layout, self.dtype),
                 (self.sV_layout, self.dtype),
                 (self.sdO_layout, self.dtype),
-                (self.sdQaccum_layout, Float32),
             ]
+        ]
+        # dQaccum smem staging is only used by the TMA bulk-reduce path. In the
+        # atomicAdd path (head_dim=256) it's dropped entirely to free the ~64KB
+        # for the 2-stage Q pipeline.
+        sdqaccum_cosize = cute.cosize(self.sdQaccum_layout) if const_expr(self.dQacc_use_TMA) else 0
+        sdQaccum_struct = cute.struct.Align[
+            cute.struct.MemRange[Float32, sdqaccum_cosize], self.buffer_align_bytes
         ]
         # For GQA, the epilogue recasts sV's bytes (extending into the
         # immediately-following sK field - see SharedStorageQKV field order
@@ -611,6 +628,11 @@ class FlashAttentionBackwardSm90:
             qhead_per_kvhead_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
 
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
+        if const_expr(self.use_block_sparsity):
+            assert self.dQacc_use_TMA, (
+                "block-sparse backward requires the TMA dQaccum staging path "
+                "(the atomicAdd dQ path is only used for head_dim=256)"
+            )
 
         if const_expr(window_size_left is not None):
             window_size_left = Int32(window_size_left)
@@ -772,7 +794,9 @@ class FlashAttentionBackwardSm90:
                 stride=(1, cute.round_up(self.tile_m, 64)),
             )
         )
-        sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
+        sdQaccum = None
+        if const_expr(self.dQacc_use_TMA):
+            sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
 
         s_rowidx = None
         if const_expr(self.enable_flashmask):
@@ -843,17 +867,18 @@ class FlashAttentionBackwardSm90:
                     cute.size(mQ.shape[2]),
                 )
             if warp_idx == 1:
-                self.dQaccum_store(
-                    mdQaccum,
-                    sdQaccum,
-                    block_info,
-                    TileSchedulerCls,
-                    SeqlenInfoCls,
-                    blocksparse_tensors,
-                    mdQ_semaphore,
-                    flashmask_info,
-                    cute.size(mQ.shape[2]),
-                )
+                if const_expr(self.dQacc_use_TMA):
+                    self.dQaccum_store(
+                        mdQaccum,
+                        sdQaccum,
+                        block_info,
+                        TileSchedulerCls,
+                        SeqlenInfoCls,
+                        blocksparse_tensors,
+                        mdQ_semaphore,
+                        flashmask_info,
+                        cute.size(mQ.shape[2]),
+                    )
         else:
             tidx, _, _ = cute.arch.thread_idx()
             tidx = tidx - 128
@@ -1368,9 +1393,11 @@ class FlashAttentionBackwardSm90:
             tLSEsdPsum = cute.group_modes(tLSEsdPsum, 0, 2)
 
         tdQsdQaccum = None
+        smem_thr_copy_dQaccum = None
         if const_expr(is_dQ_wg):
             smem_thr_copy_dQaccum = r2s_tiled_copy_dQaccum.get_slice(tidx)
-            tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
+            if const_expr(self.dQacc_use_TMA):
+                tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
 
         PdS_barrier = cutlass.pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwd.PdS), num_threads=self.num_mma_threads
@@ -1428,6 +1455,26 @@ class FlashAttentionBackwardSm90:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            # atomicAdd dQ path: partition this (head, batch)'s gmem dQaccum with
+            # the same tiled copy used for the smem staging, so element i of the
+            # dQ register accumulator maps to gmem index i (mirrors C++ FA3).
+            tdQgdQaccum = None
+            if const_expr(is_dQ_wg and not self.dQacc_use_TMA):
+                if const_expr(not seqlen.has_cu_seqlens_q):
+                    mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
+                else:
+                    mdQaccum_cur = cute.domain_offset(
+                        (seqlen.padded_offset_q * self.tile_hdim,), mdQaccum[None, head_idx]
+                    )
+                # (M*K, num_m_blocks) -> (M*K/WG, WG, num_m_blocks), matching the
+                # (M*K/WG, WG) smem staging layout so partition_D lines up 1:1.
+                gdQaccum_ = cute.local_tile(
+                    mdQaccum_cur, (self.tile_m * self.tile_hdim,), (None,)
+                )
+                gdQaccum = cute.flat_divide(
+                    gdQaccum_, (self.tile_m * self.tile_hdim // self.num_wg_dQ,)
+                )
+                tdQgdQaccum = smem_thr_copy_dQaccum.partition_D(gdQaccum)
             # mask = AttentionMaskCls(seqlen)
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             score_mod_fn_cur = partial(
@@ -1569,6 +1616,7 @@ class FlashAttentionBackwardSm90:
                                     score_mod_fn=score_mod_fn_cur,
                                     score_mod_bwd_fn=score_mod_bwd_fn_cur,
                                     dKV_accumulate=dKV_accumulate,
+                                    tdQgdQaccum=tdQgdQaccum,
                                 )
                                 dKV_accumulate = True
                     else:
@@ -1582,6 +1630,7 @@ class FlashAttentionBackwardSm90:
                                 score_mod_fn=score_mod_fn_cur,
                                 score_mod_bwd_fn=score_mod_bwd_fn_cur,
                                 dKV_accumulate=dKV_accumulate,
+                                tdQgdQaccum=tdQgdQaccum,
                             )
                             dKV_accumulate = True
                 else:
@@ -1872,6 +1921,7 @@ class FlashAttentionBackwardSm90:
         score_mod_bwd_fn: Optional[Callable] = None,
         dKV_accumulate: Boolean = True,
         partially_masked: Boolean = True,
+        tdQgdQaccum: Optional[cute.Tensor] = None,
     ):
         consumer_state_dO_cur = (
             consumer_state_Q if const_expr(self.Q_stage == self.dO_stage) else consumer_state_dO
@@ -1978,24 +2028,46 @@ class FlashAttentionBackwardSm90:
             else:
                 mma_dsq_fn(tCrA=tdKrdS, B_idx=smem_idx_Q, zero_init=not dKV_accumulate, wg_wait=1)
 
-            # dQ R2S: wait for dQaccum_store to free the smem buffer, then write dQ to smem
-            # When dQ_single_wg, only WG0 enters here so warp_group_idx == 0
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
-                number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,
-            )
-            tdQrdQaccum_flat = cute.make_tensor(
-                acc_dQ.iterator, cute.make_layout(tdQsdQaccum.shape)
-            )
-            cute.autovec_copy(tdQrdQaccum_flat, tdQsdQaccum)
-            cute.arch.fence_view_async_shared()
-            cute.arch.barrier_arrive(
-                barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
-                number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,
-            )
+            if const_expr(self.dQacc_use_TMA):
+                # dQ R2S: wait for dQaccum_store to free the smem buffer, then write dQ to smem
+                # When dQ_single_wg, only WG0 enters here so warp_group_idx == 0
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
+                    number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,
+                )
+                tdQrdQaccum_flat = cute.make_tensor(
+                    acc_dQ.iterator, cute.make_layout(tdQsdQaccum.shape)
+                )
+                cute.autovec_copy(tdQrdQaccum_flat, tdQsdQaccum)
+                cute.arch.fence_view_async_shared()
+                cute.arch.barrier_arrive(
+                    barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
+                    number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,
+                )
 
-            warpgroup.wait_group(0)
-            pipeline_Q.consumer_release(consumer_state_Q)
+                warpgroup.wait_group(0)
+                pipeline_Q.consumer_release(consumer_state_Q)
+            else:
+                # atomicAdd path (head_dim=256): dK MMA above ran with wg_wait=1,
+                # so the earlier dQ MMA is complete -> acc_dQ is ready. Reduce the
+                # dQ registers straight into gmem with vectorized (v4.f32) atomics,
+                # then wait for the dK MMA and release Q. Element i of the flat dQ
+                # accumulator maps to gmem index i of tdQgdQaccum[..., m_block]
+                # (same tiled copy that partitions the smem staging buffer).
+                tdQg_m = tdQgdQaccum[None, None, None, m_block]
+                n = cute.size(tdQg_m)
+                assert n % 4 == 0, "dQ per-thread element count must be a multiple of 4 (v4.f32 atomics)"
+                tdQr = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQg_m.shape))
+                for i in cutlass.range_constexpr(0, n, 4):
+                    copy_utils.atomic_add_fp32x4(
+                        tdQr[i],
+                        tdQr[i + 1],
+                        tdQr[i + 2],
+                        tdQr[i + 3],
+                        utils.elem_pointer(tdQg_m, i),
+                    )
+                warpgroup.wait_group(0)
+                pipeline_Q.consumer_release(consumer_state_Q)
         else:
             # dQ_single_wg: WG1 skips dQ, only does dV wait + dK
             # (7) [GEMM 5] dK += dS.T @ Q

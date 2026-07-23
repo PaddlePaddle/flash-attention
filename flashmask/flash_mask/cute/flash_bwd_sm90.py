@@ -160,6 +160,21 @@ class FlashAttentionBackwardSm90:
         # smem+TMA path); atomicAdd order is non-deterministic, so force TMA.
         self.dQacc_use_TMA = const_expr(self.tile_hdim < 256 or deterministic)
 
+        # Slice the dQ/dK/dV MMAs into two M-halves and interleave them so the
+        # dQ atomicAdd of the first half overlaps the second half's MMA (mirrors
+        # C++ FA3 Slice_dQKV_Mma for head_dim=256). Only valid on the atomicAdd dQ
+        # path with dQ_swapAB, AtomLayoutMdQ==1 and 2 MMA warp groups (same
+        # predicate as cpp). mma_dkv_is_rs must be False (guaranteed here since
+        # SdP_swapAB is False for the d256 config), matching cpp's static_assert.
+        self.slice_dQKV_mma = const_expr(
+            self.tile_hdim == 256
+            and not self.dQacc_use_TMA
+            and self.dQ_swapAB
+            and self.AtomLayoutMdQ == 1
+            and self.num_wg_mma == 2
+            and not self.mma_dkv_is_rs
+        )
+
     @staticmethod
     def can_implement(
         dtype,
@@ -1339,6 +1354,8 @@ class FlashAttentionBackwardSm90:
         sKt = layout_utils.transpose_view(sK)
         shape_mnk_dQ = (self.tile_m, self.tile_hdim, self.tile_n)
         mma_dsk_fn = None
+        mma_dsk_slice_fn = None
+        dQ_acc_shape = None
         if const_expr(is_dQ_wg):
             _, tdQrdS, tdQrKt = sm90_utils.partition_fragment_ABC(
                 wg_mma_dQ, shape_mnk_dQ, sdS, sKt, swap_AB=self.dQ_swapAB
@@ -1351,6 +1368,14 @@ class FlashAttentionBackwardSm90:
                 tdQrKt,
                 swap_AB=self.dQ_swapAB,
             )
+            if const_expr(self.slice_dQKV_mma):
+                # For the sliced schedule we allocate acc_dQ once per m_block and
+                # drive it with two m_slice MMA calls, so bind a gemm_w_idx variant
+                # (acc passed in) and precompute the (swapped) dQ C-accum shape.
+                mma_dsk_slice_fn = partial(
+                    gemm_w_idx, tiled_mma_dQ, tCrA=tdQrdS, tCrB=tdQrKt, swap_AB=self.dQ_swapAB
+                )
+                dQ_acc_shape = tiled_mma_dQ.partition_shape_C((self.tile_hdim, self.tile_m))
 
         # Smem copy atom tiling for P/dS R2S
         copy_P_r2s = None
@@ -1439,6 +1464,8 @@ class FlashAttentionBackwardSm90:
             tdQsdQaccum=tdQsdQaccum,
             softmax_scale_log2=softmax_scale_log2,
             PdS_barrier=PdS_barrier,
+            mma_dsk_slice_fn=mma_dsk_slice_fn,
+            dQ_acc_shape=dQ_acc_shape,
             # acc_dV=acc_dV,
             # acc_dK=acc_dK,
             is_dQ_wg=is_dQ_wg,
@@ -1922,6 +1949,8 @@ class FlashAttentionBackwardSm90:
         dKV_accumulate: Boolean = True,
         partially_masked: Boolean = True,
         tdQgdQaccum: Optional[cute.Tensor] = None,
+        mma_dsk_slice_fn: Optional[Callable] = None,
+        dQ_acc_shape: cutlass.Constexpr = None,
     ):
         consumer_state_dO_cur = (
             consumer_state_Q if const_expr(self.Q_stage == self.dO_stage) else consumer_state_dO
@@ -2002,6 +2031,62 @@ class FlashAttentionBackwardSm90:
 
         # R2S for dS
         copy_dS_r2s(tdKrdS, dst_idx=smem_idx_PdS)
+
+        if const_expr(self.slice_dQKV_mma):
+            # Slice_dQKV_Mma (d256 atomicAdd path, mirrors cpp run_mha_bwd_hdim256):
+            # split dV/dQ/dK into two M-halves and interleave so the dQ atomicAdd of
+            # the first half overlaps the second half's MMA, and only half the dQ
+            # accumulator is transiently consumed by the atomics at a time.
+            # dV half0
+            mma_pdo_fn(
+                A_idx=smem_idx_PdS, B_idx=smem_idx_dO, zero_init=not dKV_accumulate,
+                wg_wait=-1, m_slice=0,
+            )
+            cute.arch.fence_view_async_shared()
+            PdS_barrier.arrive_and_wait()
+            acc_dQ = cute.make_rmem_tensor(dQ_acc_shape, Float32)
+            # dQ half0
+            mma_dsk_slice_fn(acc_dQ, zero_init=True, A_idx=smem_idx_PdS, wg_wait=-1, m_slice=0)
+            # dV half1 (wg_wait=1 -> dQ half0 complete)
+            mma_pdo_fn(
+                A_idx=smem_idx_PdS, B_idx=smem_idx_dO, zero_init=not dKV_accumulate,
+                wg_wait=1, m_slice=1,
+            )
+            # atomicAdd dQ half0 (first n/2 flat elements == MMA_M slice 0)
+            tdQg_m = tdQgdQaccum[None, None, None, m_block]
+            n = cute.size(tdQg_m)
+            half = n // 2
+            assert n % 8 == 0, "dQ per-thread element count must be a multiple of 8 for sliced v4 atomics"
+            tdQr = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQg_m.shape))
+            for i in cutlass.range_constexpr(0, half, 4):
+                copy_utils.atomic_add_fp32x4(
+                    tdQr[i], tdQr[i + 1], tdQr[i + 2], tdQr[i + 3],
+                    utils.elem_pointer(tdQg_m, i),
+                )
+            # dK half0 (wg_wait=1)
+            mma_dsq_fn(
+                A_idx=smem_idx_PdS, B_idx=smem_idx_Q, zero_init=not dKV_accumulate,
+                wg_wait=1, m_slice=0,
+            )
+            pipeline_dO.consumer_release(consumer_state_dO_cur)  # release dO
+            # dQ half1 (wg_wait=0 -> dV half1 + dK half0 complete)
+            mma_dsk_slice_fn(acc_dQ, zero_init=True, A_idx=smem_idx_PdS, wg_wait=0, m_slice=1)
+            # atomicAdd dQ half1
+            for i in cutlass.range_constexpr(half, n, 4):
+                copy_utils.atomic_add_fp32x4(
+                    tdQr[i], tdQr[i + 1], tdQr[i + 2], tdQr[i + 3],
+                    utils.elem_pointer(tdQg_m, i),
+                )
+            # dK half1
+            mma_dsq_fn(
+                A_idx=smem_idx_PdS, B_idx=smem_idx_Q, zero_init=not dKV_accumulate,
+                wg_wait=-1, m_slice=1,
+            )
+            warpgroup.wait_group(0)
+            pipeline_Q.consumer_release(consumer_state_Q)
+            consumer_state_Q.advance()
+            consumer_state_dO.advance()
+            return consumer_state_Q, consumer_state_dO
 
         # (5) [GEMM 3] dV += P.T @ dO
         if const_expr(not self.mma_dkv_is_rs):

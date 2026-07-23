@@ -261,8 +261,17 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
         # accumulator is atomicAdd'd straight to gmem (dQacc_use_TMA=False in the
         # kernel), so no 64KB smem staging buffer is needed and we can afford a
         # 2-stage Q pipeline (num_stages_Q=2). dKV/dQ MMAs use swapAB.
+        #
+        # n_block_size: the d256 bwd is L2/DRAM-bound (ncu: ~78% L2, SM ~43%), and
+        # each KV-block CTA re-streams its Q/dO/LSE/dPsum and re-issues dQ atomics,
+        # so total memory traffic scales with the number of KV-blocks. Mainline FA3
+        # uses N=80 for the dense case (vs 64), giving ~20% fewer KV-blocks and a
+        # matching ~20% traffic cut. Use 80 for the dense/non-flashmask path; keep
+        # 64 for flashmask so the block max/min scan + block-list tiling (kBlockN)
+        # stay on the value the sparse masks were tuned for.
+        n_block_size = 64 if flashmask else 80
         return BwdConfig(
-            m_block_size=64, n_block_size=64,
+            m_block_size=64, n_block_size=n_block_size,
             num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
             SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=True,
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,

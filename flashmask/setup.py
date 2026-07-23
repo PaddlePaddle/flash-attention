@@ -54,7 +54,7 @@ from setuptools import setup as setuptools_setup, find_packages
 FLASHMASK_BUILD = os.environ.get('FLASHMASK_BUILD', 'all').lower()
 requested_components = set(re.split(r'[,\s+]+', FLASHMASK_BUILD.strip()))
 requested_components.discard('')
-ALLOWED_COMPONENTS = {'fa3', 'fa4', 'fla', 'cpb', 'utils', 'all'}
+ALLOWED_COMPONENTS = {'fa3', 'fa4', 'fla', 'cpb', 'utils', 'ovl', 'all'}
 invalid_components = requested_components - ALLOWED_COMPONENTS
 assert requested_components and not invalid_components, (
     f"Invalid FLASHMASK_BUILD component(s): {', '.join(sorted(invalid_components or requested_components))}. "
@@ -73,6 +73,14 @@ print(f"[flashmask] FLASHMASK_BUILD={FLASHMASK_BUILD}  "
       f"BUILD_FA3={BUILD_FA3}  BUILD_FA4={BUILD_FA4}  "
       f"BUILD_FLA={BUILD_FLA}  BUILD_CPB={BUILD_CPB}  "
       f"BUILD_UTILS={BUILD_UTILS}")
+
+# Overlap bridge is opt-in only: it needs NVSHMEM + H100/B200, so it is NOT
+# pulled in by 'all'. Request it explicitly with FLASHMASK_BUILD=...,ovl.
+BUILD_OVL = 'ovl' in requested_components
+
+print(f"[flashmask] FLASHMASK_BUILD={FLASHMASK_BUILD}  "
+      f"BUILD_FA3={BUILD_FA3}  BUILD_FA4={BUILD_FA4}  "
+      f"BUILD_FLA={BUILD_FLA}  BUILD_CPB={BUILD_CPB}  BUILD_OVL={BUILD_OVL}")
 if BUILD_FLA:
     print("[flashmask] Note: FLA (Flash Linear Attention) in flashmask currently only supports GDN and KDA operators.")
 
@@ -125,7 +133,8 @@ VERSION = _get_version()
 # ============================================================
 exclude_packages = ['build', 'build.*', 'tests', 'tests.*',
                      'flash_mask.cp_balance.csrc', 'flash_mask.cp_balance.csrc.*',
-                     'flash_mask.utils.csrc', 'flash_mask.utils.csrc.*']
+                     'flash_mask.utils.csrc', 'flash_mask.utils.csrc.*',
+                     'flash_mask.overlap.csrc', 'flash_mask.overlap.csrc.*']
 if not BUILD_FA3:
     exclude_packages += [
         'flash_mask.flashmask_attention_v3',
@@ -145,6 +154,11 @@ if not BUILD_CPB:
     exclude_packages += [
         "flash_mask.cp_balance",
         "flash_mask.cp_balance.*",
+    ]
+if not BUILD_OVL:
+    exclude_packages += [
+        "flash_mask.overlap",
+        "flash_mask.overlap.*",
     ]
 
 packages = find_packages(exclude=exclude_packages)
@@ -462,6 +476,109 @@ if BUILD_FA3:
 # To add a new submodule, just call _build_cuda_submodule() and append
 # the returned package name to _submodule_package_data.
 
+def _detect_cutlass_inc():
+    """Find a cutlass include dir containing cutlass/bfloat16.h.
+
+    Priority:
+      1. env FM4_OVERLAP_CUTLASS_INC (explicit override)
+      2. the FA4 submodule (flashmask_attention_v3/cutlass/include)
+      3. Paddle's vendored cutlass (third_party/cutlass/include) if discoverable
+    Returns the dir, or None if nothing usable is found.
+    """
+    env = os.environ.get('FM4_OVERLAP_CUTLASS_INC')
+    candidates = []
+    if env:
+        candidates.append(env)
+    candidates.append(os.path.join(FA_V3_DIR, 'cutlass', 'include'))
+    # Paddle install layout: <paddle>/third_party/cutlass/include. Try to locate
+    # paddle and derive it, best-effort (skipped silently if paddle absent).
+    try:
+        import paddle  # noqa: F401
+        _pd = os.path.dirname(os.path.abspath(paddle.__file__))
+        # paddle/__init__.py -> .../site-packages/paddle ; cutlass usually lives
+        # in the source tree, so also probe a couple of common roots.
+        for _root in (
+            os.path.join(_pd, '..', '..', '..', 'third_party', 'cutlass', 'include'),
+        ):
+            candidates.append(os.path.normpath(_root))
+    except Exception:
+        pass
+
+    for c in candidates:
+        if c and os.path.exists(os.path.join(c, 'cutlass', 'bfloat16.h')):
+            return c
+    return None
+
+
+def _build_cmake_submodule(name, csrc_dir, pkg_dir, lib_prefix, cmake_defs):
+    """Build a submodule via a standalone sub-CMake (configure + build).
+
+    Unlike _build_cuda_submodule (Paddle CUDAExtension), this drives plain CMake.
+    Used by the overlap bridge, which reuses the proven distributed/CMakeLists.txt
+    NVSHMEM link recipe. Steps:
+      1. cmake -S csrc_dir -B csrc_dir/build  <-D defs...>
+      2. cmake --build csrc_dir/build -j
+      3. copy the produced lib{lib_prefix}*.so into pkg_dir
+      4. clean the build dir
+
+    Args:
+        name: human-readable label for logs.
+        csrc_dir: dir containing the sub-CMakeLists.txt.
+        pkg_dir: package dir to copy the .so into.
+        lib_prefix: shared-lib basename prefix to glob (e.g. 'fm4_overlap').
+        cmake_defs: dict of -D cache vars.
+
+    Returns the dotted package name for package_data, or None if skipped.
+    """
+    if not os.path.isdir(csrc_dir):
+        print(f"[flashmask] {name}: csrc directory not found, skipping.")
+        return None
+
+    build_dir = os.path.join(csrc_dir, 'build')
+    print(f"[flashmask] Building {name} via CMake...")
+
+    configure = ['cmake', '-S', csrc_dir, '-B', build_dir,
+                 '-DCMAKE_BUILD_TYPE=Release']
+    for k, v in cmake_defs.items():
+        configure.append(f'-D{k}={v}')
+
+    result = subprocess.run(configure, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"[flashmask] {name} cmake configure STDOUT:\n{result.stdout}")
+        print(f"[flashmask] {name} cmake configure STDERR:\n{result.stderr}")
+        raise RuntimeError(
+            f"Failed to configure {name}.\n"
+            f"Run manually: {' '.join(configure)}"
+        )
+
+    result = subprocess.run(
+        ['cmake', '--build', build_dir, '-j'],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"[flashmask] {name} cmake build STDOUT:\n{result.stdout}")
+        print(f"[flashmask] {name} cmake build STDERR:\n{result.stderr}")
+        raise RuntimeError(
+            f"Failed to build {name}.\n"
+            f"Run manually: cmake --build {build_dir} -j"
+        )
+
+    so_files = glob.glob(os.path.join(build_dir, '**', f'lib{lib_prefix}*.so'),
+                         recursive=True)
+    if not so_files:
+        raise RuntimeError(
+            f"{name} build succeeded but no lib{lib_prefix}*.so found under "
+            f"{build_dir}/"
+        )
+    so_path = so_files[0]
+    shutil.copy2(so_path, os.path.join(pkg_dir, os.path.basename(so_path)))
+    print(f"[flashmask] {name} built: {os.path.basename(so_path)}")
+
+    shutil.rmtree(build_dir, ignore_errors=True)
+
+    return os.path.relpath(pkg_dir, ROOT_DIR).replace(os.sep, '.')
+
+
 def _build_cuda_submodule(name, csrc_dir, pkg_dir):
     """Build a CUDA submodule and copy outputs into its package directory.
 
@@ -558,6 +675,45 @@ if BUILD_UTILS:
 #   _pkg = _build_cuda_submodule('Name', csrc_dir=..., pkg_dir=...)
 #   if _pkg:
 #       _submodule_package_data[_pkg] = ['*.so']
+
+# --- overlap bridge: NVSHMEM + sm_90a/sm_100, built via standalone sub-CMake ---
+# Opt-in only (BUILD_OVL). Requires NVSHMEM; the location + target arch are env-
+# configurable so the same tree builds on H100 (reuse prebuilt sm_90 NVSHMEM) and
+# B200 (point at a sm_100 NVSHMEM). Missing NVSHMEM or cutlass -> warn + skip,
+# never fail the whole install (FA4 keeps working).
+if BUILD_OVL:
+    _ovl_csrc = os.path.join(FLASH_MASK_DIR, 'overlap', 'csrc')
+    _ovl_pkg_dir = os.path.join(FLASH_MASK_DIR, 'overlap')
+    _nvshmem_home = os.environ.get(
+        'NVSHMEM_HOME',
+        '/root/work/Paddle/build/third_party/install/nvshmem',
+    )
+    _ovl_arch = os.environ.get('FM4_OVERLAP_CUDA_ARCH', '90a')
+    _cutlass_inc = _detect_cutlass_inc()
+
+    if not os.path.isdir(_nvshmem_home):
+        print(f"[flashmask] overlap: NVSHMEM_HOME not found ({_nvshmem_home}); "
+              f"skipping overlap bridge. Set NVSHMEM_HOME to a valid install.")
+    elif _cutlass_inc is None:
+        print("[flashmask] overlap: cutlass/bfloat16.h not found "
+              "(set FM4_OVERLAP_CUTLASS_INC or init the FA4 submodule); "
+              "skipping overlap bridge.")
+    else:
+        print(f"[flashmask] overlap: NVSHMEM_HOME={_nvshmem_home}  "
+              f"arch={_ovl_arch}  cutlass_inc={_cutlass_inc}")
+        _pkg = _build_cmake_submodule(
+            'FM4 Overlap',
+            csrc_dir=_ovl_csrc,
+            pkg_dir=_ovl_pkg_dir,
+            lib_prefix='fm4_overlap',
+            cmake_defs={
+                'NVSHMEM_INSTALL_DIR': _nvshmem_home,
+                'FM4_OVERLAP_CUDA_ARCH': _ovl_arch,
+                'FM4_OVERLAP_CUTLASS_INC': _cutlass_inc,
+            },
+        )
+        if _pkg:
+            _submodule_package_data[_pkg] = ['*.so']
 
 # ============================================================
 # Build: use paddle's setup when building FA3, plain setuptools otherwise

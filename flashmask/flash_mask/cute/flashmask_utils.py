@@ -71,6 +71,23 @@ class FlashMaskInfo(NamedTuple):
         return FlashMaskInfo(*values)
 
 
+class OverlapInfo(NamedTuple):
+    """Carries the comm-side readiness handle into the fwd load warp.
+
+    write_ptr is a 1-D int32 device tensor (one entry, but laid out per batch by
+    the comm kernel: stride is (s_total - kv_chunk_size) rows per batch). The
+    load warp spins on it before each remote KV tile. kv_chunk_size is the local
+    chunk row count (== s_local); rows in the last kv_chunk_size of SRBuffer are
+    local and never remote-fetched, so they skip the wait.
+    """
+    write_ptr: cute.Tensor
+    kv_chunk_size: cutlass.Constexpr[int]
+
+    def __new_from_mlir_values__(self, values):
+        # only write_ptr is a live MLIR value; kv_chunk_size is baked at compile
+        return OverlapInfo(values[0], self.kv_chunk_size)
+
+
 @dataclass
 class FlashMaskInfoPaddle:
     is_causal: bool

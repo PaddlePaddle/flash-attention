@@ -31,6 +31,7 @@ from flash_mask.cute import utils
 from flash_mask.cute import layout_utils
 from flash_mask.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_mask.cute import copy_utils
+from flash_mask.cute.barrier import wait_flag_eq
 from flash_mask.cute import pipeline
 from flash_mask.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from flash_mask.cute.mask import AttentionMask
@@ -46,6 +47,25 @@ from flash_mask.cute.tile_scheduler import (
 from flash_mask.cute import barrier
 from flash_mask.cute.named_barrier import NamedBarrierBwdSm100
 from flash_mask.cute.flashmask_utils import FlashMaskInfo
+
+
+@cute.jit
+def _overlap_gate_bwd(
+    n_block: Int32,
+    tidx: Int32,
+    seqlen_k: Int32,
+    batch_idx: Int32,
+    work_done: cute.Pointer,
+    comm_rpb: cutlass.Constexpr[int],
+    cta_group_size: cutlass.Constexpr[int],
+    tile_n: cutlass.Constexpr[int],
+):
+    """Wait for the split-AG work item covering this cluster-wide KV tile."""
+    if tidx == 0:
+        right_edge = (n_block // cta_group_size + 1) * cta_group_size * tile_n
+        work_per_batch = seqlen_k // comm_rpb
+        work_id = batch_idx * work_per_batch + (right_edge - 1) // comm_rpb + 1
+        wait_flag_eq(work_done, Int32(work_id), Int32(1))
 
 
 class FlashAttentionBackwardSm100:
@@ -545,12 +565,81 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         blocksparse_tensors=None,
         flashmask_info: Optional[FlashMaskInfo] = None,
+        overlap_k_addr: Optional[cutlass.Int64] = None,
+        overlap_v_addr: Optional[cutlass.Int64] = None,
+        overlap_work_done_addr: Optional[cutlass.Int64] = None,
+        overlap_segment_idx: Optional[cutlass.Int32] = None,
+        overlap_dk_addr: Optional[cutlass.Int64] = None,
+        overlap_dv_addr: Optional[cutlass.Int64] = None,
+        overlap_b: Optional[cutlass.Int32] = None,
+        overlap_s: Optional[cutlass.Int32] = None,
+        overlap_h: Optional[cutlass.Int32] = None,
+        overlap_d: Optional[cutlass.Int32] = None,
+        overlap_comm_rpb: cutlass.Constexpr = None,
+        overlap_bhsd_layout: cutlass.Constexpr = False,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
         assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
             "Variable sequence length is not supported yet in FlashAttentionBackwardSm100"
         )
+        # FM-4 split-AG overlap: the segment K/V live in the NVSHMEM SRBuffer
+        # (no Paddle tensor / dlpack capsule), so they arrive as a raw addr plus
+        # the segment (B, S_segment, H, D) dims as RUNTIME Int32 scalars. Rebuild the
+        # views HERE in this jit body's MLIR Context (make_*_from_addr requires it),
+        # with Int32 dims giving the dynamic (?,?,?,?):(?,?,?,1) layout that the
+        # dlpack path produces -- static dims read the wrong bytes (utils.py:801).
+        # This mirrors the forward SRBuffer view construction. Readiness is gated
+        # per communication work item in the load warp below.
+        self.overlap_bhsd_layout = const_expr(overlap_bhsd_layout)
+        if const_expr(overlap_k_addr is not None):
+            if const_expr(overlap_bhsd_layout):
+                mK = utils.make_bhsd_storage_bshd_from_addr(
+                    overlap_k_addr,
+                    overlap_b,
+                    overlap_s,
+                    overlap_h,
+                    overlap_d,
+                    mQ.element_type,
+                    align=16,
+                )
+                mV = utils.make_bhsd_storage_bshd_from_addr(
+                    overlap_v_addr,
+                    overlap_b,
+                    overlap_s,
+                    overlap_h,
+                    overlap_d,
+                    mQ.element_type,
+                    align=16,
+                )
+            else:
+                mK = utils.make_contiguous_bshd_from_addr(
+                    overlap_k_addr,
+                    overlap_b,
+                    overlap_s,
+                    overlap_h,
+                    overlap_d,
+                    mQ.element_type,
+                    align=16,
+                )
+                mV = utils.make_contiguous_bshd_from_addr(
+                    overlap_v_addr,
+                    overlap_b,
+                    overlap_s,
+                    overlap_h,
+                    overlap_d,
+                    mQ.element_type,
+                    align=16,
+                )
+        if const_expr(overlap_dk_addr is not None):
+            mdK = utils.make_contiguous_bshd_from_addr(
+                overlap_dk_addr, overlap_b, overlap_s, overlap_h, overlap_d,
+                mQ.element_type, align=16,
+            )
+            mdV = utils.make_contiguous_bshd_from_addr(
+                overlap_dv_addr, overlap_b, overlap_s, overlap_h, overlap_d,
+                mQ.element_type, align=16,
+            )
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
@@ -1029,6 +1118,9 @@ class FlashAttentionBackwardSm100:
             tma_atom_dV,
             tma_atom_dK,
             flashmask_info,
+            overlap_work_done_addr,
+            overlap_segment_idx,
+            overlap_comm_rpb,
             self.sQ_layout,
             self.sQt_layout,
             self.sK_layout,
@@ -1095,6 +1187,9 @@ class FlashAttentionBackwardSm100:
         tma_atom_dV: Optional[cute.CopyAtom],
         tma_atom_dK: Optional[cute.CopyAtom],
         flashmask_info: Optional[FlashMaskInfo],
+        overlap_work_done_addr: Optional[cutlass.Int64],
+        overlap_segment_idx: Optional[cutlass.Int32],
+        overlap_comm_rpb: cutlass.Constexpr,
         sQ_layout: cute.ComposedLayout,
         sQt_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
@@ -1561,6 +1656,9 @@ class FlashAttentionBackwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 flashmask_info,
+                overlap_work_done_addr,
+                overlap_segment_idx,
+                overlap_comm_rpb,
                 sStartEndRowIndices,
                 sFM_max_min,
                 flashmask_loaded_mbar_ptr,
@@ -1805,6 +1903,9 @@ class FlashAttentionBackwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         flashmask_info: FlashMaskInfo,
+        overlap_work_done_addr: Optional[cutlass.Int64],
+        overlap_segment_idx: Optional[cutlass.Int32],
+        overlap_comm_rpb: cutlass.Constexpr,
         sStartEndRowIndices: cute.Tensor,
         sFM_max_min: cute.Tensor,
         flashmask_loaded_mbar_ptr: cute.Pointer,
@@ -1813,6 +1914,13 @@ class FlashAttentionBackwardSm100:
     ):
         num_load_threads = cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
+        if const_expr(overlap_work_done_addr is not None):
+            work_done = cute.make_ptr(
+                cutlass.Int32,
+                overlap_work_done_addr,
+                cute.AddressSpace.gmem,
+                assumed_align=4,
+            )
 
         producer_state_Q_LSE = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
@@ -1854,10 +1962,26 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            head_idx_kv = head_idx // self.qhead_per_kvhead
+            if const_expr(overlap_work_done_addr is not None):
+                gate_batch_idx = batch_idx
+                if const_expr(self.overlap_bhsd_layout):
+                    gate_batch_idx = (
+                        batch_idx * cute.size(mK.shape[2]) + head_idx_kv
+                    )
+                _overlap_gate_bwd(
+                    n_block,
+                    tidx,
+                    seqlen.seqlen_k,
+                    gate_batch_idx,
+                    work_done,
+                    overlap_comm_rpb,
+                    self.cta_group_size,
+                    self.tile_n,
+                )
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
-            head_idx_kv = head_idx // self.qhead_per_kvhead
             n_block_cta_group = n_block // self.cta_group_size
 
             mQ_cur = mQ[None, None, head_idx, batch_idx]
@@ -2011,7 +2135,17 @@ class FlashAttentionBackwardSm100:
                 # flashmask boundaries, but share pipeline stages. All warps on
                 # both CTAs must process the same number of blocks to stay in sync.
                 if const_expr(self.enable_flashmask):
-                    self.load_fm(flashmask_info, sStartEndRowIndices, sFM_max_min, seqlen, mQ.shape[2], n_block, head_idx, batch_idx)
+                    self.load_fm(
+                        flashmask_info,
+                        sStartEndRowIndices,
+                        sFM_max_min,
+                        seqlen,
+                        mQ.shape[2],
+                        n_block,
+                        head_idx,
+                        batch_idx,
+                        overlap_segment_idx,
+                    )
                     cute.arch.mbarrier_arrive(flashmask_loaded_mbar_ptr)
                     if tidx == 0 and self.debug_print:
                         cute.printf('LOAD FM: cta_rank=%d, n_block=%d, m_block_min=%d, m_block_max=%d, total_blocks=%d (no skip)', cute.arch.block_idx_in_cluster(), n_block, m_block_min, m_block_max, m_block_max - m_block_min)
@@ -2333,8 +2467,15 @@ class FlashAttentionBackwardSm100:
                 zero_block = False
                 if const_expr(self.enable_flashmask):
                     self.load_fm(
-                        flashmask_info, sStartEndRowIndices, sFM_max_min,
-                        seqlen, mQ.shape[2], n_block, head_idx, batch_idx,
+                        flashmask_info,
+                        sStartEndRowIndices,
+                        sFM_max_min,
+                        seqlen,
+                        mQ.shape[2],
+                        n_block,
+                        head_idx,
+                        batch_idx,
+                        overlap_segment_idx,
                     )
                     cute.arch.mbarrier_arrive(flashmask_loaded_mbar_ptr)
 
@@ -2768,8 +2909,15 @@ class FlashAttentionBackwardSm100:
                 zero_block = False
                 if const_expr(self.enable_flashmask):
                     self.load_fm(
-                        flashmask_info, sStartEndRowIndices, sFM_max_min,
-                        seqlen, mQ.shape[2], n_block, head_idx, batch_idx,
+                        flashmask_info,
+                        sStartEndRowIndices,
+                        sFM_max_min,
+                        seqlen,
+                        mQ.shape[2],
+                        n_block,
+                        head_idx,
+                        batch_idx,
+                        overlap_segment_idx,
                     )
                     cute.arch.mbarrier_arrive(flashmask_loaded_mbar_ptr)
 
@@ -3071,7 +3219,17 @@ class FlashAttentionBackwardSm100:
                     pipeline_dO.producer_tail(producer_state_dO_dPsum.clone())
                     pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
             elif const_expr(self.enable_flashmask):
-                self.load_fm(flashmask_info, sStartEndRowIndices, sFM_max_min, seqlen, mQ.shape[2], n_block, head_idx, batch_idx)
+                self.load_fm(
+                    flashmask_info,
+                    sStartEndRowIndices,
+                    sFM_max_min,
+                    seqlen,
+                    mQ.shape[2],
+                    n_block,
+                    head_idx,
+                    batch_idx,
+                    overlap_segment_idx,
+                )
                 cute.arch.mbarrier_arrive(flashmask_loaded_mbar_ptr)
 
                 zero_block = False
@@ -3393,6 +3551,7 @@ class FlashAttentionBackwardSm100:
         n_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        overlap_segment_idx: Optional[cutlass.Int32],
     ):
         # (13) warp_idx == self.load_warp_id
         #num_load_threads = len([self.load_warp_id]) * cute.arch.WARP_SIZE
@@ -3400,11 +3559,20 @@ class FlashAttentionBackwardSm100:
         tidx = cute.arch.thread_idx()[0] % num_load_threads
         nblock_seqlen = ((seqlen_info.seqlen_k + self.tile_n - 1) // self.tile_n + 3) // 4 * 4
         ntimes_copy = (self.tile_n + num_load_threads - 1) // num_load_threads
-        bsz, fm_heads, seqlen_k, num_vec = flashmask_info.startend_row_indices.shape
+        bsz, fm_heads, full_seqlen_k, num_vec = flashmask_info.startend_row_indices.shape
         fm_batch_idx = batch_idx if bsz > 1 else 0
         fm_head_idx = head_idx // (num_heads // fm_heads)
-        bh_offset = fm_batch_idx * fm_heads + fm_head_idx;
-        bh_offset_block = bh_offset * nblock_seqlen;
+        bh_offset = fm_batch_idx * fm_heads + fm_head_idx
+        if const_expr(overlap_segment_idx is not None):
+            full_nblock_seqlen = ((full_seqlen_k + self.tile_n - 1) // self.tile_n + 3) // 4 * 4
+            segment_row_offset = overlap_segment_idx * seqlen_info.seqlen_k
+            bh_offset_block = (
+                bh_offset * full_nblock_seqlen
+                + overlap_segment_idx * nblock_seqlen
+            )
+        else:
+            segment_row_offset = Int32(0)
+            bh_offset_block = bh_offset * nblock_seqlen
 
         if tidx == 0:
             # LTS is always valid, otherwise this is not a valid flashmask computation instance
@@ -3432,16 +3600,18 @@ class FlashAttentionBackwardSm100:
             copy_offset = i * num_load_threads + tidx
             sStartEndRowIndices[copy_offset, 0] = 2147483647
             sStartEndRowIndices[copy_offset, 1] = 2147483647
-            if (copy_offset < self.tile_n and n_block * self.tile_n + copy_offset < seqlen_k):
+            local_k_row = n_block * self.tile_n + copy_offset
+            if (copy_offset < self.tile_n and local_k_row < seqlen_info.seqlen_k):
+                global_k_row = segment_row_offset + local_k_row
                 LTS = flashmask_info.startend_row_indices[fm_batch_idx, fm_head_idx, None, 0]
-                sStartEndRowIndices[copy_offset, 0] = LTS[n_block * self.tile_n + copy_offset]
+                sStartEndRowIndices[copy_offset, 0] = LTS[global_k_row]
                 #assert const_expr(num_vec <= 2), "only support num_vec == 2 now"
                 if const_expr(flashmask_info.LTE_nblock_max is not None):
                     LTE = flashmask_info.startend_row_indices[fm_batch_idx, fm_head_idx, None, 1]
-                    sStartEndRowIndices[copy_offset, 1] = LTE[n_block * self.tile_n + copy_offset]
+                    sStartEndRowIndices[copy_offset, 1] = LTE[global_k_row]
                 if const_expr(flashmask_info.UTE_nblock_max is not None):
                     UTE = flashmask_info.startend_row_indices[fm_batch_idx, fm_head_idx, None, 1]
-                    sStartEndRowIndices[copy_offset, 1] = UTE[n_block * self.tile_n + copy_offset]
+                    sStartEndRowIndices[copy_offset, 1] = UTE[global_k_row]
                 #cute.printf("%d, %d", copy_offset, sStartEndRowIndices[copy_offset, 0])
                 #cute.print_tensor(LTS)
         cute.arch.sync_warp()

@@ -404,6 +404,15 @@ def _flash_attn_fwd(
     # (otherwise the per-n_block arrays disagree in length -> reshape error).
     if compute_capability == 9 and head_dim > 128:
         n_block_size = 64
+        # d256/dv256 dense fwd is tensor-core bound; a larger KV tile (80 vs 64,
+        # matching mainline FA3) cuts KV-loop iterations/overhead and feeds the
+        # MMA better. smem at N=80 (sQ 64KB + sK 80KB + sV 80KB ~= 224KB, no P
+        # since mma_pv_is_rs) fits Hopper's ~227KB. Only widen the dense
+        # (non-flashmask) d256 case: flashmask keeps 64 so the block max/min scan
+        # + block-list tiling (kBlockN) agree (and leave headroom for s_rowidx);
+        # head_dim=192 keeps 64 (dv=128 tile is a different smem shape).
+        if head_dim == 256 and v.shape[-1] == 256 and startend_row_indices is None:
+            n_block_size = 80
 
     # Each SM100 CTA processes q_stage * m_block_size query rows; Split-D
     # (d>192, d==dv) uses q_stage=1 to fit the TMEM budget. Must match

@@ -197,7 +197,7 @@ class BwdConfig:
     num_wg: int = 2  # MMA warp groups (total threads = (num_wg + 1) * 128)
     dQ_single_wg: bool = False
 
-def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None, flashmask=False):
+def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None, flashmask=False, deterministic=False):
     """Return BwdConfig for SM90.
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
@@ -257,22 +257,24 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 num_wg=2,
             )
     else:
-        # hdim 256: mirror C++ FA3 run_mha_bwd_hdim256 (Arch>=90). The dQ
-        # accumulator is atomicAdd'd straight to gmem (dQacc_use_TMA=False in the
-        # kernel), so no 64KB smem staging buffer is needed and we can afford a
-        # 2-stage Q pipeline (num_stages_Q=2). dKV/dQ MMAs use swapAB.
-        #
-        # n_block_size: the d256 bwd is L2/DRAM-bound (ncu: ~78% L2, SM ~43%), and
-        # each KV-block CTA re-streams its Q/dO/LSE/dPsum and re-issues dQ atomics,
-        # so total memory traffic scales with the number of KV-blocks. Mainline FA3
-        # uses N=80 for the dense case (vs 64), giving ~20% fewer KV-blocks and a
-        # matching ~20% traffic cut. Use 80 for the dense/non-flashmask path; keep
-        # 64 for flashmask so the block max/min scan + block-list tiling (kBlockN)
-        # stay on the value the sparse masks were tuned for.
-        n_block_size = 64 if flashmask else 80
+        # hdim 256: mirror C++ FA3 run_mha_bwd_hdim256 (Arch>=90); dKV/dQ MMAs
+        # use swapAB. The dQ-accumulation path drives the smem budget and must
+        # match flash_bwd_sm90's dQacc_use_TMA (== deterministic for d256):
+        #   - non-deterministic: dQ is atomicAdd'd straight to gmem, so the 64KB
+        #     dQ smem staging buffer is dropped. That headroom buys a 2-stage Q
+        #     pipeline and the larger dense N=80 tile (~20% fewer KV-blocks;
+        #     flashmask keeps N=64 to match its block-list tiling).
+        #   - deterministic: ordered accumulation forces the TMA-staging path,
+        #     re-adding the 64KB buffer. 2-stage Q / N=80 would then overflow
+        #     Hopper's ~227KB smem (CUDA_ERROR_INVALID_VALUE at launch), so use
+        #     a 1-stage Q pipeline and N=64.
+        if deterministic:
+            n_block_size, num_stages_Q = 64, 1
+        else:
+            n_block_size, num_stages_Q = (64 if flashmask else 80), 2
         return BwdConfig(
             m_block_size=64, n_block_size=n_block_size,
-            num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
+            num_stages_Q=num_stages_Q, num_stages_dO=1, num_stages_PdS=1,
             SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=True,
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
         )
@@ -981,6 +983,7 @@ def _flash_attn_bwd(
             False,
             sparse_block_size_q=None,
             flashmask=flashmask_info is not None,
+            deterministic=deterministic,
         ).n_block_size
 
     cute_flashmask_info = None
@@ -1032,6 +1035,7 @@ def _flash_attn_bwd(
             local,
             sparse_block_size_q=sparse_q,
             flashmask=cute_flashmask_info is not None,
+            deterministic=deterministic,
         )
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size

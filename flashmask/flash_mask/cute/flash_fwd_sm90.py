@@ -744,7 +744,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(self.use_tma_Q):
                     gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
                     load_Q, _, _ = copy_utils.tma_get_copy_fn(
-                        tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
+                        tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True,
                     )
 
                 paged_kv_manager = None
@@ -770,11 +770,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
                     # TODO: mcast
                     tma_load_K_fn, _, _ = copy_utils.tma_get_copy_fn(
-                        tma_atom_K, 0, cute.make_layout(1), gK, sK
+                        tma_atom_K, 0, cute.make_layout(1), gK, sK,
                     )
                     tma_load_K_fn = copy_utils.tma_producer_copy_fn(tma_load_K_fn, pipeline_k)
                     tma_load_V_fn, _, _ = copy_utils.tma_get_copy_fn(
-                        tma_atom_V, 0, cute.make_layout(1), gV, sV
+                        tma_atom_V, 0, cute.make_layout(1), gV, sV,
                     )
                     tma_load_V_fn = copy_utils.tma_producer_copy_fn(tma_load_V_fn, pipeline_v)
                 else:
@@ -1604,12 +1604,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             n_block, seqlen.seqlen_q, cute.size(mO.shape[2]),
                         )
                     if process:
+                        # These blocks are strictly below the causal/local diagonal
+                        # (all columns valid, no seqlen edge), so causal masking is a
+                        # no-op here. Skip mask_fn entirely to avoid the redundant
+                        # per-element compare (matches cpp's empty no_mask_fn). Keep
+                        # the mask only when a FlexAttention mask_mod is present.
+                        no_mask_fn = (
+                            None
+                            if const_expr(self.mask_mod is None)
+                            else partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
+                        )
                         kv_consumer_state = mma_one_n_block(
                             kv_consumer_state,
                             n_block=n_block,
                             seqlen=seqlen,
                             mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                            mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
+                            mask_fn=no_mask_fn,
                         )
                         O_should_accumulate = True
                 # Separate iterations with local masking on the left

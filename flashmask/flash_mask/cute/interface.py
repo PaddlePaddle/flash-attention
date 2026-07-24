@@ -618,11 +618,13 @@ def _flash_attn_fwd(
     requires_grad = not (q.stop_gradient and k.stop_gradient and v.stop_gradient)
 
     if out is None:
-        # Every scheduled (m_block, head, batch) tile writes its full O tile in the
-        # epilogue unconditionally (fully-masked rows get O=0, LSE=-inf written by
-        # the kernel), so an uninitialized buffer is safe and avoids the ~1GB
-        # zero-fill that otherwise dominates short-seq / high-sparsity calls.
-        out = paddle.empty(
+        # then stored, so fully-masked rows/blocks (incl. generate_empty_mask) come
+        # out as 0. So on SM90 use an uninitialized buffer to skip the ~1GB O
+        # zero-fill that dominates short-seq / high-sparsity calls (~5% fwd speedup).
+        # On SM100 the flashmask fwd skips the O store for a fully-masked query block
+        # (valid_block_count == 0) and has no zero-writer for it, so that O tile would
+        # be left uninitialized -- keep paddle.zeros on SM100.
+        out = (paddle.empty if compute_capability == 9 else paddle.zeros)(
             shape=[*q_batch_seqlen_shape, num_head, head_dim_v], dtype=out_paddle_dtype
         )
     else:
@@ -639,9 +641,7 @@ def _flash_attn_fwd(
 
     if lse is None:
         lse = (
-            # The epilogue writes LSE for every row (‑inf for fully-masked rows), so
-            # an uninitialized buffer is safe; skip the full(-inf) fill.
-            paddle.empty(shape=lse_shape, dtype=paddle.float32)
+            paddle.full(shape=lse_shape, fill_value=float('-inf'), dtype=paddle.float32)
             if requires_grad or return_lse
             else None
         )
@@ -2293,7 +2293,7 @@ def _flash_attn_bwd(
 
         _postprocess_run(
             dq_accum_tensor, dq_tensor, softmax_scale,
-            head_dim_rounded, m_block_size, AtomLayoutMdQ, dQ_swapAB,
+            head_dim, m_block_size, AtomLayoutMdQ, dQ_swapAB,
             use_2cta_instrs, 1, cu_seqlens_q_tensor, seqused_q_tensor, "dq",
         )
 
@@ -2301,7 +2301,7 @@ def _flash_attn_bwd(
             _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),
             _kv_out_cute(dk, dk_tensor),
             softmax_scale,
-            head_dim_rounded, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+            head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
             False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dk",
         )
 
@@ -2323,7 +2323,7 @@ def _flash_attn_bwd(
         # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
         _postprocess_run(
             dq_accum_tensor, dq_tensor, softmax_scale,
-            head_dim_rounded, m_block_size, AtomLayoutMdQ, dQ_swapAB,
+            head_dim, m_block_size, AtomLayoutMdQ, dQ_swapAB,
             use_2cta_instrs, 1, cu_seqlens_q_tensor, seqused_q_tensor, "dq",
         )
         
@@ -2332,14 +2332,14 @@ def _flash_attn_bwd(
                 _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),
                 _kv_out_cute(dk, dk_tensor),
                 softmax_scale,
-                head_dim_rounded, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
                 False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dk",
             )
             _postprocess_run(
                 _kv_accum_cute(dv_accum, dv_accum_tensor, head_dim_v_rounded),
                 _kv_out_cute(dv, dv_tensor),
                 cutlass.Float32(1.0),
-                head_dim_v_rounded, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                head_dim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
                 False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dv",
             )
 

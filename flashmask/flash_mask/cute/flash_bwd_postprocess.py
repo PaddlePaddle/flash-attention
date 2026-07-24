@@ -56,8 +56,8 @@ class FlashAttentionBackwardPostprocess:
             "Only Ampere (80), Hopper (90), and Blackwell (100) are supported"
         )
         self.arch = arch
-        # padding head_dim to a multiple of 32 as k_block_size
-        hdim_multiple_of = 32
+        # padding head_dim to a multiple of 64 for SM100 (32 for others) to match head_dim_rounded
+        hdim_multiple_of = 64 if arch // 10 == 10 else 32
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.num_threads = num_threads

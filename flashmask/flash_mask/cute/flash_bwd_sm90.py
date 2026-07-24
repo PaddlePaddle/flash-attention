@@ -1854,8 +1854,11 @@ class FlashAttentionBackwardSm90:
         if const_expr(self.has_lt_end):
             lte_min = flashmask_info.LTE_nblock_min[batch_idx, fm_head_idx, n_block]
             p3 = lte_min // T
-            c_lo = cutlass.max(m_block, p3)
-            c_hi = cutlass.max(m_block_max, c_lo)
+            # Cap c_lo at m_block_max so the segment runs [c_lo, m_block_max) like
+            # the lt/ut bands above; degenerates to an empty range when the jump
+            # target p3 is past m_block_max.
+            c_lo = cutlass.min(m_block_max, cutlass.max(m_block, p3))
+            c_hi = m_block_max
             segments.append((c_lo, c_hi))
         return segments
 

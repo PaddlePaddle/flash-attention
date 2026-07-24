@@ -222,9 +222,34 @@ class FlashAttentionBackwardPostprocess:
         scale: cutlass.Float32,
         mCuSeqlensQ: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
+        raw_output_addr: Optional[cutlass.Int64] = None,
+        raw_b: Optional[cutlass.Int32] = None,
+        raw_s: Optional[cutlass.Int32] = None,
+        raw_h: Optional[cutlass.Int32] = None,
+        raw_d: Optional[cutlass.Int32] = None,
+        raw_storage_d: Optional[cutlass.Int32] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
+        if const_expr(raw_output_addr is not None):
+            if const_expr(raw_storage_d is None):
+                mdQ = utils.make_contiguous_bshd_from_addr(
+                    raw_output_addr, raw_b, raw_s, raw_h, raw_d,
+                    self.dtype, align=16,
+                )
+            else:
+                mdQ = utils.make_gmem_tensor_from_addr(
+                    raw_output_addr,
+                    (raw_b, raw_s, raw_h, raw_d),
+                    (
+                        raw_s * raw_h * raw_storage_d,
+                        raw_h * raw_storage_d,
+                        raw_storage_d,
+                        1,
+                    ),
+                    self.dtype,
+                    align=16,
+                )
         # Get the data type and check if it is fp16 or bf16
         if const_expr(mdQ.element_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Only Float16 or BFloat16 is supported")

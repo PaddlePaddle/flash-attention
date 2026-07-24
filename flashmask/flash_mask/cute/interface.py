@@ -57,6 +57,16 @@ except ImportError:
     accum_zero_axis1_kv = None
 
 
+def _get_overlap_runtime():
+    try:
+        from flash_mask.overlap import overlap_runtime
+    except ImportError as exc:
+        raise RuntimeError(
+            "FM-4 overlap support requires the 'ovl' build component"
+        ) from exc
+    return overlap_runtime
+
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.strides[-1] != 1 else x
 
@@ -363,6 +373,10 @@ def _flash_attn_fwd(
     lse: Optional[paddle.Tensor] = None,
     aux_tensors: Optional[list[paddle.Tensor]] = None,
     startend_row_indices: Optional[paddle.Tensor] = None,
+    block_logit: Optional[paddle.Tensor] = None,
+    block_size: int = 64,
+    block_bos: Optional[paddle.Tensor] = None,
+    group=None,
 ) -> Tuple[paddle.Tensor, paddle.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -375,6 +389,22 @@ def _flash_attn_fwd(
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+        block_logit: Optional pre-allocated fp32 tensor [batch, num_heads, seqlen_q, num_blocks] that,
+            when provided, receives the fused per-(query, key-block) max of the post-score_mod, post-mask,
+            SCALED logit `softmax_scale * q*k^T` (INCLUDING any score_mod bias) -- i.e. the exact value fed
+            into softmax. Storing the scaled logit puts every head on one head-independent scale, so a
+            downstream `block_logit - LSE` yields log(max attention weight in the block), which is comparable
+            across heads for cross-head Top-K block selection. Computed in the softmax epilogue and written in
+            place; kept out of the returned tuple. num_blocks must be >= ceil(seqlen_k / block_size). The fused
+            reduction respects the same causal / flashmask masking applied to the attention. Only supported on
+            SM 10.x (non split-KV).
+            IMPORTANT: the kernel only writes key-blocks that the attention loop actually visits. Key-blocks
+            that are entirely skipped by masking (e.g. fully-future blocks under causal / flashmask, or blocks
+            past seqlen_k when num_blocks*block_size > seqlen_k) are NEVER written. The caller MUST
+            pre-initialize block_logit to -inf so those entries read as -inf (masked) rather than stale
+            garbage; do not pass an uninitialized / reused buffer.
+        block_size: Key-block width (in tokens) used to bucket the fused block-logit reduction. Must divide
+            the kernel's n_block_size. Ignored when block_logit is None.
     """
 
     assert cu_seqlens_q is None, "cu_seqlens_q must be None (varlen is not supported in flashmask)"
@@ -422,6 +452,42 @@ def _flash_attn_fwd(
     # once here so the flashmask valid_block_count and the block-sparse M-block
     # normalization below share the identical M granularity.
     q_stage = 1 if (head_dim > 192 and head_dim == v.shape[-1]) else 2
+    # FM-4 overlap: when a CP `group` is given, K/V come in LOCAL (B, S_local, H, D)
+    # and the gathered KV lives in the NVSHMEM SRBuffer. Bootstrap+init the comm
+    # singleton once, run the sparse all-gather on the internal comm_stream, then
+    # below swap the K/V cute tensors for SRBuffer-backed views with
+    # seqlen_k = S_local*nranks. The SM100 load warp gates each K/V tile on the
+    # non-splitted AG kernel's write_ptr row frontier.
+
+    enable_overlap = group is not None and group.world_size > 1
+    if enable_overlap and compute_capability != 10:
+        raise NotImplementedError("FM-4 overlap fwd is only supported on SM100")
+    overlap_view_args = None
+    overlap_bhsd_layout = None
+    if enable_overlap:
+        overlap_runtime = _get_overlap_runtime()
+        assert startend_row_indices is not None, (
+            "overlap mode requires startend_row_indices (the post-AG mask)"
+        )
+        assert page_table is None, "overlap mode does not support paged KV"
+        assert cu_seqlens_k is None, "overlap mode does not support varlen K"
+        assert k.dtype == paddle.bfloat16, "overlap SRBuffer is bf16"
+        # causal would make startend_row_indices col1 hold lt_end (not ut_end), but
+        # the comm-side compute_chunk_mask requires a non-null ut_end (overlap_comm.cu
+        # :453); FM-3 overlap forbids causal for the same reason (overlap_flashmask.py
+        # :335). Guarding here keeps the col mapping in _sparse_chunk_mask_cols exact.
+        assert not causal, "overlap mode does not support causal yet"
+        overlap_runtime.ensure_initialized(
+            k, v, group, mask_head=startend_row_indices.shape[1]
+        )
+        overlap_bhsd_layout = overlap_runtime.use_bhsd_layout()
+        overlap_stream = overlap_runtime.current_stream_handle()
+        # Launch AG and retain the gathered SRBuffer view; its FULL S_total shape
+        # drives host-side validation and the runtime-dimension kernel arguments.
+        overlap_ag_args = overlap_runtime.start_forward_ag(
+            k, v, startend_row_indices, overlap_stream
+        )
+        overlap_view_args = overlap_ag_args.view
 
     cute_flashmask_info = None
     if startend_row_indices is not None:
@@ -453,12 +519,24 @@ def _flash_attn_fwd(
         assert page_table.shape == [batch_size, max_num_pages_per_seq]
         num_pages, page_size = k.shape[:2]
         seqlen_k = num_pages * page_size
+    elif enable_overlap:
+        # K/V are still the LOCAL paddle tensors here (used only for update_kv +
+        # dtype); the kernel reads the gathered SRBuffer, so seqlen_k is the full
+        # gathered length S_total = S_local * nranks from the SRBuffer view.
+        num_pages, page_size = None, None
+        seqlen_k = overlap_view_args.shape[1]
     else:
         num_pages, page_size = None, None
         seqlen_k = k.shape[-3]
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
-    if cu_seqlens_k is None:
+    if enable_overlap:
+        # Skip the [batch, seqlen_k, ...] shape assert: k/v are LOCAL (S_local),
+        # while seqlen_k is the gathered S_total. The SRBuffer view (built below
+        # from overlap_view_args) carries the gathered shape into the kernel.
+        assert num_head_kv == overlap_view_args.shape[2]
+        assert head_dim == overlap_view_args.shape[3]
+    elif cu_seqlens_k is None:
         if page_table is None:
             assert k.shape == [batch_size, seqlen_k, num_head_kv, head_dim], (
                 f"expect k with shape {[batch_size, seqlen_k, num_head_kv, head_dim]}, received {k.shape=}"
@@ -719,10 +797,20 @@ def _flash_attn_fwd(
         )
         lse_partial = paddle.empty(shape=[num_splits, *lse_shape], dtype=paddle.float32)
 
-    q_tensor, k_tensor, v_tensor, o_tensor = [
+    q_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (q, k, v, out if not is_split_kv else out_partial)
+        for t in (q, out if not is_split_kv else out_partial)
     ]
+    if enable_overlap:
+        # K/V live in the NVSHMEM SRBuffer (gathered device memory), so there is no
+        # dlpack capsule to wrap; the kernel builds the views from their addr instead.
+        k_tensor = None
+        v_tensor = None
+    else:
+        k_tensor, v_tensor = [
+            from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
+            for t in (k, v)
+        ]
     if is_split_kv:
         lse_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(
             leading_dim=lse_partial.ndim - 1
@@ -733,6 +821,61 @@ def _flash_attn_fwd(
         )
     else:
         lse_tensor = None
+
+    if block_logit is not None:
+        assert compute_capability == 10, (
+            "block_logit (fused block-score) is only supported on SM 10.x"
+        )
+        assert not is_split_kv, "block_logit is not supported with split-KV"
+        assert not pack_gqa, (
+            "block_logit requires pack_gqa=False. block_logit is indexed by the "
+            "query head (head_idx) and the query row (m_block*m_block_size+tidx); "
+            "under pack_gqa=True the query heads are packed into the M/row dim and "
+            "head_idx is the KV head, so the block-score write would target wrong "
+            "locations. NOTE: pack_gqa defaults to (qhead_per_kvhead > 1), so GQA "
+            "callers MUST pass pack_gqa=False explicitly when requesting block_logit."
+        )
+        assert block_logit.dtype == paddle.float32, (
+            f"block_logit must be float32; got {block_logit.dtype}"
+        )
+        assert block_logit.place.is_gpu_place(), "block_logit must be on CUDA"
+        assert block_logit.ndim == 4, (
+            f"block_logit must be [batch, num_heads, seqlen_q, num_blocks]; got ndim={block_logit.ndim}"
+        )
+        block_seqlen_k = seqlen_k if enable_overlap else k.shape[1]
+        _nb_min = (block_seqlen_k + block_size - 1) // block_size
+        assert block_logit.shape[-1] >= _nb_min, (
+            f"block_logit num_blocks={block_logit.shape[-1]} < ceil(seqlen_k/block_size)={_nb_min}"
+        )
+        block_logit_tensor = from_dlpack(
+            block_logit.detach(), assumed_align=4
+        ).mark_layout_dynamic(leading_dim=block_logit.ndim - 1)
+    else:
+        block_logit_tensor = None
+
+    # Optional per-query document start (bos) for DOCUMENT-relative block
+    # bucketing (pack-equivalence). Without it the kernel buckets by absolute
+    # packed-sequence block, which is only correct for single-document (bos==0)
+    # inputs. Shape [B, S] int32, aligned with block_logit's query dim.
+    if block_bos is not None:
+        assert block_logit is not None, (
+            "block_bos requires block_logit (it drives its relative bucketing)"
+        )
+        assert block_bos.dtype == paddle.int32, (
+            f"block_bos must be int32; got {block_bos.dtype}"
+        )
+        assert block_bos.place.is_gpu_place(), "block_bos must be on CUDA"
+        assert block_bos.ndim == 2, (
+            f"block_bos must be [B, S]; got ndim={block_bos.ndim}"
+        )
+        assert list(block_bos.shape) == [batch_size, seqlen_q], (
+            f"block_bos must be [B={batch_size}, S={seqlen_q}]; got {block_bos.shape}"
+        )
+        block_bos_tensor = from_dlpack(
+            block_bos.detach(), assumed_align=4
+        ).mark_layout_dynamic(leading_dim=block_bos.ndim - 1)
+    else:
+        block_bos_tensor = None
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -782,6 +925,30 @@ def _flash_attn_fwd(
     if aux_tensors is not None:
         cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
 
+    # Build SRBuffer views inside the MLIR context. Dimensions stay runtime Int32;
+    # making this layout static changes the TMA descriptor and reads wrong bytes.
+    if enable_overlap:
+        overlap_view = overlap_ag_args.view
+        overlap_k_addr = cutlass.Int64(overlap_view.k_addr)
+        overlap_v_addr = cutlass.Int64(overlap_view.v_addr)
+        overlap_write_ptr_addr = cutlass.Int64(overlap_ag_args.write_ptr.data_ptr())
+        _ob, _os, _oh, _od = overlap_view.shape
+        overlap_b = cutlass.Int32(_ob)
+        overlap_s = cutlass.Int32(_os)
+        overlap_h = cutlass.Int32(_oh)
+        overlap_d = cutlass.Int32(_od)
+        overlap_kv_chunk_size = overlap_ag_args.kv_chunk_size
+    else:
+        overlap_k_addr = None
+        overlap_v_addr = None
+        overlap_write_ptr_addr = None
+        overlap_b = None
+        overlap_s = None
+        overlap_h = None
+        overlap_d = None
+        overlap_kv_chunk_size = None
+        overlap_bhsd_layout = None
+
     compile_key = (
         dtype,
         head_dim,
@@ -811,6 +978,12 @@ def _flash_attn_fwd(
         # flashmask
         startend_row_indices.shape[3] if startend_row_indices is not None else None,
         is_split_d if compute_capability == 10 else False,
+        block_logit is None,
+        block_size,
+        block_bos is None,
+    ) + (
+        # SRBuffer K/V require a distinct artifact only when overlap is active.
+        (overlap_bhsd_layout, overlap_kv_chunk_size) if enable_overlap else ()
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
@@ -859,6 +1032,9 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, 128],
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 is_split_d=is_split_d,
+                has_block_logit=block_logit is not None,
+                block_size=block_size,
+                has_block_bos=block_bos is not None,
             )
         else:
             raise ValueError(
@@ -873,19 +1049,45 @@ def _flash_attn_fwd(
             o_tensor,
             lse_tensor,
             softmax_scale,
-            cu_seqlens_q_tensor,
-            cu_seqlens_k_tensor,
-            seqused_q_tensor,
-            seqused_k_tensor,
-            page_table_tensor,
-            window_size_left,
-            window_size_right,
-            learnable_sink_tensor,
-            sparse_tensors,
-            cute_aux_tensors,
-            cute_flashmask_info,
-            current_stream,
+            mCuSeqlensQ=cu_seqlens_q_tensor,
+            mCuSeqlensK=cu_seqlens_k_tensor,
+            mSeqUsedQ=seqused_q_tensor,
+            mSeqUsedK=seqused_k_tensor,
+            mPageTable=page_table_tensor,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            learnable_sink=learnable_sink_tensor,
+            blocksparse_tensors=sparse_tensors,
+            aux_tensors=cute_aux_tensors,
+            flashmask_info=cute_flashmask_info,
+            **(
+                {
+                    "mBlockLogit": block_logit_tensor,
+                    "mBlockBos": block_bos_tensor,
+                }
+                if compute_capability == 10
+                else {}
+            ),
+            **(
+                {
+                    "overlap_k_addr": overlap_k_addr,
+                    "overlap_v_addr": overlap_v_addr,
+                    "overlap_write_ptr_addr": overlap_write_ptr_addr,
+                    "overlap_b": overlap_b,
+                    "overlap_s": overlap_s,
+                    "overlap_h": overlap_h,
+                    "overlap_d": overlap_d,
+                    "overlap_kv_chunk_size": overlap_kv_chunk_size,
+                    "overlap_bhsd_layout": overlap_bhsd_layout,
+                }
+                if enable_overlap
+                else {}
+            ),
+            stream=current_stream,
         )
+    # Runtime address and shape scalars are re-supplied below; compile-time
+    # overlap_kv_chunk_size is captured by the compiled callable.
+
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor,
         k_tensor,
@@ -893,18 +1095,39 @@ def _flash_attn_fwd(
         o_tensor,
         lse_tensor,
         softmax_scale,
-        cu_seqlens_q_tensor,
-        cu_seqlens_k_tensor,
-        seqused_q_tensor,
-        seqused_k_tensor,
-        page_table_tensor,
-        window_size_left,
-        window_size_right,
-        learnable_sink_tensor,
-        sparse_tensors,
-        cute_aux_tensors,
-        cute_flashmask_info,
-        current_stream,
+        mCuSeqlensQ=cu_seqlens_q_tensor,
+        mCuSeqlensK=cu_seqlens_k_tensor,
+        mSeqUsedQ=seqused_q_tensor,
+        mSeqUsedK=seqused_k_tensor,
+        mPageTable=page_table_tensor,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        learnable_sink=learnable_sink_tensor,
+        blocksparse_tensors=sparse_tensors,
+        aux_tensors=cute_aux_tensors,
+        flashmask_info=cute_flashmask_info,
+        **(
+            {
+                "mBlockLogit": block_logit_tensor,
+                "mBlockBos": block_bos_tensor,
+            }
+            if compute_capability == 10
+            else {}
+        ),
+        **(
+            {
+                "overlap_k_addr": overlap_k_addr,
+                "overlap_v_addr": overlap_v_addr,
+                "overlap_write_ptr_addr": overlap_write_ptr_addr,
+                "overlap_b": overlap_b,
+                "overlap_s": overlap_s,
+                "overlap_h": overlap_h,
+                "overlap_d": overlap_d,
+            }
+            if enable_overlap
+            else {}
+        ),
+        stream=current_stream,
     )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -953,6 +1176,7 @@ def _flash_attn_bwd(
     deterministic: bool = False,
     kv_postprocess_start: Optional[int] = None,
     kv_postprocess_end: Optional[int] = None,
+    group=None,
 ) -> Tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor, Optional[paddle.Tensor]]:
     compute_capability = paddle.device.cuda.get_device_capability()[0]
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
@@ -1024,6 +1248,48 @@ def _flash_attn_bwd(
 
     is_split_d_bwd = False
     is_split_dv_bwd = False
+
+    # FM-4 backward consumes one split-AG segment at a time and gates each KV tile
+    # on the producer's per-work completion bitmap.
+    enable_overlap = group is not None and group.world_size > 1
+    overlap_view_args = None
+    overlap_bhsd_layout = None
+    overlap_segment_idx = None
+    if enable_overlap:
+        if compute_capability != 10:
+            raise NotImplementedError("FM-4 overlap bwd is only supported on SM100")
+        overlap_runtime = _get_overlap_runtime()
+        assert flashmask_info is not None, "overlap bwd requires flashmask_info (the post-AG mask)"
+        assert cu_seqlens_q is None and cu_seqlens_k is None, "overlap bwd does not support varlen"
+        assert kv_postprocess_start is None and kv_postprocess_end is None, (
+            "overlap bwd owns the KV segment postprocess range"
+        )
+        assert k.dtype == paddle.bfloat16, "overlap SRBuffer is bf16"
+        assert not causal, "overlap bwd does not support causal yet"
+        startend_row_indices = flashmask_info.startend_row_indices
+        overlap_runtime.ensure_initialized(
+            k, v, group, mask_head=startend_row_indices.shape[1]
+        )
+        overlap_bhsd_layout = overlap_runtime.use_bhsd_layout()
+        overlap_stream = overlap_runtime.current_stream_handle()
+        overlap_ag_args = overlap_runtime.start_backward_ag(
+            k, v, startend_row_indices, overlap_stream
+        )
+        overlap_view_args = overlap_ag_args.kv_view(0)
+        segment_seqlen = overlap_ag_args.segment_seqlen
+        full_seqlen_k = startend_row_indices.shape[2]
+        assert full_seqlen_k == segment_seqlen * overlap_ag_args.num_segments
+        assert segment_seqlen % n_block_size == 0
+        segment_nblocks = segment_seqlen // n_block_size
+        assert segment_nblocks % 4 == 0, (
+            "FM-3 segment mask metadata requires a 4-block-aligned segment"
+        )
+        # Keep the full mask tensors. The SM100 loader applies the segment offset
+        # while indexing, preserving the original batch/head stride without copies.
+        cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
+        # All segment-local scheduler and semaphore shapes use this length. The
+        # original local length is retained by k/v and by the final dK/dV outputs.
+        seqlen_k = segment_seqlen
 
     if compute_capability == 9:
         sparse_q = None
@@ -1102,7 +1368,14 @@ def _flash_attn_bwd(
         seqlen_k = None
         total_k = k.shape[0]
 
-    if cu_seqlens_k is None:
+    if enable_overlap:
+        # k/v are local inputs, while the grad kernel consumes one gathered SRBuffer
+        # segment at a time. The segment view supplies the scheduler and dK/dV shape.
+        seqlen_k = overlap_view_args.shape[1]
+        total_k = batch_size * seqlen_k
+        assert num_head_kv == overlap_view_args.shape[2]
+        assert head_dim == overlap_view_args.shape[3]
+    elif cu_seqlens_k is None:
         assert k.shape == [batch_size, seqlen_k, num_head_kv, head_dim]
         assert v.shape == [batch_size, seqlen_k, num_head_kv, head_dim_v]
     else:
@@ -1173,7 +1446,11 @@ def _flash_attn_bwd(
         dq = paddle.empty_like(q)
     else:
         dq = paddle.zeros_like(q)
-    if fixed_seqlen and kv_postprocess_full:
+    # Native RS writes the final local dK/dV directly into these tensors.
+    if enable_overlap:
+        dk = paddle.empty_like(k)
+        dv = paddle.empty_like(v)
+    elif fixed_seqlen and kv_postprocess_full:
         dk = paddle.empty_like(k)
         dv = paddle.empty_like(v)
     else:
@@ -1357,7 +1634,40 @@ def _flash_attn_bwd(
     ]
     current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
 
-    # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
+    # Rebuild segment-local SRBuffer views inside the MLIR context. Split AG
+    # publishes one completion flag per communication work item.
+    if enable_overlap:
+        overlap_view = overlap_view_args
+        overlap_k_addr = cutlass.Int64(overlap_view.k_addr)
+        overlap_v_addr = cutlass.Int64(overlap_view.v_addr)
+        overlap_work_done_addr = cutlass.Int64(overlap_ag_args.work_done_addr)
+        _ob, _os, _oh, _od = overlap_view.shape
+        overlap_b = cutlass.Int32(_ob)
+        overlap_s = cutlass.Int32(_os)
+        overlap_h = cutlass.Int32(_oh)
+        overlap_d = cutlass.Int32(_od)
+        overlap_segment_idx = cutlass.Int32(0)
+        overlap_comm_rpb = overlap_ag_args.comm_rpb
+        overlap_dk_send_addr, overlap_dv_send_addr = overlap_ag_args.dkv_send_addrs(0)
+        overlap_dk_addr = (
+            None if need_kv_accum else cutlass.Int64(overlap_dk_send_addr)
+        )
+        overlap_dv_addr = (
+            None if need_kv_accum else cutlass.Int64(overlap_dv_send_addr)
+        )
+    else:
+        overlap_k_addr = None
+        overlap_v_addr = None
+        overlap_work_done_addr = None
+        overlap_dk_addr = None
+        overlap_dv_addr = None
+        overlap_b = None
+        overlap_s = None
+        overlap_h = None
+        overlap_d = None
+        overlap_comm_rpb = None
+        overlap_bhsd_layout = None
+
     compile_key_pre = (compute_capability, dtype, head_dim, head_dim_v, head_dim_rounded, m_block_size, num_threads)
     if compile_key_pre not in _flash_attn_bwd.compile_cache_pre:
         fa_bwd_pre = FlashAttentionBackwardPreprocess(
@@ -1445,6 +1755,11 @@ def _flash_attn_bwd(
             deterministic,
             is_split_d_bwd if compute_capability == 10 else False,
             is_split_dv_bwd if compute_capability == 10 else False,
+            # overlap: an overlap grad kernel (K/V rebuilt from SRBuffer addr) and a
+            # plain one for the same shapes are different compiled artifacts.
+            enable_overlap,
+            overlap_bhsd_layout,
+            overlap_comm_rpb,
         )
 
     # SM100/SM110 uses default from function signature (384).
@@ -1528,19 +1843,15 @@ def _flash_attn_bwd(
                 f_mdK if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else f_mdKaccum,
                 f_mdV if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else f_mdVaccum,
                 softmax_scale,
-                None,  # mCuSeqlensQ
-                None,  # mCuSeqlensK
-                None,  # mSeqUsedQ
-                None,  # mSeqUsedK
-                None,  # window_size_left
-                None,  # window_size_right
-                f_mdQ_semaphore,  # mdQ_semaphore
-                f_mdK_semaphore,  # mdK_semaphore
-                f_mdV_semaphore,  # mdV_semaphore
-                None,  # aux_tensors
-                None,  # blocksparse_tensors
-                cute_flashmask_info,  # flashmask_info
-                current_stream,
+                mCuSeqlensQ=None,
+                mCuSeqlensK=None,
+                mSeqUsedQ=None,
+                mSeqUsedK=None,
+                mdQ_semaphore=f_mdQ_semaphore,
+                mdK_semaphore=f_mdK_semaphore,
+                mdV_semaphore=f_mdV_semaphore,
+                flashmask_info=cute_flashmask_info,
+                stream=current_stream,
             )
         else:
             fa_bwd_obj = FlashAttentionBackwardSm100(
@@ -1556,7 +1867,6 @@ def _flash_attn_bwd(
                 is_split_d=is_split_d_bwd,
                 is_split_dv=is_split_dv_bwd,
             )
-
             _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
                 fa_bwd_obj,
                 q_tensor,
@@ -1569,46 +1879,101 @@ def _flash_attn_bwd(
                 dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dk_accum_tensor,
                 dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dv_accum_tensor,
                 softmax_scale,
-                cu_seqlens_q_tensor,
-                cu_seqlens_k_tensor,
-                seqused_q_tensor,
-                seqused_k_tensor,
-                None,  # window_size_left
-                None,  # window_size_right
-                dQ_semaphore_tensor,
-                dK_semaphore_tensor,
-                dV_semaphore_tensor,
-                None,  # aux_tensors
-                None,  # blocksparse_tensors
-                cute_flashmask_info,
-                current_stream,
+                mCuSeqlensQ=cu_seqlens_q_tensor,
+                mCuSeqlensK=cu_seqlens_k_tensor,
+                mSeqUsedQ=seqused_q_tensor,
+                mSeqUsedK=seqused_k_tensor,
+                mdQ_semaphore=dQ_semaphore_tensor,
+                mdK_semaphore=dK_semaphore_tensor,
+                mdV_semaphore=dV_semaphore_tensor,
+                flashmask_info=cute_flashmask_info,
+                overlap_k_addr=overlap_k_addr,
+                overlap_v_addr=overlap_v_addr,
+                overlap_work_done_addr=overlap_work_done_addr,
+                overlap_segment_idx=overlap_segment_idx,
+                overlap_dk_addr=overlap_dk_addr,
+                overlap_dv_addr=overlap_dv_addr,
+                overlap_b=overlap_b,
+                overlap_s=overlap_s,
+                overlap_h=overlap_h,
+                overlap_d=overlap_d,
+                overlap_comm_rpb=overlap_comm_rpb,
+                overlap_bhsd_layout=overlap_bhsd_layout,
+                stream=current_stream,
+            )
+    if compute_capability == 9:
+        _flash_attn_bwd.compile_cache[compile_key](
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            do_tensor,
+            lse_log2_tensor,
+            dpsum_tensor,
+            dq_accum_tensor,
+            dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dk_accum_tensor,
+            dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dv_accum_tensor,
+            softmax_scale,
+            mCuSeqlensQ=cu_seqlens_q_tensor,
+            mCuSeqlensK=cu_seqlens_k_tensor,
+            mSeqUsedQ=seqused_q_tensor,
+            mSeqUsedK=seqused_k_tensor,
+            mdQ_semaphore=dQ_semaphore_tensor,
+            mdK_semaphore=dK_semaphore_tensor,
+            mdV_semaphore=dV_semaphore_tensor,
+            flashmask_info=cute_flashmask_info,
+            stream=current_stream,
+        )
+    else:
+        def _run_bwd_main(
+            segment_flashmask_info,
+            segment_k_addr,
+            segment_v_addr,
+            segment_dk_addr,
+            segment_dv_addr,
+            segment_idx=None,
+        ):
+            _flash_attn_bwd.compile_cache[compile_key](
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                do_tensor,
+                lse_log2_tensor,
+                dpsum_tensor,
+                dq_accum_tensor,
+                dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dk_accum_tensor,
+                dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dv_accum_tensor,
+                softmax_scale,
+                mCuSeqlensQ=cu_seqlens_q_tensor,
+                mCuSeqlensK=cu_seqlens_k_tensor,
+                mSeqUsedQ=seqused_q_tensor,
+                mSeqUsedK=seqused_k_tensor,
+                mdQ_semaphore=dQ_semaphore_tensor,
+                mdK_semaphore=dK_semaphore_tensor,
+                mdV_semaphore=dV_semaphore_tensor,
+                flashmask_info=segment_flashmask_info,
+                overlap_k_addr=segment_k_addr,
+                overlap_v_addr=segment_v_addr,
+                overlap_work_done_addr=overlap_work_done_addr,
+                overlap_segment_idx=(
+                    None if segment_idx is None else cutlass.Int32(segment_idx)
+                ),
+                overlap_dk_addr=segment_dk_addr,
+                overlap_dv_addr=segment_dv_addr,
+                overlap_b=overlap_b,
+                overlap_s=overlap_s,
+                overlap_h=overlap_h,
+                overlap_d=overlap_d,
+                stream=current_stream,
             )
 
-    _flash_attn_bwd.compile_cache[compile_key](
-        q_tensor,
-        k_tensor,
-        v_tensor,
-        do_tensor,
-        lse_log2_tensor,
-        dpsum_tensor,
-        dq_accum_tensor,
-        dk_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dk_accum_tensor,
-        dv_tensor if (qhead_per_kvhead == 1 and not is_split_d_bwd and not is_split_dv_bwd) else dv_accum_tensor,
-        softmax_scale,
-        cu_seqlens_q_tensor,
-        cu_seqlens_k_tensor,
-        seqused_q_tensor,
-        seqused_k_tensor,
-        None,  # window_size_left
-        None,  # window_size_right
-        dQ_semaphore_tensor,
-        dK_semaphore_tensor,
-        dV_semaphore_tensor,
-        None,  # aux_tensors
-        None,  # blocksparse_tensors
-        cute_flashmask_info,
-        current_stream,
-    )
+        if not enable_overlap:
+            _run_bwd_main(
+                cute_flashmask_info,
+                overlap_k_addr,
+                overlap_v_addr,
+                overlap_dk_addr,
+                overlap_dv_addr,
+            )
 
     num_threads = 256 if compute_capability == 9 else 128
     arch = compute_capability * 10
@@ -1652,11 +2017,39 @@ def _flash_attn_bwd(
     def _kv_accum_cute(t, tensor, accum_hdim):
         return _to_cute(_slice_kv_accum(t, accum_hdim)) if kv_postprocess_enabled else tensor
 
-    def _postprocess_run(d_accum_t, d_out_t, scale, hd, block_size, atom_layout, swapAB,
-                         use_2cta, cluster, cu_seqlens_t, seqused_t, cache_tag):
-        compile_key_post = (dtype, hd, arch, block_size, num_threads, atom_layout, swapAB,
-                            use_2cta, cluster, cache_tag)
-
+    def _postprocess_run(
+        d_accum_t,
+        d_out_t,
+        scale,
+        hd,
+        block_size,
+        atom_layout,
+        swapAB,
+        use_2cta,
+        cluster,
+        cu_seqlens_t,
+        seqused_t,
+        cache_tag,
+        raw_output_addr=None,
+        raw_b=None,
+        raw_s=None,
+        raw_h=None,
+        raw_d=None,
+        raw_storage_d=None,
+    ):
+        compile_key_post = (
+            dtype,
+            hd,
+            arch,
+            block_size,
+            num_threads,
+            atom_layout,
+            swapAB,
+            use_2cta,
+            cluster,
+            cache_tag,
+            raw_output_addr is not None,
+        )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             fa_bwd_post = FlashAttentionBackwardPostprocess(
                 dtype, hd, arch, block_size, num_threads, atom_layout, swapAB,
@@ -1666,14 +2059,180 @@ def _flash_attn_bwd(
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
                 fa_bwd_post,
                 d_accum_t, d_out_t, scale,
-                cu_seqlens_t, seqused_t, current_stream,
+                cu_seqlens_t, seqused_t,
+                raw_output_addr=raw_output_addr,
+                raw_b=raw_b,
+                raw_s=raw_s,
+                raw_h=raw_h,
+                raw_d=raw_d,
+                raw_storage_d=raw_storage_d,
+                stream=current_stream,
             )
         _flash_attn_bwd.compile_cache_post[compile_key_post](
             d_accum_t, d_out_t, scale,
-            cu_seqlens_t, seqused_t, current_stream,
+            cu_seqlens_t, seqused_t,
+            raw_output_addr=raw_output_addr,
+            raw_b=raw_b,
+            raw_s=raw_s,
+            raw_h=raw_h,
+            raw_d=raw_d,
+            raw_storage_d=raw_storage_d,
+            stream=current_stream,
         )
 
-    if is_split_d_bwd:
+    if enable_overlap:
+        raw_b = cutlass.Int32(batch_size)
+        raw_s = cutlass.Int32(segment_seqlen)
+        raw_h = cutlass.Int32(num_head_kv)
+        raw_storage_d_k = cutlass.Int32(head_dim)
+        raw_storage_d_v = cutlass.Int32(head_dim_v)
+
+        def _raw_addr(addr, element_offset=0):
+            return cutlass.Int64(int(addr) + 2 * element_offset)
+
+        def _run_overlap_dkv_postprocess(dk_send_addr, dv_send_addr):
+            if is_split_d_bwd:
+                half_hdim = head_dim // 2
+                half_hdim_v = head_dim_v // 2
+                dk_accum_low, dk_accum_high = (
+                    dk_accum[..., : dk_accum.shape[-1] // 2],
+                    dk_accum[..., dk_accum.shape[-1] // 2 :],
+                )
+                dv_accum_low, dv_accum_high = (
+                    dv_accum[..., : dv_accum.shape[-1] // 2],
+                    dv_accum[..., dv_accum.shape[-1] // 2 :],
+                )
+                for accum_part, output_addr, hd in (
+                    (dk_accum_low, _raw_addr(dk_send_addr), half_hdim),
+                    (dk_accum_high, _raw_addr(dk_send_addr, half_hdim), half_hdim),
+                ):
+                    _postprocess_run(
+                        _to_cute(_slice_kv_accum(accum_part, hd)), dk_tensor,
+                        softmax_scale, hd, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                        False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dk_split",
+                        output_addr, raw_b, raw_s, raw_h, cutlass.Int32(hd),
+                        raw_storage_d_k,
+                    )
+                for accum_part, output_addr, hd in (
+                    (dv_accum_low, _raw_addr(dv_send_addr), half_hdim_v),
+                    (dv_accum_high, _raw_addr(dv_send_addr, half_hdim_v), half_hdim_v),
+                ):
+                    _postprocess_run(
+                        _to_cute(_slice_kv_accum(accum_part, hd)), dv_tensor,
+                        cutlass.Float32(1.0), hd, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                        False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dv_split",
+                        output_addr, raw_b, raw_s, raw_h, cutlass.Int32(hd),
+                        raw_storage_d_v,
+                    )
+            elif is_split_dv_bwd:
+                half_hdim_v = head_dim_v // 2
+                _postprocess_run(
+                    _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),
+                    _kv_out_cute(dk, dk_tensor), softmax_scale,
+                    head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                    False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dk",
+                    _raw_addr(dk_send_addr), raw_b, raw_s, raw_h,
+                    cutlass.Int32(head_dim), raw_storage_d_k,
+                )
+                dv_accum_low, dv_accum_high = dv_accum[..., : dv_accum.shape[-1] // 2], dv_accum[..., dv_accum.shape[-1] // 2 :]
+                for accum_part, output_addr in (
+                    (dv_accum_low, _raw_addr(dv_send_addr)),
+                    (dv_accum_high, _raw_addr(dv_send_addr, half_hdim_v)),
+                ):
+                    _postprocess_run(
+                        _to_cute(_slice_kv_accum(accum_part, half_hdim_v)), dv_tensor,
+                        cutlass.Float32(1.0), half_hdim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                        False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dv_split",
+                        output_addr, raw_b, raw_s, raw_h, cutlass.Int32(half_hdim_v),
+                        raw_storage_d_v,
+                    )
+            else:
+                _postprocess_run(
+                    _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),
+                    _kv_out_cute(dk, dk_tensor), softmax_scale,
+                    head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                    False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dk",
+                    _raw_addr(dk_send_addr), raw_b, raw_s, raw_h,
+                    cutlass.Int32(head_dim), raw_storage_d_k,
+                )
+                _postprocess_run(
+                    _kv_accum_cute(dv_accum, dv_accum_tensor, head_dim_v_rounded),
+                    _kv_out_cute(dv, dv_tensor), cutlass.Float32(1.0),
+                    head_dim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                    False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dv",
+                    _raw_addr(dv_send_addr), raw_b, raw_s, raw_h,
+                    cutlass.Int32(head_dim_v), raw_storage_d_v,
+                )
+
+        for segment_idx in range(overlap_ag_args.num_segments):
+            segment_view = overlap_ag_args.kv_view(segment_idx)
+            segment_dk_send_addr, segment_dv_send_addr = (
+                overlap_ag_args.dkv_send_addrs(segment_idx)
+            )
+            segment_k_addr = cutlass.Int64(segment_view.k_addr)
+            segment_v_addr = cutlass.Int64(segment_view.v_addr)
+            segment_dk_addr = (
+                None
+                if need_kv_accum
+                else cutlass.Int64(segment_dk_send_addr)
+            )
+            segment_dv_addr = (
+                None
+                if need_kv_accum
+                else cutlass.Int64(segment_dv_send_addr)
+            )
+
+            if not need_kv_accum:
+                overlap_runtime.wait_dkv_buffer(segment_idx, overlap_stream)
+            _run_bwd_main(
+                cute_flashmask_info,
+                segment_k_addr,
+                segment_v_addr,
+                segment_dk_addr,
+                segment_dv_addr,
+                segment_idx=segment_idx,
+            )
+            if need_kv_accum:
+                overlap_runtime.wait_dkv_buffer(segment_idx, overlap_stream)
+                _run_overlap_dkv_postprocess(
+                    segment_dk_send_addr, segment_dv_send_addr
+                )
+            overlap_runtime.run_backward_rs(dk, dv, segment_idx, overlap_stream)
+
+            if segment_idx + 1 < overlap_ag_args.num_segments:
+                if need_kv_accum:
+                    dk_accum.zero_()
+                    dv_accum.zero_()
+                overlap_runtime.start_backward_segment(
+                    segment_idx + 1, overlap_stream
+                )
+                if deterministic:
+                    dQ_semaphore.zero_()
+                    if need_kv_accum:
+                        dK_semaphore.zero_()
+                        dV_semaphore.zero_()
+        overlap_runtime.wait_backward_rs(overlap_stream)
+
+    if enable_overlap:
+        if is_split_d_bwd:
+            half_hdim = head_dim // 2
+            dq_accum_low, dq_accum_high = dq_accum[..., : dq_accum.shape[-1] // 2], dq_accum[..., dq_accum.shape[-1] // 2 :]
+            for accum_part, out_part in (
+                (dq_accum_low, dq[..., :half_hdim]),
+                (dq_accum_high, dq[..., half_hdim:]),
+            ):
+                _postprocess_run(
+                    _to_cute(accum_part), _to_cute(out_part), softmax_scale,
+                    half_hdim, m_block_size, AtomLayoutMdQ, dQ_swapAB,
+                    False, 1, cu_seqlens_q_tensor, seqused_q_tensor, "ovl_dq_split",
+                )
+        else:
+            _postprocess_run(
+                dq_accum_tensor, dq_tensor, softmax_scale,
+                head_dim, m_block_size, AtomLayoutMdQ, dQ_swapAB,
+                use_2cta_instrs, 1, cu_seqlens_q_tensor, seqused_q_tensor, "ovl_dq",
+            )
+    elif is_split_d_bwd:
         half_hdim = head_dim // 2
         half_hdim_v = head_dim_v // 2
 
@@ -2340,6 +2899,7 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
         learnable_sink: paddle.Tensor | None = None,
         startend_row_indices: paddle.Tensor | None = None,
         block_mask: paddle.Tensor | None = None,
+        group=None,
     ) -> paddle.Tensor | Tuple[paddle.Tensor, paddle.Tensor]:
         out, lse = _flash_attn_fwd(
             query,
@@ -2351,10 +2911,12 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
             return_lse=True,
             startend_row_indices=startend_row_indices,
             pack_gqa=False,
+            group=group,
         )
         ctx.save_for_backward(query, key, value, startend_row_indices, out, lse, learnable_sink)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.group = group
         return [out, lse]
 
     @staticmethod
@@ -2379,6 +2941,7 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
             causal=ctx.causal,
             deterministic=paddle.get_flags(["FLAGS_cudnn_deterministic"])["FLAGS_cudnn_deterministic"],
             learnable_sink=learnable_sink,
+            group=ctx.group,
         )
         if learnable_sink is None:
             return dq, dk, dv
@@ -2403,6 +2966,7 @@ def flashmask_attention(
     softmax_scale: float | None = None,
     block_mask: paddle.Tensor | None = None,
     learnable_sink: paddle.Tensor | None = None,
+    group=None,
 ):
     if _is_cutedsl_kernel_supported(query, key, value, startend_row_indices):
         assert dropout == 0.0, (
@@ -2480,6 +3044,7 @@ def flashmask_attention(
             softmax_scale=softmax_scale,
             learnable_sink=learnable_sink,
             startend_row_indices=startend_row_indices,
+            group=group,
         )
         if return_softmax_lse:
             return [out, lse]

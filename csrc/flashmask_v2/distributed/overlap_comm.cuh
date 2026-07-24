@@ -120,8 +120,24 @@ public:
 
     void wait_wptr_init();
 
+    // Legacy diagnostic helper. The active FM-4 forward and split backward paths
+    // use per-tile/per-work readiness and do not call this host synchronization.
+    void sync_comm_stream() { cudaStreamSynchronize(comm_stream); }
+
     void* k_data() const { return kv_buffer->k_data(); }
     void* v_data() const { return kv_buffer->v_data(); }
+    void* segment_k_data(int segment_idx) const {
+        const size_t offset = _flags.use_hierarchical
+            ? static_cast<size_t>(segment_idx) * B * num_chunks * _local_batch_stride
+            : 0;
+        return kv_buffer->k_data() + offset;
+    }
+    void* segment_v_data(int segment_idx) const {
+        const size_t offset = _flags.use_hierarchical
+            ? static_cast<size_t>(segment_idx) * B * num_chunks * _local_batch_stride
+            : 0;
+        return kv_buffer->v_data() + offset;
+    }
 
     // we need to reroute the bwd dx_accum output buffer to dk_send and dv_send
     // so that the output of post-proc kernel can be directly sent
@@ -139,6 +155,12 @@ public:
     );
 
     int dkv_buffer_stage() const;
+
+    void wait_dkv_buffer(int segment_idx, cudaStream_t stream) const {
+        if (segment_idx >= dkv_buffer_stage()) {
+            dkv_buffer->wait_buffer(segment_idx, stream);
+        }
+    }
 
     void wait_reduce_done(cudaStream_t stream) const {
         cudaEventRecord(reduce_done, aux_c_stream);

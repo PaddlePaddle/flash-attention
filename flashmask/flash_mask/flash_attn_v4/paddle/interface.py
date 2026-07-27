@@ -2285,6 +2285,9 @@ def flash_attn_varlen_func(
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.
     """
+    print(f"wsm debug {cu_seqlens_q=}")
+    print(f"wsm debug {cu_seqlens_k=}")
+    print(f"wsm debug {causal=}")
     return FlashAttnVarlenFunc.apply(
         q,
         k,

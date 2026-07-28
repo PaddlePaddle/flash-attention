@@ -42,6 +42,7 @@ from flash_mask.cute.flashmask_utils import (
     to_cute_flashmask_info,
     reduce_block_count,
     compute_flashmask_block_lists,
+    build_flashmask_block_lists,
 )
 
 from flash_mask.cute.block_sparsity import (
@@ -206,7 +207,7 @@ class BwdConfig:
     num_wg: int = 2  # MMA warp groups (total threads = (num_wg + 1) * 128)
     dQ_single_wg: bool = False
 
-def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None, flashmask=False):
+def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None, flashmask=False, deterministic=False):
     """Return BwdConfig for SM90.
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
@@ -266,11 +267,25 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 num_wg=2,
             )
     else:
-        # hdim 256
+        # hdim 256: mirror C++ FA3 run_mha_bwd_hdim256 (Arch>=90); dKV/dQ MMAs
+        # use swapAB. The dQ-accumulation path drives the smem budget and must
+        # match flash_bwd_sm90's dQacc_use_TMA (== deterministic for d256):
+        #   - non-deterministic: dQ is atomicAdd'd straight to gmem, so the 64KB
+        #     dQ smem staging buffer is dropped. That headroom buys a 2-stage Q
+        #     pipeline and the larger dense N=80 tile (~20% fewer KV-blocks;
+        #     flashmask keeps N=64 to match its block-list tiling).
+        #   - deterministic: ordered accumulation forces the TMA-staging path,
+        #     re-adding the 64KB buffer. 2-stage Q / N=80 would then overflow
+        #     Hopper's ~227KB smem (CUDA_ERROR_INVALID_VALUE at launch), so use
+        #     a 1-stage Q pipeline and N=64.
+        if deterministic:
+            n_block_size, num_stages_Q = 64, 1
+        else:
+            n_block_size, num_stages_Q = (64 if flashmask else 80), 2
         return BwdConfig(
-            m_block_size=64, n_block_size=64,
-            num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
-            SdP_swapAB=False, dKV_swapAB=False, dQ_swapAB=False,
+            m_block_size=64, n_block_size=n_block_size,
+            num_stages_Q=num_stages_Q, num_stages_dO=1, num_stages_PdS=1,
+            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=True,
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
         )
 
@@ -421,6 +436,15 @@ def _flash_attn_fwd(
     # (otherwise the per-n_block arrays disagree in length -> reshape error).
     if compute_capability == 9 and head_dim > 128:
         n_block_size = 64
+        # d256/dv256 dense fwd is tensor-core bound; a larger KV tile (80 vs 64,
+        # matching mainline FA3) cuts KV-loop iterations/overhead and feeds the
+        # MMA better. smem at N=80 (sQ 64KB + sK 80KB + sV 80KB ~= 224KB, no P
+        # since mma_pv_is_rs) fits Hopper's ~227KB. Only widen the dense
+        # (non-flashmask) d256 case: flashmask keeps 64 so the block max/min scan
+        # + block-list tiling (kBlockN) agree (and leave headroom for s_rowidx);
+        # head_dim=192 keeps 64 (dv=128 tile is a different smem shape).
+        if head_dim == 256 and v.shape[-1] == 256 and startend_row_indices is None:
+            n_block_size = 80
 
     # Each SM100 CTA processes q_stage * m_block_size query rows; Split-D
     # (d>192, d==dv) uses q_stage=1 to fit the TMEM budget. Must match
@@ -474,10 +498,18 @@ def _flash_attn_fwd(
             is_causal=causal,
             startend_row_indices=startend_row_indices,
         )
-        flashmask_info.valid_block_count = paddle.empty([fm_batch_size, fm_heads, num_m_blocks], dtype=paddle.int32)
+        # valid_block_count (produced by reduce_block_count) feeds only the SM100
+        # path and the bwd 2CTA density heuristic. The SM90 fwd kernel iterates the
+        # block-sparse lists built below (build_flashmask_block_lists) and never
+        # reads valid_block_count, so skip both the extra [b,h,num_m_blocks] alloc
+        # and the reduce_block_count kernel launch there. Per-call fixed overhead
+        # dominates the high-sparsity / short-seq configs, so this is pure win.
+        if compute_capability != 9:
+            flashmask_info.valid_block_count = paddle.empty([fm_batch_size, fm_heads, num_m_blocks], dtype=paddle.int32)
         prepare_block_maxmin(flashmask_info, kBlockN=n_block_size)
         cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
-        reduce_block_count(cute_flashmask_info, causal, q_stage * m_block_size, n_block_size, seqlen_q)
+        if compute_capability != 9:
+            reduce_block_count(cute_flashmask_info, causal, q_stage * m_block_size, n_block_size, seqlen_q)
 
     if page_table is not None:
         assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
@@ -586,7 +618,13 @@ def _flash_attn_fwd(
     requires_grad = not (q.stop_gradient and k.stop_gradient and v.stop_gradient)
 
     if out is None:
-        out = paddle.zeros(
+        # then stored, so fully-masked rows/blocks (incl. generate_empty_mask) come
+        # out as 0. So on SM90 use an uninitialized buffer to skip the ~1GB O
+        # zero-fill that dominates short-seq / high-sparsity calls (~5% fwd speedup).
+        # On SM100 the flashmask fwd skips the O store for a fully-masked query block
+        # (valid_block_count == 0) and has no zero-writer for it, so that O tile would
+        # be left uninitialized -- keep paddle.zeros on SM100.
+        out = (paddle.empty if compute_capability == 9 else paddle.zeros)(
             shape=[*q_batch_seqlen_shape, num_head, head_dim_v], dtype=out_paddle_dtype
         )
     else:
@@ -650,7 +688,7 @@ def _flash_attn_fwd(
         and block_sparse_tensors is None
         and seqlen_q is not None
     ):
-        fm_full_cnt, fm_full_idx, fm_mask_cnt, fm_mask_idx = compute_flashmask_block_lists(
+        fm_full_cnt, fm_full_idx, fm_mask_cnt, fm_mask_idx = build_flashmask_block_lists(
             flashmask_info,
             causal,
             m_block_size,
@@ -706,15 +744,11 @@ def _flash_attn_fwd(
 
     current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
 
-    if compute_capability == 9:  # TODO: tune block size according to hdim.
-        if (
-            head_dim == head_dim_v == 128
-            and not causal
-            and not local
-            and not use_block_sparsity
-            and startend_row_indices is None
-        ):
-            n_block_size = 192
+    # NOTE: do NOT bump n_block_size to 192 for the dense d=128 (non-causal,
+    # non-flashmask) case. tile_n=192 with num_stages=2 needs ~225 KiB smem, which
+    # hits Hopper's ~228 KiB ceiling -> 1 block/SM and near-zero L1, making Full
+    # ~6% slower than tile_n=128 (FA4 uses 128 and reaches ~647 vs ~613 TFLOP/s
+    # here). Keep the default 128 to match FA4's dense config.
     if compute_capability == 10:
         # TODO: fix the varlen case
         if (
@@ -1173,6 +1207,7 @@ def _flash_attn_bwd(
             False,
             sparse_block_size_q=None,
             flashmask=flashmask_info is not None,
+            deterministic=deterministic,
         ).n_block_size
 
     cute_flashmask_info = None
@@ -1266,6 +1301,7 @@ def _flash_attn_bwd(
             local,
             sparse_block_size_q=sparse_q,
             flashmask=cute_flashmask_info is not None,
+            deterministic=deterministic,
         )
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size
@@ -2257,7 +2293,7 @@ def _flash_attn_bwd(
 
         _postprocess_run(
             dq_accum_tensor, dq_tensor, softmax_scale,
-            head_dim_rounded, m_block_size, AtomLayoutMdQ, dQ_swapAB,
+            head_dim, m_block_size, AtomLayoutMdQ, dQ_swapAB,
             use_2cta_instrs, 1, cu_seqlens_q_tensor, seqused_q_tensor, "dq",
         )
 
@@ -2265,7 +2301,7 @@ def _flash_attn_bwd(
             _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),
             _kv_out_cute(dk, dk_tensor),
             softmax_scale,
-            head_dim_rounded, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+            head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
             False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dk",
         )
 
@@ -2287,7 +2323,7 @@ def _flash_attn_bwd(
         # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
         _postprocess_run(
             dq_accum_tensor, dq_tensor, softmax_scale,
-            head_dim_rounded, m_block_size, AtomLayoutMdQ, dQ_swapAB,
+            head_dim, m_block_size, AtomLayoutMdQ, dQ_swapAB,
             use_2cta_instrs, 1, cu_seqlens_q_tensor, seqused_q_tensor, "dq",
         )
         
@@ -2296,14 +2332,14 @@ def _flash_attn_bwd(
                 _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),
                 _kv_out_cute(dk, dk_tensor),
                 softmax_scale,
-                head_dim_rounded, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
                 False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dk",
             )
             _postprocess_run(
                 _kv_accum_cute(dv_accum, dv_accum_tensor, head_dim_v_rounded),
                 _kv_out_cute(dv, dv_tensor),
                 cutlass.Float32(1.0),
-                head_dim_v_rounded, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                head_dim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
                 False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dv",
             )
 

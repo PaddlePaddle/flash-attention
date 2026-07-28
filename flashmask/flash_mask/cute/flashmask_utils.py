@@ -679,11 +679,23 @@ def compute_flashmask_block_lists(
     n_full = paddle.broadcast_to(n_idx, [b, h_fm, nq, nk])
 
     def _pack(sel):
-        # ascending packed indices via sort of key = n where selected else nk
-        key = paddle.where(sel, n_full, paddle.full_like(n_full, nk))
-        sorted_key = paddle.sort(key, axis=-1)
-        idx = paddle.where(sorted_key < nk, sorted_key, paddle.zeros_like(sorted_key))
-        cnt = paddle.sum(sel.astype("int32"), axis=-1)
+        # Compact the selected KV-block indices to the front in ascending order.
+        # Equivalent to the previous sort-based packing (key = n where selected
+        # else nk, then sort), but ~20x cheaper: a cumsum prefix-sum + scatter
+        # instead of paddle.sort over (b, h_fm, nq, nk). paddle.sort dominated the
+        # per-call host prologue that is included in the fwd benchmark timing.
+        seli = sel.astype("int32")
+        cnt = paddle.sum(seli, axis=-1)
+        # 0-based rank of each selected column among the selected ones, scanning
+        # low->high n so the packed output stays ascending (matches the sort).
+        rank = paddle.cumsum(seli, axis=-1) - 1
+        # Selected columns scatter their n (= column index) to their rank slot;
+        # unselected columns scatter to a trash slot at index nk that is dropped,
+        # so they never collide with a valid rank in [0, cnt).
+        target = paddle.where(sel, rank, paddle.full_like(rank, nk)).astype("int64")
+        idx_ext = paddle.zeros([b, h_fm, nq, nk + 1], dtype="int32")
+        idx_ext = paddle.put_along_axis(idx_ext, target, n_full, axis=-1)
+        idx = idx_ext[..., :nk]
         return cnt.astype("int32"), idx.astype("int32")
 
     full_cnt, full_idx = _pack(is_full)
@@ -698,3 +710,324 @@ def compute_flashmask_block_lists(
         mask_idx = paddle.repeat_interleave(mask_idx, rep, axis=1)
 
     return full_cnt, full_idx, mask_cnt, mask_idx
+
+
+@cute.kernel
+def build_flashmask_block_lists_kernel(
+    LTS_nblock_max: cute.Tensor,  # [b, h_fm, nblocks_padded]
+    LTS_nblock_min: cute.Tensor,
+    LTE_nblock_max: cute.Tensor,
+    LTE_nblock_min: cute.Tensor,
+    UTS_nblock_max: cute.Tensor,
+    UTS_nblock_min: cute.Tensor,
+    UTE_nblock_max: cute.Tensor,
+    UTE_nblock_min: cute.Tensor,
+    full_cnt: cute.Tensor,  # [b, num_heads, nq]
+    full_idx: cute.Tensor,  # [b, num_heads, nq, nk]
+    mask_cnt: cute.Tensor,  # [b, num_heads, nq]
+    mask_idx: cute.Tensor,  # [b, num_heads, nq, nk]
+    num_blocks_row: cutlass.Int32,  # nq
+    num_blocks_col: cutlass.Int32,  # nk
+    is_causal: cutlass.Constexpr[bool],
+    has_lte: cutlass.Constexpr[bool],
+    has_uts: cutlass.Constexpr[bool],
+    has_ute: cutlass.Constexpr[bool],
+    split_full: cutlass.Constexpr[bool],
+    batch_size: cutlass.Int32,
+    num_heads: cutlass.Int32,
+    h_flashmask: cutlass.Int32,
+    kBlockM: cutlass.Int32,
+    kBlockN: cutlass.Int32,
+    seqlen_q: cutlass.Int32,
+    seqlen_k: cutlass.Int32,
+):
+    """In-kernel generation of the per-(b, head, m_block) compact surviving-block
+    lists. One warp per (batch, head, m_block) row scans all n_blocks in chunks of
+    32; each lane classifies its n_block (skip / full / mask) with the identical
+    predicates as compute_flashmask_block_lists, then a warp prefix-sum compacts
+    the surviving indices (ascending) into full_idx / mask_idx with counts in
+    full_cnt / mask_cnt. Replaces the ~40 paddle eager ops (host prologue) with a
+    single kernel. idx arrays must be zero-initialized by the caller (unused
+    positions stay 0)."""
+    tidx = cute.arch.thread_idx()[0]
+    bidx = cute.arch.block_idx()[0]
+    bdimx = cute.arch.block_dim()[0]
+    lane_id = tidx & 31
+    warp_id = tidx >> 5
+    global_warp_id = warp_id + (bidx * bdimx >> 5)
+    total_num_blocks_row = batch_size * num_heads * num_blocks_row
+
+    if global_warp_id < total_num_blocks_row:
+        block_row_idx = global_warp_id % num_blocks_row
+        head_idx = (global_warp_id // num_blocks_row) % num_heads
+        batch_idx = global_warp_id // (num_heads * num_blocks_row)
+        fm_head_idx = head_idx // (num_heads // h_flashmask)
+
+        m_start = block_row_idx * kBlockM
+        m_end = cutlass.min(m_start + kBlockM, seqlen_q)
+        offset = seqlen_k - seqlen_q
+
+        loop_num = (num_blocks_col + 31) >> 5
+        run_mask = cutlass.Int32(0)
+        run_full = cutlass.Int32(0)
+        for i in cutlass.range(loop_num):
+            block_col_idx = i * 32 + lane_id
+            is_mask = cutlass.Int32(0)
+            is_full = cutlass.Int32(0)
+            # fm_partial flag for mask-list blocks: encoded into the high bit of
+            # the stored index so the fwd producer/consumer can decide whether a
+            # per-element flashmask apply is needed without recomputing the
+            # (gmem-read) partial predicate per block.
+            mask_is_fm_partial = cutlass.Int32(0)
+            if block_col_idx < num_blocks_col:
+                n_start = block_col_idx * kBlockN
+                n_end = cutlass.min(n_start + kBlockN, seqlen_k)
+                lts_max = LTS_nblock_max[batch_idx, fm_head_idx, block_col_idx]
+                lts_min = LTS_nblock_min[batch_idx, fm_head_idx, block_col_idx]
+                if cutlass.const_expr(has_uts):
+                    lte_max = LTE_nblock_max[batch_idx, fm_head_idx, block_col_idx]
+                    lte_min = LTE_nblock_min[batch_idx, fm_head_idx, block_col_idx]
+                    uts_max = UTS_nblock_max[batch_idx, fm_head_idx, block_col_idx]
+                    uts_min = UTS_nblock_min[batch_idx, fm_head_idx, block_col_idx]
+                    ute_max = UTE_nblock_max[batch_idx, fm_head_idx, block_col_idx]
+                    ute_min = UTE_nblock_min[batch_idx, fm_head_idx, block_col_idx]
+                    fm_fully = ((m_start >= lts_max) and (m_end <= lte_min)) or (
+                        (m_start >= uts_max) and (m_end <= ute_min)
+                    )
+                    fm_partial = ((m_start < lte_max) and (m_end > lts_min)) or (
+                        (m_start < ute_max) and (m_end > uts_min)
+                    )
+                elif cutlass.const_expr(has_lte):
+                    lte_max = LTE_nblock_max[batch_idx, fm_head_idx, block_col_idx]
+                    lte_min = LTE_nblock_min[batch_idx, fm_head_idx, block_col_idx]
+                    fm_fully = (m_start >= lts_max) and (m_end <= lte_min)
+                    fm_partial = (m_start < lte_max) and (m_end > lts_min)
+                elif cutlass.const_expr(has_ute):
+                    ute_max = UTE_nblock_max[batch_idx, fm_head_idx, block_col_idx]
+                    ute_min = UTE_nblock_min[batch_idx, fm_head_idx, block_col_idx]
+                    fm_fully = (m_start >= lts_max) or (m_end <= ute_min)
+                    fm_partial = (m_end > lts_min) or (m_start < ute_max)
+                else:
+                    fm_fully = m_start >= lts_max
+                    fm_partial = m_end > lts_min
+
+                if cutlass.const_expr(is_causal):
+                    causal_empty = n_start > (m_end - 1 + offset)
+                    causal_full = (n_end - 1) <= (m_start + offset)
+                    causal_partial = (not causal_empty) and (not causal_full)
+                    skip = causal_empty or fm_fully
+                    needs_mask = causal_partial or (n_end < (n_start + kBlockN)) or fm_partial
+                else:
+                    skip = fm_fully
+                    needs_mask = (n_end < (n_start + kBlockN)) or fm_partial
+
+                if cutlass.const_expr(split_full):
+                    if (not skip) and needs_mask:
+                        is_mask = cutlass.Int32(1)
+                        if fm_partial:
+                            mask_is_fm_partial = cutlass.Int32(1)
+                    elif not skip:
+                        is_full = cutlass.Int32(1)
+                else:
+                    if not skip:
+                        is_mask = cutlass.Int32(1)
+                        if fm_partial:
+                            mask_is_fm_partial = cutlass.Int32(1)
+
+            # Warp-compact the surviving indices (ascending) with a prefix sum.
+            incl_mask = utils.warp_prefix_sum(is_mask, lane_id)
+            incl_full = utils.warp_prefix_sum(is_full, lane_id)
+            excl_mask = incl_mask - is_mask
+            excl_full = incl_full - is_full
+            tot_mask = cute.arch.shuffle_sync(incl_mask, cute.arch.WARP_SIZE - 1)
+            tot_full = cute.arch.shuffle_sync(incl_full, cute.arch.WARP_SIZE - 1)
+            if is_mask != 0:
+                # High bit (1<<30) marks blocks that actually overlap the flashmask
+                # region (need per-element apply). nk << 2^30 so bit 30 is free.
+                encoded_idx = block_col_idx
+                if mask_is_fm_partial != 0:
+                    encoded_idx = block_col_idx | (cutlass.Int32(1) << 30)
+                mask_idx[batch_idx, head_idx, block_row_idx, run_mask + excl_mask] = encoded_idx
+            if is_full != 0:
+                full_idx[batch_idx, head_idx, block_row_idx, run_full + excl_full] = block_col_idx
+            run_mask = run_mask + tot_mask
+            run_full = run_full + tot_full
+
+        if lane_id == 0:
+            mask_cnt[batch_idx, head_idx, block_row_idx] = run_mask
+            full_cnt[batch_idx, head_idx, block_row_idx] = run_full
+
+
+@cute.jit
+def build_flashmask_block_lists_cute(
+    LTS_nblock_max: cute.Tensor,
+    LTS_nblock_min: cute.Tensor,
+    LTE_nblock_max: cute.Tensor,
+    LTE_nblock_min: cute.Tensor,
+    UTS_nblock_max: cute.Tensor,
+    UTS_nblock_min: cute.Tensor,
+    UTE_nblock_max: cute.Tensor,
+    UTE_nblock_min: cute.Tensor,
+    full_cnt: cute.Tensor,
+    full_idx: cute.Tensor,
+    mask_cnt: cute.Tensor,
+    mask_idx: cute.Tensor,
+    num_blocks_row: cutlass.Int32,
+    num_blocks_col: cutlass.Int32,
+    is_causal: cutlass.Constexpr[bool],
+    has_lte: cutlass.Constexpr[bool],
+    has_uts: cutlass.Constexpr[bool],
+    has_ute: cutlass.Constexpr[bool],
+    split_full: cutlass.Constexpr[bool],
+    batch_size: cutlass.Int32,
+    num_heads: cutlass.Int32,
+    h_flashmask: cutlass.Int32,
+    kBlockM: cutlass.Int32,
+    kBlockN: cutlass.Int32,
+    seqlen_q: cutlass.Int32,
+    seqlen_k: cutlass.Int32,
+    stream: cuda.CUstream,
+):
+    build_flashmask_block_lists_kernel(
+        LTS_nblock_max,
+        LTS_nblock_min,
+        LTE_nblock_max if LTE_nblock_max is not None else None,
+        LTE_nblock_min if LTE_nblock_min is not None else None,
+        UTS_nblock_max if UTS_nblock_max is not None else None,
+        UTS_nblock_min if UTS_nblock_min is not None else None,
+        UTE_nblock_max if UTE_nblock_max is not None else None,
+        UTE_nblock_min if UTE_nblock_min is not None else None,
+        full_cnt,
+        full_idx,
+        mask_cnt,
+        mask_idx,
+        num_blocks_row,
+        num_blocks_col,
+        is_causal,
+        has_lte,
+        has_uts,
+        has_ute,
+        split_full,
+        batch_size,
+        num_heads,
+        h_flashmask,
+        kBlockM,
+        kBlockN,
+        seqlen_q,
+        seqlen_k,
+    ).launch(
+        grid=[(num_blocks_row * batch_size * num_heads + 3) >> 2, 1, 1],
+        block=[32 * 4, 1, 1],
+        stream=stream,
+    )
+
+
+def build_flashmask_block_lists(
+    flashmask_info: "FlashMaskInfoPaddle",
+    is_causal: bool,
+    kBlockM: int,
+    kBlockN: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    num_heads: int,
+    split_full: bool = True,
+):
+    """cute-kernel replacement for compute_flashmask_block_lists: produces the same
+    (full_cnt, full_idx, mask_cnt, mask_idx) tensors (cnt shape (b, num_heads, nq),
+    idx shape (b, num_heads, nq, nk), int32, ascending, unused positions 0) via a
+    single kernel launch instead of ~40 paddle eager ops. Requires the *_nblock
+    max/min arrays to already be filled (prepare_block_maxmin)."""
+    srow = flashmask_info.startend_row_indices
+    b, h_fm, _, num_vecs = srow.shape
+    nq = (seqlen_q + kBlockM - 1) // kBlockM
+    nk = (seqlen_k + kBlockN - 1) // kBlockN
+    has_lte, has_uts, has_ute = _flashmask_config_flags(num_vecs, is_causal)
+
+    full_cnt = paddle.zeros([b, num_heads, nq], dtype=paddle.int32)
+    mask_cnt = paddle.zeros([b, num_heads, nq], dtype=paddle.int32)
+    full_idx = paddle.zeros([b, num_heads, nq, nk], dtype=paddle.int32)
+    mask_idx = paddle.zeros([b, num_heads, nq, nk], dtype=paddle.int32)
+
+    def _c3(t):
+        if t is None:
+            return None
+        return from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=2)
+
+    def _c4(t):
+        return from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=3)
+
+    lts_max_t = _c3(flashmask_info.LTS_nblock_max)
+    lts_min_t = _c3(flashmask_info.LTS_nblock_min)
+    lte_max_t = _c3(flashmask_info.LTE_nblock_max)
+    lte_min_t = _c3(flashmask_info.LTE_nblock_min)
+    uts_max_t = _c3(flashmask_info.UTS_nblock_max)
+    uts_min_t = _c3(flashmask_info.UTS_nblock_min)
+    ute_max_t = _c3(flashmask_info.UTE_nblock_max)
+    ute_min_t = _c3(flashmask_info.UTE_nblock_min)
+    full_cnt_t = _c3(full_cnt)
+    mask_cnt_t = _c3(mask_cnt)
+    full_idx_t = _c4(full_idx)
+    mask_idx_t = _c4(mask_idx)
+
+    current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
+
+    compile_key = (is_causal, has_lte, has_uts, has_ute, split_full, kBlockM, kBlockN)
+    if compile_key not in build_flashmask_block_lists.compile_cache:
+        build_flashmask_block_lists.compile_cache[compile_key] = cute.compile(
+            build_flashmask_block_lists_cute,
+            lts_max_t,
+            lts_min_t,
+            lte_max_t,
+            lte_min_t,
+            uts_max_t,
+            uts_min_t,
+            ute_max_t,
+            ute_min_t,
+            full_cnt_t,
+            full_idx_t,
+            mask_cnt_t,
+            mask_idx_t,
+            cutlass.Int32(nq),
+            cutlass.Int32(nk),
+            is_causal,
+            has_lte,
+            has_uts,
+            has_ute,
+            split_full,
+            cutlass.Int32(b),
+            cutlass.Int32(num_heads),
+            cutlass.Int32(h_fm),
+            cutlass.Int32(kBlockM),
+            cutlass.Int32(kBlockN),
+            cutlass.Int32(seqlen_q),
+            cutlass.Int32(seqlen_k),
+            current_stream,
+        )
+    build_flashmask_block_lists.compile_cache[compile_key](
+        lts_max_t,
+        lts_min_t,
+        lte_max_t,
+        lte_min_t,
+        uts_max_t,
+        uts_min_t,
+        ute_max_t,
+        ute_min_t,
+        full_cnt_t,
+        full_idx_t,
+        mask_cnt_t,
+        mask_idx_t,
+        cutlass.Int32(nq),
+        cutlass.Int32(nk),
+        cutlass.Int32(b),
+        cutlass.Int32(num_heads),
+        cutlass.Int32(h_fm),
+        cutlass.Int32(kBlockM),
+        cutlass.Int32(kBlockN),
+        cutlass.Int32(seqlen_q),
+        cutlass.Int32(seqlen_k),
+        current_stream,
+    )
+    return full_cnt, full_idx, mask_cnt, mask_idx
+
+
+build_flashmask_block_lists.compile_cache = {}

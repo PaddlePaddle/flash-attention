@@ -267,7 +267,11 @@ class SoftmaxSm100(Softmax):
         row_max_scaled = row_max * self.scale_log2
         max_offset = Float32(self.max_offset)
         bias = max_offset - row_max_scaled
-        for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
+        # range_constexpr, not range(..., unroll_full=True): the latter emits a real loop
+        # with a dynamic induction variable, and a dynamically indexed store into
+        # acc_S_row keeps its alloca out of registers -- the whole S fragment then lives
+        # in local memory and every access becomes an ld.local/st.local.
+        for i in cutlass.range_constexpr(0, cute.size(acc_S_row.shape), 2):
             acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
                 (acc_S_row[i], acc_S_row[i + 1]),
                 (self.scale_log2, self.scale_log2),

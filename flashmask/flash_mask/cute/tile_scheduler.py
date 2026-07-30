@@ -65,6 +65,15 @@ class TileSchedulerArguments(ParamsBase):
     total_q: Int32
     tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
     cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+    # How `num_block` relates to the CTAs of a cluster. Two conventions exist and they
+    # are NOT interchangeable:
+    #   False (default): num_block counts the blocks of ONE CTA, and blockIdx.x IS that
+    #     CTA's block index -- the CTAs of a pair work on DIFFERENT blocks (the SM100 bwd:
+    #     each CTA owns its own KV tile; the pair index is n_block // cluster_shape_mn[0]).
+    #   True: num_block counts the work tiles of a CTA PAIR, so every CTA of the cluster
+    #     must resolve the SAME tile index and the MMA splits that tile's M across the pair
+    #     (the SM100 2-CTA fwd). The grid is then num_block * cluster_shape_mn[0].
+    cluster_share_tile: cutlass.Constexpr[bool] = False
     mCuSeqlensQ: Optional[cute.Tensor] = None
     mSeqUsedQ: Optional[cute.Tensor] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
@@ -84,6 +93,7 @@ class SingleTileScheduler:
         num_splits_divmod: FastDivmodDivisor
         is_split_kv: cutlass.Constexpr[bool] = False
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+        cluster_share_tile: cutlass.Constexpr[bool] = False
 
         @staticmethod
         def create(
@@ -97,6 +107,7 @@ class SingleTileScheduler:
                 FastDivmodDivisor(args.num_splits),
                 args.is_split_kv,
                 args.cluster_shape_mn,
+                args.cluster_share_tile,
             )
 
     def __init__(self, params: Params, blk_coord: cute.Coord, *, loc=None, ip=None):
@@ -113,6 +124,18 @@ class SingleTileScheduler:
     @staticmethod
     def create(params: Params, *, loc=None, ip=None) -> "SingleTileScheduler":
         blk_coord = cute.arch.block_idx()
+        if const_expr(params.cluster_share_tile and params.cluster_shape_mn[0] > 1):
+            # 2-CTA UMMA with a shared work tile: every CTA of a cluster resolves the SAME
+            # tile and the MMA splits the tile's M rows across the pair. Keeping the tile
+            # index shared is what keeps the flashmask block list / valid_block_count
+            # semantics per-tile (both CTAs walk the identical n_block sequence, so they
+            # never block each other on a skipped block). Only kernels that opt in via
+            # cluster_share_tile want this; see TileSchedulerArguments.cluster_share_tile.
+            blk_coord = (
+                blk_coord[0] // params.cluster_shape_mn[0],
+                blk_coord[1],
+                blk_coord[2],
+            )
         return SingleTileScheduler(params, blk_coord, loc=loc, ip=ip)
 
     # called by host
@@ -125,8 +148,16 @@ class SingleTileScheduler:
     ) -> Tuple[Int32, Int32, Int32]:
         # TODO: this hard-codes the fact that we only use cluster = (1, 1) or (2, 1)
         assert params.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
+        # Shared tile: num_block counts CTA-pair tiles, so the grid needs one block per CTA.
+        # Otherwise num_block already counts per-CTA blocks and only has to be rounded up to
+        # a whole number of clusters.
+        num_blk_x = (
+            params.num_block * params.cluster_shape_mn[0]
+            if const_expr(params.cluster_share_tile)
+            else cute.round_up(params.num_block, params.cluster_shape_mn[0])
+        )
         return (
-            cute.round_up(params.num_block, params.cluster_shape_mn[0]),
+            num_blk_x,
             params.num_head * params.num_splits,
             params.num_batch,
         )
@@ -263,6 +294,8 @@ class SingleTileLPTScheduler:
         l2_minor_residual_divmod: FastDivmodDivisor
         num_hb_quotient: Int32
         is_split_kv: cutlass.Constexpr[bool] = False
+        cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+        cluster_share_tile: cutlass.Constexpr[bool] = False
 
         @staticmethod
         @cute.jit
@@ -299,6 +332,8 @@ class SingleTileLPTScheduler:
                 num_hb_quotient=Int32(num_hb_quotient),
                 num_splits=args.num_splits,
                 is_split_kv=args.is_split_kv,
+                cluster_shape_mn=args.cluster_shape_mn,
+                cluster_share_tile=args.cluster_share_tile,
             )
 
     def __init__(self, params: Params, tile_idx: Int32, split_idx: Int32, *, loc=None, ip=None):
@@ -316,6 +351,9 @@ class SingleTileLPTScheduler:
     @cute.jit
     def create(params: Params, *, loc=None, ip=None) -> "SingleTileLPTScheduler":
         tile_idx, split_idx, _ = cute.arch.block_idx()
+        if const_expr(params.cluster_share_tile and params.cluster_shape_mn[0] > 1):
+            # See SingleTileScheduler.create: all CTAs of a cluster share the work tile.
+            tile_idx = tile_idx // params.cluster_shape_mn[0]
         return SingleTileLPTScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
 
     # called by host
@@ -326,7 +364,17 @@ class SingleTileLPTScheduler:
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
-        return (params.total_blocks, params.num_splits, Int32(1))
+        assert params.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
+        num_blk_x = (
+            params.total_blocks * params.cluster_shape_mn[0]
+            if const_expr(params.cluster_share_tile)
+            else params.total_blocks
+        )
+        return (
+            num_blk_x,
+            params.num_splits,
+            Int32(1),
+        )
 
     @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:

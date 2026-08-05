@@ -229,7 +229,7 @@ class FlashAttentionBackwardSm100:
             # is_split_both already handled above; here is_split_dv means DV-only.
             # Split-DV-only TMEM layout
             # d = 192, dv = 128 -> dv_low = 64, dv_high = 64
-            # dV_low [0, 64] | dV_high [64, 128], S/P   [128, 256], dS/dP [256, 448]
+            # dV_low [0, 64] | dV_high [64, 128], S/P   [128, 256], dS/dP [256, 384]
             #                                     dK/dQ [128, 320]
             assert self.tile_n == 128
             assert self.tile_m == 128
@@ -1606,6 +1606,9 @@ class FlashAttentionBackwardSm100:
                     block_info,
                     SeqlenInfoCls,
                     TileSchedulerCls,
+                    flashmask_info,
+                    sFM_max_min,
+                    flashmask_loaded_mbar_ptr,
                 )
             else:
                 cute.arch.setmaxregister_decrease(self.num_regs_empty)
@@ -1828,9 +1831,14 @@ class FlashAttentionBackwardSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
+        flashmask_info: Optional[FlashMaskInfo],
+        sFM_max_min: Optional[cute.Tensor],
+        flashmask_loaded_mbar_ptr: Optional[cute.Pointer],
     ):
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         dS_cluster_phase = Int32(0)
+        if const_expr(self.enable_flashmask):
+            flashmask_phase = Int32(0)
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1846,6 +1854,13 @@ class FlashAttentionBackwardSm100:
 
             if process_tile:
                 num_iters = m_block_max - m_block_min
+                if const_expr(self.enable_flashmask):
+                    # One relay per dS exchange, so the fully masked blocks the compute
+                    # warp skips must be skipped here as well.
+                    cute.arch.mbarrier_wait(flashmask_loaded_mbar_ptr, flashmask_phase)
+                    num_iters = self.fm_skip_info(
+                        flashmask_info, sFM_max_min, m_block_min, m_block_max
+                    )[6]
                 for _ in cutlass.range(num_iters, unroll=1):
                     # Wait for dS_xchg from peer CTA
                     cute.arch.mbarrier_wait(dS_cluster_full_mbar_ptr, phase=dS_cluster_phase)
@@ -1855,6 +1870,9 @@ class FlashAttentionBackwardSm100:
                         cute.arch.mbarrier_arrive(dS_cluster_leader_mbar_ptr, Int32(0))
 
                     dS_cluster_phase ^= 1
+
+            if const_expr(self.enable_flashmask):
+                flashmask_phase ^= 1
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -2130,10 +2148,13 @@ class FlashAttentionBackwardSm100:
             load_step = partial(self.load_step, **load_step_kwargs)
 
             if const_expr(self.use_2cta_instrs):
-                # In 2CTA mode, load FM data but do NOT skip blocks.
-                # Both CTAs in the cluster have different n_blocks with different
-                # flashmask boundaries, but share pipeline stages. All warps on
-                # both CTAs must process the same number of blocks to stay in sync.
+                # The m blocks this CTA loads. With flashmask the fully masked ones drop
+                # out; the bounds in sFM_max_min are the CTA pair's combined bounds (see
+                # load_fm), so both CTAs of the cluster walk the same blocks and the
+                # shared pipelines, the cta_group::2 MMAs and the multicast loads stay in
+                # lockstep.
+                num_m_iters = m_block_max - m_block_min
+                fm_skip = None
                 if const_expr(self.enable_flashmask):
                     self.load_fm(
                         flashmask_info,
@@ -2147,8 +2168,15 @@ class FlashAttentionBackwardSm100:
                         overlap_segment_idx,
                     )
                     cute.arch.mbarrier_arrive(flashmask_loaded_mbar_ptr)
-                    if tidx == 0 and self.debug_print:
-                        cute.printf('LOAD FM: cta_rank=%d, n_block=%d, m_block_min=%d, m_block_max=%d, total_blocks=%d (no skip)', cute.arch.block_idx_in_cluster(), n_block, m_block_min, m_block_max, m_block_max - m_block_min)
+                    fm_skip = self.fm_skip_info(
+                        flashmask_info, sFM_max_min, m_block_min, m_block_max
+                    )
+                    num_m_iters = fm_skip[6]
+
+                # fm_skip stays None without flashmask, which fm_m_block reads as "no
+                # block is skipped". A closure would be easier to read, but the DSL
+                # rejects closures that capture variables inside dynamic control flow.
+                m_block_first = self.fm_m_block(fm_skip, m_block_min, Int32(0))
 
                 if const_expr(self.tile_hdim == 192):
                     #### Prologue ####
@@ -2159,14 +2187,14 @@ class FlashAttentionBackwardSm100:
                         extra_tx_count=self.tma_copy_bytes["K"],
                     )
                     load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_Qt))
-                    load_Q(m_block_min, producer_state=producer_state_Q_Qt)
+                    load_Q(m_block_first, producer_state=producer_state_Q_Qt)
                     pipeline_Q.producer_commit(producer_state_Q_Qt)
                     producer_state_Q_Qt.advance()
                     # LSE
                     pipeline_LSE.producer_acquire(producer_state_LSE)
                     with cute.arch.elect_one():
                         copy_stats(
-                            gLSE[None, m_block_min],
+                            gLSE[None, m_block_first],
                             sLSE[None, producer_state_LSE.index],
                             mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
                         )
@@ -2178,14 +2206,14 @@ class FlashAttentionBackwardSm100:
                         extra_tx_count=self.tma_copy_bytes["V"],
                     )
                     load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_O_Ot))
-                    load_dOt(m_block_min, producer_state=producer_state_O_Ot)
+                    load_dOt(m_block_first, producer_state=producer_state_O_Ot)
                     pipeline_dO.producer_commit(producer_state_O_Ot)
                     producer_state_O_Ot.advance()
                     # dPsum
                     pipeline_dPsum.producer_acquire(producer_state_dPsum)
                     with cute.arch.elect_one():
                         copy_stats(
-                            gdPsum[None, m_block_min],
+                            gdPsum[None, m_block_first],
                             sdPsum[None, producer_state_dPsum.index],
                             mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dPsum),
                         )
@@ -2196,20 +2224,21 @@ class FlashAttentionBackwardSm100:
                         producer_state_Q_Qt,
                         extra_tx_count=self.tma_copy_bytes["K"],
                     )
-                    load_Qt(m_block_min, producer_state=producer_state_Q_Qt)
+                    load_Qt(m_block_first, producer_state=producer_state_Q_Qt)
                     load_Kt(tma_bar_ptr=pipeline_Qt.producer_get_barrier(producer_state_Q_Qt))
                     pipeline_Qt.producer_commit(producer_state_Q_Qt)
                     producer_state_Q_Qt.advance()
 
                     # dO, for dV = P.T @ dO
                     pipeline_dO.producer_acquire(producer_state_O_Ot)
-                    load_dO(m_block_min, producer_state=producer_state_O_Ot)
+                    load_dO(m_block_first, producer_state=producer_state_O_Ot)
                     pipeline_dO.producer_commit(producer_state_O_Ot)
                     producer_state_O_Ot.advance()
 
                     #### Mainloop ####
                     # 2CTA hdim192: [lse | Q | dOt | dPsum | Qt | dO]
-                    for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
+                    for it in cutlass.range(1, num_m_iters, unroll=1):
+                        m_block = self.fm_m_block(fm_skip, m_block_min, it)
                         # LSE
                         pipeline_LSE.producer_acquire(producer_state_LSE)
                         with cute.arch.elect_one():
@@ -2268,14 +2297,14 @@ class FlashAttentionBackwardSm100:
                         producer_state_Q_LSE, extra_tx_count=self.tma_copy_bytes["K"]
                     )
                     load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE))
-                    load_Q(m_block_min, producer_state=producer_state_Q_LSE)
+                    load_Q(m_block_first, producer_state=producer_state_Q_LSE)
                     pipeline_Q.producer_commit(producer_state_Q_LSE)
 
                     # LSE
                     pipeline_LSE.producer_acquire(producer_state_Q_LSE)
                     with cute.arch.elect_one():
                         copy_stats(
-                            gLSE[None, m_block_min],
+                            gLSE[None, m_block_first],
                             sLSE[None, producer_state_Q_LSE.index],
                             mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
                         )
@@ -2291,16 +2320,16 @@ class FlashAttentionBackwardSm100:
                     load_V(
                         tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum)
                     )
-                    load_dO(m_block_min, producer_state=producer_state_dO_dPsum)
+                    load_dO(m_block_first, producer_state=producer_state_dO_dPsum)
                     if const_expr(tma_atom_dOt is not None):
-                        load_dOt(m_block_min, producer_state=producer_state_dO_dPsum)
+                        load_dOt(m_block_first, producer_state=producer_state_dO_dPsum)
                     pipeline_dO.producer_commit(producer_state_dO_dPsum)
 
                     # dPsum
                     pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
                     with cute.arch.elect_one():
                         copy_stats(
-                            gdPsum[None, m_block_min],
+                            gdPsum[None, m_block_first],
                             sdPsum[None, producer_state_dO_dPsum.index],
                             mbar_ptr=pipeline_dPsum.producer_get_barrier(
                                 producer_state_dO_dPsum
@@ -2315,10 +2344,16 @@ class FlashAttentionBackwardSm100:
                     producer_state_Kt.advance()
 
                     #### Mainloop (2CTA hdim128) ####
-                    for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
+                    for it in cutlass.range(1, num_m_iters, unroll=1):
+                        m_block = self.fm_m_block(fm_skip, m_block_min, it)
                         if const_expr(tma_atom_Qt is not None):
+                            # Qt lags one iteration behind, so it wants the previous
+                            # *processed* block, not m_block - 1.
                             pipeline_Qt.producer_acquire(producer_state_Qt)
-                            load_Qt(m_block - 1, producer_state=producer_state_Qt)
+                            load_Qt(
+                                self.fm_m_block(fm_skip, m_block_min, it - 1),
+                                producer_state=producer_state_Qt,
+                            )
                             pipeline_Qt.producer_commit(producer_state_Qt)
                             producer_state_Qt.advance()
 
@@ -2366,7 +2401,10 @@ class FlashAttentionBackwardSm100:
                     #### Tail (2CTA hdim128) ####
                     if const_expr(tma_atom_Qt is not None):
                         pipeline_Qt.producer_acquire(producer_state_Qt)
-                        load_Qt(m_block_max - 1, producer_state=producer_state_Qt)
+                        load_Qt(
+                            self.fm_m_block(fm_skip, m_block_min, num_m_iters - 1),
+                            producer_state=producer_state_Qt,
+                        )
                         pipeline_Qt.producer_commit(producer_state_Qt)
                         producer_state_Qt.advance()
 
@@ -3574,27 +3612,65 @@ class FlashAttentionBackwardSm100:
             segment_row_offset = Int32(0)
             bh_offset_block = bh_offset * nblock_seqlen
 
+        # The n blocks whose bounds decide which m blocks can be skipped. At cta_group=1
+        # that is just this CTA's key block (nb1 == nb0, so the folding below is a no-op).
+        # At cta_group=2 the two CTAs of a cluster own adjacent key blocks but share every
+        # collective operation (the gemms are cta_group::2, the loads are multicast, some
+        # mbarrier arrives carry the cluster mask), so they must walk the SAME m blocks.
+        # Folding the pair's bounds together -- *_max with max, *_min with min, i.e.
+        # intersecting the two fully-masked ranges -- makes them agree by construction:
+        # same inputs, same expressions, no cross-CTA reduction. The per-element mask
+        # stays the source of truth, so skipping less than one CTA alone could is only a
+        # performance loss, never a wrong answer.
+        nb0 = n_block
+        nb1 = n_block
+        if const_expr(self.cta_group_size > 1):
+            n_block_last = (
+                seqlen_info.seqlen_k + self.tile_n - 1
+            ) // self.tile_n - 1
+            nb0 = (n_block // self.cta_group_size) * self.cta_group_size
+            nb1 = min(nb0 + 1, n_block_last)
+        fm_layout = cute.make_layout(
+            (cutlass.Int32(nblock_seqlen)), stride=(cutlass.Int32(1))
+        )
+
         if tidx == 0:
             # LTS is always valid, otherwise this is not a valid flashmask computation instance
-            LTS_nblock_max = cute.make_tensor(flashmask_info.LTS_nblock_max.iterator + bh_offset_block, cute.make_layout((cutlass.Int32(nblock_seqlen)), stride=(cutlass.Int32(1))))
-            LTS_nblock_min = cute.make_tensor(flashmask_info.LTS_nblock_min.iterator + bh_offset_block, cute.make_layout((cutlass.Int32(nblock_seqlen)), stride=(cutlass.Int32(1))))
-            sFM_max_min[0] = (LTS_nblock_max[n_block] - 1) // self.tile_m
-            sFM_max_min[1] = LTS_nblock_min[n_block] // self.tile_m
+            LTS_max = cute.make_tensor(
+                flashmask_info.LTS_nblock_max.iterator + bh_offset_block, fm_layout
+            )
+            LTS_min = cute.make_tensor(
+                flashmask_info.LTS_nblock_min.iterator + bh_offset_block, fm_layout
+            )
+            sFM_max_min[0] = max(LTS_max[nb0] - 1, LTS_max[nb1] - 1) // self.tile_m
+            sFM_max_min[1] = min(LTS_min[nb0], LTS_min[nb1]) // self.tile_m
             if const_expr(flashmask_info.LTE_nblock_max is not None):
-                LTE_nblock_max = cute.make_tensor(flashmask_info.LTE_nblock_max.iterator + bh_offset_block, cute.make_layout((cutlass.Int32(nblock_seqlen)), stride=(cutlass.Int32(1))))
-                LTE_nblock_min = cute.make_tensor(flashmask_info.LTE_nblock_min.iterator + bh_offset_block, cute.make_layout((cutlass.Int32(nblock_seqlen)), stride=(cutlass.Int32(1))))
-                sFM_max_min[2] = (LTE_nblock_max[n_block] - 1) // self.tile_m
-                sFM_max_min[3] = LTE_nblock_min[n_block] // self.tile_m
+                LTE_max = cute.make_tensor(
+                    flashmask_info.LTE_nblock_max.iterator + bh_offset_block, fm_layout
+                )
+                LTE_min = cute.make_tensor(
+                    flashmask_info.LTE_nblock_min.iterator + bh_offset_block, fm_layout
+                )
+                sFM_max_min[2] = max(LTE_max[nb0] - 1, LTE_max[nb1] - 1) // self.tile_m
+                sFM_max_min[3] = min(LTE_min[nb0], LTE_min[nb1]) // self.tile_m
             if const_expr(flashmask_info.UTS_nblock_max is not None):
-                UTS_nblock_max = cute.make_tensor(flashmask_info.UTS_nblock_max.iterator + bh_offset_block, cute.make_layout((cutlass.Int32(nblock_seqlen)), stride=(cutlass.Int32(1))))
-                UTS_nblock_min = cute.make_tensor(flashmask_info.UTS_nblock_min.iterator + bh_offset_block, cute.make_layout((cutlass.Int32(nblock_seqlen)), stride=(cutlass.Int32(1))))
-                sFM_max_min[4] = (UTS_nblock_max[n_block] - 1) // self.tile_m
-                sFM_max_min[5] = UTS_nblock_min[n_block] // self.tile_m
+                UTS_max = cute.make_tensor(
+                    flashmask_info.UTS_nblock_max.iterator + bh_offset_block, fm_layout
+                )
+                UTS_min = cute.make_tensor(
+                    flashmask_info.UTS_nblock_min.iterator + bh_offset_block, fm_layout
+                )
+                sFM_max_min[4] = max(UTS_max[nb0] - 1, UTS_max[nb1] - 1) // self.tile_m
+                sFM_max_min[5] = min(UTS_min[nb0], UTS_min[nb1]) // self.tile_m
             if const_expr(flashmask_info.UTE_nblock_max is not None):
-                UTE_nblock_max = cute.make_tensor(flashmask_info.UTE_nblock_max.iterator + bh_offset_block, cute.make_layout((cutlass.Int32(nblock_seqlen)), stride=(cutlass.Int32(1))))
-                UTE_nblock_min = cute.make_tensor(flashmask_info.UTE_nblock_min.iterator + bh_offset_block, cute.make_layout((cutlass.Int32(nblock_seqlen)), stride=(cutlass.Int32(1))))
-                sFM_max_min[6] = (UTE_nblock_max[n_block] - 1) // self.tile_m
-                sFM_max_min[7] = UTE_nblock_min[n_block] // self.tile_m
+                UTE_max = cute.make_tensor(
+                    flashmask_info.UTE_nblock_max.iterator + bh_offset_block, fm_layout
+                )
+                UTE_min = cute.make_tensor(
+                    flashmask_info.UTE_nblock_min.iterator + bh_offset_block, fm_layout
+                )
+                sFM_max_min[6] = max(UTE_max[nb0] - 1, UTE_max[nb1] - 1) // self.tile_m
+                sFM_max_min[7] = min(UTE_min[nb0], UTE_min[nb1]) // self.tile_m
 
         for i in cutlass.range_constexpr(ntimes_copy):
             copy_offset = i * num_load_threads + tidx
@@ -3615,6 +3691,106 @@ class FlashAttentionBackwardSm100:
                 #cute.printf("%d, %d", copy_offset, sStartEndRowIndices[copy_offset, 0])
                 #cute.print_tensor(LTS)
         cute.arch.sync_warp()
+
+    @cute.jit
+    def fm_skip_info(
+        self,
+        flashmask_info: FlashMaskInfo,
+        sFM_max_min: cute.Tensor,
+        m_block_min: Int32,
+        m_block_max: Int32,
+    ):
+        """The fully masked m blocks of this key block, as two ordered exclusion bands.
+
+        An m block whose every element is masked contributes nothing (P == 0 => dV, and
+        dS = P * (dP - dPsum) == 0 => dK, dQ), so it can be dropped from the m loop.
+        flashmask's bounds collapse to at most two such half-open bands: the lower tail
+        gives [LTS_max + 1, LTE_min) and, when the mask is not causal, the upper tail
+        gives [UTS_max + 1, UTE_min). Clipping them to [m_block_min, m_block_max),
+        ordering them by their start and merging them when they touch leaves the blocks
+        that must be processed as three contiguous segments, which is what lets every
+        warp -- load, mma, compute, dQ reduce -- walk the same blocks from one formula.
+
+        Args:
+            flashmask_info: Flashmask tensors and compile-time bound availability.
+            sFM_max_min: Reduced lower and upper flashmask bounds for the KV tile.
+            m_block_min: Inclusive first m-block considered by the scheduler.
+            m_block_max: Exclusive last m-block considered by the scheduler.
+
+        Returns:
+            ``(a_lo, a_hi, b_lo, b_hi, n1, n2, num_iters)``, where the first four
+            values are the ordered exclusion bands and ``n1`` / ``n2`` are the
+            lengths of the first two retained segments. Use ``fm_m_block`` and
+            ``fm_is_full_mask`` to consume the result.
+        """
+        l_lo = sFM_max_min[0] + 1
+        if const_expr(flashmask_info.LTE_nblock_max is not None):
+            l_hi = sFM_max_min[3]
+        else:
+            l_hi = m_block_max
+        # A causal mask has no upper tail, so that band stays empty and the ordering
+        # below pushes it to the far side. As in the segment walks, a non-causal
+        # flashmask is assumed to carry UTE bounds.
+        if const_expr(not self.is_causal):
+            u_lo = Int32(0)
+            if const_expr(flashmask_info.UTS_nblock_max is not None):
+                u_lo = sFM_max_min[4] + 1
+            u_hi = sFM_max_min[7]
+        else:
+            u_lo, u_hi = m_block_max, m_block_max
+
+        # Clip both bands to [m_block_min, m_block_max) and keep them non-empty-safe
+        # (hi >= lo), so the segment arithmetic below cannot go negative.
+        l_lo = min(max(l_lo, m_block_min), m_block_max)
+        l_hi = min(max(l_hi, l_lo), m_block_max)
+        u_lo = min(max(u_lo, m_block_min), m_block_max)
+        u_hi = min(max(u_hi, u_lo), m_block_max)
+        u_first = u_lo <= l_lo
+        a_lo = u_lo if u_first else l_lo
+        a_hi = u_hi if u_first else l_hi
+        b_lo = l_lo if u_first else u_lo
+        b_hi = l_hi if u_first else u_hi
+        # Merge: b starts at or after a ends, so the two segments below can neither
+        # overlap nor leave a gap.
+        b_lo = max(b_lo, a_hi)
+        b_hi = max(b_hi, b_lo)
+
+        n1 = a_lo - m_block_min
+        n2 = b_lo - a_hi
+        num_iters = n1 + n2 + (m_block_max - b_hi)
+        if const_expr(self.use_2cta_instrs):
+            # A key block that is masked everywhere would leave the m loop empty, but the
+            # 2CTA epilogue writes dK / dV unconditionally and the accumulators are only
+            # initialized by the first MMA of the loop. Keep the first block instead: it
+            # is fully masked, so its contribution is zero, and it costs one iteration
+            # only in this degenerate case.
+            if num_iters == 0 and m_block_max > m_block_min:
+                a_lo = a_lo + 1
+                n1 = 1
+                num_iters = 1
+        return a_lo, a_hi, b_lo, b_hi, n1, n2, num_iters
+
+    @cute.jit
+    def fm_m_block(self, fm_skip_info, m_block_min: Int32, it: Int32):
+        """The m block of iteration `it`, walking around the two exclusion bands.
+
+        `fm_skip_info` is None when flashmask is off, i.e. nothing is skipped.
+        """
+        if const_expr(fm_skip_info is None):
+            return m_block_min + it
+        a_lo, a_hi, b_lo, b_hi, n1, n2, num_iters = fm_skip_info
+        m_block = b_hi + (it - n1 - n2)
+        m_block = a_hi + (it - n1) if it < n1 + n2 else m_block
+        m_block = m_block_min + it if it < n1 else m_block
+        return m_block
+
+    @cute.jit
+    def fm_is_full_mask(self, fm_skip_info, m_block: Int32):
+        """Whether `m_block` falls inside one of the two exclusion bands."""
+        a_lo, a_hi, b_lo, b_hi, n1, n2, num_iters = fm_skip_info
+        return (m_block >= a_lo and m_block < a_hi) or (
+            m_block >= b_lo and m_block < b_hi
+        )
 
     @cute.jit
     def mma(
@@ -3825,7 +4001,12 @@ class FlashAttentionBackwardSm100:
                         num_blocks = num_blocks + (loop_end - loop_start)
                         if tidx == 0 and self.debug_print:
                             cute.printf('after lts ~ seqlen_q mma: n_block: %d, %d', n_block, num_blocks)
-                # else: 2CTA - keep num_blocks = m_block_max - m_block_min (no skipping)
+                else:
+                    # 2CTA: the same block count the load / compute / reduce warps derive
+                    # from the pair's combined bounds.
+                    num_blocks = self.fm_skip_info(
+                        flashmask_info, sFM_max_min, m_block_min, m_block_max
+                    )[6]
                 if tidx == 0 and self.debug_print:
                     cute.printf('MMA FM: cta_rank=%d, n_block=%d, num_blocks=%d, m_block_min=%d, m_block_max=%d, 2cta=%d', cute.arch.block_idx_in_cluster(), n_block, num_blocks, m_block_min, m_block_max, const_expr(self.use_2cta_instrs))
 
@@ -3954,7 +4135,7 @@ class FlashAttentionBackwardSm100:
                     # 4. dQ   = dS   @ K
                     # 5. dV   = P.T  @ dO
 
-                    main_loop_iters = m_block_max - m_block_min - 1
+                    main_loop_iters = num_blocks - 1
 
                     for _ in cutlass.range(main_loop_iters, unroll=1):
                         # (1) S.T = K @ Q.T (next)
@@ -4685,11 +4866,17 @@ class FlashAttentionBackwardSm100:
                     if tidx == 0 and self.debug_print:
                         cute.printf('COMPUTE: CTA %d after flashmask_loaded_mbar_wait', cute.arch.block_idx_in_cluster())
                     if const_expr(self.use_2cta_instrs):
-                        # 2CTA: process ALL blocks without skipping for pipeline sync.
-                        # Both CTAs have different flashmask boundaries but share pipelines,
-                        # so they must iterate the same number of blocks.
-                        compute_iter_idx = cute.Int32(0)
-                        for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
+                        # 2CTA: one flat loop over the blocks that are not fully masked.
+                        # sFM_max_min holds the CTA pair's combined bounds (load_fm), so
+                        # both CTAs walk the same blocks -- required, since they share the
+                        # pipelines and the cta_group::2 MMAs. Every block is treated as
+                        # partially masked: the element mask is applied anyway, which is
+                        # what makes the block-level bounds allowed to be conservative.
+                        fm_skip = self.fm_skip_info(
+                            flashmask_info, sFM_max_min, m_block_min, m_block_max
+                        )
+                        for it in cutlass.range(fm_skip[6], unroll=1):
+                            m_block = self.fm_m_block(fm_skip, m_block_min, it)
                             zero_block = False
                             if tidx == 0 and self.debug_print:
                                 cute.printf('COMPUTE 2CTA: cta_rank=%d, n_block=%d, m_block=%d of [%d,%d)', cute.arch.block_idx_in_cluster(), n_block, m_block, m_block_min, m_block_max)
@@ -4701,9 +4888,8 @@ class FlashAttentionBackwardSm100:
                                 producer_state_dS=producer_state_dS,
                                 dS_cluster_empty_phase=dS_cluster_empty_phase,
                                 partially_masked=True,
-                                iter_idx=compute_iter_idx,
+                                iter_idx=it,
                             )
-                            compute_iter_idx = compute_iter_idx + 1
                             if tidx == 0 and self.debug_print:
                                 cute.printf('n_block: %d, after compute_step 2CTA all: %d', n_block, m_block)
                     else:
@@ -5491,78 +5677,68 @@ class FlashAttentionBackwardSm100:
 
             if const_expr(self.enable_flashmask):
                 cute.arch.mbarrier_wait(flashmask_loaded_mbar_ptr, flashmask_phase)
-                if const_expr(self.use_2cta_instrs):
-                    # 2CTA: process ALL blocks without skipping for pipeline sync.
-                    # Both CTAs have different flashmask boundaries but share pipelines.
-                    for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
+                # Walk every block but reduce only the ones the mma warp produced. The
+                # skipped blocks still have to run the deterministic semaphore handshake
+                # below, which is why this loop is written as a predicate instead of the
+                # segment walk the load / mma / compute warps use. In 2CTA mode the bounds
+                # are the CTA pair's combined bounds (load_fm), so both CTAs agree on the
+                # skipped set.
+                fm_skip = self.fm_skip_info(
+                    flashmask_info, sFM_max_min, m_block_min, m_block_max
+                )
+                for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
+                    full_mask = self.fm_is_full_mask(fm_skip, m_block)
+
+                    if not full_mask:
                         if tidx == 0 and self.debug_print:
-                            cute.printf('REDUCE 2CTA: cta_rank=%d, n_block=%d, m_block=%d of [%d,%d), stage_offset=%d', cta_rank_in_cluster, n_block, m_block, m_block_min, m_block_max, stage_offset)
+                            cute.printf('n_block: %d, m_block: %d, before reduce_step', n_block, m_block)
                         dQ_consumer_state, dQ_tma_store_producer_state = dQacc_reduce_step(
                             m_block=m_block,
                             dQ_consumer_state=dQ_consumer_state,
                             dQ_tma_store_producer_state=dQ_tma_store_producer_state,
                         )
                         if tidx == 0 and self.debug_print:
-                            cute.printf('n_block: %d, m_block: %d, after reduce_step 2CTA', n_block, m_block)
-                else:
-                    # 1CTA: skip full-mask blocks
-                    loop_start = m_block_min
-                    loop_end = m_block_max
-                    for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
-                        full_mask = False
-                        if const_expr(not self.is_causal):
-                            UTS_max = -1
-                            if const_expr(flashmask_info.UTS_nblock_max is not None):
-                                UTS_max = sFM_max_min[4]
-                            UTE_min = sFM_max_min[7]
-                            if m_block > UTS_max and m_block < UTE_min:
-                                full_mask = True
+                            cute.printf('n_block: %d, m_block: %d, after reduce_step', n_block, m_block)
 
-                        LTS_max = sFM_max_min[0]
-                        LTE_min = m_block_max
-                        if const_expr(flashmask_info.LTE_nblock_max is not None):
-                            LTE_min = sFM_max_min[3]
-
-                        if m_block > LTS_max and m_block < LTE_min:
-                            full_mask = True
-
-                        if not full_mask:
+                    if const_expr(self.deterministic):
+                        if full_mask:
                             if tidx == 0 and self.debug_print:
-                                cute.printf('n_block: %d, m_block: %d, before reduce_step', n_block, m_block)
-                            dQ_consumer_state, dQ_tma_store_producer_state = dQacc_reduce_step(
-                                m_block=m_block,
-                                dQ_consumer_state=dQ_consumer_state,
-                                dQ_tma_store_producer_state=dQ_tma_store_producer_state,
-                            )
-                            if tidx == 0 and self.debug_print:
-                                cute.printf('n_block: %d, m_block: %d, after reduce_step', n_block, m_block)
-
-                        if const_expr(self.deterministic):
-                            if full_mask:
-                                if tidx == 0 and self.debug_print:
-                                    cute.printf('n_block: %d, m_block: %d, before reduce_step SKIPPPPPPP', n_block, m_block)
-
-                                if const_expr(self.spt):
-                                    _, n_block_max_for_m_block = block_info.get_n_block_min_max(
-                                        seqlen, m_block
-                                    )
-                                    lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
-                                else:
-                                    lock_value = n_block_cta_group
-                                barrier.wait_eq(
-                                    mdQ_semaphore_cur[(m_block, None)].iterator, tidx, cta_rank_in_cluster, lock_value
+                                cute.printf(
+                                    'n_block: %d, m_block: %d, before reduce_step SKIPPPPPPP',
+                                    n_block,
+                                    m_block,
                                 )
 
-                                if const_expr(delay_semaphore_release):
-                                    if m_block > m_block_min:
-                                        barrier.arrive_inc(
-                                            mdQ_semaphore_cur[(m_block - 1, None)].iterator, tidx, cta_rank_in_cluster, 1
-                                        )
-                                else:
-                                    barrier.arrive_inc(mdQ_semaphore_cur[m_block, None].iterator, tidx, cta_rank_in_cluster, 1)
+                            if const_expr(self.spt):
+                                _, n_block_max_for_m_block = block_info.get_n_block_min_max(
+                                    seqlen, m_block
+                                )
+                                lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
+                            else:
+                                lock_value = n_block_cta_group
+                            barrier.wait_eq(
+                                mdQ_semaphore_cur[(m_block, None)].iterator, tidx, cta_rank_in_cluster, lock_value
+                            )
 
-                                if tidx == 0 and self.debug_print:
-                                    cute.printf('n_block: %d, m_block: %d, after reduce_step SKIPPPPPPP', n_block, m_block)
+                            if const_expr(delay_semaphore_release):
+                                if m_block > m_block_min:
+                                    barrier.arrive_inc(
+                                        mdQ_semaphore_cur[(m_block - 1, None)].iterator, tidx, cta_rank_in_cluster, 1
+                                    )
+                            else:
+                                barrier.arrive_inc(
+                                    mdQ_semaphore_cur[m_block, None].iterator,
+                                    tidx,
+                                    cta_rank_in_cluster,
+                                    1,
+                                )
+
+                            if tidx == 0 and self.debug_print:
+                                cute.printf(
+                                    'n_block: %d, m_block: %d, after reduce_step SKIPPPPPPP',
+                                    n_block,
+                                    m_block,
+                                )
 
             else:
                 for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):

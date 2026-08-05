@@ -1,11 +1,13 @@
-"""SM100 backward for MLA-shaped head dims (head_dim=576, head_dim_v=512).
+"""SM100 backward for head dims larger than 256 (supported and measured: 512/512).
 
 Why a separate file from `flash_bwd_sm100.py`: that kernel hand-unrolls the
 low|high halves of its split axes in ~8 places in the load warp, and hardcodes
-`tile_m == tile_n == 128`. head_dim=576 needs 3 chunks (576/2 = 288 exceeds the
-UMMA N limit of 256), so every one of those sites would have to become a loop,
-which puts the already-working d256/d192 configs at risk. Here the chunk count
-and `cta_group` are parameters from the start.
+`tile_m == tile_n == 128`. Two halves is not enough once head_dim exceeds 512
+(576/2 = 288 exceeds the UMMA N limit of 256, so that shape needs 3 chunks), so
+every one of those sites would have to become a loop, which puts the
+already-working d256/d192 configs at risk. Here the chunk count and `cta_group`
+are parameters from the start, so the axis splits into as many chunks as the
+shape needs.
 
 Resource model (all numbers verified on B200, see the "column rule" below):
 
@@ -21,22 +23,20 @@ Resource model (all numbers verified on B200, see the "column rule" below):
   (TMEM addresses put the lane in the high bits and the column in the low 16,
   so a stride of 65536 is one lane and a stride of 1 is one column.)
 
-Phase 1 (this file's default): cta_group=1, no swapAB, all three of dV/dK/dQ are
-produced per m-iteration and drained by the reduce warps into the fp32 gmem
+Phase 1 (the only path that runs today): cta_group=1, no swapAB, all three of dV/dK/dQ
+are produced per m-iteration and drained by the reduce warps into the fp32 gmem
 accumulators. Correct but accum-traffic bound.
 
 Phase 2 (later): cta_group=2 + swapAB on dV/dK so both stay resident in TMEM for
 the whole m loop, dropping the accum traffic from once per m-iteration to once
-per n-block.
-
-Run this file directly on an SM100 machine to print the resource report:
-
-    python -m flash_mask.cute.flash_bwd_sm100_bigd
+per n-block. The cta_group=2 arithmetic is already threaded through (column rules,
+n_block_pair skip derivation, MMA M constraints) but the path is NOT enabled: `_launch`
+passes no `cluster=` to .launch() and does not round the grid to the pair size, so a
+cta_group=2 kernel would build multicast TMA atoms without a cluster to multicast to.
 """
 
 import functools
 import math
-import os
 from typing import Optional
 
 import cutlass
@@ -48,7 +48,6 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from flash_mask.cute import blackwell_helpers as sm100_utils
 from flash_mask.cute import copy_utils, layout_utils, utils
-from flash_mask.cute.named_barrier import NamedBarrierBwdSm100
 from flash_mask.cute.tile_scheduler import SingleTileScheduler, TileSchedulerArguments
 
 
@@ -58,19 +57,8 @@ SM100_SMEM_CAPACITY_BYTES = 227 * 1024
 # Slack for barrier storage, LSE / dPsum, the flashmask row indices and the
 # per-buffer alignment padding that cute.struct adds on top of the tile bytes.
 # Measured on 576/512: the real struct is 3076 B larger than the solver's tile bytes,
-# so 6KB is ~2x headroom. It used to be 12KB, which was pure slack that cost the
-# accumulator pipeline a stage.
+# so 6KB is ~2x headroom.
 SM100_SMEM_RESERVE_BYTES = 6 * 1024
-# Accumulator staging stages to aim for. The reduce of one 32-column slice must not
-# have to complete before the next slice can be staged, or every one of the ~48
-# slices per m tile serialises on a 16KB gmem round trip.
-SM100_ACCUM_STAGE_MAX = 4
-# How many stages the ranking is willing to pay chunk width for. Measured (512/512,
-# b=16 s=4096 h=16): stage 1 -> 4 is -12%, and a 2x narrower d_chunk is +8%, so the
-# first stages are clearly worth buying. Nothing separates stage 3 from stage 4 in the
-# data, and the benefit has to saturate, so credit stops at 3 -- past that, chunk width
-# wins. tests/bench_bigd_bwd.py can settle it.
-ACCUM_STAGE_CREDIT = 3
 # UMMA N limit (cutlass/cute/nvgpu/tcgen05/mma.py).
 UMMA_MAX_N = 256
 # All accumulators that take part in a "T2R then packed-bf16 R2T" round trip must
@@ -78,13 +66,24 @@ UMMA_MAX_N = 256
 # exist and their per-thread element order does not survive the bf16 packing
 # (measured on B200: exact for a constant A operand, ~7% off for A = m or A = n).
 UMMA_REQUIRED_M = 128
+# Slots used to reduce flashmask bounds before deriving per-m-block skip ranges. Two are
+# in use (max of the lower-tail starts, min of the ends); the rest are headroom for the
+# 4-bound form, which needs four.
+FLASHMASK_META_SLOTS = 8
 
 
 def tmem_columns(n: int, m_total: int, cta_group: int) -> int:
-    """TMEM columns an (m_total x n) accumulator occupies, per CTA.
+    """Return per-CTA TMEM columns for an ``m_total x n`` accumulator.
 
-    See the column rule in the module docstring. `m_total` is the MMA's M mode,
-    i.e. the row count across the whole CTA group.
+    See the column rule in the module docstring.
+
+    Args:
+        n: MMA N mode.
+        m_total: MMA M mode across the full CTA group.
+        cta_group: Number of CTAs participating in the MMA.
+
+    Returns:
+        Number of TMEM columns occupied by each CTA.
     """
     rows_per_cta = m_total // cta_group
     assert rows_per_cta in (64, 128), f"unexpected rows per CTA: {rows_per_cta}"
@@ -94,9 +93,61 @@ def tmem_columns(n: int, m_total: int, cta_group: int) -> int:
     return n if rows_per_cta == 128 else n // 2
 
 
+MAX_OUT_SLOTS = 2
 
-def accum_slice_width(hdim: int, chunk: int, max_slice: int = 192) -> int:
-    """head_dim width of one accumulator slice.
+
+def tmem_plan(tile_m: int, tile_n: int, d_chunk: int, dv_chunk: int, cta_group: int):
+    """Return the TMEM column plan for one configuration.
+
+    Args:
+        tile_m: Query tile height.
+        tile_n: Key tile width.
+        d_chunk: GEMM chunk width along head_dim.
+        dv_chunk: GEMM chunk width along head_dim_v.
+        cta_group: Number of CTAs participating in each MMA.
+
+    Returns:
+        Dictionary with the S / dP offsets, the output scratch slot width, the number
+        of output slots and the total per-CTA column count.
+
+    The single source of truth for the layout: ``solve_config`` uses it to decide
+    feasibility and ``__init__`` uses it to place the regions. They used to carry two
+    hand-written copies of the formula that disagreed on both terms that matter -- the
+    solver charged the dQ accumulator ``tile_m`` columns where the layout charges it
+    ``d_chunk``, and it did not account for the output slot count at all, so it could
+    hand back a config the constructor then rejected.
+    """
+    s_cols = tmem_columns(tile_m, cta_group * tile_n, cta_group)
+    dp_cols = tmem_columns(tile_m, cta_group * tile_n, cta_group)
+    dv_cols = tmem_columns(dv_chunk, cta_group * tile_n, cta_group)
+    dk_cols = tmem_columns(d_chunk, cta_group * tile_n, cta_group)
+    dq_cols = tmem_columns(d_chunk, tile_m, cta_group)
+    out_offset = s_cols + dp_cols
+    slot_cols = max(dv_cols, dk_cols, dq_cols)
+    num_out_slots = min(
+        MAX_OUT_SLOTS, (SM100_TMEM_CAPACITY_COLUMNS - out_offset) // slot_cols
+    )
+    return dict(
+        s_cols=s_cols,
+        dp_cols=dp_cols,
+        out_offset=out_offset,
+        slot_cols=slot_cols,
+        num_out_slots=num_out_slots,
+        total=out_offset + max(num_out_slots, 1) * slot_cols,
+    )
+
+
+
+def accum_slice_candidates(hdim: int, chunk: int, max_slice: int = 192) -> list:
+    """Return the legal accumulator slice widths for an axis, narrowest first.
+
+    Args:
+        hdim: Padded head dimension represented by the accumulator.
+        chunk: GEMM chunk width; a slice must contain whole chunks.
+        max_slice: Preferred maximum width accepted by postprocessing.
+
+    Returns:
+        Ascending list of legal slice widths, empty if the chunk admits none.
 
     The fp32 accumulators are blocked as [slice][row block][...] so that each slice
     is byte-identical to a `head_dim = slice` accumulator and can be handed to the
@@ -110,10 +161,25 @@ def accum_slice_width(hdim: int, chunk: int, max_slice: int = 192) -> int:
     """
     max_slice = max(max_slice, chunk)
     step = chunk * 64 // math.gcd(chunk, 64)
-    widths = [w for w in range(step, min(hdim, max_slice) + 1, step) if hdim % w == 0]
+    return [w for w in range(step, min(hdim, max_slice) + 1, step) if hdim % w == 0]
+
+
+def accum_slice_width(hdim: int, chunk: int, max_slice: int = 192) -> int:
+    """Return the widest legal accumulator slice width for an axis.
+
+    Args:
+        hdim: Padded head dimension represented by the accumulator.
+        chunk: GEMM chunk width; a slice must contain whole chunks.
+        max_slice: Preferred maximum width accepted by postprocessing.
+
+    Returns:
+        Largest legal slice width not exceeding the effective maximum.
+    """
+    widths = accum_slice_candidates(hdim, chunk, max_slice)
     assert widths, (
         f"no legal accumulator slice for hdim={hdim}, chunk={chunk} "
-        f"(need a multiple of {step} that divides {hdim} and is <= {max_slice})"
+        f"(nothing that is a whole number of chunks, a multiple of 64, divides "
+        f"{hdim} and is <= {max(max_slice, chunk)})"
     )
     return widths[-1]
 
@@ -138,56 +204,64 @@ def solve_config(
     *,
     cta_group: int = 1,
     dtype_bytes: int = 2,
-    # tile_m == tile_n == 128 only: the accumulator staging maps one compute thread to
-    # one accumulator row and asserts it (a 64-row m tile would need a second mapping).
-    # 64 stays reachable so tests/bench_bigd_bwd.py can probe it, but it must not be a
-    # default -- and it cannot buy occupancy either: sK / sV / sdS all scale with
-    # tile_n, which the UMMA M=128 rule pins, so the best case is ~163KB, still 1 CTA/SM.
+    # tile_m == tile_n == 128 only: the output drain maps one drain thread to one
+    # accumulator row and asserts it (a 64-row m tile would need a second mapping).
+    # 64 cannot buy occupancy either: sK / sV / sdS all scale with tile_n, which the UMMA
+    # M=128 rule pins, so the best case is ~163KB, still 1 CTA/SM.
     tile_m_choices: tuple = (128,),
     smem_budget: int = SM100_SMEM_CAPACITY_BYTES - SM100_SMEM_RESERVE_BYTES,
-    dq_swap_ab: bool = True,
     reduce_ncol: int = 32,
-    all_solutions: bool = False,
 ):
-    """Pick (tile_m, tile_n, d_chunk, dv_chunk, d_chunks_resident) for a shape.
+    """Pick a feasible tile and chunk configuration for a head shape.
+
+    Args:
+        head_dim: Query/key head dimension before padding.
+        head_dim_v: Value head dimension before padding.
+        cta_group: Number of CTAs participating in each MMA.
+        dtype_bytes: Bytes per input element used by the SMEM model.
+        tile_m_choices: Candidate query tile heights.
+        smem_budget: Maximum modeled shared-memory bytes per CTA.
+        reduce_ncol: Column width of each output T2R / reduce slice.
+
+    Returns:
+        Dictionary containing the selected tile, chunk, and resource values.
 
     Feasibility is the verified resource model:
 
-      TMEM (columns, per CTA)
-        S/P            tile_m           (N of the K@Q^T gemm)
-        dP/dS          tile_m           (N of the V@dO^T gemm)
-        output scratch max(dv_chunk, d_chunk, dQ chunk)   -- time-shared
+      TMEM (columns, per CTA)  -- see tmem_plan(), which is what actually decides
+        S/P and dP/dS live across the whole m iteration; the three outputs time-share
+        a scratch region of num_out_slots x the widest output chunk.
 
       SMEM (bytes)
         sQ  tile_m * d_chunk      sK  tile_n * d_chunk * d_chunks_resident
         sV  tile_n * dv_chunk     sdO tile_m * dv_chunk
-        sdS tile_n * tile_m       sdQaccum tile_m * reduce_ncol * 4 * accum_stage
+        sdS tile_n * tile_m
+
+      Accumulator slicing -- a chunk width that admits no legal slice (see
+      accum_slice_candidates) is rejected here rather than left to blow up in the
+      constructor.
 
     Ranking is MEASURED, not modelled. `flush/work` (accumulator traffic per unit of
     work) used to be the primary key; the kernel turned out to sit at ~20% of HBM
     bandwidth and ~11% of the MMA peak, i.e. bound by latency rather than traffic, so
-    that model does not describe the bottleneck. What the sweep
-    (tests/bench_bigd_bwd.py, 512/512, b=16 s=4096 h=16) actually shows:
+    that model does not describe the bottleneck. What the 512/512 sweep
+    (b=16 s=4096 h=16) actually showed:
 
       dv_chunk == tile_n is a sweet spot, not "wider is better": dv 128 -> 64 costs
         10%, -> 32 costs 24%, and dv 256 (which forces d_chunk 32) is the worst config
         measured. dv_chunk is the dV gemm's N; away from tile_n it either adds MMA
         rounds or starves the output scratch.
-      Accumulator staging depth is the strongest single factor: stage 1 -> 4 is -12%.
-      At equal staging, a wider d_chunk wins: d128/stage1 beat d64/stage1 by 8%. The
-        only reason d64 wins overall is that it affords stage 4.
+      At equal SMEM, a wider d_chunk wins: d128 beat d64 by 8%.
 
-    Hence the key: |dv_chunk - tile_n|, then staging depth (credited up to
-    ACCUM_STAGE_CREDIT), then d_chunk, then flush/work, then the LOWER K residency.
+    Hence the key: |dv_chunk - tile_n|, then d_chunk, then flush/work, then the LOWER
+    K residency.
 
-    That last key looks backwards -- more resident K chunks ought to help the S gemm --
-    but once the staging credit is saturated the leftover SMEM has nothing better to
-    buy, and the data cannot separate "one more resident chunk" from "one more stage".
-    Low residency is kept because it is the combination that was actually measured
-    (d64/dv128/res2/stage4, 112.5 ms); the alternative is only a guess.
-
-    With dq_swap_ab the dQ gemm is dQ^T = K^T @ dS^T, so its M is a 128-row block
-    of d and its accumulator is tile_m columns wide instead of d_chunk.
+    That last key looks backwards -- more resident K chunks ought to help the S and dQ
+    gemms -- but it is what keeps the ranking on measured ground: the sweep that produced
+    the numbers above ran at d_chunks_resident=2, and nothing has measured what the
+    leftover SMEM is worth as extra residency. That leftover is real (the accumulator
+    staging buffer this model used to charge for is gone), so residency is the obvious
+    next knob to sweep; until then the solver does not spend it on a guess.
     """
     pad = lambda x: int(math.ceil(x / 64) * 64)
     d, dv = pad(head_dim), pad(head_dim_v)
@@ -198,28 +272,23 @@ def solve_config(
         for d_chunk in _chunk_candidates(d):
             for dv_chunk in _chunk_candidates(dv):
                 num_d_chunks = d // d_chunk
+                if not accum_slice_candidates(d, d_chunk):
+                    continue
+                if not accum_slice_candidates(dv, dv_chunk):
+                    continue
                 for resident in range(min(2, num_d_chunks), num_d_chunks + 1):
-                    dq_cols = tile_m if dq_swap_ab else d_chunk
-                    tmem = 2 * tile_m + max(dv_chunk, d_chunk, dq_cols)
-                    if tmem > SM100_TMEM_CAPACITY_COLUMNS:
+                    plan = tmem_plan(tile_m, tile_n, d_chunk, dv_chunk, cta_group)
+                    if plan["num_out_slots"] < 1:
                         continue
-                    stage_bytes = tile_m * reduce_ncol * 4
-                    tile_bytes = dtype_bytes * (
+                    if plan["total"] > SM100_TMEM_CAPACITY_COLUMNS:
+                        continue
+                    smem = dtype_bytes * (
                         tile_m * d_chunk                      # sQ (aliases sQt)
                         + tile_n * d_chunk * resident         # sK (aliases sKt)
                         + tile_n * dv_chunk                   # sV
                         + tile_m * dv_chunk                   # sdO (aliases sdOt)
                         + tile_n * tile_m                     # sdS
                     )
-                    # Spend whatever SMEM is left on accumulator stages. Ranking below
-                    # puts stages ahead of K residency: the dataflow is bound by the
-                    # accumulator traffic, so pipelining the reduce is worth more than
-                    # holding one more K chunk.
-                    accum_stage = min(
-                        SM100_ACCUM_STAGE_MAX,
-                        max(1, (smem_budget - tile_bytes) // stage_bytes),
-                    )
-                    smem = tile_bytes + accum_stage * stage_bytes
                     if smem > smem_budget:
                         continue
                     flush_per_work = (
@@ -232,34 +301,16 @@ def solve_config(
                             d_chunk=d_chunk,
                             dv_chunk=dv_chunk,
                             d_chunks_resident=resident,
-                            sdQaccum_stage=accum_stage,
                             dQ_reduce_ncol=reduce_ncol,
                             cta_group=cta_group,
-                            tmem_columns=tmem,
+                            tmem_columns=plan["total"],
                             smem_bytes=smem,
                             flush_per_work=flush_per_work,
-                            # Ranking (see _rank below): measured, not modelled.
+                            # Ranking key: measured, not modelled. Prefer dv_chunk ==
+                            # tile_n, then the wider d_chunk.
                             _tie=(
                                 abs(dv_chunk - tile_n),
-                                -min(accum_stage, ACCUM_STAGE_CREDIT),
                                 -d_chunk,
-                                flush_per_work,
-                                resident,
-                            ),
-                            # "mma" policy. The `_tie` above was fitted when the
-                            # accumulator drain was believed to be the bottleneck, so
-                            # it buys staging depth with chunk width. Measured on
-                            # 512/512 (b1/s8192/h64, FLASHMASK_BIGD_DRAIN_MODE):
-                            # BW full 24.93ms, no_reduce 15.25ms -- the gmem reduce is
-                            # only 39%, and the remaining 15.25ms (271 TFLOPs/s, vs
-                            # 515 for this repo's own d256 bwd) is the chunked gemm
-                            # pipeline. So this key spends SMEM on FEWER chunk rounds
-                            # first (d_chunk, then dv_chunk == tile_n), and takes
-                            # staging depth only with what is left.
-                            _tie_mma=(
-                                -d_chunk,
-                                abs(dv_chunk - tile_n),
-                                -min(accum_stage, ACCUM_STAGE_CREDIT),
                                 flush_per_work,
                                 resident,
                             ),
@@ -270,139 +321,52 @@ def solve_config(
             f"no feasible config for head_dim={head_dim}, head_dim_v={head_dim_v}, "
             f"cta_group={cta_group}"
         )
-    solutions.sort(key=lambda s: s["_tie" if _RANK_POLICY == "accum" else "_tie_mma"])
-    return solutions if all_solutions else solutions[0]
+    solutions.sort(key=lambda s: s["_tie"])
+    return solutions[0]
 
 
 CONFIG_KEYS = (
-    "tile_m", "tile_n", "d_chunk", "dv_chunk", "d_chunks_resident", "sdQaccum_stage",
-    "dQ_reduce_ncol",
-)
-# Set by set_config_override() to force a configuration instead of the solver's pick.
-# The solver ranks by accumulator traffic per unit of work, which is a *model*; the
-# measured kernel sits at ~20% of HBM bandwidth and ~11% of the MMA peak, so that model
-# does not currently describe the bottleneck. tests/bench_bigd_bwd.py sweeps real
-# configurations through this hook instead of trusting the ranking.
-_CONFIG_OVERRIDE = None
-
-
-def _parse_config_env(spec: Optional[str]):
-    """`FLASHMASK_BIGD_CONFIG="d_chunk=128,sdQaccum_stage=1"` -> dict.
-
-    An env var (and not only the set_config_override() hook) because the benchmark
-    that drives this kernel lives outside this repo and cannot be edited to call it.
-    """
-    if not spec:
-        return None
-    cfg = {}
-    for item in spec.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        key, _, value = item.partition("=")
-        key = key.strip()
-        assert key in CONFIG_KEYS, (
-            f"FLASHMASK_BIGD_CONFIG: unknown key {key!r}; known: {CONFIG_KEYS}"
-        )
-        cfg[key] = int(value)
-    return cfg or None
-
-
-_CONFIG_OVERRIDE = _parse_config_env(os.environ.get("FLASHMASK_BIGD_CONFIG"))
-
-# Which ranking key solve_config() sorts by: "accum" (the original, staging-first)
-# or "mma" (chunk-width-first, see _tie_mma). Default stays "accum" until the
-# chunk-width sweep has been run -- the original key came with measurements, this
-# one comes with a hypothesis.
-_RANK_POLICY = os.environ.get("FLASHMASK_BIGD_RANK", "accum")
-assert _RANK_POLICY in ("accum", "mma"), (
-    f"FLASHMASK_BIGD_RANK must be 'accum' or 'mma', got {_RANK_POLICY!r}"
+    "tile_m", "tile_n", "d_chunk", "dv_chunk", "d_chunks_resident", "dQ_reduce_ncol",
 )
 
-
-def set_rank_policy(policy: str):
-    """'accum' | 'mma'. See _RANK_POLICY."""
-    global _RANK_POLICY
-    assert policy in ("accum", "mma")
-    _RANK_POLICY = policy
-    bigd_host_config.cache_clear()
-
-
-# Measured pins, keyed by (head_dim, head_dim_v, cta_group). These win over the
-# solver's ranking (either policy) and lose to FLASHMASK_BIGD_CONFIG.
+# Measured pins, keyed by (head_dim, head_dim_v, cta_group). These win over the solver's
+# ranking, which is a *model*: the measured kernel sits at ~20% of HBM bandwidth and ~11%
+# of the MMA peak, so it does not currently describe the bottleneck.
 #
-# 512/512: measured on B30Z (sm103), b1/s8192/h64/hkv1, causal document mask,
-# BW ms at pack_gqa=auto:
-#   solver default  d64  / res2 / stage4 / ncol32   24.12
-#   _tie_mma        d128 / res2 / stage1 / ncol32   25.19
-#   this pin        d128 / res2 / stage1 / ncol64   23.75
-# The chunk width itself is worth nothing (32 -> 20 chunk gemms per m tile moved
-# BW by -1.5%..+4.5%); what this pin actually buys is the halved slice count in
-# the drain (48 -> 24 per m tile), which is why ncol has to come with it.
-#
-# NB: the solver's feasibility filter rejects this config -- its SMEM estimate is
-# 224KB against a 221KB budget (227KB cap minus a 6KB reserve). The reserve is
-# deliberate slack for the barrier / LSE / dPsum / alignment padding the estimate
-# does not model; this config launches and runs, so for a pinned, measured entry
-# the filter is bypassed rather than loosened for everything.
+# 512/512 (B30Z / sm103, b1/s8192/h64/hkv1, causal document mask): 23.75ms against the
+# 24.12ms of the config the solver ranked first at the time. What the pin buys is the
+# halved slice count in the drain (48 -> 24 per m tile), which is why dQ_reduce_ncol has
+# to come with the wider d_chunk -- d_chunk is the tile the drain slices, so a 64-column
+# slice is only legal once the chunk is at least 64 wide.
 _MEASURED_CONFIG = {
     (512, 512, 1): {
         "d_chunk": 128,
         "d_chunks_resident": 2,
-        "sdQaccum_stage": 1,
         "dQ_reduce_ncol": 64,
     },
 }
 
-# Diagnostic: how much of the runtime is the output drain?
-#   "full"      -- normal (T2R -> SMEM staging -> cp.reduce.add into the fp32 accum)
-#   "no_reduce" -- T2R + staging, but no cp.reduce issue: isolates the gmem RMW
-#   "none"      -- neither; only the mbarrier handshake with the mma warp
-# The last two produce WRONG dQ/dK/dV on purpose. They exist because the drain is
-# ~48 slices x 16KB per m tile (~38GB for b1/s8192/h64/d512) and the whole
-# phase-2 plan (keeping dK/dV resident so the drain happens once per n block
-# instead of once per m iteration) is only worth its risk if that traffic is in
-# fact what the kernel is spending its time on. Run the same benchmark in the
-# three modes and the difference bounds it.
-#
-# Prefer the env var and one process per mode: the compiled-kernel cache in
-# interface.py is not keyed on this, so flipping it inside a live process can
-# reuse an already-compiled kernel.
-_DRAIN_MODE = os.environ.get("FLASHMASK_BIGD_DRAIN_MODE", "full")
-_DRAIN_MODES = ("full", "no_reduce", "none")
-assert _DRAIN_MODE in _DRAIN_MODES, (
-    f"FLASHMASK_BIGD_DRAIN_MODE must be one of {_DRAIN_MODES}, got {_DRAIN_MODE!r}"
-)
-
-
-def set_drain_mode(mode: str):
-    """Diagnostic only: 'full' | 'no_reduce' | 'none'. See _DRAIN_MODE."""
-    global _DRAIN_MODE
-    assert mode in _DRAIN_MODES, f"drain mode must be one of {_DRAIN_MODES}"
-    _DRAIN_MODE = mode
-    bigd_host_config.cache_clear()
-
-
-def set_config_override(cfg: Optional[dict]):
-    """Force (a subset of) the kernel config. Pass None to go back to the solver."""
-    global _CONFIG_OVERRIDE
-    if cfg is not None:
-        bad = set(cfg) - set(CONFIG_KEYS)
-        assert not bad, f"unknown config keys {sorted(bad)}; known: {CONFIG_KEYS}"
-    _CONFIG_OVERRIDE = dict(cfg) if cfg else None
-    bigd_host_config.cache_clear()
-
 
 class FlashAttentionBackwardSm100BigD:
+    """SM100 backward kernel specialized for head dimensions larger than 256."""
+
     @classmethod
     def from_shape(cls, head_dim: int, head_dim_v: int, cta_group: int = 1, **kwargs):
-        """Build with the solver's configuration for this (head_dim, head_dim_v)."""
+        """Build a kernel with the selected configuration for a head shape.
+
+        Args:
+            head_dim: Query/key head dimension.
+            head_dim_v: Value head dimension.
+            cta_group: Number of CTAs participating in each MMA.
+            **kwargs: Explicit constructor overrides for selected configuration values.
+
+        Returns:
+            Configured ``FlashAttentionBackwardSm100BigD`` instance.
+        """
         cfg = solve_config(head_dim, head_dim_v, cta_group=cta_group)
         pin = _MEASURED_CONFIG.get((head_dim, head_dim_v, cta_group))
         if pin is not None:
             cfg = {**cfg, **pin}
-        if _CONFIG_OVERRIDE is not None:
-            cfg = {**cfg, **_CONFIG_OVERRIDE}
         for key in CONFIG_KEYS:
             kwargs.setdefault(key, cfg[key])
         kwargs.setdefault("cta_group", cta_group)
@@ -419,56 +383,67 @@ class FlashAttentionBackwardSm100BigD:
         d_chunk: int = 96,
         dv_chunk: int = 128,
         d_chunks_resident: int = 3,
-        sdQaccum_stage: int = 1,
         dQ_reduce_ncol: int = 32,
         cta_group: int = 1,
         swap_dKV: bool = False,
         deterministic: bool = False,
-        is_persistent: bool = False,
         fm_bound_num: int = 0,
     ):
-        # head_dim is padded to a multiple of 64 to match head_dim_rounded in the interface
+        # head_dim is padded to a multiple of 64 to match head_dim_rounded in the
+        # interface. Out-of-range columns need no predication here: the TMA zero-fills
+        # them and the per-element mask below kills their contribution.
         hdim_multiple_of = 64
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         self.tile_hdimv = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
-        self.check_hdim_oob = head_dim != self.tile_hdim
-        self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
 
         self.tile_m = tile_m
         self.tile_n = tile_n
         self.d_chunk = d_chunk
         self.dv_chunk = dv_chunk
         self.d_chunks_resident = d_chunks_resident
-        # Depth of the accumulator staging buffer. >1 lets the cp.reduce of one 32-column
-        # slice overlap the T2R + staging of the next instead of every slice paying a full
-        # gmem round trip; the solver spends whatever SMEM is left on it.
-        assert 1 <= sdQaccum_stage <= SM100_ACCUM_STAGE_MAX
-        self.sdQaccum_stage = sdQaccum_stage
-        # Width of one accumulator staging slice. Narrower slices buy pipeline depth at
-        # the same SMEM but double the transfer and barrier count; 32 is the default and
-        # tests/bench_bigd_bwd.py sweeps it. Any multiple of 4 keeps the byte layout the
-        # postprocess expects (its run is ordered [4-column group][row][4 columns], so a
-        # slice of any multiple of 4 columns is still a contiguous range).
+        # Width of one output T2R / reduce slice. Narrower slices mean more, smaller
+        # vector atomics; 32 is the default and 64 is what 512/512 measured best at. Any
+        # multiple of 4 keeps the byte layout the postprocess expects (its run is ordered
+        # [4-column group][row][4 columns], so a slice of any multiple of 4 columns is
+        # still a contiguous range).
         assert dQ_reduce_ncol % 4 == 0 and d_chunk % dQ_reduce_ncol == 0
         assert dv_chunk % dQ_reduce_ncol == 0
         self.dQ_reduce_ncol_cfg = dQ_reduce_ncol
         self.cta_group_size = cta_group
-        self.swap_dKV = swap_dKV
         self.is_causal = is_causal
-        self.is_local = False
         self.qhead_per_kvhead = qhead_per_kvhead
-        self.deterministic = deterministic
-        self.is_persistent = is_persistent
-        self.pack_gqa = False
         # Number of columns of startend_row_indices (0 = no flashmask). It has to be a
         # constructor arg: the tensor arrives with a fully dynamic layout, so the kernel
         # cannot read it off the shape at trace time.
-        self.fm_bound_num = fm_bound_num
-        assert fm_bound_num in (0, 1, 2, 4), (
-            f"unexpected startend_row_indices width {fm_bound_num}"
+        #
+        # The legal widths depend on is_causal, and the dependency is load bearing in
+        # two places, so an out-of-set width is a silently wrong answer rather than a
+        # missed optimization:
+        #   - the per-element mask derives `has_end` as (causal and 2) or (not causal
+        #     and 4); a non-causal width of 1 takes the has_end=False path, which reads
+        #     fm_row[1] -- past the end of a single-column tensor.
+        #   - the m-block skip only reduces an `end` bound when the width is >= 2, so a
+        #     non-causal width of 1 leaves min_end at INT32_MAX, which pushes m_lo past
+        #     m_hi and makes num_iters 0: the whole n block computes nothing and dK / dV
+        #     / dQ stay at their zero-initialised accumulator values.
+        legal_bound_num = (0, 1, 2) if is_causal else (0, 2, 4)
+        assert fm_bound_num in legal_bound_num, (
+            f"startend_row_indices width {fm_bound_num} is not valid for "
+            f"is_causal={is_causal} (legal widths: {legal_bound_num})"
         )
+        self.fm_bound_num = fm_bound_num
 
+        assert not deterministic, (
+            "deterministic reduction is not supported by the big-headdim bwd: dK / dV / "
+            "dQ are accumulated with red.global.add, whose order is not reproducible"
+        )
+        # cta_group=2 is NOT ENABLED and has never run: _launch builds multicast TMA
+        # atoms from cluster_shape_mnk but passes no `cluster=` to .launch(), and the grid
+        # is not rounded to a multiple of the pair size. The column rules in tmem_plan(),
+        # the n_block_pair skip derivation and the tile_m constraint below are all in
+        # place for it, but turning it on means fixing the launch and the grid first.
         assert cta_group in (1, 2)
+
         assert not swap_dKV, "swapAB (phase 2) is not implemented yet"
         # UMMA N limit. This is what rules out the d=576 -> 2x288 split that the
         # d=256 config uses.
@@ -508,7 +483,6 @@ class FlashAttentionBackwardSm100BigD:
             assert tile_m >= 128, "cta_group=2 requires tile_m >= 128 for the dQ gemm"
 
         self.acc_dtype = Float32
-        self.startend_row_indices_dtype = cutlass.Int32
         self.cluster_shape_mn = (cg, 1)
         self.cta_group = tcgen05.CtaGroup.TWO if cg == 2 else tcgen05.CtaGroup.ONE
 
@@ -517,11 +491,28 @@ class FlashAttentionBackwardSm100BigD:
         # the dV gemm, dS of the dK/dQ gemms). The three outputs are produced and
         # immediately drained, so they time-share one scratch region whose width
         # is the widest of them.
-        self.tmem_S_cols = tmem_columns(tile_m, self.mma_tiler_kq[0], cg)
-        self.tmem_dP_cols = tmem_columns(tile_m, self.mma_tiler_vdo[0], cg)
-        self.tmem_dV_cols = tmem_columns(dv_chunk, self.mma_tiler_pdo[0], cg)
-        self.tmem_dK_cols = tmem_columns(d_chunk, self.mma_tiler_dsq[0], cg)
-        self.tmem_dQ_cols = tmem_columns(d_chunk, self.mma_tiler_dsk[0], cg)
+        #
+        # Output scratch slots. All three outputs share the same columns -- they never
+        # overlap in time -- but with a single slot the mma warp cannot issue chunk
+        # c+1's gemm until the drain warps have emptied chunk c, so the ~20 output
+        # gemms per m tile are fully serialised against their own drain.
+        #
+        # A second slot breaks that: chunk c+1 goes to the other slot, so its gemm
+        # overlaps chunk c's T2R + reduce. This is what DSA does for its dKV
+        # (dsa_bwd_sm100.py:100-105 gives dKV two slots and aliases dKV2/3 onto
+        # them) -- note it does NOT keep dKV resident either, it double buffers.
+        #
+        # True residency for dK/dV is a different thing and does not fit here: at
+        # tile_n=128 one resident dV is tile_n * head_dim_v * 4B = 256KB, which is
+        # the entire 512-column TMEM (512 cols x 128 lanes x 4B). Both dK and dV
+        # resident needs 512KB, i.e. cta_group=2 (two CTAs' TMEM, and each
+        # accumulator split in half along N). No column trick substitutes for that.
+        #
+        # The arithmetic lives in tmem_plan() so that solve_config's feasibility test
+        # and this layout cannot drift apart.
+        plan = tmem_plan(tile_m, tile_n, d_chunk, dv_chunk, cg)
+        self.tmem_S_cols = plan["s_cols"]
+        self.tmem_dP_cols = plan["dp_cols"]
 
         self.tmem_S_offset = 0
         # P and dS are bf16, so they need only half the columns of the f32
@@ -531,55 +522,20 @@ class FlashAttentionBackwardSm100BigD:
         self.tmem_P_offset = self.tmem_S_offset + self.tmem_s_to_p_offset
         self.tmem_dP_offset = self.tmem_S_offset + self.tmem_S_cols
         self.tmem_dS_offset = self.tmem_dP_offset + self.tmem_s_to_p_offset
-        self.tmem_out_offset = self.tmem_dP_offset + self.tmem_dP_cols
-        self.tmem_out_slot_cols = max(
-            self.tmem_dV_cols, self.tmem_dK_cols, self.tmem_dQ_cols
-        )
-        # Output scratch slots. All three outputs share the same columns -- they never
-        # overlap in time -- but with a single slot the mma warp cannot issue chunk
-        # c+1's gemm until the drain warps have emptied chunk c, so the ~20 output
-        # gemms per m tile are fully serialised against their own drain.
-        #
-        # A second slot breaks that: chunk c+1 goes to the other slot, so its gemm
-        # overlaps chunk c's T2R + cp.reduce. This is what DSA does for its dKV
-        # (dsa_bwd_sm100.py:100-105 gives dKV two slots and aliases dKV2/3 onto
-        # them) -- note it does NOT keep dKV resident either, it double buffers.
-        #
-        # True residency for dK/dV is a different thing and does not fit here: at
-        # tile_n=128 one resident dV is tile_n * head_dim_v * 4B = 256KB, which is
-        # the entire 512-column TMEM (512 cols x 128 lanes x 4B). Both dK and dV
-        # resident needs 512KB, i.e. cta_group=2 (two CTAs' TMEM, and each
-        # accumulator split in half along N). No column trick substitutes for that.
-        self.num_out_slots = min(
-            2,
-            (SM100_TMEM_CAPACITY_COLUMNS - self.tmem_out_offset)
-            // self.tmem_out_slot_cols,
-        )
+        self.tmem_out_offset = plan["out_offset"]
+        self.tmem_out_slot_cols = plan["slot_cols"]
+        self.num_out_slots = plan["num_out_slots"]
         assert self.num_out_slots >= 1, (
             f"no room for an output slot: out_offset={self.tmem_out_offset}, "
             f"slot={self.tmem_out_slot_cols}"
         )
-        self.tmem_out_cols = self.num_out_slots * self.tmem_out_slot_cols
-        # Slot 0's base. Chunk c uses slot c % num_out_slots, i.e.
-        # tmem_out_offset + (c % num_out_slots) * tmem_out_slot_cols.
-        self.tmem_dV_offset = self.tmem_out_offset
-        self.tmem_dK_offset = self.tmem_out_offset
-        self.tmem_dQ_offset = self.tmem_out_offset
-
-        self.tmem_total = self.tmem_out_offset + self.tmem_out_cols
+        # Chunk c uses slot c % num_out_slots, starting at tmem_out_offset plus
+        # (c % num_out_slots) * tmem_out_slot_cols.
+        self.tmem_total = plan["total"]
         assert self.tmem_total <= SM100_TMEM_CAPACITY_COLUMNS, (
             f"TMEM overflow: {self.tmem_total} > {SM100_TMEM_CAPACITY_COLUMNS} columns"
         )
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
-
-        # The K-side accumulators (S, dP, dV, dK) have M = cta_group * tile_n. At
-        # cta_group=1 with tile_n=64 that is the 16-datapath layout, which needs
-        # the Ld16x*/St16x* copy atoms instead of Ld32x32b/St32x32b.
-        self.kside_rows_per_cta = self.mma_tiler_kq[0] // cg
-        self.kside_16dp = cg == 1 and self.kside_rows_per_cta == 64
-        # dQ's M is tile_m, so it keeps the 32-datapath atoms whenever tile_m=128.
-        self.dq_rows_per_cta = self.mma_tiler_dsk[0] // cg
-        self.dq_16dp = cg == 1 and self.dq_rows_per_cta == 64
 
         # ------------------------------------------------------------ warps / barriers
         # The output drain (T2R of dV/dK/dQ -> SMEM staging -> cp.reduce into the
@@ -590,17 +546,12 @@ class FlashAttentionBackwardSm100BigD:
         # thread) live inside the compute warps' budget. DSA's sm100 bwd splits the
         # same way (4 compute + 8 reduce warps).
         self.drain_warp_ids = (0, 1, 2, 3)
-        # Kept as an alias: `reduce_warp_ids` is what the register-budget comment and
-        # the debug kernel refer to.
-        self.reduce_warp_ids = self.drain_warp_ids
         # The TMEM->register copies are partitioned over 128 threads (one
         # warpgroup): tcgen05.make_tmem_copy sizes its thread layout from the
         # accumulator, and for these shapes that is 4 warps. Dispatching 8 compute
-        # warps at it made threads 128..255 read/write past their fragment, which
-        # silently corrupted the debug buffers. Warps 8-11 stay idle until the real
-        # kernel gives them work (the second warpgroup will get its own tile).
+        # warps at it made threads 128..255 read/write past their fragment. Warps 8-11
+        # stay idle until they get a tile of their own (the second warpgroup).
         self.compute_warp_ids = (4, 5, 6, 7)
-        self.idle_warp_ids = (8, 9, 10, 11)
         self.mma_warp_id = 12
         self.load_warp_id = 13
         self.relay_warp_id = 14
@@ -616,17 +567,16 @@ class FlashAttentionBackwardSm100BigD:
         # The drain warpgroup got the registers the output fragments need now that
         # the drain moved there (dV 128 + dK 64 + dQ 64 f32 per thread, processed one
         # chunk at a time); compute keeps its 136 since its four S/P/dP/dS fragments
-        # did not change. The old form of this assert reserved a second *compute*
-        # warpgroup for warps 8-11; they are idle at runtime (num_regs_empty), so the
-        # budget below is what the kernel actually allocates. Reinstate the reserve
-        # when warps 8-11 get a real tile.
-        self.num_regs_reduce = 200
+        # did not change. Warps 8-11 are idle at runtime (num_regs_empty), so the budget
+        # below is what the kernel actually allocates -- reserve a second compute
+        # warpgroup here once they get a real tile.
+        self.num_regs_drain = 200
         self.num_regs_compute = 136
         self.num_regs_load = 88
         self.num_regs_mma = 88
         self.num_regs_empty = 24
         assert (
-            self.num_regs_reduce
+            self.num_regs_drain
             + self.num_regs_compute
             + self.num_regs_empty
             + max(self.num_regs_load, self.num_regs_mma)
@@ -634,8 +584,6 @@ class FlashAttentionBackwardSm100BigD:
         )
 
         self.buffer_align_bytes = 1024
-        # Diagnostic knob, see _DRAIN_MODE. "full" is the only correct setting.
-        self.drain_mode = _DRAIN_MODE
         # Width, in m columns, of one S -> P -> dP -> dS round trip. The live register
         # set of that round trip is 5 * softmax_chunk_m f32 per thread (S, P, dP, dS
         # and the two packed R2T buffers, which are half-width), so this is what keeps
@@ -654,38 +602,20 @@ class FlashAttentionBackwardSm100BigD:
     def _setup_attributes(self):
         # Phase 1 keeps the pipelines at their shallowest: Q and dO chunks are
         # re-fetched per use, K holds `d_chunks_resident` chunks for the whole
-        # n-block. Deeper staging is a later perf knob (there is SMEM headroom
-        # only if d_chunks_resident is reduced).
+        # n-block. Deeper staging is a later perf knob.
         self.Q_stage = 1
         self.dO_stage = 1
         self.K_smem_stages = self.d_chunks_resident
-        self.single_stage = 1
-        self.sdKVaccum_stage = 2
 
-        # dQ reduce granularity: identical to the existing 1CTA sm100 bwd so the
-        # reduce path's thread mapping -- and therefore the accumulator's byte
-        # layout -- is the one FlashAttentionBackwardPostprocess already expects.
+        # Output reduce granularity: the T2R slice width, which also fixes the byte
+        # layout of the fp32 accumulators and therefore has to stay something
+        # FlashAttentionBackwardPostprocess can read back.
         self.dQ_reduce_ncol = self.dQ_reduce_ncol_cfg
-        self.dQ_reduce_ncol_t2r = self.dQ_reduce_ncol
-        hdim_for_reduce = self.d_chunk
-        assert (hdim_for_reduce // self.cta_group_size) % self.dQ_reduce_ncol == 0
-        self.dQaccum_reduce_stage = hdim_for_reduce // self.dQ_reduce_ncol
-        self.dQaccum_reduce_stage_t2r = hdim_for_reduce // self.dQ_reduce_ncol_t2r
-        self.dK_reduce_ncol = math.gcd(32, hdim_for_reduce // 2)
-        self.dV_reduce_ncol = math.gcd(32, self.dv_chunk // 2)
-        # One named barrier around the staging buffer, same role as the existing
-        # kernel's reduce_sync_barrier: all drain threads fill sAccum, one thread
-        # issues the bulk reduce, everybody waits for it to have drained SMEM.
-        self.reduce_sync_barrier = cutlass.pipeline.NamedBarrier(
-            barrier_id=int(NamedBarrierBwdSm100.dQaccReduce),
-            num_threads=len(self.drain_warp_ids) * cute.arch.WARP_SIZE,
-        )
+        assert (self.d_chunk // self.cta_group_size) % self.dQ_reduce_ncol == 0
 
-        # mbarrier slot offsets inside the single mbar_ptr MemRange. Only the two
-        # scalar barriers are needed by the step-1a smoke launch; the pipeline
-        # slots occupy [0, mbar_count() - 2).
-        self.mbar_tmem_dealloc_offset = self.mbar_count() - 2
-        self.mbar_flashmask_offset = self.mbar_count() - 1
+        # mbarrier slot offsets inside the single mbar_ptr MemRange: the pipeline slots
+        # occupy [0, mbar_count() - 1) and the one scalar barrier sits at the end.
+        self.mbar_tmem_dealloc_offset = self.mbar_count() - 1
 
     def _get_tiled_mma(self, ab_dtype):
         cg = self.cta_group
@@ -703,7 +633,8 @@ class FlashAttentionBackwardSm100BigD:
         # with M=64 the 16-datapath atoms are forced, and their per-thread element
         # order does not survive the bf16 packing (measured: exact for a constant A
         # operand, ~7% off for A = m or A = n, i.e. a local permutation). Hence
-        # tile_n = 128, tile_m = 64.
+        # the K-side MMA M mode is fixed at 128; tile_m independently remains 128
+        # for the accumulator staging and dQ mapping used by this kernel.
         tiled_mma_dV = mma(self.mma_tiler_pdo, mn, tmem_src)
         tiled_mma_dK = mma(self.mma_tiler_dsq, mn, tmem_src)
         tiled_mma_dQ = sm100_utils_basic.make_trivial_tiled_mma(
@@ -756,19 +687,11 @@ class FlashAttentionBackwardSm100BigD:
         )
         self.sKt_layout = lb(mma_dQ, self.mma_tiler_dsk, ab_dtype, self.K_smem_stages)
 
-        self.sdQaccum_layout = cute.make_layout(
-            (self.tile_m * self.dQ_reduce_ncol, self.sdQaccum_stage)
-        )
         self.sLSE_layout = cute.make_layout(
             shape=(self.tile_m, self.Q_stage), stride=(1, cute.round_up(self.tile_m, 64))
         )
         self.sdPsum_layout = cute.make_layout(
             shape=(self.tile_m, self.dO_stage), stride=(1, cute.round_up(self.tile_m, 64))
-        )
-        self.sdK_layout = None  # dK / dV no longer stage through their own SMEM buffers:
-        self.sdV_layout = None  # every output goes through sdQaccum (see the reduce path)
-        self.sStartEndRowIndices_layout = cute.make_layout(
-            shape=(self.tile_n, 2), stride=(1, self.tile_n)
         )
 
     def mbar_count(self):
@@ -778,22 +701,44 @@ class FlashAttentionBackwardSm100BigD:
         fixed fudge factor silently capped the config space: with 8 d chunks and 8 dv
         chunks the slots overflowed the MemRange and the config became unusable.
 
-          Sin full/empty     2 * num_d_chunks       S full            1
-          dPin full/empty    2 * num_dv_chunks      dP full           1
-          dVin full/empty    2 * num_dv_chunks      PdS full          1
-          dKin full/empty    2 * num_d_chunks       dSsmem full       1
-          dQin full/empty    2 * num_d_chunks       tmem dealloc      1
-          out full/empty     2 * (num_dv_chunks + 2 * num_d_chunks)   flashmask   1
-        """
-        return 10 * self.num_d_chunks + 6 * self.num_dv_chunks + 5 + 4
+          Sin  full/empty    2 * num_d_chunks       S full          1
+          dPin full/empty    2 * num_dv_chunks      dP full         1
+          dVin full/empty    2 * num_dv_chunks      PdS full        1
+          dKin full/empty    2 * num_d_chunks       dSsmem full     1
+          dQin full/empty    2 * num_d_chunks       tmem dealloc    1
+          out  full/empty    2 * (num_dv_chunks + 2 * num_d_chunks)
 
-    def make_shared_storage(self, q_dtype, do_dtype, ds_dtype, dqaccum_dtype):
-        """Build the SharedStorage struct.
+        tmem dealloc is last, so it is the slot mbar_tmem_dealloc_offset points at.
+        """
+        per_chunk = (
+            2 * self.num_d_chunks       # Sin
+            + 2 * self.num_dv_chunks    # dPin
+            + 2 * self.num_dv_chunks    # dVin
+            + 2 * self.num_d_chunks     # dKin
+            + 2 * self.num_d_chunks     # dQin
+            + 2 * (self.num_dv_chunks + 2 * self.num_d_chunks)  # out
+        )
+        scalars = 5  # S full, dP full, PdS full, dSsmem full, tmem dealloc
+        return per_chunk + scalars
+
+    def make_shared_storage(self, q_dtype, do_dtype, ds_dtype):
+        """Build the shared-memory storage type for the selected configuration.
+
+        Args:
+            q_dtype: Element type used by Q, K, and V staging buffers.
+            do_dtype: Element type used by dO staging buffers.
+            ds_dtype: Element type used by dS staging buffers.
+
+        Returns:
+            Cute struct type describing the kernel's shared-memory allocation.
 
         Aliasing, mirroring the 1CTA layout of flash_bwd_sm100.py:
-          - sQ also backs sQt (transposed view) and the sdK epilogue staging
-          - sdO also backs sdOt and the sdV epilogue staging
+          - sQ also backs sQt (transposed view)
+          - sdO also backs sdOt
           - sK also backs sKt
+
+        The outputs have no SMEM buffer of their own: dV / dK / dQ leave TMEM through
+        vector atomics straight out of the drain warps' registers.
         """
         sQ_alloc_bytes = max(
             cute.size_in_bytes(q_dtype, self.sQ_layout),
@@ -808,9 +753,13 @@ class FlashAttentionBackwardSm100BigD:
 
         @cute.struct
         class SharedStorage:
+            """Shared-memory buffers and barriers used by one BigD CTA."""
+
             mbar_ptr: cute.struct.MemRange[cutlass.Int64, mbar_count]
             tmem_holding_buf: cutlass.Int32
-            sFM_max_min_ptr: cute.struct.MemRange[cutlass.Int32, 8]
+            sFM_max_min_ptr: cute.struct.MemRange[
+                cutlass.Int32, FLASHMASK_META_SLOTS
+            ]
 
             sQ: cute.struct.Align[cute.struct.MemRange[cute.Uint8, sQ_alloc_bytes], align]
             sK: cute.struct.Align[
@@ -820,9 +769,6 @@ class FlashAttentionBackwardSm100BigD:
                 cute.struct.MemRange[q_dtype, cute.cosize(self.sV_layout)], align
             ]
             sdO: cute.struct.Align[cute.struct.MemRange[cute.Uint8, sdO_alloc_bytes], align]
-            sdQaccum: cute.struct.Align[
-                cute.struct.MemRange[dqaccum_dtype, cute.cosize(self.sdQaccum_layout)], align
-            ]
             sdS: cute.struct.Align[
                 cute.struct.MemRange[ds_dtype, cute.cosize(self.sdSt_layout)], 128
             ]
@@ -832,53 +778,11 @@ class FlashAttentionBackwardSm100BigD:
             sdPsum: cute.struct.Align[
                 cute.struct.MemRange[Float32, cute.cosize(self.sdPsum_layout)], 128
             ]
-            sStartEndRowIndices: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.startend_row_indices_dtype,
-                    cute.cosize(self.sStartEndRowIndices_layout),
-                ],
-                64,
-            ]
 
         return SharedStorage
 
-    def smem_bytes(self, ab_dtype):
-        """Byte total of the persistent SMEM buffers, for the budget assert.
-
-        sQt / sdOt / sKt are transposed views that alias sQ / sdO / sK, and
-        sdK / sdV alias sQ / sdO (they are only live in the epilogue), so they do
-        not add to the total -- but each must fit inside the buffer it aliases.
-        """
-        b = lambda layout, dtype=ab_dtype: cute.size_in_bytes(dtype, layout)
-        sQ_b = max(b(self.sQ_layout), b(self.sQt_layout))
-        sK_b = max(b(self.sK_layout), b(self.sKt_layout))
-        sV_b = b(self.sV_layout)
-        sdO_b = max(b(self.sdO_layout), b(self.sdOt_layout))
-        sdS_b = b(self.sdSt_layout)
-        sdQaccum_b = b(self.sdQaccum_layout, Float32)
-        sLSE_b = b(self.sLSE_layout, Float32)
-        sdPsum_b = b(self.sdPsum_layout, Float32)
-        sFM_b = b(self.sStartEndRowIndices_layout, cutlass.Int32)
-        parts = {
-            "sQ": sQ_b,
-            "sK": sK_b,
-            "sV": sV_b,
-            "sdO": sdO_b,
-            "sdS": sdS_b,
-            "sdQaccum": sdQaccum_b,
-            "sLSE": sLSE_b,
-            "sdPsum": sdPsum_b,
-            "sFM": sFM_b,
-            "mbar": self.mbar_count() * 8 + 4 + 8 * 4,
-        }
-        total = sum(parts.values())
-        return total, parts
-
-    # ------------------------------------------------------------------ entries
-    # `__call__` is the production entry and matches FlashAttentionBackwardSm100's
-    # signature so interface.py can pick between the two by shape alone.
-    # `debug_s_launch` is the self-check entry: same kernel, plus a per-stage dump
-    # of S / P / dP / dS and the diagnostic A operands.
+    # `__call__` matches FlashAttentionBackwardSm100's signature so interface.py can pick
+    # between the two by shape alone.
 
     @cute.jit
     def __call__(
@@ -920,7 +824,9 @@ class FlashAttentionBackwardSm100BigD:
         # Always keep stream as the last parameter.
         stream=None,
     ):
-        # Everything below is M5/M6 work; fail loudly rather than silently wrong.
+        # None of the features below are implemented; fail loudly rather than silently
+        # wrong.
+
         assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
             "varlen is not supported by the big-headdim bwd"
         )
@@ -964,39 +870,6 @@ class FlashAttentionBackwardSm100BigD:
             ),
         )
 
-    @cute.jit
-    def debug_s_launch(
-        self,
-        mQ: cute.Tensor,
-        mK: cute.Tensor,
-        mV: cute.Tensor,
-        mdO: cute.Tensor,
-        mLSE: cute.Tensor,
-        mdPsum: cute.Tensor,
-        mDbg: cute.Tensor,
-        mdQaccum: cute.Tensor,
-        mdKaccum: cute.Tensor,
-        mdVaccum: cute.Tensor,
-        softmax_scale_log2: Float32,
-        stream,
-        const_A: cutlass.Constexpr = 0,
-    ):
-        self._launch(
-            mQ,
-            mK,
-            mV,
-            mdO,
-            mLSE,
-            mdPsum,
-            mdQaccum,
-            mdKaccum,
-            mdVaccum,
-            softmax_scale_log2,
-            stream,
-            mDbg=mDbg,
-            const_A=const_A,
-        )
-
     def _launch(
         self,
         mQ: cute.Tensor,
@@ -1010,16 +883,13 @@ class FlashAttentionBackwardSm100BigD:
         mdVaccum: cute.Tensor,
         softmax_scale_log2: Float32,
         stream,
-        mDbg: Optional[cute.Tensor] = None,
         mFM: Optional[cute.Tensor] = None,
-        const_A: cutlass.Constexpr = 0,
     ):
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.do_dtype = mdO.element_type
         self.ds_dtype = mQ.element_type
-        self.dqaccum_dtype = Float32
 
         self._setup_attributes()
         self._setup_smem_layout(self.q_dtype)
@@ -1032,7 +902,18 @@ class FlashAttentionBackwardSm100BigD:
         ) = self._get_tiled_mma(self.q_dtype)
         self.cluster_shape_mnk = cute.make_layout((*self.cluster_shape_mn, 1))
         self.shared_storage = self.make_shared_storage(
-            self.q_dtype, self.do_dtype, self.ds_dtype, self.dqaccum_dtype
+            self.q_dtype, self.do_dtype, self.ds_dtype
+        )
+        # solve_config's SMEM model is an estimate (it does not know about the barriers,
+        # LSE / dPsum or cute.struct's alignment padding) and _MEASURED_CONFIG can pin a
+        # config the estimate never approved, so check the real struct against the
+        # hardware cap here rather than finding out as a launch failure.
+        smem_bytes = self.shared_storage.size_in_bytes()
+        assert smem_bytes <= SM100_SMEM_CAPACITY_BYTES, (
+            f"shared storage is {smem_bytes} B, over the {SM100_SMEM_CAPACITY_BYTES} B "
+            f"SM100 cap (tile_m={self.tile_m}, tile_n={self.tile_n}, "
+            f"d_chunk={self.d_chunk}, dv_chunk={self.dv_chunk}, "
+            f"d_chunks_resident={self.d_chunks_resident})"
         )
 
         layout_transpose = [1, 3, 2, 0]  # (b, s, h, d) -> (s, d, h, b)
@@ -1128,7 +1009,7 @@ class FlashAttentionBackwardSm100BigD:
 
         num_n_block = cute.ceil_div(cute.size(mK.shape[0]), self.tile_n)
         grid_dim = (num_n_block, cute.size(mQ.shape[2]), cute.size(mK.shape[3]))
-        self.kernel_debug_s(
+        self.kernel(
             tma_tensor_Q,
             tma_tensor_K,
             tma_tensor_V,
@@ -1138,7 +1019,6 @@ class FlashAttentionBackwardSm100BigD:
             tma_tensor_Kt,
             mLSE,
             mdPsum,
-            mDbg,
             mFM,
             mdQaccum,
             mdKaccum,
@@ -1167,7 +1047,6 @@ class FlashAttentionBackwardSm100BigD:
             self.sdSt_layout,
             self.sKt_layout,
             softmax_scale_log2,
-            const_A,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1176,7 +1055,7 @@ class FlashAttentionBackwardSm100BigD:
         )
 
     @cute.kernel
-    def kernel_debug_s(
+    def kernel(
         self,
         mQ: cute.Tensor,
         mK: cute.Tensor,
@@ -1187,7 +1066,6 @@ class FlashAttentionBackwardSm100BigD:
         mK_dQ: cute.Tensor,
         mLSE: cute.Tensor,
         mdPsum: cute.Tensor,
-        mDbg: Optional[cute.Tensor],
         mFM: Optional[cute.Tensor],
         mdQaccum: cute.Tensor,
         mdKaccum: cute.Tensor,
@@ -1216,8 +1094,14 @@ class FlashAttentionBackwardSm100BigD:
         sdSt_layout: cute.ComposedLayout,
         sKt_layout: cute.ComposedLayout,
         softmax_scale_log2: Float32,
-        const_A: cutlass.Constexpr,
     ):
+        """Run the tiled BigD backward dataflow for one scheduled KV block.
+
+        Tensor arguments provide global inputs and fp32 gradient accumulators; TMA
+        atoms, MMA descriptors, and layouts define the compile-time transfer and
+        compute mappings. The kernel writes dQ, dK, and dV through the accumulator
+        tensors and has no Python return value.
+        """
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx = cute.arch.thread_idx()[0]
         n_block, head_idx, batch_idx = cute.arch.block_idx()
@@ -1225,8 +1109,9 @@ class FlashAttentionBackwardSm100BigD:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         mbar_ptr = storage.mbar_ptr.data_ptr()
-        # Every barrier below is used exactly once (single m tile), so all waits
-        # are on phase 0 and no phase bookkeeping is needed.
+        # Every barrier below is used exactly ONCE per m iteration, which is what lets a
+        # single phase bit per warp track all of them (see the m loops: iteration j waits
+        # on parity j & 1).
         # K and Q for one d chunk arrive on the same barrier (same producer, same
         # consuming gemm), so one full/empty pair per d chunk.
         mbar_Sin_full = mbar_ptr + 0
@@ -1239,7 +1124,7 @@ class FlashAttentionBackwardSm100BigD:
         mbar_dP_full = mbar_dPin_empty + self.num_dv_chunks
         # P/dS written back to TMEM by the compute warps (bf16, upper half of the
         # S/dP regions), then the three output gemms. Each edge gets its own
-        # barrier so every wait is on phase 0.
+        # barrier so that the one-arrival-per-iteration rule above holds.
         mbar_PdS_full = mbar_dP_full + 1
         mbar_dVin_full = mbar_PdS_full + 1
         mbar_dVin_empty = mbar_dVin_full + self.num_dv_chunks
@@ -1255,12 +1140,25 @@ class FlashAttentionBackwardSm100BigD:
         num_out_chunks = self.num_dv_chunks + 2 * self.num_d_chunks
         mbar_out_empty = mbar_out_full + num_out_chunks
         mbar_tmem_dealloc = mbar_ptr + self.mbar_tmem_dealloc_offset
-        assert (
-            2 * self.num_d_chunks + 2 * self.num_dv_chunks + 2
-            + 2 + 2 * self.num_dv_chunks + 4 * self.num_d_chunks + 1
-            + 2 * num_out_chunks
-            <= self.mbar_tmem_dealloc_offset
-        ), "debug kernel barrier slots overflow the mbar MemRange"
+        # The pipeline slots above have to end exactly where tmem_dealloc starts, or
+        # mbar_count() and this layout have drifted apart and some barrier is aliasing
+        # another.
+        pipeline_slots = (
+            2 * self.num_d_chunks       # Sin full / empty
+            + 1                         # S full
+            + 2 * self.num_dv_chunks    # dPin full / empty
+            + 1                         # dP full
+            + 1                         # PdS full
+            + 2 * self.num_dv_chunks    # dVin full / empty
+            + 2 * self.num_d_chunks     # dKin full / empty
+            + 1                         # dSsmem full
+            + 2 * self.num_d_chunks     # dQin full / empty
+            + 2 * num_out_chunks        # out full / empty
+        )
+        assert pipeline_slots == self.mbar_tmem_dealloc_offset, (
+            f"kernel uses {pipeline_slots} pipeline barrier slots but mbar_count() "
+            f"reserved {self.mbar_tmem_dealloc_offset}"
+        )
 
         if warp_idx == 1:
             # *_in_empty and out_empty are arrived by the DRAIN warps (they own the
@@ -1347,27 +1245,21 @@ class FlashAttentionBackwardSm100BigD:
         sKt = storage.sK.get_tensor(
             sKt_layout.outer, swizzle=sKt_layout.inner, dtype=self.k_dtype
         )
-        # fp32 staging buffer for the output accumulators: one (tile_m * 32) run,
-        # exactly the shape the existing 1CTA bwd stages its dQ/dK accum through.
+        # Flashmask metadata reduced before deriving the m-block skip ranges.
         #
         # Built HERE, at the kernel's top level, and not inside the warp regions: the
         # DSL's AST pass treats `obj.method(...)` as a write to `obj` and threads that
         # object through every enclosing region, and a SharedStorage instance cannot be
         # flattened into a region argument ("unable to convert SharedStorage to
         # Numeric"). Every storage.*.get_tensor() call therefore has to stay out here.
-        # The layout is built here rather than reused from self.sdQaccum_layout: a
+        # The layout is built here rather than reused from a host-side attribute: a
         # layout created in the host-side jit function is an SSA value of *that*
         # region, and kernel regions are isolated ("'cute.make_view' op using value
         # defined outside the region"). Layouts either come in as kernel parameters
         # or are constructed inside the kernel.
-        sAccum = storage.sdQaccum.get_tensor(
-            cute.make_layout(
-                (self.tile_m * self.dQ_reduce_ncol, self.sdQaccum_stage)
-            )
+        sFM_red = storage.sFM_max_min_ptr.get_tensor(
+            cute.make_layout(FLASHMASK_META_SLOTS)
         )
-        # Two int32 slots for the flashmask m-block skip range (see below); same
-        # top-level rule as sAccum.
-        sFM_red = storage.sFM_max_min_ptr.get_tensor(cute.make_layout(8))
         # A-operand views for the output gemms (address comes from tA_addr).
         thr_mma_dV = tiled_mma_dV.get_slice(0)
         thr_mma_dK = tiled_mma_dK.get_slice(0)
@@ -1407,9 +1299,6 @@ class FlashAttentionBackwardSm100BigD:
             )
             for s in range(self.num_out_slots)
         )
-        tdVtdV = tdVtdV_slots[0]
-        tdQtdQ = tdQtdQ_slots[0]
-        tdKtdK = tdKtdK_slots[0]
 
         # The m loop: every barrier below is used exactly once per m iteration, so a
         # single phase bit per warp tracks all of them (mbarrier phases flip on each
@@ -1431,6 +1320,14 @@ class FlashAttentionBackwardSm100BigD:
         # truth, which makes these bounds only need to be CONSERVATIVE: skipping less
         # than possible costs time, skipping a block that still has an unmasked element
         # is a wrong answer.
+        #
+        # At cta_group=2 the two CTAs of a pair own adjacent key blocks but share every
+        # collective operation (the gemms below take cta_group=2, the loads are
+        # multicast), so they must run the SAME number of m iterations. The range is
+        # therefore computed over the pair's whole key range -- both CTAs read the same
+        # bounds and apply the same expressions, so they agree by construction and no
+        # cross-CTA reduction is needed. cta_group=1 keeps its exact previous range.
+        n_block_pair = (n_block // self.cta_group_size) * self.cta_group_size
         m_lo = Int32(0)
         m_hi = num_m_block
         b_lo = num_m_block
@@ -1438,17 +1335,25 @@ class FlashAttentionBackwardSm100BigD:
         if cutlass.const_expr(self.is_causal):
             # keep n_global <= m_global + seqlen_k - seqlen_q, so the first m block that
             # can hold an unmasked element is (n_lo + seqlen_q - seqlen_k) / tile_m --
-            # the identical expression to block_info.py's get_m_block_min_max.
+            # the identical expression to block_info.py's get_m_block_min_max, evaluated
+            # at the pair's lowest key (the least constraining of the two).
             m_lo = cutlass.max(
                 Int32(0),
-                (n_block * self.tile_n + seqlen_q - seqlen_k) // self.tile_m,
+                (n_block_pair * self.tile_n + seqlen_q - seqlen_k) // self.tile_m,
             )
         if cutlass.const_expr(self.fm_bound_num > 0):
             fm_heads = cute.size(mFM.shape[1])
             fm_b = batch_idx if cute.size(mFM.shape[0]) > 1 else Int32(0)
             fm_h = head_idx // (cute.size(mQ.shape[2]) // fm_heads)
         if cutlass.const_expr(self.fm_bound_num in (1, 2)):
-            # Reduce this key block's per-column bounds to two scalars: the largest
+            # fm_bound_num == 4 (non-causal, both tails bounded) deliberately gets NO
+            # skip: it would need four reduced scalars (max/min of both tails' starts and
+            # ends) and the resulting iteration space is two bands rather than one, which
+            # the seg1 / seg2 walk below cannot express. Falling through leaves
+            # [0, num_m_block) and only costs time -- the per-element mask stays the
+            # source of truth.
+            #
+            # Reduce this key pair's per-column bounds to two scalars: the largest
             # lower-tail start and the smallest end. One warp does it (32 lanes x 4
             # columns + a butterfly reduce, so every lane ends up with the result and can
             # write the same value), then the CTA barrier publishes it to the load / mma /
@@ -1459,11 +1364,13 @@ class FlashAttentionBackwardSm100BigD:
                 lane = tidx % cute.arch.WARP_SIZE
                 acc_ds = Int32(0)
                 acc_end = Int32(2**31 - 1)
-                for j in cutlass.range_constexpr(self.tile_n // cute.arch.WARP_SIZE):
-                    col = n_block * self.tile_n + j * cute.arch.WARP_SIZE + lane
+                pair_cols = self.cta_group_size * self.tile_n
+                for j in cutlass.range_constexpr(pair_cols // cute.arch.WARP_SIZE):
+                    col = n_block_pair * self.tile_n + j * cute.arch.WARP_SIZE + lane
                     # Columns past seqlen_k are masked for every m, so they must not
                     # constrain the skip: ds = 0 and end = INT32_MAX are the neutral
-                    # elements of max(ds) and min(end).
+                    # elements of max(ds) and min(end). The same clamp covers a pair
+                    # whose second key block falls entirely past seqlen_k.
                     in_range = col < seqlen_k
                     safe_col = cutlass.min(col, seqlen_k - 1)
                     acc_ds = cutlass.max(
@@ -1925,14 +1832,6 @@ class FlashAttentionBackwardSm100BigD:
         elif warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_compute)
             compute_tidx = tidx - self.compute_warp_ids[0] * cute.arch.WARP_SIZE
-            num_compute_threads = cutlass.const_expr(
-                cute.arch.WARP_SIZE * len(self.compute_warp_ids)
-            )
-            # Accumulator staging: the same 1D tiled copy the existing bwd uses for
-            # its dQ/dK accum r2s (copy_utils.tiled_copy_1d, 128-bit per thread), so
-            # the bytes that land in gmem are bit-for-bit what
-            # FlashAttentionBackwardPostprocess reads back. sAccum itself is built at
-            # the kernel's top level (see the note there).
             phase = Int32(0)
             for it in cutlass.range(num_iters, unroll=1):
                 # The iteration counter drives the barrier phases; m_iter is the actual
@@ -2086,7 +1985,7 @@ class FlashAttentionBackwardSm100BigD:
                 #
                 # If this breaks, the symptom is precise: dS feeds dK through TMEM and dQ
                 # through SMEM, so dQ wrong while dK stays right means the store mapping
-                # is off, and the [2] / [3] diagnostic modes name the axis.
+                # is off.
                 smem_store_atom = sm100_utils_basic.get_smem_store_op(
                     LayoutEnum.ROW_MAJOR,
                     self.ds_dtype,
@@ -2125,9 +2024,9 @@ class FlashAttentionBackwardSm100BigD:
                 # mode 1 is the query index and is a per-element compile-time constant.
                 # So the key-side predicates are loop- and chunk-invariant and only the
                 # query side is per element.
-                # (Measured on B200 with the A = m / A = n diagnostic modes -- note this
-                # is the OPPOSITE of what mask.py's apply_mask_sm100_transposed assumes,
-                # which is why that helper is not used here.)
+                # (Measured on B200 -- note this is the OPPOSITE of what mask.py's
+                # apply_mask_sm100_transposed assumes, which is why that helper is not
+                # used here.)
                 #
                 # TMA already zero-fills the out-of-range Q / K / dO tiles; what it
                 # cannot do is stop exp2(0 - lse_pad) from being a nonzero P.
@@ -2171,13 +2070,6 @@ class FlashAttentionBackwardSm100BigD:
                             fm_us, fm_ue = fm_row[2], fm_row[3]
                         else:
                             fm_us, fm_ue = Int32(0), fm_row[1]
-                # The n coordinate is loop-invariant per thread: tScS's strides are all
-                # on coordinate mode 1, so mode 0 (the key index) is a single
-                # thread-derived value while m is a per-element constant. Hoisting it
-                # keeps the A = n diagnostic to one dynamic conversion instead of
-                # frag_len of them inside an unrolled loop (which stalled MLIR).
-                if cutlass.const_expr(const_A == 3):
-                    probe_n = Float32(tScS[0][0])
 
                 # S^T, then P = exp2(S * scale_log2 - lse[m]). S^T is (n, m) = (key,
                 # query), and softmax normalizes over keys, so LSE and dPsum are
@@ -2246,23 +2138,8 @@ class FlashAttentionBackwardSm100BigD:
 
                     # R2T of this chunk's P and dS, then its dS slice to SMEM.
                     for i in cutlass.range_constexpr(frag_len):
-                        if cutlass.const_expr(const_A == 0):
-                            tSrP_r2t[i] = tSrP[i].to(self.q_dtype)
-                            tSrdS_r2t[i] = tSrdS[i].to(self.ds_dtype)
-                        else:
-                            # Diagnostic A operands: 1 -> ones, 2 -> m index, 3 -> n index.
-                            # Their references are order-independent, so they localise a
-                            # wrong element mapping to rows vs columns.
-                            if cutlass.const_expr(const_A == 1):
-                                probe = Float32(1.0)
-                            elif cutlass.const_expr(const_A == 2):
-                                # Float32(...) not .to(): a coordinate component can be a
-                                # static Python int, which has no .to().
-                                probe = Float32(tScS[i][1] + m_off)
-                            else:
-                                probe = probe_n
-                            tSrP_r2t[i] = probe.to(self.q_dtype)
-                            tSrdS_r2t[i] = probe.to(self.ds_dtype)
+                        tSrP_r2t[i] = tSrP[i].to(self.q_dtype)
+                        tSrdS_r2t[i] = tSrdS[i].to(self.ds_dtype)
                     cute.copy(thr_store_P, tSrP_r2t_f32, thr_store_P.partition_D(tStP_c))
                     cute.copy(
                         thr_store_dS, tSrdS_r2t_f32, thr_store_dS.partition_D(tStdS_c)
@@ -2281,48 +2158,6 @@ class FlashAttentionBackwardSm100BigD:
                         cute.make_tensor(tSrdS_r2t.iterator, tdSsdS.shape),
                         tdSsdS,
                     )
-                    if cutlass.const_expr(mDbg is not None):
-                        # Self-check only (mDbg is None on the production path): dump
-                        # every stage as (index, value) pairs through a flat per-thread
-                        # slice, one slot per (chunk, thread) so the total is unchanged.
-                        # Partitioning a *gmem* tile with the TMEM copy wrote out of
-                        # bounds (it corrupted the input buffers: kernel output looked
-                        # sane while the host reference came back NaN), so the dump
-                        # deliberately avoids any exotic tiler -- each thread writes
-                        # frag_len contiguous floats, and the matching linear coordinates
-                        # let the host scatter them back without knowing the per-thread
-                        # order.
-                        tSrIdx = cute.make_fragment(tScS.shape, Float32)
-                        assert (
-                            cute.arch.WARP_SIZE
-                            * len(self.compute_warp_ids)
-                            * frag_len
-                            * self.num_softmax_chunks
-                            == self.tile_n * self.tile_m
-                        ), "S/P/dP/dS dump slot arithmetic"
-                        for i in cutlass.range_constexpr(frag_len):
-                            crd = tScS[i]
-                            tSrIdx[i] = Float32(
-                                crd[0] * self.tile_m + crd[1] + m_off
-                            )
-                        frags = [tSrS, tSrP, tSrdP, tSrdS]
-                        dbg_slot = (
-                            cm * cute.arch.WARP_SIZE * len(self.compute_warp_ids)
-                            + compute_tidx
-                        )
-                        for stage in cutlass.range_constexpr(4):
-                            for src, half in ((frags[stage], 0), (tSrIdx, 1)):
-                                cute.autovec_copy(
-                                    cute.make_tensor(
-                                        src.iterator, cute.make_layout(frag_len)
-                                    ),
-                                    cute.local_tile(
-                                        mDbg[batch_idx, head_idx, stage, half, None],
-                                        (frag_len,),
-                                        (dbg_slot,),
-                                    ),
-                                )
-
                 # P and dS are complete for the whole tile: publish them to the mma
                 # warp (TMEM) and to the dQ gemm (SMEM). One arrive each per m
                 # iteration, which is what the barriers were initialised for.
@@ -2362,14 +2197,10 @@ class FlashAttentionBackwardSm100BigD:
             #
             # The postprocess still has to be *called* per head_dim slice: its
             # 1CTA path stages a whole tile_m x head_dim fp32 tile in SMEM
-            # (128*576*4 = 288KB) and holds it in registers, so head_dim 576 has
-            # to go through it as e.g. 3 x 192 with raw_storage_d.
-            #
-            # NB: sAccum / sdQaccum_stage are now dead for this path (the atomics need
-            # no staging). The buffer is still declared, so ~32KB of SMEM is reclaimable
-            # once this is measured -- freeing it would change smem_bytes and therefore
-            # the solver's choice, so it is left alone for now.
-            cute.arch.setmaxregister_increase(self.num_regs_reduce)
+            # (at head_dim 512 that is 128*512*4 = 256KB) and holds it in
+            # registers, so it has to be driven as e.g. 4 x 128 with
+            # raw_storage_d instead of once at the full head_dim.
+            cute.arch.setmaxregister_increase(self.num_regs_drain)
             drain_tidx = tidx - self.drain_warp_ids[0] * cute.arch.WARP_SIZE
             num_drain_threads = cutlass.const_expr(
                 cute.arch.WARP_SIZE * len(self.drain_warp_ids)
@@ -2385,10 +2216,9 @@ class FlashAttentionBackwardSm100BigD:
             mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
             # ONE T2R per dQ_reduce_ncol-column slice, not one per chunk.
             #
-            # MEASURED, and this is what the whole drain hinges on:
-            #   FLASHMASK_BIGD_DRAIN_MODE=full  local ld/st 19.70 / 19.40 GB, BW 18.97ms
-            #   FLASHMASK_BIGD_DRAIN_MODE=none  local ld/st  0.33 /  0.03 GB, BW  6.55ms
-            # So all 39GB of local traffic and 65% of the runtime is this drain, and the
+            # MEASURED, and this is what the whole drain hinges on: with the drain in and
+            # out, local ld/st went 19.70 / 19.40 GB vs 0.33 / 0.03 GB and BW 18.97ms vs
+            # 6.55ms. So all 39GB of local traffic and 65% of the runtime is this drain, and the
             # 39GB is exactly "every T2R fragment element written once and read once"
             # (12 chunks x 512B = 6KB per thread per m tile, x 128 threads x ~49k m
             # tiles = 37GB). The fragments were not living in registers at all.
@@ -2498,34 +2328,32 @@ class FlashAttentionBackwardSm100BigD:
                         slot_base = cutlass.const_expr(
                             (out_c % self.num_out_slots) * self.tmem_out_slot_cols
                         )
-                        for s in cutlass.range_constexpr(
-                            chunk_w // ncol if self.drain_mode != "none" else 0
-                        ):
+                        for s in cutlass.range_constexpr(chunk_w // ncol):
                             # One ncol-column slice per pass: T2R it, then reduce it into
                             # the fp32 gmem accumulator with red.global.add.v4.f32
                             # straight out of the registers.
                             #
-                            # This replaced a SMEM staging round trip (fill sAccum with a
-                            # vectorised r2s, two named barriers around it, one elected
-                            # thread issuing a 32KB cp.reduce.async.bulk.add.f32).
-                            # MEASURED split of the drain before this change:
+                            # This replaced a SMEM staging round trip (a vectorised r2s
+                            # into a staging buffer, two named barriers around it, one
+                            # elected thread issuing a 32KB cp.reduce.async.bulk.add.f32).
+                            # MEASURED split of the drain before that change:
                             #   full 15.0ms, no_reduce 9.65ms, none 6.68ms
                             # i.e. the gmem reduce was 5.35ms and the on-chip
-                            # T2R + staging was 2.97ms -- and with sdQaccum_stage == 1
-                            # (what the SMEM budget allows at ncol=64) that staging was
-                            # fully serialised: wait for every outstanding reduce to have
-                            # read the single slot, barrier, fill, fence, barrier, issue.
-                            # Per m tile that is 24 slices x 2 whole-warpgroup barriers.
-                            # DSA drains its dKV the same way this does now
-                            # (dsa_bwd_sm100.py's scatter_dkv_atomic: float4 atomics from
-                            # registers, no staging).
+                            # T2R + staging was 2.97ms -- and at the one staging slot the
+                            # SMEM budget allowed at ncol=64 that staging was fully
+                            # serialised: wait for every outstanding reduce to have read
+                            # the slot, barrier, fill, fence, barrier, issue. Per m tile
+                            # that is 24 slices x 2 whole-warpgroup barriers. DSA drains
+                            # its dKV the same way this does now (dsa_bwd_sm100.py's
+                            # scatter_dkv_atomic: float4 atomics from registers, no
+                            # staging).
                             #
                             # Byte layout is preserved exactly, which is what keeps
                             # FlashAttentionBackwardPostprocess and _unblock_accum valid.
                             # The old path was: tiled_copy_1d(f32, 128 threads, 4 elems)
-                            # put thread t's fragment element r*4+v at sAccum position
-                            # r*512 + t*4 + v, and the bulk copy moved sAccum to gmem in
-                            # order. So element r*4+v belongs at gmem offset
+                            # put thread t's fragment element r*4+v at staging position
+                            # r*512 + t*4 + v, and the bulk copy moved the buffer to gmem
+                            # in order. So element r*4+v belongs at gmem offset
                             # r*(num_drain_threads*4) + t*4 + v -- which is what the 16
                             # vector atomics below write. Each is 16B aligned (t*4 f32)
                             # and a warp's 32 lanes cover 512 contiguous bytes.
@@ -2537,20 +2365,17 @@ class FlashAttentionBackwardSm100BigD:
                                 thr_t2r_out, thr_t2r_out.partition_S(tmem_src), frag
                             )
                             cute.arch.fence_view_async_tmem_load()
-                            if cutlass.const_expr(self.drain_mode == "full"):
-                                gbase = maccum.iterator + (
-                                    elem_base
-                                    + s * (self.tile_m * ncol)
-                                    + drain_tidx * 4
+                            gbase = maccum.iterator + (
+                                elem_base + s * (self.tile_m * ncol) + drain_tidx * 4
+                            )
+                            for r in cutlass.range_constexpr(flen_slice // 4):
+                                copy_utils.atomic_add_fp32x4(
+                                    frag[r * 4 + 0],
+                                    frag[r * 4 + 1],
+                                    frag[r * 4 + 2],
+                                    frag[r * 4 + 3],
+                                    gbase + r * (num_drain_threads * 4),
                                 )
-                                for r in cutlass.range_constexpr(flen_slice // 4):
-                                    copy_utils.atomic_add_fp32x4(
-                                        frag[r * 4 + 0],
-                                        frag[r * 4 + 1],
-                                        frag[r * 4 + 2],
-                                        frag[r * 4 + 3],
-                                        gbase + r * (num_drain_threads * 4),
-                                    )
                         cute.arch.mbarrier_arrive(mbar_out_empty + out_c)
                         cute.arch.mbarrier_arrive(in_bar + c)
 
@@ -2563,161 +2388,19 @@ class FlashAttentionBackwardSm100BigD:
         else:
             cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
-    def tmem_report(self):
-        lines = [
-            f"tile=({self.tile_m},{self.tile_n}) cta_group={self.cta_group_size} "
-            f"d={self.tile_hdim}={self.d_chunk}x{self.num_d_chunks} "
-            f"dv={self.tile_hdimv}={self.dv_chunk}x{self.num_dv_chunks}",
-            f"  S / P        [{self.tmem_S_offset:3d}, {self.tmem_S_offset + self.tmem_S_cols:3d})"
-            f"  {self.tmem_S_cols:3d} cols  (M={self.mma_tiler_kq[0]}, N={self.tile_m})",
-            f"  dP / dS      [{self.tmem_dP_offset:3d}, {self.tmem_dP_offset + self.tmem_dP_cols:3d})"
-            f"  {self.tmem_dP_cols:3d} cols  (M={self.mma_tiler_vdo[0]}, N={self.tile_m})",
-            f"  out scratch  [{self.tmem_out_offset:3d}, {self.tmem_total:3d})"
-            f"  {self.num_out_slots} slot(s) x {self.tmem_out_slot_cols}"
-            f"  {self.tmem_out_cols:3d} cols  "
-            f"(dV {self.tmem_dV_cols} | dK {self.tmem_dK_cols} | dQ {self.tmem_dQ_cols})",
-            f"  total {self.tmem_total}/{SM100_TMEM_CAPACITY_COLUMNS} columns"
-            f"   free {SM100_TMEM_CAPACITY_COLUMNS - self.tmem_total}",
-            f"  K-side accumulators 16-datapath: {self.kside_16dp}"
-            f"   dQ 16-datapath: {self.dq_16dp}",
-        ]
-        return "\n".join(lines)
-
-    # ------------------------------------------------------------------ step 1a
-    # Smoke launch: builds the real resource layout, allocates SMEM + TMEM,
-    # dispatches all 16 warps at the phase-1 register split, and exits. This is
-    # what confirms on hardware that (a) a 217.8KB dynamic SMEM request launches
-    # and (b) a 512-column TMEM allocation coexists with 16 warps. The loads,
-    # gemms and reduces land in steps 1b-1d.
-
-    @cute.jit
-    def smoke_launch(self, mQ: cute.Tensor, mK: cute.Tensor, mV: cute.Tensor, stream=None):
-        self.q_dtype = mQ.element_type
-        self.k_dtype = mK.element_type
-        self.v_dtype = mV.element_type
-        self.ds_dtype = mQ.element_type
-        self.dqaccum_dtype = Float32
-
-        self._setup_attributes()
-        self._setup_smem_layout(self.q_dtype)
-        tiled_mma_S, tiled_mma_dP, _, _, _ = self._get_tiled_mma(self.q_dtype)
-        self.cluster_shape_mnk = cute.make_layout((*self.cluster_shape_mn, 1))
-        self.shared_storage = self.make_shared_storage(
-            self.q_dtype, self.q_dtype, self.ds_dtype, self.dqaccum_dtype
-        )
-
-        # (b, s, h, d) -> (s, d, h, b), matching flash_bwd_sm100's transposes.
-        layout_transpose = [1, 3, 2, 0]
-        mQ, mK, mV = [
-            layout_utils.select(t, mode=layout_transpose) for t in (mQ, mK, mV)
-        ]
-        tile_sched_args = TileSchedulerArguments(
-            cute.ceil_div(cute.size(mK.shape[0]), self.tile_n),  # n-blocks
-            cute.size(mQ.shape[2]),                             # num_head
-            cute.size(mK.shape[3]),                             # num_batch
-            1,                                                  # num_splits
-            cute.size(mQ.shape[0]),                             # seqlen (q here)
-            mQ.shape[1],                                        # headdim
-            mV.shape[1],                                        # headdim_v
-            total_q=cute.size(mQ.shape[0]),
-            tile_shape_mn=(self.tile_n, self.tile_m),
-            cluster_shape_mn=self.cluster_shape_mn,
-            qhead_per_kvhead_packgqa=1,
-            element_size=self.k_dtype.width // 8,
-            is_persistent=self.is_persistent,
-        )
-        tile_sched_params = SingleTileScheduler.to_underlying_arguments(tile_sched_args)
-        grid_dim = SingleTileScheduler.get_grid_shape(tile_sched_params)
-
-        # TMA atoms. K/V are the A operands of their gemms, Q/dO the B operands.
-        # dO's atom is built against the dV gemm (mma_tiler_pdo), not the dP gemm:
-        # the dP gemm consumes dO^T, which is a separate (transposed) atom added
-        # with the real load path in step 1b.
-        tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
-        tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            mK,
-            cute.select(self.sK_layout, mode=[0, 1, 2]),
-            self.mma_tiler_kq,
-            tiled_mma_S,
-            self.cluster_shape_mnk.shape,
-        )
-        tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            mQ,
-            cute.select(self.sQ_layout, mode=[0, 1, 2]),
-            self.mma_tiler_kq,
-            tiled_mma_S,
-            self.cluster_shape_mnk.shape,
-        )
-        tma_atom_V, tma_tensor_V = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            mV,
-            cute.select(self.sV_layout, mode=[0, 1, 2]),
-            self.mma_tiler_vdo,
-            tiled_mma_dP,
-            self.cluster_shape_mnk.shape,
-        )
-        self.tma_copy_bytes = {
-            name: self.cta_group_size
-            * cute.size_in_bytes(dtype, cute.select(layout, mode=[0, 1, 2]))
-            for name, dtype, layout in [
-                ("Q", self.q_dtype, self.sQ_layout),
-                ("K", self.k_dtype, self.sK_layout),
-                ("V", self.v_dtype, self.sV_layout),
-            ]
-        }
-
-        self.kernel(tma_tensor_Q, tile_sched_params).launch(
-            grid=grid_dim,
-            block=[self.threads_per_cta, 1, 1],
-            smem=self.shared_storage.size_in_bytes(),
-            stream=stream,
-        )
-
-    @cute.kernel
-    def kernel(self, mQ: cute.Tensor, tile_sched_params):
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-
-        smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(self.shared_storage)
-        mbar_ptr = storage.mbar_ptr.data_ptr()
-
-        if warp_idx == 1:
-            cute.arch.mbarrier_init(
-                mbar_ptr + self.mbar_tmem_dealloc_offset,
-                cute.arch.WARP_SIZE
-                * (len(self.compute_warp_ids) + len(self.reduce_warp_ids)),
-            )
-        cute.arch.mbarrier_init_fence()
-        cute.arch.barrier()
-
-        if warp_idx == self.mma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_mma)
-            cute.arch.alloc_tmem(Int32(self.tmem_alloc_cols), storage.tmem_holding_buf)
-            cute.arch.sync_warp()
-            cute.arch.relinquish_tmem_alloc_permit()
-            tmem_ptr = cute.arch.retrieve_tmem_ptr(
-                Float32, alignment=16, ptr_to_buffer_holding_addr=storage.tmem_holding_buf
-            )
-            # The 1a stub has no m loop: this handshake happens once, phase 0.
-            cute.arch.mbarrier_wait(mbar_ptr + self.mbar_tmem_dealloc_offset, 0)
-            cute.arch.dealloc_tmem(tmem_ptr, Int32(self.tmem_alloc_cols))
-        elif warp_idx == self.load_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_load)
-        elif warp_idx == self.empty_warp_id or warp_idx == self.relay_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_empty)
-        elif warp_idx <= self.reduce_warp_ids[-1]:
-            cute.arch.setmaxregister_increase(self.num_regs_reduce)
-            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
-        else:
-            cute.arch.setmaxregister_increase(self.num_regs_compute)
-            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
-
 
 @functools.lru_cache(maxsize=None)
 def bigd_host_config(head_dim: int, head_dim_v: int, cta_group: int = 1):
-    """What interface.py needs to know about this shape's kernel config.
+    """Return the BigD configuration values required by ``interface.py``.
+
+    Args:
+        head_dim: Query/key head dimension.
+        head_dim_v: Value head dimension.
+        cta_group: Number of CTAs participating in each MMA.
+
+    Returns:
+        Tile sizes and accumulator slice widths used by host-side allocation and
+        postprocessing.
 
     tile_m / tile_n have to match the interface's m_block_size / n_block_size (they
     size the accumulators and drive the postprocess grid), and the accumulator slice
@@ -2733,307 +2416,3 @@ def bigd_host_config(head_dim: int, head_dim_v: int, cta_group: int = 1):
         "accum_slice_d": kernel.accum_slice_d,
         "accum_slice_dv": kernel.accum_slice_dv,
     }
-
-
-def _print_report(kernel, total, parts):
-    print(kernel.tmem_report())
-    print("  SMEM " + "  ".join("%s=%d" % (k, v) for k, v in parts.items()))
-    print(
-        "  SMEM total %d B = %.1f KB  (cap %d B = %d KB)  %s"
-        % (
-            total,
-            total / 1024.0,
-            SM100_SMEM_CAPACITY_BYTES,
-            SM100_SMEM_CAPACITY_BYTES // 1024,
-            "OK" if total <= SM100_SMEM_CAPACITY_BYTES else "OVERFLOW",
-        )
-    )
-
-
-@cute.jit
-def _report_smem(
-    head_dim: cutlass.Constexpr,
-    head_dim_v: cutlass.Constexpr,
-    tile_m: cutlass.Constexpr,
-    tile_n: cutlass.Constexpr,
-    d_chunk: cutlass.Constexpr,
-    dv_chunk: cutlass.Constexpr,
-    d_chunks_resident: cutlass.Constexpr,
-    cta_group: cutlass.Constexpr,
-    sdQaccum_stage: cutlass.Constexpr = 1,
-):
-    kernel = FlashAttentionBackwardSm100BigD(
-        head_dim,
-        head_dim_v,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        d_chunk=d_chunk,
-        dv_chunk=dv_chunk,
-        d_chunks_resident=d_chunks_resident,
-        sdQaccum_stage=sdQaccum_stage,
-        cta_group=cta_group,
-    )
-    kernel._setup_attributes()
-    kernel._setup_smem_layout(cutlass.BFloat16)
-    total, parts = kernel.smem_bytes(cutlass.BFloat16)
-    # Build the struct too: it asserts the aliasing constraints and is what the
-    # kernel launch will actually size its dynamic SMEM from.
-    kernel.make_shared_storage(cutlass.BFloat16, cutlass.BFloat16, cutlass.BFloat16, Float32)
-    _print_report(kernel, total, parts)
-
-
-def _smoke_launch():
-    """Step 1a on hardware: does the phase-1 resource request actually launch?"""
-    import paddle
-    from cutlass.cute.runtime import from_dlpack
-
-    paddle.set_device("gpu")
-    b, sq, sk, h, d, dv = 1, 128, 128, 1, 576, 512
-    q = paddle.randn([b, sq, h, d], dtype=paddle.bfloat16)
-    k = paddle.randn([b, sk, h, d], dtype=paddle.bfloat16)
-    v = paddle.randn([b, sk, h, dv], dtype=paddle.bfloat16)
-    tensors = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (q, k, v)
-    ]
-    kernel = FlashAttentionBackwardSm100BigD.from_shape(d, dv)
-    try:
-        import cuda.bindings.driver as cuda_driver
-
-        stream = cuda_driver.CUstream(paddle.device.cuda.current_stream().cuda_stream)
-    except Exception:  # noqa: BLE001
-        stream = None
-    kernel.smoke_launch(*tensors, stream=stream)
-    paddle.device.synchronize()
-    print("  smoke launch OK (smem %d B, tmem %d cols, %d threads)"
-          % (kernel.shared_storage.size_in_bytes(), kernel.tmem_alloc_cols,
-             kernel.threads_per_cta))
-
-
-def _debug_s(const_a=0, n_m=2):
-    """Step 1b on hardware: S -> P -> dP -> dS -> dV / dK, checked vs paddle.
-
-    const_a selects a diagnostic A operand for the dV / dK gemms (0 = the real
-    P / dS): 1 = all ones, 2 = the m (query) index, 3 = the n (key) index. Each
-    has an order-independent reference, so together they localise a wrong R2T
-    element mapping to rows vs columns.
-
-    n_m sets the number of m blocks, i.e. num_m_block inside the kernel. n_m=1
-    exercises the single-tile dataflow only; n_m>=2 additionally exercises the m
-    loop, its phase tracking and the buffer handover across iterations. Running
-    both separates "the dataflow broke" from "the m loop broke".
-    """
-    import math as pymath
-
-    import paddle
-    from cutlass.cute.runtime import from_dlpack
-
-    paddle.set_device("gpu")
-    b, h, d, dv = 1, 1, 576, 512
-    kernel = FlashAttentionBackwardSm100BigD.from_shape(d, dv)
-    # n_m m blocks, one n block. The kernel has no gmem accumulator yet (that is
-    # M3), so each m iteration overwrites the debug buffers and only the LAST
-    # block's contribution survives -- which is what the references below are
-    # sliced to. A wrong phase makes that last iteration read the wrong Q / dO /
-    # LSE block, so the numbers still catch it.
-    tm = kernel.tile_m
-    sq, sk = n_m * tm, kernel.tile_n
-    m0 = sq - tm
-    q = paddle.randn([b, sq, h, d], dtype=paddle.bfloat16)
-    k = paddle.randn([b, sk, h, d], dtype=paddle.bfloat16)
-    v = paddle.randn([b, sk, h, dv], dtype=paddle.bfloat16)
-    do = paddle.randn([b, sq, h, dv], dtype=paddle.bfloat16)
-    softmax_scale = 1.0 / pymath.sqrt(d)
-    log2e = pymath.log2(pymath.e)
-
-    # fp32 reference, in the kernel's S^T = (key, query) orientation.
-    qf, kf, vf, dof = [t.astype("float32")[0, :, 0, :] for t in (q, k, v, do)]
-    sT_raw = paddle.matmul(kf, qf, transpose_y=True)              # (sk, sq)
-    sT = sT_raw * softmax_scale
-    lse = paddle.logsumexp(sT, axis=0)                            # (sq,)
-    p = paddle.exp(sT - lse)                                      # (sk, sq)
-    o = paddle.matmul(p, vf, transpose_x=True)                    # (sq, dv)
-    dpsum = (dof * o).sum(axis=-1)                                # (sq,)
-    dpT = paddle.matmul(vf, dof, transpose_y=True)                # (sk, sq)
-    dsT = p * (dpT - dpsum)
-    refs = [sT_raw[:, m0:], p[:, m0:], dpT[:, m0:], dsT[:, m0:]]
-    names = ["S", "P", "dP", "dS"]
-
-    lse_log2 = (lse * log2e).astype("float32").reshape([b, h, sq]).contiguous()
-    dpsum_dev = dpsum.astype("float32").reshape([b, h, sq]).contiguous()
-    dbg = paddle.zeros([b, h, 4, 2, sk * kernel.tile_m], dtype=paddle.float32)
-    # fp32 accumulators, blocked by (m or n) tile: the kernel add-reduces into them,
-    # so they MUST start at zero.
-    dq_accum = paddle.zeros([b, h, sq * kernel.tile_hdim], dtype=paddle.float32)
-    dk_accum = paddle.zeros([b, h, sk * kernel.tile_hdim], dtype=paddle.float32)
-    dv_accum = paddle.zeros([b, h, sk * kernel.tile_hdimv], dtype=paddle.float32)
-
-    tensors = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (q, k, v, do, lse_log2, dpsum_dev, dbg, dq_accum, dk_accum, dv_accum)
-    ]
-    import cuda.bindings.driver as cuda_driver
-
-    stream = cuda_driver.CUstream(paddle.device.cuda.current_stream().cuda_stream)
-    kernel.debug_s_launch(*tensors, Float32(softmax_scale * log2e), stream, const_a)
-    paddle.device.synchronize()
-
-    dbg_host = dbg.numpy()
-    if const_a == 0:
-        for stage in range(4):
-            val = dbg_host[0, 0, stage, 0]
-            idx = dbg_host[0, 0, stage, 1].astype("int64")
-            scattered = paddle.zeros([sk * tm], dtype=paddle.float32).numpy()
-            scattered[idx] = val
-            got = paddle.to_tensor(scattered.reshape(sk, tm))
-            ref = refs[stage]
-            diff = (got - ref).abs()
-            amax = ref.abs().max().item()
-            tol = max(1e-3, 5e-3 * amax)
-            print(
-                "  %-3s max_abs=%.5f mean_abs=%.6f ref_absmax=%.4f coords=%d/%d  %s"
-                % (names[stage], diff.max().item(), diff.mean().item(), amax,
-                   len(set(idx.tolist())), sk * tm,
-                   "OK" if diff.max().item() <= tol else "BAD")
-            )
-
-    # dV = A @ dO, dK = A @ Q, dQ = A^T @ K, where A is P / dS in the (key, query)
-    # orientation. Unlike the earlier dump-based check these now cover ALL m blocks,
-    # because the accumulator is what the m loop adds into.
-    n_idx = paddle.arange(sk, dtype="float32").reshape([sk, 1])
-    if const_a == 1:
-        a_probe = paddle.ones([sk, sq], dtype="float32")
-    elif const_a == 2:
-        # The kernel's m index is per-tile, so the reference repeats per m block.
-        a_probe = (
-            (paddle.arange(sq, dtype="int32") % tm).astype("float32").reshape([1, sq])
-        ).expand([sk, sq])
-    elif const_a == 3:
-        a_probe = n_idx.expand([sk, sq])
-    if const_a == 0:
-        dv_ref = paddle.matmul(p, dof)
-        dk_ref = paddle.matmul(dsT, qf)
-        dq_ref = paddle.matmul(dsT, kf, transpose_x=True)
-    else:
-        dv_ref = paddle.matmul(a_probe, dof)
-        dk_ref = paddle.matmul(a_probe, qf)
-        dq_ref = paddle.matmul(a_probe, kf, transpose_x=True)
-    for name, accum, ref, rows, width, hd_slice in (
-        ("dV", dv_accum, dv_ref, sk, kernel.tile_hdimv, kernel.accum_slice_dv),
-        ("dK", dk_accum, dk_ref, sk, kernel.tile_hdim, kernel.accum_slice_d),
-        ("dQ", dq_accum, dq_ref, sq, kernel.tile_hdim, kernel.accum_slice_d),
-    ):
-        got = _unblock_accum(accum, rows, width, tm, hd_slice)[0, 0][:, : ref.shape[1]]
-        diff = (got - ref).abs()
-        amax = ref.abs().max().item()
-        print(
-            "  %-3s max_abs=%.5f mean_abs=%.6f ref_absmax=%.4f  %s"
-            % (name, diff.max().item(), diff.mean().item(), amax,
-               "OK" if diff.max().item() <= max(1e-2, 2e-2 * amax) else "BAD")
-        )
-
-
-def _unblock_accum(accum, seqlen_rounded, hdim, tile, hd_slice):
-    """fp32 accumulator -> a plain (b, h, seqlen, hdim) view.
-
-    DEBUG ONLY. The real path is FlashAttentionBackwardPostprocess, which the
-    kernel's accumulator layout is byte-compatible with by construction; this is
-    just the host-side mirror of that layout so the self-check can compare numbers
-    without launching another kernel.
-
-    Per (b, h) the run is
-
-        [head_dim slice][row block][4-column group][row][4 columns]
-
-    The outer slice exists so each slice can be handed to the postprocess as a
-    head_dim=hd_slice accumulator; the inner three levels are what
-    copy_utils.tiled_copy_1d(f32, tile, 4) produces when thread `row` stores its
-    fragment (fragment element i == column i).
-    """
-    b, hh = accum.shape[0], accum.shape[1]
-    group = 4
-    nblk = seqlen_rounded // tile
-    return (
-        accum.reshape(
-            [b, hh, hdim // hd_slice, nblk, hd_slice // group, tile, group]
-        )
-        .transpose([0, 1, 3, 5, 2, 4, 6])
-        .reshape([b, hh, seqlen_rounded, hdim])
-    )
-    group = 4
-    return (
-        accum.reshape([b, hh, seqlen_rounded // tile, hdim // group, tile, group])
-        .transpose([0, 1, 2, 4, 3, 5])
-        .reshape([b, hh, seqlen_rounded, hdim])
-    )
-
-
-def main():
-    print("=" * 96)
-    print("head_dim / head_dim_v backward: resource report (solver config per shape)")
-    print("=" * 96)
-    # Every shape the kernel is expected to cover, with the config its solver picks:
-    # this is the "config change only" generality claim, checked on every run.
-    for hd, hdv in ((576, 512), (512, 512), (512, 576), (256, 256)):
-        cfg = solve_config(hd, hdv)
-        try:
-            _report_smem(
-                hd,
-                hdv,
-                cfg["tile_m"],
-                cfg["tile_n"],
-                cfg["d_chunk"],
-                cfg["dv_chunk"],
-                cfg["d_chunks_resident"],
-                1,
-                cfg["sdQaccum_stage"],
-            )
-        except Exception as e:  # noqa: BLE001
-            print(f"{hd}/{hdv} {cfg} -> ERROR: {e}")
-        print()
-
-    print("=" * 96)
-    print("step 1a smoke launch (phase-1 default config)")
-    print("=" * 96)
-    try:
-        _smoke_launch()
-    except Exception as e:  # noqa: BLE001
-        print("  smoke launch -> ERROR: %s" % e)
-
-    print()
-    print("=" * 96)
-    print("step 1b: S -> P -> dP -> dS -> dV / dK  (per-stage numerical check)")
-    print("=" * 96)
-    # Mode 1 runs twice, with one m block and then two: a launch failure with
-    # n_m=1 means the single-tile dataflow itself is broken, while "n_m=1 passes,
-    # n_m=2 fails" isolates the m loop / cross-iteration handover.
-    # Diagnostics before the real values so their results survive a later death.
-    # A failed launch poisons the CUDA context (every later launch and even cuBLAS
-    # returns the same error), so the first failure stops the run -- anything
-    # printed after it would be noise.
-    for mode, n_m, label in (
-        (1, 1, "A = 1, 1 m block   -> single-tile dataflow (R2T addressing)"),
-        (1, 2, "A = 1, 2 m blocks  -> adds the m loop and its buffer handover"),
-        (2, 2, "A = m index  -> checks the query/column mapping"),
-        (3, 2, "A = n index  -> checks the key/row mapping"),
-        (0, 2, "A = real P / dS"),
-    ):
-        print("  [%d] %s" % (mode, label), flush=True)
-        try:
-            _debug_s(const_a=mode, n_m=n_m)
-        except Exception as e:  # noqa: BLE001
-            import traceback
-
-            print("      ERROR: %s" % e, flush=True)
-            traceback.print_exc()
-            print(
-                "      -> the CUDA context is now poisoned; skipping the remaining "
-                "modes.",
-                flush=True,
-            )
-            break
-        print(flush=True)
-
-
-if __name__ == "__main__":
-    main()

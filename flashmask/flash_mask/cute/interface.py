@@ -1424,6 +1424,8 @@ def _flash_attn_bwd(
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
     assert cu_seqlens_q is None, "cu_seqlens_q must be None (varlen is not supported in flashmask)"
     assert cu_seqlens_k is None, "cu_seqlens_k must be None (varlen is not supported in flashmask)"
+    assert seqused_q is None, "seqused_q must be None (varlen is not supported in flashmask)"
+    assert seqused_k is None, "seqused_k must be None (varlen is not supported in flashmask)"
 
     num_head, head_dim = q.shape[-2:]
     num_head_kv = k.shape[-2]
@@ -1446,6 +1448,10 @@ def _flash_attn_bwd(
 
     bigd_cfg = None
     if is_bigd_bwd:
+        assert not deterministic, "deterministic reduction is not supported by big-headdim bwd"
+        assert group is None or group.world_size <= 1, (
+            "overlap is not supported by big-headdim bwd"
+        )
         # The kernel solves its own tile config; the accumulator shapes and the
         # postprocess grid below are built from m_block_size / n_block_size, so they
         # have to agree with it.
@@ -1495,17 +1501,7 @@ def _flash_attn_bwd(
         cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
         num_flashmask_tensors = 2 * flashmask_info.startend_row_indices.shape[-1]
         if compute_density:
-            bwd_192x128_use_2cta = _bwd_192x128_use_2cta(
-                cute_flashmask_info,
-                flashmask_info.valid_block_count,
-                causal,
-                m_block_size,
-                n_block_size,
-                seqlen_q,
-                seqlen_k,
-                fm_b,
-                fm_h,
-            )
+            bwd_192x128_use_2cta = True
 
     is_split_d_bwd = False
     is_split_dv_bwd = False
@@ -2781,6 +2777,9 @@ class FlashAttnFunc(paddle.autograd.PyLayer):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, lse = ctx.saved_tensor()
+        assert all(size is None for size in ctx.window_size), (
+            "local attention backward is not supported"
+        )
         dq, dk, dv, _ = _flash_attn_bwd(
             q,
             k,

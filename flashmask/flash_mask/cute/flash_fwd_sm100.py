@@ -169,11 +169,11 @@ class FlashAttentionForwardSm100:
         # 2-CTA (tcgen05 CTA-pair) UMMA. The MMA tiler's M spans the whole pair while
         # each CTA still owns `m_block_size` rows, so a pair covers
         # `cta_group_size * m_block_size` query rows. Everything that indexes a work
-        # tile / mask / block list must use `m_tile_size`, everything that indexes this
-        # CTA's own rows must use `m_block_size`.
+        # tile / mask / block list must use that product (the interface computes it as
+        # fwd_m_tile_rows), everything that indexes this CTA's own rows must use
+        # `m_block_size`.
         self.use_2cta_instrs = use_2cta_instrs
         self.cta_group_size = 2 if use_2cta_instrs else 1
-        self.m_tile_size = self.cta_group_size * m_block_size
 
         # 2 Q tile per CTA
         self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.head_dim_padded)
@@ -232,7 +232,6 @@ class FlashAttentionForwardSm100:
         # Folded accumulator: the CTA owns fewer than 128 accumulator rows, so CuTe splits N
         # over the TMEM lanes and a query row is shared by two threads (t, t + m_block_size).
         self.folded_acc = self.m_block_size < 128
-        self.folded_acc_pair_stride = self.m_block_size
         if self.folded_acc:
             # These paths map a thread index straight to a query row (block_logit's
             # `row = m_block * m_block_size + blk_tidx`, PackGQA's per-row q_head_idx) or
@@ -270,9 +269,9 @@ class FlashAttentionForwardSm100:
             # accumulator (head_dim_v_padded cols) fit the 512-col TMEM budget. Two
             # configs use it:
             #   - symmetric d == dv == 256 (n_block=128): 2*128 + 256 = 512
-            #   - big-d d=576, dv<=256 (n_block=32): 2*32 + 256 = 320. This is the
-            #     per-pass config of the 576/512 case, which the interface builds from
-            #     two passes over head_dim_v (dv=512 alone would need all 512 columns).
+            #   - big-d d>256 with a caller-provided dv <= 256 (n_block=32):
+            #     2*32 + 256 = 320. dv > 256 cannot use this config at all (dv=512
+            #     alone would need all 512 columns) and goes folded instead.
             assert self.head_dim_padded > 192, "Split-D requires head_dim > 192"
             assert self.head_dim_v_padded <= 256 or self.folded_acc, (
                 "Split-D requires head_dim_v <= 256 so O (head_dim_v cols) fits TMEM "
@@ -1239,7 +1238,7 @@ class FlashAttentionForwardSm100:
         self.mbar_generate_block_full_offset = self.mbar_P_full_2_offset + 2
         # ------------------------------------------------------------------
         # Split-D barrier invariants (q_stage == num_s_stages == 1, i.e. d == dv == 256
-        # or the big-d d>256 / dv<=256 per-pass config):
+        # or the big-d d>256 / dv<=256 config):
         #   - Every stage-indexed barrier (load_q_full/empty, S_full, O_full, P_full_2,
         #     P_full_O_rescaled, softmax_corr_full/empty, load_startend_row_indices) is
         #     driven only for stage 0: the MMA warp issues one QK and one PV gemm per KV

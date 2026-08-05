@@ -86,7 +86,7 @@ def _get_fa_version():
     return paddle.base.framework.get_flags(["FLAGS_flash_attn_version"])["FLAGS_flash_attn_version"]
 
 
-def _is_valid_flash_dims(query, key, value, fa_version=None):
+def _is_valid_flash_dims(query, key, value, fa_version=2):
     q_headdim, k_headdim, v_headdim = query.shape[-1], key.shape[-1], value.shape[-1]
     if (
         (q_headdim <= 128 and k_headdim <= 128 and v_headdim <= 128)
@@ -94,16 +94,14 @@ def _is_valid_flash_dims(query, key, value, fa_version=None):
         or (q_headdim == 256 and k_headdim == 256 and v_headdim == 256)
     ):
         return True
-    # SM100 (fa4) large head_dim, forward + backward. The forward runs head_dim_v as
-    # several <=256-wide passes (see _flash_attn_fwd); the backward is the dedicated
-    # chunked kernel in flash_bwd_sm100_bigd.py, which solves its own tile / chunk
-    # config. Both mechanisms are generic in (head_dim, head_dim_v); this list is what
+    # SM100 (fa4) large head_dim, forward + backward.
     # has been run end to end.
-    #   576/512, 512/512 : forward + backward verified
-    #   512/576          : backward verified; the forward runs as 3 x 192 and has not
-    #                      been through the test suite yet
-    if fa_version == 4 and q_headdim == k_headdim:
-        return (q_headdim, v_headdim) in ((576, 512), (512, 512), (512, 576))
+    #   512/512 : forward + backward verified
+    if fa_version == 4:
+        if (
+            (q_headdim == 512 and k_headdim == 512 and v_headdim == 512)
+        ):
+            return True
     return False
 
 
@@ -120,83 +118,6 @@ def _is_cutedsl_kernel_supported(query, key, value, startend_row_indices=None):
     if fa_version == 4:                       # SM100
         return _is_non_4vec_startend(startend_row_indices)
     return False
-
-# FA4 backward, head_dim=192 / head_dim_v=128: pick 2cta vs 1cta-split-dv per mask.
-#
-# Each N-block of an M-row falls into one of three categories:
-#   - full    : nothing masked   -> must be computed in full
-#   - partial : partially masked -> still computed, with a mask applied
-#   - empty   : entirely masked   -> can be skipped completely
-#
-# valid_block_count (V) = NON-empty blocks = full + partial.
-# S = blocks the 2cta kernel actually walks = full + partial + empty within the
-#     causal-structured region. 2cta does structured causal skip but does NOT skip
-#     flashmask-empty blocks (its two CTAs share pipeline stages, so both must walk
-#     the same set of N-blocks).
-# density  r = V / S = (full + partial) / (full + partial + empty)  in [0, 1].
-#
-# 2cta: ~2.4x higher peak, but pays for every empty block -> wins when dense.
-# 1cta: lower peak, but skips empty blocks (work == V)     -> wins when sparse.
-#   time_2cta ~ S/peak_2cta ,  time_1cta ~ V/peak_1cta
-#   2cta faster  <=>  V/S > peak_1cta/peak_2cta  <=>  r >= threshold.
-# Crossover ≈ peak_1cta / peak_2cta ≈ 0.42.
-#   r >= 0.42 -> dense  -> 2cta
-#   r < 0.42  -> sparse -> 1cta-split-dv
-_FA4_BWD_SPLIT_DV_DENSITY_THRESHOLD = 0.42
-
-
-def _bwd_2cta_total_block_count(seqlen_q, seqlen_k, kBlockM, kBlockN, causal):
-    """ blocks the 2cta kernel actually walks = full + partial + empty within the
-        causal-structured region. 2cta does structured causal skip but does NOT skip
-        flashmask-empty blocks (its two CTAs share pipeline stages, so both must walk
-        the same set of N-blocks)"""
-    M = (seqlen_q + kBlockM - 1) // kBlockM
-    N = (seqlen_k + kBlockN - 1) // kBlockN
-    if not causal:
-        return M * N
-    total = 0
-    for i in range(M):
-        row_idx_end = min((i + 1) * kBlockM, seqlen_q)
-        n_idx_right = row_idx_end + seqlen_k - seqlen_q
-        n_block_max_i = min(N, (n_idx_right + kBlockN - 1) // kBlockN)
-        if n_block_max_i > 0:
-            total += n_block_max_i
-    return total
-
-
-def _bwd_192x128_use_2cta(
-    cute_flashmask_info,
-    valid_block_count,
-    causal,
-    kBlockM,
-    kBlockN,
-    seqlen_q,
-    seqlen_k,
-    fm_b,
-    fm_h,
-):
-    """ FA4 backward, head_dim=192 / head_dim_v=128: pick 2cta vs 1cta-split-dv per mask.
-        Each N-block of an M-row falls into one of three categories:
-          - full    : nothing masked      -> must be computed in full
-          - partial : partially masked    -> still computed, with a mask applied
-          - empty   : entirely masked     -> can be skipped completely
-        V: counts the NON-empty blocks (= full + partial).
-        S: blocks the 2cta kernel actually walks = full + partial + empty within the
-           causal-structured region. 2cta does structured causal skip but does NOT skip
-           flashmask-empty blocks (its two CTAs share pipeline stages, so both must walk
-           the same set of N-blocks).
-        r = V / S = (full + partial) / (full + partial + empty)  in [0, 1].
-    """
-    reduce_block_count(cute_flashmask_info, causal, kBlockM, kBlockN, seqlen_q)
-
-    # full + partial
-    V = int(valid_block_count.sum().item())
-    # full + partial + empty, actually walks
-    S = _bwd_2cta_total_block_count(seqlen_q, seqlen_k, kBlockM, kBlockN, causal) * fm_b * fm_h
-    if S <= 0:
-        return True
-    return V / S >= _FA4_BWD_SPLIT_DV_DENSITY_THRESHOLD
-
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
@@ -392,7 +313,6 @@ def _flash_attn_fwd(
     block_logit: Optional[paddle.Tensor] = None,
     block_size: int = 64,
     block_bos: Optional[paddle.Tensor] = None,
-    fwd_single_pass: bool = True,
     group=None,
 ) -> Tuple[paddle.Tensor, paddle.Tensor]:
     """Forward pass for FlashAttention.
@@ -422,12 +342,6 @@ def _flash_attn_fwd(
             garbage; do not pass an uninitialized / reused buffer.
         block_size: Key-block width (in tokens) used to bucket the fused block-logit reduction. Must divide
             the kernel's n_block_size. Ignored when block_logit is None.
-        fwd_single_pass: SM100 head_dim > 256 only. When True (default) head_dim_v stays whole and the
-            kernel runs the folded-accumulator config (m_block_size=64), which removes the redundant
-            Q*K^T of the head_dim_v split (measured 37.8ms vs 49.5ms for b16 s8192 h16 d512/dv512).
-            Set False to force the head_dim_v-split path; it is also selected automatically for the
-            configs the folded accumulator cannot express (split-KV, paged KV, block sparsity,
-            block_logit, head_dim_v > 512).
     """
 
     assert cu_seqlens_q is None, "cu_seqlens_q must be None (varlen is not supported in flashmask)"
@@ -450,141 +364,35 @@ def _flash_attn_fwd(
     )
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
 
-    # --- SM100 large head_dim_v: one pass, or several <=256-wide head_dim_v passes ---
-    # `fwd_single_pass` (default) keeps head_dim_v whole and runs the folded-accumulator
-    # config below. The alternative splits it, which costs one full redundant Q*K^T per
-    # pass: for d=dv=512 that is 1.5x the useful FLOPs (measured 49.5ms / 711 effective
-    # TFLOPs/s, i.e. 1067 TFLOPs/s of real MMA throughput, vs 37.8ms / 931 effective for
-    # the single pass on b16 s8192 h16 d512).
+    # --- SM100 large head_dim: the folded-accumulator single pass ---
+    # head_dim > 256 keeps head_dim_v whole and runs the folded (m_block_size == 64)
+    # accumulator config below. There used to be a fallback that split head_dim_v into
+    # several <= 256-wide passes; it is gone because every extra pass costs a FULL
+    # redundant Q*K^T. For d=dv=512 the split is 1.5x the useful FLOPs (measured 49.5ms /
+    # 711 effective TFLOPs/s, vs 37.8ms / 931 effective for the single pass on
+    # b16 s8192 h16 d512), and at dv=128 it is 2.5x (86.9ms / 405 effective).
     #
-    # The split stays as the fallback for everything the folded (m_block_size == 64)
-    # accumulator cannot express -- see the asserts in FlashAttentionForwardSm100.__init__.
-    # Deciding it here (instead of letting the kernel assert) keeps single-pass safe as a
-    # default: an unsupported caller silently gets the proven two-pass path.
-    use_single_pass = (
-        fwd_single_pass
-        and compute_capability == 10
-        and head_dim > 256
-        and v.shape[-1] <= 512
-        and num_splits == 1  # folded: not is_split_kv
-        and block_logit is None  # folded: not has_block_logit
-        and page_table is None
-        and block_sparse_tensors is None
-    )
-    if (
-        compute_capability == 10
-        and head_dim > 256
-        and v.shape[-1] > 256
-        and not use_single_pass
-    ):
-
-        head_dim_v_full = v.shape[-1]
-        # Max head_dim_v per pass. This is also the PV UMMA's N.
-        #
-        # 256 (the TMEM-budget maximum: O takes head_dim_v f32 columns, plus S n_block and
-        # P n_block/2). Every extra split costs a FULL redundant Q*K^T pass, which for
-        # d=512 is 4x the FLOPs of the dv slice it enables: at dv=128 the kernel executes
-        # 2.5x the useful FLOPs (measured 86.9ms / 405 TFLOPs/s for b16 s8192 h16 d512,
-        # i.e. ~1012 TFLOPs/s of real MMA throughput wasted on redundancy), at dv=256 only
-        # 1.5x. The softmax/exp2 work is duplicated per pass too.
-        #
-        # History: this was temporarily capped at 128 because with N=256 the peer CTA of
-        # the 2-CTA pair appeared to leave its dv 0..127 unwritten. That symptom was the
-        # epilogue bug in `correction_epilogue`, which partitioned the PER-CTA `sO` with
-        # the CTA-sliced `thr_mma` -- `partition_C` then shifted the peer's view by another
-        # m_block_size rows, so the peer stored O outside its own sO buffer and the
-        # epilogue read stale smem. It was not an MMA N limit.
-        dv_max_per_pass = 256
-        num_dv_pass = -(-head_dim_v_full // dv_max_per_pass)
-        while head_dim_v_full % num_dv_pass != 0:
-            num_dv_pass += 1
-        dv_part = head_dim_v_full // num_dv_pass
-        assert dv_part <= dv_max_per_pass and dv_part % 32 == 0, (
-            f"head_dim={head_dim}/{head_dim_v_full}: cannot split head_dim_v into "
-            f"equal parts of at most {dv_max_per_pass} (got {num_dv_pass} x {dv_part})"
+    # The features the folded accumulator cannot express are therefore not supported at
+    # head_dim_v > 256 -- assert instead of silently taking a 1.3-2.3x slower route. See
+    # also the folded_acc asserts in FlashAttentionForwardSm100.__init__.
+    if compute_capability == 10 and head_dim > 256 and v.shape[-1] > 256:
+        assert v.shape[-1] <= 512, (
+            f"head_dim={head_dim}/{v.shape[-1]}: the folded accumulator supports "
+            "head_dim_v <= 512 (O takes head_dim_v / 2 TMEM columns)"
         )
-        assert num_splits == 1, "large head_dim_v: num_splits>1 not supported"
-        assert page_table is None, "large head_dim_v: paged KV not supported"
-        assert block_sparse_tensors is None, "large head_dim_v: block sparsity not supported"
-        # flashmask (startend_row_indices) and causal are forwarded to every dv part
-        # pass; each pass rebuilds its own flashmask block lists (same startend), so
-        # the mask is applied identically to all O parts.
-        # Each pass writes directly into out_full[..., part] instead of returning its own
-        # buffer for a final paddle.concat: the concat costs one extra full read + write
-        # of O (2 x 512MB at B1/S8K/H64/dv512, ~0.17ms) for no compute. out_full[..., a:b]
-        # is a strided view keeping the full head_dim_v row stride, which the epilogue's
-        # TMA descriptor handles: the innermost dim is still contiguous, the base byte
-        # offset (part * dv_part * itemsize) and the row stride (head_dim_v_full *
-        # itemsize) are both multiples of 16 because dv_part % 32 == 0.
-        if out is None:
-            # The SM100 flashmask fwd skips the O store for a fully-masked query block
-            # and has no zero-writer for it, so O must start zeroed. Same reason as the
-            # paddle.zeros in the single-pass path below.
-            out_full = paddle.zeros(
-                shape=[batch_size, seqlen_q, num_head, head_dim_v_full], dtype=q.dtype
-            )
-        else:
-            expected_out_shape = [batch_size, seqlen_q, num_head, head_dim_v_full]
-            assert out.shape == expected_out_shape, (
-                f"out tensor shape {out.shape} does not match expected shape {expected_out_shape}"
-            )
-            assert out.dtype == q.dtype, (
-                f"out tensor dtype {out.dtype} does not match expected dtype {q.dtype}"
-            )
-            out_full = out
-            # Fully-masked query blocks are never stored to; the previous concat-based
-            # version got zeros there because every pass allocated a zeroed buffer.
-            out_full.zero_()
-        # Allocated by the first pass (if needed at all) and then reused, so the later
-        # passes neither allocate nor re-fill an LSE buffer. All passes compute the
-        # identical LSE.
-        lse_last = lse
-        for part in range(num_dv_pass):
-            # v[..., a:b] keeps the full head_dim_v row stride; the recursive call's
-            # maybe_contiguous() materializes the narrow part.
-            v_h = v[..., part * dv_part : (part + 1) * dv_part]
-            _, lse_last = _flash_attn_fwd(
-                q,
-                k,
-                v_h,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                seqused_q=seqused_q,
-                seqused_k=seqused_k,
-                page_table=page_table,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                softcap=softcap,
-                window_size_left=window_size_left,
-                window_size_right=window_size_right,
-                learnable_sink=learnable_sink,
-                m_block_size=m_block_size,
-                n_block_size=n_block_size,
-                num_threads=num_threads,
-                num_splits=num_splits,
-                # is_split_d (q_stage=1) does not support pack_gqa; GQA is still handled
-                # correctly via qhead_per_kvhead without the packing optimization.
-                pack_gqa=False,
-                _compute_capability=_compute_capability,
-                score_mod=score_mod,
-                mask_mod=mask_mod,
-                block_sparse_tensors=block_sparse_tensors,
-                return_lse=return_lse,
-                out=out_full[..., part * dv_part : (part + 1) * dv_part],
-                lse=lse_last,
-                aux_tensors=aux_tensors,
-                startend_row_indices=startend_row_indices,
-                # block_logit is a QK-side (per key-block) reduction, identical across
-                # the two V halves; only write it once (first pass).
-                block_logit=block_logit if part == 0 else None,
-                block_size=block_size,
-                block_bos=block_bos,
-                # Each pass has head_dim_v <= 256, so it must NOT re-enter the folded
-                # single-pass config: keep every pass on the m_block_size=128 layout.
-                fwd_single_pass=False,
-                group=group,
-            )
-        return out_full, lse_last
+        assert num_splits == 1, (
+            "head_dim_v > 256 does not support split-KV: the folded accumulator shares "
+            "each query row between two threads, which the split-KV row map cannot express"
+        )
+        assert block_logit is None, (
+            "head_dim_v > 256 does not support block_logit (folded accumulator)"
+        )
+        assert page_table is None, (
+            "head_dim_v > 256 does not support paged KV (folded accumulator)"
+        )
+        assert block_sparse_tensors is None, (
+            "head_dim_v > 256 does not support block sparsity (folded accumulator)"
+        )
 
     # num_stages=2 exceeds Hopper's ~227KB per-block shared-memory limit
     # (e.g. hdim=256 needs ~320KB -> cuLaunchKernel CUDA_ERROR_INVALID_VALUE), so
@@ -610,9 +418,7 @@ def _flash_attn_fwd(
     # m*576*2B = 144KB (sO overlaps sQ) and K/V share one buffer of kv_stage*n*576*2B
     # (72KB at n=32, kv_stage=2) -> ~216KB of the ~227KB budget.
     # n_block must stay a multiple of 32 (tilePlikeFP32 = n//32*16).
-    is_bigd_fwd = compute_capability == 10 and head_dim > 256 and (
-        v.shape[-1] <= 256 or use_single_pass
-    )
+    is_bigd_fwd = compute_capability == 10 and head_dim > 256
     if is_bigd_fwd:
         m_block_size = 128
         n_block_size = 32
@@ -646,15 +452,15 @@ def _flash_attn_fwd(
         # m_block_size 128 keeps one accumulator row per thread. 64 folds the accumulator (64
         # rows spread over all 128 TMEM lanes, N split between the lane halves), which HALVES
         # its column cost: O(64x512) f32 takes 256 of the 512 TMEM columns, so dv=512 fits in
-        # ONE pass (O 256 + S 32 + P 16 = 304). That is the only way to drop the 1.5x QK
-        # redundancy of the dv split; the price is half the arithmetic intensity per KV tile
-        # (the pair covers 128 query rows instead of 256).
-        if use_single_pass and v.shape[-1] > 256:
+        # ONE pass (O 256 + S 32 + P 16 = 304). That is the only way to avoid a 1.5x QK
+        # redundancy; the price is half the arithmetic intensity per KV tile (the pair covers
+        # 128 query rows instead of 256).
+        if v.shape[-1] > 256:
             m_block_size = 64
         else:
             m_block_size = 128
         # n=64 doubles the 1-CTA KV tile at identical per-CTA SMEM (the pair splits the MMA's
-        # N, so sK/sV per CTA is halved). The folded single-pass config additionally requires
+        # N, so sK/sV per CTA is halved). The folded config additionally requires
         # n_block_size * sizeof(dtype) == 128B, i.e. one P row is exactly one swizzle period
         # of the A-operand SMEM layout (asserted in softmax_loop).
         n_block_size = 64
@@ -812,15 +618,13 @@ def _flash_attn_fwd(
     ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     # head_dim <= 256 for the symmetric / Split-D paths. Larger head_dim is the SM100
-    # big-d path (Split-D with q_stage=1); head_dim_v > 256 either stays whole on the
-    # single-pass folded (m_block_size == 64) accumulator, which supports up to
-    # head_dim_v = 512, or was split into several <= 256 passes above.
+    # big-d path (Split-D with q_stage=1); head_dim_v > 256 stays whole on the folded
+    # (m_block_size == 64) accumulator, which supports up to head_dim_v = 512.
     assert (
         head_dim <= 256
-        or (compute_capability == 10 and head_dim_v <= 256)
-        or (compute_capability == 10 and use_single_pass and head_dim_v <= 512)
+        or (compute_capability == 10 and head_dim_v <= 512)
     ), (
-        "head_dim must be <= 256, or head_dim>256 with head_dim_v<=256 on SM100 "
+        "head_dim must be <= 256, or head_dim>256 with head_dim_v<=512 on SM100 "
         f"(got {head_dim}/{head_dim_v})"
     )
     alignment = 16 // q.element_size()
@@ -992,11 +796,10 @@ def _flash_attn_fwd(
         # The big-d fwd configs cannot pack q heads into the M dim. PackGQA derives each
         # row's q_head (and its O destination) straight from tidx, which neither Split-D's
         # q_stage=1 row map nor the folded (m_block_size=64) accumulator provides -- in the
-        # folded layout a row is shared by threads t and t + m_block_size. The dv-split route
-        # already passes pack_gqa=False in its recursive call; single-pass reaches the kernel
-        # directly, so gate it here instead of letting the kernel assert. GQA/MQA stays
-        # correct via qhead_per_kvhead, just without the packing optimization (which only
-        # pays off when seqlen_q per head is too small to fill the M tile, i.e. decode).
+        # folded layout a row is shared by threads t and t + m_block_size. Gate it here
+        # instead of letting the kernel assert. GQA/MQA stays correct via qhead_per_kvhead,
+        # just without the packing optimization (which only pays off when seqlen_q per head
+        # is too small to fill the M tile, i.e. decode).
         if is_bigd_fwd:
             pack_gqa = False
         # Split-D (q_stage=1) for d=dv=256, and for the head_dim=576 per-pass config:
@@ -1479,7 +1282,6 @@ def _flash_attn_bwd(
 
     cute_flashmask_info = None
     num_flashmask_tensors = 0
-    bwd_192x128_use_2cta = True
 
     if flashmask_info is not None and isinstance(flashmask_info, paddle.Tensor):
         flashmask_info = FlashMaskInfoPaddle(
@@ -1488,20 +1290,13 @@ def _flash_attn_bwd(
         )
     if flashmask_info is not None:
         assert isinstance(flashmask_info, FlashMaskInfoPaddle)
-        compute_density = (
-            compute_capability == 10 and head_dim == 192 and head_dim_v == 128
-        )
-        if compute_density:
-            fm_b, fm_h = flashmask_info.startend_row_indices.shape[:2]
-            num_m_blocks = (seqlen_q + m_block_size - 1) // m_block_size
-            flashmask_info.valid_block_count = paddle.empty(
-                [fm_b, fm_h, num_m_blocks], dtype=paddle.int32
-            )
+        # No valid_block_count here: unlike the forward, no backward kernel reads it.
+        # It only ever fed a host-side density heuristic that chose between 2CTA and
+        # 1CTA+split_dv for d192/dv128; the 2CTA path now skips fully-masked m blocks
+        # itself, so the heuristic and the block-count scan behind it are both gone.
         prepare_block_maxmin(flashmask_info, kBlockN=n_block_size)
         cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
         num_flashmask_tensors = 2 * flashmask_info.startend_row_indices.shape[-1]
-        if compute_density:
-            bwd_192x128_use_2cta = True
 
     is_split_d_bwd = False
     is_split_dv_bwd = False
@@ -1596,10 +1391,9 @@ def _flash_attn_bwd(
         elif head_dim == 256 and head_dim_v == 256:
             is_split_d_bwd = True
             is_split_dv_bwd = True
-        elif head_dim == 192 and head_dim_v == 128:
-            is_split_d_bwd = False
-            is_split_dv_bwd = not bwd_192x128_use_2cta
         else:
+            # d192/dv128 included: it used to fall back to split_dv on sparse masks,
+            # but the 2CTA path skips fully-masked m blocks itself now.
             is_split_d_bwd = False
             is_split_dv_bwd = False
 

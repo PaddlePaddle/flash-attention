@@ -129,7 +129,6 @@ def tmem_plan(tile_m: int, tile_n: int, d_chunk: int, dv_chunk: int, cta_group: 
     )
     return dict(
         s_cols=s_cols,
-        dp_cols=dp_cols,
         out_offset=out_offset,
         slot_cols=slot_cols,
         num_out_slots=num_out_slots,
@@ -512,7 +511,6 @@ class FlashAttentionBackwardSm100BigD:
         # and this layout cannot drift apart.
         plan = tmem_plan(tile_m, tile_n, d_chunk, dv_chunk, cg)
         self.tmem_S_cols = plan["s_cols"]
-        self.tmem_dP_cols = plan["dp_cols"]
 
         self.tmem_S_offset = 0
         # P and dS are bf16, so they need only half the columns of the f32
@@ -554,8 +552,6 @@ class FlashAttentionBackwardSm100BigD:
         self.compute_warp_ids = (4, 5, 6, 7)
         self.mma_warp_id = 12
         self.load_warp_id = 13
-        self.relay_warp_id = 14
-        self.empty_warp_id = 15
         self.threads_per_cta = cute.arch.WARP_SIZE * 16
 
         # setmaxnreg budget. The launch is 512 threads, so every warp starts at

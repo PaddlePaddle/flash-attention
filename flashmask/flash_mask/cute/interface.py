@@ -1262,6 +1262,14 @@ def _flash_attn_bwd(
         m_block_size = bigd_cfg["tile_m"]
         n_block_size = bigd_cfg["tile_n"]
 
+    # SM100 d=256/dv=256 runs the 2-CTA backward, whose accumulators are folded
+    # (64 rows per CTA). Folding is what halves their TMEM column cost and lets dK
+    # and dV both stay resident -- no dK reduce, no dKV postprocess -- and it
+    # requires a 64-row KV tile. Set here, BEFORE prepare_block_maxmin / the
+    # block-list generation below, for the same reason as the SM90 case.
+    if compute_capability == 10 and head_dim == 256 and head_dim_v == 256:
+        n_block_size = 64
+
     # SM90: finalize n_block_size (the head_dim-dependent bwd N tile from
     # _tile_size_bwd_sm90, e.g. 64 for head_dim=256) BEFORE prepare_block_maxmin /
     # the block-list generation below, so they all agree with the actual kernel's N
@@ -1388,12 +1396,11 @@ def _flash_attn_bwd(
             # halving scheme and do not apply.
             is_split_d_bwd = False
             is_split_dv_bwd = False
-        elif head_dim == 256 and head_dim_v == 256:
-            is_split_d_bwd = True
-            is_split_dv_bwd = True
         else:
             # d192/dv128 included: it used to fall back to split_dv on sparse masks,
-            # but the 2CTA path skips fully-masked m blocks itself now.
+            # but the 2CTA path skips fully-masked m blocks itself now. d256/dv256
+            # used to split both axes because dK did not fit in TMEM; the 2CTA folded
+            # layout (n_block_size=64 above) keeps dK and dV resident instead.
             is_split_d_bwd = False
             is_split_dv_bwd = False
 
@@ -1942,8 +1949,8 @@ def _flash_attn_bwd(
                     head_dim_v,
                     is_causal=causal,
                     qhead_per_kvhead=qhead_per_kvhead,
-                    # tile_m=m_block_size,
-                    # tile_n=n_block_size,
+                    tile_m=m_block_size,
+                    tile_n=n_block_size,
                     cluster_size=cluster_size,
                     use_2cta_instrs=use_2cta_instrs,
                     deterministic=deterministic,
@@ -2060,6 +2067,29 @@ def _flash_attn_bwd(
 
     num_threads = 256 if compute_capability == 9 else 128
     arch = compute_capability * 10
+
+    # The dK/dV postprocess decodes the fp32 accum with its 2-CTA branch
+    # (flash_bwd_postprocess.py:412+), which hard-codes row_groups = 2: it reads a
+    # panel of (128 threads x ncol) values and interprets threads 0..63 as rows
+    # 0..63 of the block and threads 64..127 as the SAME 64 rows at hdim + 128.
+    # That is exactly what the folded 2CTA bwd kernel writes with a 64-row KV
+    # tile, so the postprocess block must span TWO of its n_blocks -> 128 rows.
+    # (seqlen_k_rounded is padded to a multiple of 2 * n_block_size whenever
+    # cluster_size == 2, so the pairing never runs off the end.) It is also the
+    # only workable choice mechanically: tcgen05.make_tmem_copy cannot slice a
+    # 1-CTA accumulator with fewer than 128 rows -- at block_size=64 it becomes
+    # (((16,4),hdim),1,1):(((65536,2097152),1),0,0) and every Ld32x32b Repetition
+    # (8..128) is rejected.
+    n_block_size_kv_post = (
+        max(n_block_size, 128) if compute_capability == 10 else n_block_size
+    )
+    # ... and the same folding is why the dK/dV postprocess must use the 2-CTA
+    # decode branch: it is the only one that reads a panel as "threads 0..63 ->
+    # rows 0..63, threads 64..127 -> the same rows at hdim + hdim/2". The plain
+    # branch assumes row == thread index, i.e. an unfolded 128-row writer.
+    dKV_accum_folded = (
+        compute_capability == 10 and use_2cta_instrs and n_block_size < 128
+    )
 
     kv_postprocess_enabled = kv_postprocess_start is not None or kv_postprocess_end is not None
 
@@ -2191,7 +2221,7 @@ def _flash_attn_bwd(
                 ):
                     _postprocess_run(
                         _to_cute(_slice_kv_accum(accum_part, hd)), dk_tensor,
-                        softmax_scale, hd, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                        softmax_scale, hd, n_block_size_kv_post, AtomLayoutNdKV, dKV_swapAB,
                         False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dk_split",
                         output_addr, raw_b, raw_s, raw_h, cutlass.Int32(hd),
                         raw_storage_d_k,
@@ -2202,7 +2232,7 @@ def _flash_attn_bwd(
                 ):
                     _postprocess_run(
                         _to_cute(_slice_kv_accum(accum_part, hd)), dv_tensor,
-                        cutlass.Float32(1.0), hd, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                        cutlass.Float32(1.0), hd, n_block_size_kv_post, AtomLayoutNdKV, dKV_swapAB,
                         False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dv_split",
                         output_addr, raw_b, raw_s, raw_h, cutlass.Int32(hd),
                         raw_storage_d_v,
@@ -2212,7 +2242,7 @@ def _flash_attn_bwd(
                 _postprocess_run(
                     _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),
                     _kv_out_cute(dk, dk_tensor), softmax_scale,
-                    head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                    head_dim, n_block_size_kv_post, AtomLayoutNdKV, dKV_swapAB,
                     False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dk",
                     _raw_addr(dk_send_addr), raw_b, raw_s, raw_h,
                     cutlass.Int32(head_dim), raw_storage_d_k,
@@ -2224,7 +2254,7 @@ def _flash_attn_bwd(
                 ):
                     _postprocess_run(
                         _to_cute(_slice_kv_accum(accum_part, half_hdim_v)), dv_tensor,
-                        cutlass.Float32(1.0), half_hdim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                        cutlass.Float32(1.0), half_hdim_v, n_block_size_kv_post, AtomLayoutNdKV, dKV_swapAB,
                         False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dv_split",
                         output_addr, raw_b, raw_s, raw_h, cutlass.Int32(half_hdim_v),
                         raw_storage_d_v,
@@ -2233,16 +2263,16 @@ def _flash_attn_bwd(
                 _postprocess_run(
                     _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),
                     _kv_out_cute(dk, dk_tensor), softmax_scale,
-                    head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
-                    False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dk",
+                    head_dim, n_block_size_kv_post, AtomLayoutNdKV, dKV_swapAB,
+                    dKV_accum_folded, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dk",
                     _raw_addr(dk_send_addr), raw_b, raw_s, raw_h,
                     cutlass.Int32(head_dim), raw_storage_d_k,
                 )
                 _postprocess_run(
                     _kv_accum_cute(dv_accum, dv_accum_tensor, head_dim_v_rounded),
                     _kv_out_cute(dv, dv_tensor), cutlass.Float32(1.0),
-                    head_dim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
-                    False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dv",
+                    head_dim_v, n_block_size_kv_post, AtomLayoutNdKV, dKV_swapAB,
+                    dKV_accum_folded, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "ovl_dv",
                     _raw_addr(dv_send_addr), raw_b, raw_s, raw_h,
                     cutlass.Int32(head_dim_v), raw_storage_d_v,
                 )
@@ -2390,7 +2420,7 @@ def _flash_attn_bwd(
         ):
             _postprocess_run(
                 _to_cute(accum_part), _to_cute(out_part), softmax_scale,
-                half_hdim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                half_hdim, n_block_size_kv_post, AtomLayoutNdKV, dKV_swapAB,
                 False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "dk_split",
             )
 
@@ -2405,7 +2435,7 @@ def _flash_attn_bwd(
         ):
             _postprocess_run(
                 _to_cute(accum_part), _to_cute(out_part), cutlass.Float32(1.0),
-                half_hdim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                half_hdim_v, n_block_size_kv_post, AtomLayoutNdKV, dKV_swapAB,
                 False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "dv_split",
             )
     elif is_split_dv_bwd:
@@ -2425,7 +2455,7 @@ def _flash_attn_bwd(
             _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),
             _kv_out_cute(dk, dk_tensor),
             softmax_scale,
-            head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+            head_dim, n_block_size_kv_post, AtomLayoutNdKV, dKV_swapAB,
             False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dk",
         )
 
@@ -2440,7 +2470,7 @@ def _flash_attn_bwd(
         ):
             _postprocess_run(
                 _to_cute(accum_part), _to_cute(out_part), cutlass.Float32(1.0),
-                half_hdim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
+                half_hdim_v, n_block_size_kv_post, AtomLayoutNdKV, dKV_swapAB,
                 False, 1, cu_seqlens_k_tensor, seqused_k_tensor, "dv_split",
             )
     else:
@@ -2456,15 +2486,15 @@ def _flash_attn_bwd(
                 _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),
                 _kv_out_cute(dk, dk_tensor),
                 softmax_scale,
-                head_dim, n_block_size, AtomLayoutNdKV, dKV_swapAB,
-                False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dk",
+                head_dim, n_block_size_kv_post, AtomLayoutNdKV, dKV_swapAB,
+                dKV_accum_folded, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dk",
             )
             _postprocess_run(
                 _kv_accum_cute(dv_accum, dv_accum_tensor, head_dim_v_rounded),
                 _kv_out_cute(dv, dv_tensor),
                 cutlass.Float32(1.0),
-                head_dim_v, n_block_size, AtomLayoutNdKV, dKV_swapAB,
-                False, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dv",
+                head_dim_v, n_block_size_kv_post, AtomLayoutNdKV, dKV_swapAB,
+                dKV_accum_folded, cluster_size, cu_seqlens_k_tensor, seqused_k_tensor, "dv",
             )
 
     # ---- learnable_sink gradient ----

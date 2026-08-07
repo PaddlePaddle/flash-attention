@@ -14,6 +14,7 @@
 
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
 import math
+import os
 from typing import Callable, Optional
 from functools import partial
 
@@ -47,6 +48,8 @@ from flash_mask.cute.tile_scheduler import (
 from flash_mask.cute import barrier
 from flash_mask.cute.named_barrier import NamedBarrierBwdSm100
 from flash_mask.cute.flashmask_utils import FlashMaskInfo
+
+SM100_SMEM_CAPACITY_BYTES = 227 * 1024
 
 
 @cute.jit
@@ -118,12 +121,16 @@ class FlashAttentionBackwardSm100:
         self.tile_m = tile_m
         self.tile_n = tile_n
         self.debug_print = False
-
-        # D  axis (tile_hdim)  may exceed 128 only if it is physically split (is_split_d)
-        #                      or it is the 2CTA / dv-only d=192,dv=128 layout.
-        # DV axis (tile_hdimv) may exceed 128 only if it is physically split (is_split_dv).
-        assert self.tile_hdim <= 128 or (self.tile_hdim == 192 and self.tile_hdimv == 128) or self.is_split_d
-        assert self.tile_hdimv <= 128 or self.is_split_dv
+        # TEMPORARY (folded d256/dv256 bring-up): FLASHMASK_BWD_FOLD_DEBUG=1 dumps the
+        # folded thread map once per kernel. Separate from debug_print so it does not
+        # drag in the per-n_block load-warp traces.
+        self.debug_print_folded = os.environ.get("FLASHMASK_BWD_FOLD_DEBUG", "0") == "1"
+        # FLASHMASK_BWD_2CTA_SKIP_DEBUG=1 dumps, once per (n_block, head, batch) work
+        # tile, the per-CTA key block index and the flashmask bounds it reads. Use it to
+        # check whether the two CTAs of a cluster see the same n_block / the same mask.
+        self.debug_print_2cta_skip = (
+            os.environ.get("FLASHMASK_BWD_2CTA_SKIP_DEBUG", "0") == "1"
+        )
 
         self.use_2cta_instrs = bool(use_2cta_instrs and cluster_size == 2)
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
@@ -140,9 +147,19 @@ class FlashAttentionBackwardSm100:
             assert self.tile_hdim == 192 and self.tile_hdimv == 128, "DV-only split only support d=192 and dv=128"
         else:
             if use_2cta_instrs:
-                assert (self.tile_hdim <= 128 and self.tile_hdimv <= 128) or (self.tile_hdim == 192 and self.tile_hdimv == 128)
+                assert (
+                    (self.tile_hdim <= 128 and self.tile_hdimv <= 128)
+                    or (self.tile_hdim == 192 and self.tile_hdimv == 128)
+                    or (self.tile_hdim == 256 and self.tile_hdimv == 256)
+                ), (
+                    f"2CTA backward does not support d={self.tile_hdim}, "
+                    f"dv={self.tile_hdimv}; legal: both <= 128, (192, 128), (256, 256)"
+                )
             else:
-                assert self.tile_hdim <= 128 and self.tile_hdimv <= 128
+                assert self.tile_hdim <= 128 and self.tile_hdimv <= 128, (
+                    f"1CTA backward needs d <= 128 and dv <= 128, "
+                    f"got d={self.tile_hdim}, dv={self.tile_hdimv}"
+                )
 
         self.dK_as_reduce = True if (is_split_d or is_split_dv) else False
 
@@ -214,6 +231,44 @@ class FlashAttentionBackwardSm100:
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
+        # A 2-CTA MMA splits its M across the CTA pair, so a CTA can end up owning
+        # fewer than the 128 TMEM lanes. Such an accumulator is FOLDED: logical
+        # columns j and j + N/2 share one column, living in lanes [0, rows) and
+        # [rows, 128) respectively, which shrinks the column footprint by the same
+        # factor (see tmem_cols). Measured on SM100: (M=128, N=192, cta_group=2)
+        # occupies 96 columns, which is what the d192 dQ offset below relies on.
+        # Folding has two consequences beyond the column count:
+        #   - the accumulator cannot back an MMA A operand (that layout wants a
+        #     whole row in one lane, and tmem stores are lane-local), so P / dS
+        #     move to SMEM -- see mma_P_from_smem
+        #   - copy_utils.make_tmem_copy's fixed 128-datapath tiler mis-slices it;
+        #     the compute warp must go through tcgen05.make_tmem_copy instead
+        self.folded_kv_acc = self.tile_n < 128  # S / dP / dV / dK
+        self.folded_dQ_acc = self.tile_m // self.cta_group_size < 128
+        # P (A of the dV MMA) and dS (A of the dK MMA) cannot live in a folded
+        # S / dP accumulator.
+        self.mma_P_from_smem = self.folded_kv_acc
+        # dS has the same problem on the dK side. Outside the folded config the
+        # 2-CTA dK MMA must take dS from TMEM, so the smem variant is 1-CTA only.
+        self.mma_dS_from_smem = self.mma_P_from_smem or (
+            self.use_smem_dS_for_mma_dK and not self.use_2cta_instrs
+        )
+        self.mma_A_source = (
+            tcgen05.OperandSource.SMEM
+            if self.mma_P_from_smem
+            else tcgen05.OperandSource.TMEM
+        )
+        # sdSt (A of the dK MMA, M=n K=m) and sdS (A of the dQ MMA, M=m K=n) share
+        # one allocation everywhere else, because at most one of them is ever live.
+        # Both are m-contiguous in 128B blocks, so per CTA they tile the same two
+        # blocks -- but they want different content in one of them:
+        #   sdSt block b = (own n slice, m half b)          -- both blocks local
+        #   sdS  block b = (n slice b,   own m half)        -- block peer is remote
+        # The b == cta_rank block agrees; the other one does not. So when the dK MMA
+        # also reads dS from SMEM (the folded path) the two views need their own
+        # buffers.
+        self.separate_sdS_buffers = self.mma_dS_from_smem and self.use_2cta_instrs
+
         if self.is_split_both:
             # Split-Both TMEM layout (512 cols, 100% utilization):
             # S/P [0, 128) | dV_low [128, 256) | dV_high [256, 384) | dP/dS [384, 512)
@@ -240,16 +295,39 @@ class FlashAttentionBackwardSm100:
             self.tmem_dQ_offset = self.tmem_S_offset                    # 128 (time-share with S/P)
             self.tmem_dP_offset = self.tmem_dK_offset + self.tile_hdim  # 320
             self.tmem_dS_offset = self.tmem_dP_offset       
+        elif self.use_2cta_instrs and self.tile_hdim == 256 and self.tile_hdimv == 256:
+            # 2-CTA d=256/dv=256. Folding (tile_n=64 -> 64 lanes per CTA) halves
+            # every accumulator, which is what makes dK resident -- and therefore
+            # dK_as_reduce / dKV_postprocess unnecessary:
+            #   dV [0,128) | dK [128,256) | S/P [256,320) | dP/dS [320,384) | dQ [384,512)
+            # Exactly 512 columns with no overlap, so unlike the d192 layout below
+            # no accumulator has to be time-shared.
+            assert self.tile_m == 128
+            assert self.tile_n == 64
+            self.tmem_dV_offset = 0
+            self.tmem_dK_offset = self.tmem_dV_offset + self.tmem_cols(self.mma_tiler_pdo)
+            self.tmem_S_offset = self.tmem_dK_offset + self.tmem_cols(self.mma_tiler_dsq)
+            self.tmem_P_offset = self.tmem_S_offset  # overlap with S
+            self.tmem_dP_offset = self.tmem_S_offset + self.tmem_cols(self.mma_tiler_kq)
+            self.tmem_dS_offset = self.tmem_dP_offset  # overlap with dP
+            self.tmem_dQ_offset = self.tmem_dP_offset + self.tmem_cols(self.mma_tiler_vdo)
+            assert (
+                self.tmem_dQ_offset + self.tmem_cols(self.mma_tiler_dsk)
+                == SM100_TMEM_CAPACITY_COLUMNS
+            )
         elif self.use_2cta_instrs and self.tile_hdim == 192 and self.tile_hdimv == 128:
             assert self.tile_m == 128
             assert self.tile_n == 128
+            # Only dV and dK are resident; S/P, dP/dS and dQ time-share the tail
+            # 192 columns (the ranges below deliberately overlap and the MMA warp
+            # gates each reuse on a pipeline empty-barrier).
             self.tmem_dV_offset = 0
-            self.tmem_dK_offset = self.tmem_dV_offset + self.tile_hdimv
-            self.tmem_S_offset = self.tmem_dK_offset + self.tile_hdim
+            self.tmem_dK_offset = self.tmem_dV_offset + self.tmem_cols(self.mma_tiler_pdo)
+            self.tmem_S_offset = self.tmem_dK_offset + self.tmem_cols(self.mma_tiler_dsq)
             self.tmem_P_offset = self.tmem_S_offset  # overlap with S
-            self.tmem_dP_offset = 512 - self.tile_m
+            self.tmem_dP_offset = SM100_TMEM_CAPACITY_COLUMNS - self.tmem_cols(self.mma_tiler_vdo)
             self.tmem_dS_offset = self.tmem_dP_offset  # overlaps with dP
-            self.tmem_dQ_offset = 512 - self.tile_hdim // 2
+            self.tmem_dQ_offset = SM100_TMEM_CAPACITY_COLUMNS - self.tmem_cols(self.mma_tiler_dsk)
         else:
             # TODO(split_d_only): there is no D-only (is_split_d=True, is_split_dv=False)
             # branch above, so that future config would fall through to this generic
@@ -267,6 +345,20 @@ class FlashAttentionBackwardSm100:
             self.tmem_dK_offset = self.tmem_dP_offset + self.tile_m
             self.tmem_dS_offset = self.tmem_dP_offset  # overlap with dP
 
+        # The 2-CTA path with hdim > 128: dV and dK are TMEM-resident, Q/dO have no
+        # separate transposed smem copies, and the MMA warp runs the flat loop.
+        # d192/dv128 and d256/dv256 both land here.
+        self.use_2cta_bigd = self.use_2cta_instrs and self.tile_hdim > 128
+        # Whether the dQ accumulator shares columns with S/P. When it does, the
+        # compute warp has to release the S_P pipeline early (before P is written)
+        # and the MMA warp has to wait for dQ to drain before issuing S. The
+        # d256/dv256 layout is disjoint, so it keeps the cheaper late release.
+        self.tmem_dQ_overlaps_S = (
+            self.tmem_dQ_offset < self.tmem_S_offset + self.tmem_cols(self.mma_tiler_kq)
+            and self.tmem_S_offset
+            < self.tmem_dQ_offset + self.tmem_cols(self.mma_tiler_dsk)
+        )
+
         if (not is_causal and not is_local) or deterministic:
             self.num_regs_reduce = 136 if self.use_2cta_instrs else 152
             self.num_regs_compute = 136
@@ -279,7 +371,7 @@ class FlashAttentionBackwardSm100:
             self.num_regs_mma = 104 if self.use_2cta_instrs else self.num_regs_load
         self.num_regs_empty = 24
 
-        if const_expr(self.tile_hdim == 192 and self.use_2cta_instrs):
+        if const_expr(self.use_2cta_bigd):
             self.num_regs_reduce = 128 + 8
             self.num_regs_compute = 128 + 8
             self.num_regs_load = 128 - 24
@@ -293,6 +385,67 @@ class FlashAttentionBackwardSm100:
         )
 
         self.buffer_align_bytes = 1024
+
+    def tmem_cols(self, mma_tiler) -> int:
+        """TMEM columns one CTA's accumulator for `mma_tiler` occupies.
+
+        The tiler's M is cluster-wide, so a CTA owns M // cta_group_size rows of
+        the accumulator. Rows map to TMEM lanes; when they do not fill all 128
+        lanes the accumulator is folded (see folded_kv_acc) and the column count
+        shrinks by the same ratio.
+        """
+        rows_per_cta = mma_tiler[0] // self.cta_group_size
+        assert 128 % rows_per_cta == 0, f"unsupported accumulator rows {rows_per_cta}"
+        return mma_tiler[1] * rows_per_cta // 128
+
+    def smem_A_mn_view(self, sA: cute.Tensor, dtype, swizzle) -> cute.Tensor:
+        """(n, m) view of an MMA A operand in SMEM, as the compute warp writes it.
+
+        make_smem_layout_a stores the operand as one 128B-period block per mma_k
+        elements, i.e. offset(n, m) = n * mma_k + m % mma_k
+        + (m // mma_k) * tile_n * mma_k. Cross-checked against the measured
+        tP_layout.outer of both d192/dv128 (((128,16),1,(4,2)):((64,1),0,(16,8192)))
+        and d256/dv256 (((64,16),1,(4,2)):((64,1),0,(16,4096))). The two blocks
+        line up with the folded accumulator's two lane halves, so this view needs
+        no transpose. Rank 3 to satisfy the tiled copy's tiler rank.
+
+        `swizzle` is the operand layout's .inner and is NOT optional: sA.iterator
+        drops the swizzle, so writing through the bare iterator lands the values at
+        unswizzled addresses while the MMA descriptor reads them swizzled. That
+        produced correct dQ (which goes through smem_dS_dq_block_view, where the
+        swizzle was always applied) and garbage dK / dV.
+        """
+        mma_k = 128 // (dtype.width // 8)
+        assert self.tile_m % mma_k == 0
+        return cute.make_tensor(
+            cute.recast_ptr(sA.iterator, swizzle, dtype=dtype),
+            cute.make_layout(
+                ((self.tile_n, (mma_k, self.tile_m // mma_k)), 1, 1),
+                stride=((mma_k, (1, self.tile_n * mma_k)), 0, 0),
+            ),
+        )
+
+    def smem_dS_dq_block_view(self, base_iter, swizzle) -> cute.Tensor:
+        """(n, m) view of ONE mma_k-block of the dQ MMA's A operand (dS, M=m K=n).
+
+        Same byte formula as smem_A_mn_view -- offset(n, m) = n * mma_k + m % mma_k
+        -- because both operands are m-contiguous in 128B blocks. The difference is
+        which (n slice, m half) pair each block holds: sdSt's two blocks are the two
+        m halves of our own n slice, sdS's are the two n slices of our own m half
+        (see separate_sdS_buffers). Coordinates stay the folded accumulator's, so m
+        still runs over all tile_m rows and its high bit gets stride 0: a thread must
+        only store through the block that matches its own lane half.
+        """
+        mma_k = 128 // (self.ds_dtype.width // 8)
+        assert self.tile_n <= mma_k, "one n slice must fit in a single 128B block"
+        assert self.tile_m == mma_k * self.cta_group_size
+        return cute.make_tensor(
+            cute.recast_ptr(base_iter, swizzle),
+            cute.make_layout(
+                ((self.tile_n, (mma_k, self.cta_group_size)), 1, 1),
+                stride=((mma_k, (1, 0)), 0, 0),
+            ),
+        )
 
     def _setup_attributes(self):
         if self.is_split_both:
@@ -320,6 +473,17 @@ class FlashAttentionBackwardSm100:
             self.dQ_reduce_ncol_t2r = 32
             self.dQ_reduce_ncol = 24 if not self.is_causal else 32
             self.sdQaccum_stage = 2 if not self.is_causal else 1
+        elif self.use_2cta_instrs and self.tile_hdim == 256:
+            # 128 = hdim_for_reduce // cta_group_size must be a multiple of ncol,
+            # which rules out the 24 that d192 uses.
+            self.dQ_reduce_ncol_t2r = 32
+            # dQ_reduce_ncol is NOT a free knob: flash_bwd_postprocess.py builds its
+            # TMEM load atom as Repetition(dQ_reduce_ncol) and 16 does not tile a
+            # (128, 256) accumulator. So free the 16 KB the folded path's sdS_dq needs
+            # by dropping to a single sdQaccum buffer instead (d192 causal does the
+            # same); d256/dv256 sits exactly on the 227 KB SMEM cap.
+            self.dQ_reduce_ncol = 32
+            self.sdQaccum_stage = 1
         else:
             if self.use_2cta_instrs:
                 self.dQ_reduce_ncol = 16 if self.deterministic else 8
@@ -371,13 +535,14 @@ class FlashAttentionBackwardSm100:
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_pdo[:2],
-            a_source=tcgen05.OperandSource.TMEM,
+            a_source=self.mma_A_source,
         )
         # dK += dS.T @ Q
-        if const_expr(self.use_smem_dS_for_mma_dK):
-            mma_dK_a_src = tcgen05.OperandSource.SMEM
-        else:
-            mma_dK_a_src = tcgen05.OperandSource.TMEM
+        mma_dK_a_src = (
+            tcgen05.OperandSource.SMEM
+            if self.mma_dS_from_smem
+            else tcgen05.OperandSource.TMEM
+        )
         tiled_mma_dK = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
             tcgen05.OperandMajorMode.K,  # dS_major_mode
@@ -492,6 +657,15 @@ class FlashAttentionBackwardSm100:
         self.sdQaccum_layout = cute.make_layout(
             (self.tile_m * self.dQ_reduce_ncol, self.sdQaccum_stage)
         )
+        if self.use_2cta_bigd:
+            # The bigd path has no sdS_xchg allocation of its own, it borrows
+            # sdQaccum (gated on dQaccum_empty), so shrinking sdQaccum must not
+            # shrink it below the exchange buffer.
+            assert cute.cosize(self.sdS_xchg_layout) * (
+                self.ds_dtype.width // 8
+            ) <= cute.cosize(self.sdQaccum_layout) * (self.dqaccum_dtype.width // 8), (
+                "sdS_xchg does not fit in sdQaccum"
+            )
         self.sLSE_layout = cute.make_layout(
             shape=(self.tile_m, self.Q_stage),
             stride=(1, cute.round_up(self.tile_m, 64)),
@@ -502,37 +676,68 @@ class FlashAttentionBackwardSm100:
         )
         hdim_epi = self.half_hdim if self.is_split_d else self.tile_hdim
         hdimv_epi = self.half_hdimv if self.is_split_dv else self.tile_hdimv
+        # Folded dKV accumulator: a CTA owns only tile_n < 128 TMEM lanes, so the
+        # accumulator's N (= hdim) is split and [hdim/2, hdim) lives in lanes
+        # 64..127. One warpgroup's 128 threads therefore cover 128 lanes = two
+        # disjoint hdim strips (delta = hdim/2) of tile_n rows each, instead of
+        # one 128-row strip.
+        #   * TMA store path: GMEM wants the two strips at different hdim
+        #     offsets, so each strip needs its own SMEM buffer and its own store
+        #     (epi_smem_strips = 2). Halving the columns per buffer keeps the
+        #     staging bytes and the number of stores identical to the unfolded case.
+        #   * fp32 reduce path: the accum "panel" convention is exactly
+        #     "128 threads x ncol values, fold inside the panel" -- the same one
+        #     dQ already uses (its accumulator is folded too) and the one
+        #     flash_bwd_postprocess.py's 2-CTA branch decodes with row_groups=2.
+        #     So the two strips share ONE 128*ncol buffer and ONE bulk reduce;
+        #     only the panel size doubles.
+        self.epi_num_strips = 2 if self.folded_kv_acc else 1
+        self.epi_smem_strips = self.epi_num_strips if not self.dKV_postprocess else 1
+        # One SMEM strip is epi_tile[0] = tile_n rows tall and is fed by
+        # 128 / epi_smem_strips threads: when the strips are staged separately the
+        # other half of the warpgroup owns the OTHER hdim strip and writes its own
+        # buffer, so it must not be tiled into this one.
+        self.epi_threads_r2s = 128 // self.epi_smem_strips
+        epi_col_max = 128 // (self.dk_dtype.width // 8) // self.epi_smem_strips  # 64 or 32
         self.sdK_epi_tile = (
             self.tile_n,
-            math.gcd(128 // (self.dk_dtype.width // 8), hdim_epi // 2),  # 64 or 32
+            math.gcd(epi_col_max, hdim_epi // 2 // self.epi_smem_strips),  # 64 or 32
         )  # subtiles mma_tiler_dsq[:2] = mma_tiler_pdo[:2]
         self.sdV_epi_tile = (
             self.tile_n,
-            math.gcd(128 // (self.dk_dtype.width // 8), hdimv_epi // 2),  # 64 or 32
+            math.gcd(epi_col_max, hdimv_epi // 2 // self.epi_smem_strips),  # 64 or 32
         )  # subtiles mma_tiler_pdo[:2]
         # headdim_64 gets 1 stage
-        self.num_epi_stages = max(1, (hdim_epi // 2) // self.sdK_epi_tile[1])
-        self.num_epi_stages_v = max(1, (hdimv_epi // 2) // self.sdV_epi_tile[1])
+        self.num_epi_stages = max(
+            1, (hdim_epi // 2 // self.epi_smem_strips) // self.sdK_epi_tile[1]
+        )
+        self.num_epi_stages_v = max(
+            1, (hdimv_epi // 2 // self.epi_smem_strips) // self.sdV_epi_tile[1]
+        )
         self.sdK_flat_epi_tile = self.tile_n * (hdim_epi // 2) // self.num_epi_stages
         self.sdV_flat_epi_tile = self.tile_n * (hdimv_epi // 2) // self.num_epi_stages_v
+
+        # fp32 reduce staging: one panel = 128 threads x dK_reduce_ncol values,
+        # i.e. epi_num_strips * tile_n rows (both hdim strips live in one panel).
+        self.dKV_reduce_panel = self.epi_num_strips * self.tile_n * self.dK_reduce_ncol
 
         if const_expr(not self.dKV_postprocess):
             self.sdK_layout = sm100_utils_basic.make_smem_layout_epi(
                 self.dk_dtype,
                 LayoutEnum.ROW_MAJOR,
                 self.sdK_epi_tile,
-                2,  # num compute wgs
+                2 * self.epi_smem_strips,  # num compute wgs x staged hdim strips per wg
             )
             self.sdV_layout = sm100_utils_basic.make_smem_layout_epi(
                 self.dv_dtype,
                 LayoutEnum.ROW_MAJOR,
                 self.sdV_epi_tile,
-                2,  # num compute wgs
+                2 * self.epi_smem_strips,  # num compute wgs x staged hdim strips per wg
             )
         else:
-            self.sdK_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
+            self.sdK_layout = cute.make_layout((self.dKV_reduce_panel, 2))
             # self.dK_reduce_ncol same for dV
-            self.sdV_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
+            self.sdV_layout = cute.make_layout((self.dKV_reduce_panel, 2))
 
         # TODO(GuoxiaWang): 2 means only support flashmask startend_row_indices.shape[-1] <= 2
         self.sStartEndRowIndices_layout = cute.make_layout(
@@ -760,7 +965,9 @@ class FlashAttentionBackwardSm100:
             tma_atom_dK = None
 
         if const_expr(not self.dKV_postprocess):
-            thr_layout_r2s_dKV = cute.make_ordered_layout((128, 1), order=(1, 0))  # 128 threads
+            thr_layout_r2s_dKV = cute.make_ordered_layout(
+                (self.epi_threads_r2s, 1), order=(1, 0)
+            )  # 128 or 64 threads (see epi_num_strips)
             val_layout_r2s_dKV = cute.make_ordered_layout(
                 (1, 128 // self.dk_dtype.width), order=(1, 0)
             )  # 4 or 8 vals for 16 byte store
@@ -874,6 +1081,11 @@ class FlashAttentionBackwardSm100:
         self.tma_copy_bytes["dPsum"] = self.tile_m * Float32.width // 8
         self.tma_copy_bytes["dQ"] = self.tile_m * self.dQ_reduce_ncol * Float32.width // 8
         self.tma_copy_bytes["dKacc"] = self.tile_n * self.dK_reduce_ncol * Float32.width // 8
+        # The dKV epilogue's own reduce panel: with a folded accumulator one panel
+        # spans both hdim strips (2 * tile_n rows worth of lanes), so it is twice
+        # tma_copy_bytes["dKacc"]. reduce_step's split-D/split-dV dKacc writes are a
+        # different (unfolded-panel) path and keep using tma_copy_bytes["dKacc"].
+        self.dKV_reduce_bytes = self.dKV_reduce_panel * Float32.width // 8
         self.tma_copy_bytes["dS"] = cute.size_in_bytes(self.ds_dtype, self.sdS_layout)
         self.tma_copy_bytes["sdS_xchg"] = self.tma_copy_bytes["dS"] // 2  # Half of dS for exchange
 
@@ -933,9 +1145,17 @@ class FlashAttentionBackwardSm100:
             assert sdK_bytes <= sK_bytes, "sdK doesn't fit in sK storage allocation (2-CTA)"
 
         if const_expr(self.use_2cta_instrs):
-            sQt_size = cute.cosize(self.sQt_layout) if const_expr(self.tile_hdim <= 128) else 0
-            sdOt_size = cute.cosize(self.sdOt_layout) if const_expr(self.tile_hdim <= 128) else 0
-            sdS_xchg_size = cute.cosize(self.sdS_xchg_layout) if const_expr(self.tile_hdim <= 128) else 0
+            sQt_size = cute.cosize(self.sQt_layout) if const_expr(not self.use_2cta_bigd) else 0
+            sdOt_size = cute.cosize(self.sdOt_layout) if const_expr(not self.use_2cta_bigd) else 0
+            sdS_xchg_size = cute.cosize(self.sdS_xchg_layout) if const_expr(not self.use_2cta_bigd) else 0
+            # Folded S/dP cannot back the dV MMA's A operand, so P lives in SMEM in
+            # exactly the layout that MMA wants (see mma_P_from_smem). dS already has
+            # sdS for the same reason on the dK side.
+            sP_size = cute.cosize(self.tP_layout) if const_expr(self.mma_P_from_smem) else 0
+            # Separate buffer for the dQ MMA's A view (see separate_sdS_buffers).
+            sdS_dq_size = (
+                cute.cosize(self.sdS_layout) if const_expr(self.separate_sdS_buffers) else 0
+            )
 
             @cute.struct
             class SharedStorage:
@@ -1002,6 +1222,14 @@ class FlashAttentionBackwardSm100:
                 ]
                 sdS: cute.struct.Align[
                     cute.struct.MemRange[self.ds_dtype, cute.cosize(self.sdSt_layout)],
+                    self.buffer_align_bytes,
+                ]
+                sdS_dq: cute.struct.Align[
+                    cute.struct.MemRange[self.ds_dtype, sdS_dq_size],
+                    self.buffer_align_bytes,
+                ]
+                sP: cute.struct.Align[
+                    cute.struct.MemRange[self.do_dtype, sP_size],
                     self.buffer_align_bytes,
                 ]
                 sLSE: cute.struct.Align[
@@ -1086,6 +1314,15 @@ class FlashAttentionBackwardSm100:
                 ]
 
         self.shared_storage = SharedStorage
+        # Overshooting the SM100 dynamic SMEM cap only shows up as a
+        # CUDA_ERROR_INVALID_VALUE at launch, so check the real struct here.
+        smem_bytes = SharedStorage.size_in_bytes()
+        assert smem_bytes <= SM100_SMEM_CAPACITY_BYTES, (
+            f"shared storage is {smem_bytes} B, over the {SM100_SMEM_CAPACITY_BYTES} B "
+            f"SM100 cap (d={self.tile_hdim}, dv={self.tile_hdimv}, "
+            f"tile_m={self.tile_m}, tile_n={self.tile_n}, "
+            f"2cta={self.use_2cta_instrs}, folded={self.folded_kv_acc})"
+        )
 
         LOG2_E = math.log2(math.e)
         softmax_scale_log2 = softmax_scale * LOG2_E
@@ -1284,7 +1521,7 @@ class FlashAttentionBackwardSm100:
                 cute.arch.mbarrier_init(
                     tmem_cluster_mbar_ptr, cute.arch.WARP_SIZE * len([self.mma_warp_id])
                 )
-            if const_expr(self.tile_hdim == 192):
+            if const_expr(self.use_2cta_bigd):
                 if warp_idx == 2:
                     cute.arch.mbarrier_init(
                         dQaccum_empty_mbar_ptr,
@@ -1401,7 +1638,7 @@ class FlashAttentionBackwardSm100:
         )
 
         if const_expr(self.use_2cta_instrs):
-            if const_expr(self.tile_hdim == 192):
+            if const_expr(self.use_2cta_bigd):
                 pipeline_Qt = pipeline_Q
             else:
                 pipeline_Qt = pipeline.PipelineTmaUmma.create(
@@ -1436,7 +1673,7 @@ class FlashAttentionBackwardSm100:
         )
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
-        if const_expr(self.use_2cta_instrs and self.tile_hdim <= 128):
+        if const_expr(self.use_2cta_instrs and not self.use_2cta_bigd):
             sQt = storage.sQt.get_tensor(
                 sQt_layout.outer, swizzle=sQt_layout.inner, dtype=self.q_dtype
             )
@@ -1451,10 +1688,13 @@ class FlashAttentionBackwardSm100:
             sKt = cute.make_tensor(cute.recast_ptr(sK.iterator, sKt_layout.inner), sKt_layout.outer)
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         sdSt = storage.sdS.get_tensor(sdSt_layout.outer, swizzle=sdSt_layout.inner)
-        sdS = cute.make_tensor(cute.recast_ptr(sdSt.iterator, sdS_layout.inner), sdS_layout.outer)
+        if const_expr(self.separate_sdS_buffers):
+            sdS = storage.sdS_dq.get_tensor(sdS_layout.outer, swizzle=sdS_layout.inner)
+        else:
+            sdS = cute.make_tensor(cute.recast_ptr(sdSt.iterator, sdS_layout.inner), sdS_layout.outer)
 
         if const_expr(self.use_2cta_instrs):
-            if const_expr(self.tile_hdim <= 128):
+            if const_expr(not self.use_2cta_bigd):
                 sdS_xchg = storage.sdS_xchg.get_tensor(sdS_xchg_layout)
             else:
                 sdS_xchg = storage.sdQaccum.get_tensor(sdS_xchg_layout, dtype=self.ds_dtype)
@@ -1462,7 +1702,7 @@ class FlashAttentionBackwardSm100:
             sdS_xchg = None
 
         sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner, dtype=self.do_dtype)
-        if const_expr(self.use_2cta_instrs and self.tile_hdim <= 128):
+        if const_expr(self.use_2cta_instrs and not self.use_2cta_bigd):
             sdOt = storage.sdOt.get_tensor(
                 sdOt_layout.outer, swizzle=sdOt_layout.inner, dtype=self.do_dtype
             )
@@ -1541,9 +1781,17 @@ class FlashAttentionBackwardSm100:
                     tdVtdV_high.iterator.toint() - tdVtdV.iterator.toint(),
                 )
 
-        tP = cute.make_tensor(
-            cute.recast_ptr(tmem_ptr + self.tmem_P_offset, dtype=self.do_dtype), tP_layout.outer
-        )
+        if const_expr(self.mma_P_from_smem):
+            # Folded S accumulator: P is written to SMEM by the compute warp and read
+            # from there by the dV MMA (see mma_P_from_smem).
+            tP = storage.sP.get_tensor(
+                tP_layout.outer, swizzle=tP_layout.inner, dtype=self.do_dtype
+            )
+        else:
+            tP = cute.make_tensor(
+                cute.recast_ptr(tmem_ptr + self.tmem_P_offset, dtype=self.do_dtype),
+                tP_layout.outer,
+            )
         # dK
         thr_mma_dK = tiled_mma_dK.get_slice(mma_tile_coord_v)
         dkacc_shape = thr_mma_dK.partition_shape_C(self.mma_tiler_dsq[:2])
@@ -1755,6 +2003,8 @@ class FlashAttentionBackwardSm100:
                 mdV,
                 mdK,
                 sdS,
+                sdSt,
+                tP,
                 sdS_xchg,
                 pipeline_LSE,
                 pipeline_dPsum,
@@ -1786,6 +2036,9 @@ class FlashAttentionBackwardSm100:
                 sFM_max_min,
                 flashmask_loaded_mbar_ptr,
                 is_leader_cta,
+                sdS_layout.inner if const_expr(self.folded_kv_acc) else None,
+                sdSt_layout.inner if const_expr(self.folded_kv_acc) else None,
+                tP_layout.inner if const_expr(self.folded_kv_acc) else None,
             )
             cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
@@ -2178,7 +2431,7 @@ class FlashAttentionBackwardSm100:
                 # rejects closures that capture variables inside dynamic control flow.
                 m_block_first = self.fm_m_block(fm_skip, m_block_min, Int32(0))
 
-                if const_expr(self.tile_hdim == 192):
+                if const_expr(self.use_2cta_bigd):
                     #### Prologue ####
                     assert should_load_Q and should_load_dO
                     # K & Q (for S)
@@ -3644,6 +3897,30 @@ class FlashAttentionBackwardSm100:
             )
             sFM_max_min[0] = max(LTS_max[nb0] - 1, LTS_max[nb1] - 1) // self.tile_m
             sFM_max_min[1] = min(LTS_min[nb0], LTS_min[nb1]) // self.tile_m
+            if const_expr(self.debug_print_2cta_skip):
+                # Own key block vs the pair's two key blocks. If the two CTAs of a
+                # cluster really shared a key block, own_* would be equal across
+                # cta_rank and folded_* would equal own_*.
+                cute.printf(
+                    "[2cta-skip] cta_rank=%d n_block=%d nb0=%d nb1=%d "
+                    "own_LTS_max=%d own_LTS_min=%d",
+                    cute.arch.block_idx_in_cluster(),
+                    n_block,
+                    nb0,
+                    nb1,
+                    LTS_max[n_block],
+                    LTS_min[n_block],
+                )
+                cute.printf(
+                    "[2cta-skip] cta_rank=%d n_block=%d LTS_max[nb0]=%d LTS_max[nb1]=%d "
+                    "folded_max_mblk=%d folded_min_mblk=%d",
+                    cute.arch.block_idx_in_cluster(),
+                    n_block,
+                    LTS_max[nb0],
+                    LTS_max[nb1],
+                    sFM_max_min[0],
+                    sFM_max_min[1],
+                )
             if const_expr(flashmask_info.LTE_nblock_max is not None):
                 LTE_max = cute.make_tensor(
                     flashmask_info.LTE_nblock_max.iterator + bh_offset_block, fm_layout
@@ -3785,6 +4062,49 @@ class FlashAttentionBackwardSm100:
         return m_block
 
     @cute.jit
+    def fm_needs_mask(
+        self,
+        flashmask_info: FlashMaskInfo,
+        sFM_max_min: cute.Tensor,
+        m_block: Int32,
+    ):
+        """Whether the per-element flashmask has to be applied to `m_block`.
+
+        The three ranges the 1CTA segment walk processes with partially_masked=False
+        are exactly the ones where no element of the block is masked: below UTS_min,
+        between UTE_max and LTS_min, and above LTE_max. This returns the complement
+        of those ranges, so the 2CTA flat loop can skip the mask on the same blocks.
+
+        Safe under the 2CTA bound folding: load_fm reduces the pair's *_min with min
+        and *_max with max, so a block that this test calls unmasked is unmasked for
+        BOTH key blocks, hence for this CTA. It also never calls a FULLY masked block
+        unmasked -- the fully masked bands are [LTS_max + 1, LTE_min) and
+        [UTS_max + 1, UTE_min), which are disjoint from all three ranges above. That
+        matters because fm_skip_info deliberately keeps one fully masked block alive
+        when a KV tile is masked everywhere, and relies on the mask to zero it.
+        """
+        needs_mask = cutlass.Boolean(True)
+        if const_expr(not self.is_causal):
+            # UTE_max ~ LTS_min
+            if const_expr(flashmask_info.UTE_nblock_max is not None):
+                if m_block < sFM_max_min[1]:
+                    if m_block > sFM_max_min[6]:
+                        needs_mask = cutlass.Boolean(False)
+            if const_expr(flashmask_info.UTS_nblock_max is not None):
+                # 0 ~ UTS_min
+                if m_block < sFM_max_min[5]:
+                    needs_mask = cutlass.Boolean(False)
+        else:
+            # Causal has no upper tail, so this range reaches down to m_block_min.
+            if m_block < sFM_max_min[1]:
+                needs_mask = cutlass.Boolean(False)
+        if const_expr(flashmask_info.LTE_nblock_max is not None):
+            # LTE_max ~ seqlen_q
+            if m_block > sFM_max_min[2]:
+                needs_mask = cutlass.Boolean(False)
+        return needs_mask
+
+    @cute.jit
     def fm_is_full_mask(self, fm_skip_info, m_block: Int32):
         """Whether `m_block` falls inside one of the two exclusion bands."""
         a_lo, a_hi, b_lo, b_hi, n1, n2, num_iters = fm_skip_info
@@ -3851,8 +4171,7 @@ class FlashAttentionBackwardSm100:
         tdPrV = tiled_mma_dP.make_fragment_A(sV)
         tdPrdOt = tiled_mma_dP.make_fragment_B(sdOt)
         # dK = dS.T @ Q
-        # For 2-CTA, dS (dK mma) MUST come from TMEM (cannot use SMEM)
-        if const_expr(self.use_smem_dS_for_mma_dK and not self.use_2cta_instrs):
+        if const_expr(self.mma_dS_from_smem):
             tdKrdS = tiled_mma_dK.make_fragment_A(sdSt)  # From SMEM
         else:
             tdKrdS = tiled_mma_dK.make_fragment_A(tdS)  # From TMEM
@@ -3888,9 +4207,12 @@ class FlashAttentionBackwardSm100:
             tdVtdV,
             tdVrP,
             tdVrdO,
-            sA=None,
+            # On the folded path P lives in SMEM (see mma_P_from_smem), so the MMA
+            # needs its smem descriptor; tA_addr is A's TMEM address and only
+            # applies when A comes from TMEM.
+            sA=tP if const_expr(self.mma_P_from_smem) else None,
             sB=sdO,
-            tA_addr=self.tmem_P_offset,
+            tA_addr=None if const_expr(self.mma_P_from_smem) else self.tmem_P_offset,
             cta_group=self.cta_group_size,
         )
 
@@ -3922,9 +4244,9 @@ class FlashAttentionBackwardSm100:
                 tdKtdK,
                 tdKrdS,
                 tdKrQ,
-                sA=None,
+                sA=sdSt if const_expr(self.mma_dS_from_smem) else None,
                 sB=sQt,
-                tA_addr=self.tmem_dS_offset,
+                tA_addr=None if const_expr(self.mma_dS_from_smem) else self.tmem_dS_offset,
                 cta_group=self.cta_group_size,
             )
 
@@ -4007,11 +4329,11 @@ class FlashAttentionBackwardSm100:
                     num_blocks = self.fm_skip_info(
                         flashmask_info, sFM_max_min, m_block_min, m_block_max
                     )[6]
-                if tidx == 0 and self.debug_print:
+                if tidx == 0 and (self.debug_print or self.debug_print_2cta_skip):
                     cute.printf('MMA FM: cta_rank=%d, n_block=%d, num_blocks=%d, m_block_min=%d, m_block_max=%d, 2cta=%d', cute.arch.block_idx_in_cluster(), n_block, num_blocks, m_block_min, m_block_max, const_expr(self.use_2cta_instrs))
 
-            if const_expr(self.use_2cta_instrs and self.tile_hdim == 192):
-                # hdim192: flat loop with double pipeline_Q/dO consumption
+            if const_expr(self.use_2cta_bigd):
+                # 2CTA big-hdim: flat loop with double pipeline_Q/dO consumption
                 # Only leader CTA executes MMA loop; non-leader CTA's MMA warps are idle
                 if is_leader_cta:
                     if tidx == 0 and self.debug_print:
@@ -4647,6 +4969,8 @@ class FlashAttentionBackwardSm100:
         mdV: cute.Tensor,
         mdK: cute.Tensor,
         sdS: cute.Tensor,
+        sdSt: cute.Tensor,
+        tP: cute.Tensor,
         sdS_xchg: cute.Tensor,
         pipeline_LSE: PipelineAsync,
         pipeline_dPsum: PipelineAsync,
@@ -4678,6 +5002,9 @@ class FlashAttentionBackwardSm100:
         sFM_max_min: cute.Tensor,
         flashmask_loaded_mbar_ptr: cute.Pointer,
         is_leader_cta: cutlass.Boolean,
+        sdS_swizzle=None,
+        sdSt_swizzle=None,
+        tP_swizzle=None,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -4704,6 +5031,7 @@ class FlashAttentionBackwardSm100:
         # tidx = cute.arch.thread_idx()[0] - (cute.arch.WARP_SIZE * self.compute_warp_ids[0])
         dp_idx = tidx % 128
         num_wg = len(self.compute_warp_ids) // 4  # 2
+        wg_idx = tidx // 128
         # wg_idx:
         # 0: [256...384]
         # 1: [128...256]
@@ -4733,46 +5061,154 @@ class FlashAttentionBackwardSm100:
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), Float32
         )
 
-        # tmem -> rmem
-        thr_copy_t2r = copy_utils.make_tmem_copy(tmem_load_atom, num_wg).get_slice(tidx)
-        tStS_t2r = thr_copy_t2r.partition_S(tStS)  # (((32, 32), 1), 2, 1, 1)
-        tdPtdP_t2r = thr_copy_t2r.partition_S(tdPtdP)
-        tScS_t2r = thr_copy_t2r.partition_D(tScS)  # ((32, 1), 2, 1, 1)
-        t0ScS_t2r = thr_copy_t2r.get_slice(0).partition_D(tScS)  # ((32, 1), 2, 1, 1)
-        # ((32, 1), 2, 1, 1, STAGE)
-        tSsLSE = thr_copy_t2r.partition_D(thr_mma_S.partition_C(sLSE_2D))
-        tSsdPsum = thr_copy_t2r.partition_D(thr_mma_dP.partition_C(sdPsum_2D))
-        # rmem -> tmem
-        thr_copy_r2t = copy_utils.make_tmem_copy(tmem_store_atom, num_wg).get_slice(tidx)
-        tScP_r2t = thr_copy_r2t.partition_S(tScP)
-        tStP_r2t = thr_copy_r2t.partition_D(tStP)
-        tdPcdS_r2t = thr_copy_r2t.partition_S(tdPcdS)
-        tdPtdS_r2t = thr_copy_r2t.partition_D(tdPtdS)
+        if const_expr(self.folded_kv_acc):
+            # copy_utils.make_tmem_copy's fixed 128-datapath tiler mis-slices a
+            # folded accumulator -- measured on SM100, it walks every OTHER column
+            # (coords (0,0), (0,2), (0,4), ... instead of (0,0), (0,1), (0,2), ...).
+            # Use the folded-aware tiler tcgen05 derives from the tensor instead.
+            #
+            # This copy covers 128 threads and is NOT split across the two compute
+            # warp groups, so both groups recompute the same values and store them
+            # to the same addresses (idempotent). Splitting it would also break the
+            # cluster dS exchange, which needs a thread's lane half to be its m half.
+            tiled_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tStS)
+            thr_copy_t2r = tiled_copy_t2r.get_slice(dp_idx)
+            tStS_t2r = thr_copy_t2r.partition_S(tStS)
+            tdPtdP_t2r = thr_copy_t2r.partition_S(tdPtdP)
+            tScS_t2r = thr_copy_t2r.partition_D(tScS)
+            t0ScS_t2r = tiled_copy_t2r.get_slice(0).partition_D(tScS)
+            tSsLSE = thr_copy_t2r.partition_D(thr_mma_S.partition_C(sLSE_2D))
+            tSsdPsum = thr_copy_t2r.partition_D(thr_mma_dP.partition_C(sdPsum_2D))
+            # P never reaches TMEM on this path (see mma_P_from_smem).
+            thr_copy_r2t = None
+            tScP_r2t, tStP_r2t = None, None
+            tdPcdS_r2t, tdPtdS_r2t = None, None
+        else:
+            # tmem -> rmem
+            thr_copy_t2r = copy_utils.make_tmem_copy(tmem_load_atom, num_wg).get_slice(tidx)
+            tStS_t2r = thr_copy_t2r.partition_S(tStS)  # (((32, 32), 1), 2, 1, 1)
+            tdPtdP_t2r = thr_copy_t2r.partition_S(tdPtdP)
+            tScS_t2r = thr_copy_t2r.partition_D(tScS)  # ((32, 1), 2, 1, 1)
+            t0ScS_t2r = thr_copy_t2r.get_slice(0).partition_D(tScS)  # ((32, 1), 2, 1, 1)
+            # ((32, 1), 2, 1, 1, STAGE)
+            tSsLSE = thr_copy_t2r.partition_D(thr_mma_S.partition_C(sLSE_2D))
+            tSsdPsum = thr_copy_t2r.partition_D(thr_mma_dP.partition_C(sdPsum_2D))
+            # rmem -> tmem
+            thr_copy_r2t = copy_utils.make_tmem_copy(tmem_store_atom, num_wg).get_slice(tidx)
+            tScP_r2t = thr_copy_r2t.partition_S(tScP)
+            tStP_r2t = thr_copy_r2t.partition_D(tStP)
+            tdPcdS_r2t = thr_copy_r2t.partition_S(tdPcdS)
+            tdPtdS_r2t = thr_copy_r2t.partition_D(tdPtdS)
         # rmem -> smem
         # This part is a bit iffy, we might be making a lot of assumptions here
         copy_atom_r2s = sm100_utils_basic.get_smem_store_op(
             LayoutEnum.ROW_MAJOR, self.ds_dtype, Float32, thr_copy_t2r
         )
-        thr_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, thr_copy_t2r).get_slice(tidx)
-        # We assume the swizzle (i.e. layout.inner) stays the same
-        sdS_epi_layout = sm100_utils_basic.make_smem_layout_epi(
-            self.ds_dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_m), 1
-        )
-        sdS_layout = cute.slice_(sdS_epi_layout.outer, (None, None, 0))  # ((8,16), (64,2))
-        # Need to group into 1 mode to be compatible w thr_copy_r2s
-        sdS_layout = cute.make_layout((sdS_layout.shape,), stride=(sdS_layout.stride,))
-        sdS_epi = cute.make_tensor(sdS.iterator, sdS_layout)
-        tRS_sdS = thr_copy_r2s.partition_D(sdS_epi)
+        if const_expr(self.folded_kv_acc):
+            thr_copy_r2s = cute.make_tiled_copy_D(
+                copy_atom_r2s, tiled_copy_t2r
+            ).get_slice(dp_idx)
+            # Both dS (A of the dK MMA) and P (A of the dV MMA) are written through
+            # the MMA's own A-operand layout, addressed by its natural coordinate.
+            # Drop the trailing singleton modes so a [None, stage] slice works, the
+            # same shape the non-folded sdS_epi partition has.
+            tRS_sdS = thr_copy_r2s.partition_D(
+                self.smem_A_mn_view(sdSt, self.ds_dtype, sdSt_swizzle)
+            )[None, None, 0, 0]
+            tRS_sP = thr_copy_r2s.partition_D(
+                self.smem_A_mn_view(tP, self.do_dtype, tP_swizzle)
+            )[None, None, 0, 0]
+            # The epi view only exists on the non-folded path; compute_step takes
+            # it as None.
+            sdS_epi_layout = None
+            if const_expr(self.debug_print_folded):
+                # TEMPORARY: does the copy's coordinate map carry the folded lane
+                # half, or does only the hardware apply it on the TMEM side?
+                # flash_fwd_sm100.py:4303-4304 says the TV layout has warp stride 0,
+                # which would mean thread t and t+64 see the SAME (n, m) and every
+                # non-TMEM consumer (SMEM destinations, mask, LSE, dPsum) needs the
+                # m += tile_m/2 put back by hand.
+                print(f"[fold] tiler_mn      = {tiled_copy_t2r.tiler_mn}")
+                print(f"[fold] tStS_t2r      = {tStS_t2r.layout}")
+                print(f"[fold] tScS_t2r      = {tScS_t2r.layout}")
+                print(f"[fold] t0ScS_t2r     = {t0ScS_t2r.layout}")
+                print(f"[fold] tSsLSE        = {tSsLSE.layout}")
+                print(f"[fold] tRS_sdS       = {tRS_sdS.layout}")
+                print(f"[fold] tRS_sP        = {tRS_sP.layout}")
+                print(f"[fold] num_stages    = {cute.size(tScS_t2r, mode=[1])}")
+                print(f"[fold] vals/thread   = {cute.size(tScS_t2r, mode=[0])}")
+                # The r2s copy's D side is derived from tiled_copy_t2r. If its thread
+                # map disagrees with the t2r one, the register values land at the
+                # wrong SMEM addresses -- which would hit exactly P and dS (dK / dV
+                # wrong) and leave dQ alone, since dQ's store picks its block by base
+                # address instead.
+                tRS_cS_dbg = thr_copy_r2s.partition_D(tScS)
+                print(f"[fold] tRS_cS(r2s D) = {tRS_cS_dbg.layout}")
+                if (
+                    tidx == 0 or tidx == 1 or tidx == 63 or tidx == 64
+                    or tidx == 65 or tidx == 127 or tidx == 128 or tidx == 192
+                ):
+                    c_first = tScS_t2r[0, 0, 0, 0]
+                    c_last = tScS_t2r[cute.size(tScS_t2r, mode=[0]) - 1, 0, 0, 0]
+                    c_thr0 = t0ScS_t2r[0, 0, 0, 0]
+                    r_first = tRS_cS_dbg[0, 0, 0, 0]
+                    r_last = tRS_cS_dbg[cute.size(tRS_cS_dbg, mode=[0]) - 1, 0, 0, 0]
+                    cute.printf(
+                        "[fold] tidx=%d dp=%d | t2r first=(%d,%d) last=(%d,%d) thr0=(%d,%d)"
+                        " | r2s first=(%d,%d) last=(%d,%d)",
+                        tidx,
+                        dp_idx,
+                        c_first[0],
+                        c_first[1],
+                        c_last[0],
+                        c_last[1],
+                        c_thr0[0],
+                        c_thr0[1],
+                        r_first[0],
+                        r_first[1],
+                        r_last[0],
+                        r_last[1],
+                    )
+        else:
+            thr_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, thr_copy_t2r).get_slice(tidx)
+            # We assume the swizzle (i.e. layout.inner) stays the same
+            sdS_epi_layout = sm100_utils_basic.make_smem_layout_epi(
+                self.ds_dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_m), 1
+            )
+            sdS_layout = cute.slice_(sdS_epi_layout.outer, (None, None, 0))  # ((8,16), (64,2))
+            # Need to group into 1 mode to be compatible w thr_copy_r2s
+            sdS_layout = cute.make_layout((sdS_layout.shape,), stride=(sdS_layout.stride,))
+            sdS_epi = cute.make_tensor(sdS.iterator, sdS_layout)
+            tRS_sdS = thr_copy_r2s.partition_D(sdS_epi)
+            tRS_sP = None
 
         tRS_sdS_xchg = None
-        if const_expr(self.use_2cta_instrs):
+        tRS_sdS_dq = None
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        dS_cluster_empty_phase = Int32(1)
+        if const_expr(self.folded_kv_acc):
+            # Folded: a thread's m half is its lane half, not a stage index, so the
+            # dS store for the dQ MMA picks a destination instead of a slice:
+            # our own m half goes to our sdS block cta_rank, the peer's m half goes
+            # to sdS_xchg and from there to the peer's sdS block cta_rank.
+            dS_block_elems = const_expr(
+                self.tile_n * (128 // (self.ds_dtype.width // 8))
+            )
+            tRS_sdS_dq = thr_copy_r2s.partition_D(
+                self.smem_dS_dq_block_view(
+                    sdS.iterator + cta_rank_in_cluster * dS_block_elems,
+                    sdS_swizzle,
+                )
+            )[None, None, 0, 0]
+            tRS_sdS_xchg = thr_copy_r2s.partition_D(
+                self.smem_dS_dq_block_view(sdS_xchg.iterator, sdS_swizzle)
+            )[None, None, 0, 0]
+        elif const_expr(self.use_2cta_instrs):
             sdS_xchg_epi = cute.make_tensor(
                 cute.recast_ptr(sdS_xchg.iterator, sdS_epi_layout.inner), sdS_layout
             )
             tRS_sdS_xchg = thr_copy_r2s.partition_D(sdS_xchg_epi)
 
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        dS_cluster_empty_phase = Int32(1)
         # 2-CTA: CTA 0 exchanges stage 1 (bottom half), CTA 1 exchanges stage 0 (top half)
         exchange_stage = cta_rank_in_cluster ^ 1 if const_expr(self.use_2cta_instrs) else Int32(0)
 
@@ -4832,6 +5268,7 @@ class FlashAttentionBackwardSm100:
                 tStP_r2t=tStP_r2t,
                 tSsLSE=tSsLSE,
                 tRS_sdS=tRS_sdS,
+                tRS_sP=tRS_sP,
                 tdPtdS_r2t=tdPtdS_r2t,
                 tdPtdP_t2r=tdPtdP_t2r,
                 tSsdPsum=tSsdPsum,
@@ -4845,6 +5282,7 @@ class FlashAttentionBackwardSm100:
                 mask_fn=mask_fn,
                 sdS_xchg=sdS_xchg,
                 tRS_sdS_xchg=tRS_sdS_xchg,
+                tRS_sdS_dq=tRS_sdS_dq,
                 exchange_stage=exchange_stage,
                 dS_cluster_empty_mbar_ptr=dS_cluster_empty_mbar_ptr,
                 dS_cluster_full_mbar_ptr=dS_cluster_full_mbar_ptr,
@@ -4869,15 +5307,26 @@ class FlashAttentionBackwardSm100:
                         # 2CTA: one flat loop over the blocks that are not fully masked.
                         # sFM_max_min holds the CTA pair's combined bounds (load_fm), so
                         # both CTAs walk the same blocks -- required, since they share the
-                        # pipelines and the cta_group::2 MMAs. Every block is treated as
-                        # partially masked: the element mask is applied anyway, which is
-                        # what makes the block-level bounds allowed to be conservative.
+                        # pipelines and the cta_group::2 MMAs. The iteration count and the
+                        # m_block sequence therefore MUST stay exactly what fm_skip_info /
+                        # fm_m_block produce (load, mma and relay derive theirs from the
+                        # same formula). Only the per-block work varies: fm_needs_mask
+                        # picks out the blocks that no key row of the pair masks, and those
+                        # skip the element mask entirely.
                         fm_skip = self.fm_skip_info(
                             flashmask_info, sFM_max_min, m_block_min, m_block_max
                         )
+                        if const_expr(self.debug_print_2cta_skip):
+                            mask_iters = Int32(0)
                         for it in cutlass.range(fm_skip[6], unroll=1):
                             m_block = self.fm_m_block(fm_skip, m_block_min, it)
                             zero_block = False
+                            needs_mask = self.fm_needs_mask(
+                                flashmask_info, sFM_max_min, m_block
+                            )
+                            if const_expr(self.debug_print_2cta_skip):
+                                if needs_mask:
+                                    mask_iters += 1
                             if tidx == 0 and self.debug_print:
                                 cute.printf('COMPUTE 2CTA: cta_rank=%d, n_block=%d, m_block=%d of [%d,%d)', cute.arch.block_idx_in_cluster(), n_block, m_block, m_block_min, m_block_max)
                             consumer_state_LSE, consumer_state_S_P_dP, consumer_state_dPsum, producer_state_dS, dS_cluster_empty_phase = compute_step(
@@ -4887,11 +5336,20 @@ class FlashAttentionBackwardSm100:
                                 consumer_state_dPsum=consumer_state_dPsum,
                                 producer_state_dS=producer_state_dS,
                                 dS_cluster_empty_phase=dS_cluster_empty_phase,
-                                partially_masked=True,
+                                partially_masked=needs_mask,
                                 iter_idx=it,
                             )
                             if tidx == 0 and self.debug_print:
                                 cute.printf('n_block: %d, after compute_step 2CTA all: %d', n_block, m_block)
+                        if const_expr(self.debug_print_2cta_skip):
+                            if tidx == 0:
+                                cute.printf(
+                                    "[2cta-mask] cta_rank=%d n_block=%d iters=%d masked_iters=%d",
+                                    cute.arch.block_idx_in_cluster(),
+                                    n_block,
+                                    fm_skip[6],
+                                    mask_iters,
+                                )
                     else:
                         # 1CTA: iterate flashmask segments, skipping full-mask blocks
                         loop_start = m_block_min
@@ -5080,7 +5538,12 @@ class FlashAttentionBackwardSm100:
                             softmax_scale,
                         )
                     else:
-                        thr_copy_r2s_dKV = tiled_copy_r2s_dKV.get_slice(dp_idx)
+                        # With epi_num_strips == 2 the upper 64 threads serve the
+                        # other hdim strip (its own SMEM buffer), so they reuse
+                        # rows 0..63 of the tile: slice modulo the strip's threads.
+                        thr_copy_r2s_dKV = tiled_copy_r2s_dKV.get_slice(
+                            dp_idx % self.epi_threads_r2s
+                        )
 
                     if const_expr(self.is_split_dv):
                         # DV axis is physically split (d=dv=256 OR d=192/dv=128):
@@ -5199,9 +5662,14 @@ class FlashAttentionBackwardSm100:
         consumer_state_dPsum: cutlass.pipeline.PipelineState,
         producer_state_dS: cutlass.pipeline.PipelineState,
         mask_fn: Callable,
-        partially_masked: bool = False,
+        # bool for the 1CTA segment walk (compile-time branch in the mask), or a
+        # dynamic cutlass.Boolean for the 2CTA flat loop (runtime branch around the
+        # mask's unrolled element loop). Do NOT annotate: a `bool` annotation would
+        # make the DSL treat the 2CTA value as constexpr.
+        partially_masked = False,
         sdS_xchg: cute.Tensor = None,
         tRS_sdS_xchg = None,
+        tRS_sdS_dq = None,
         exchange_stage: cute.Int32 = Int32(0),
         dS_cluster_empty_mbar_ptr: cute.Pointer = None,
         dS_cluster_full_mbar_ptr: cute.Pointer = None,
@@ -5210,6 +5678,7 @@ class FlashAttentionBackwardSm100:
         dS_cluster_empty_phase: cute.Int32 = Int32(1),
         cta_rank_in_cluster: cute.Int32 = Int32(0),
         tidx: cute.Int32 = Int32(0),
+        tRS_sP: cute.Tensor = None,
         sdS: cute.Tensor = None,
         iter_idx: cute.Int32 = Int32(0),
     ):
@@ -5232,9 +5701,10 @@ class FlashAttentionBackwardSm100:
         tSrS_t2r = cute.make_fragment(tScS_t2r.shape, Float32)
         cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
 
-        if const_expr(self.use_2cta_instrs and self.tile_hdim == 192):
-            # 2CTA d=192: dQ overlaps with S in TMEM, must release S_P early
-            # (before P is written to TMEM at offset 0).
+        if const_expr(self.tmem_dQ_overlaps_S):
+            # dQ shares TMEM columns with S/P, so S_P has to be released before P
+            # is written over it. The d256/dv256 layout is disjoint and takes the
+            # late release below instead.
             cute.arch.fence_view_async_tmem_load()
             if tidx == 0 and self.debug_print:
                 cute.printf('compute_step: CTA %d m_block=%d before S_P.consumer_release', cute.arch.block_idx_in_cluster(), m_block)
@@ -5242,7 +5712,7 @@ class FlashAttentionBackwardSm100:
                 pipeline_S_P.consumer_release(consumer_state_S_P_dP)
             if tidx == 0 and self.debug_print:
                 cute.printf('compute_step: CTA %d m_block=%d after S_P.consumer_release', cute.arch.block_idx_in_cluster(), m_block)
-        if const_expr(self.use_2cta_instrs and self.tile_hdim <= 128):
+        if const_expr(self.use_2cta_instrs and not self.use_2cta_bigd):
             # Signal S tmem load completion using pipeline_dS when 2cta hdim 128
             # dQ is overlapped with S
             if iter_idx > 0:
@@ -5260,8 +5730,14 @@ class FlashAttentionBackwardSm100:
         #### P = exp(S - LSE)
         # ---------------------------------------------
         lane_idx = cute.arch.lane_idx()
-        tSrP_r2t_f32 = cute.make_fragment(tScP_r2t.shape, Float32)  # 64
-        tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
+        if const_expr(self.folded_kv_acc):
+            # Folded accumulator: the CTA owns tile_n TMEM lanes and the copy covers
+            # 2 * tile_n threads, the upper half being the fold, so a thread's m half
+            # is exactly which half of the datapath index it sits in.
+            m_half_idx = (tidx % 128) // self.tile_n
+        if const_expr(not self.mma_P_from_smem):
+            tSrP_r2t_f32 = cute.make_fragment(tScP_r2t.shape, Float32)  # 64
+            tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
         for stage in cutlass.range_constexpr(num_stages):
             tSrS_cur = tSrS_t2r[None, stage, 0, 0]
             tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
@@ -5286,24 +5762,35 @@ class FlashAttentionBackwardSm100:
                 )
                 tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
                 tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
-            utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
-            if const_expr(stage == 0):
-                cute.arch.fence_view_async_tmem_load()
-                # Without this barrier, we could have 1 warp writing to P in tmem while
-                # another warp is still reading S from tmem.
-                self.compute_sync_barrier.arrive_and_wait()
-            cute.copy(
-                thr_copy_r2t,
-                tSrP_r2t_f32[None, stage, None, None],
-                tStP_r2t[None, stage, None, None],
-            )
+            if const_expr(self.mma_P_from_smem):
+                # P goes straight to SMEM as the dV MMA's A operand: a folded S
+                # accumulator cannot hold it (see mma_P_from_smem).
+                tSrP_cvt = cute.make_fragment_like(tSrS_cur, self.q_dtype)
+                utils.cvt_f16(tSrS_cur, tSrP_cvt)
+                cute.autovec_copy(tSrP_cvt, tRS_sP[None, stage])
+            else:
+                utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
+                if const_expr(stage == 0):
+                    cute.arch.fence_view_async_tmem_load()
+                    # Without this barrier, we could have 1 warp writing to P in tmem while
+                    # another warp is still reading S from tmem.
+                    self.compute_sync_barrier.arrive_and_wait()
+                cute.copy(
+                    thr_copy_r2t,
+                    tSrP_r2t_f32[None, stage, None, None],
+                    tStP_r2t[None, stage, None, None],
+                )
     
-        cute.arch.fence_view_async_tmem_store()
+        if const_expr(self.mma_P_from_smem):
+            # P was stored to SMEM, not TMEM: make those stores visible to the
+            # async (MMA) proxy instead.
+            cute.arch.fence_view_async_shared()
+        else:
+            cute.arch.fence_view_async_tmem_store()
         self.compute_sync_barrier.arrive_and_wait()
     
-        if const_expr(not (self.use_2cta_instrs and self.tile_hdim == 192)):
-            # Late S_P release: 1CTA non-192, split_d, split_dv all release here.
-            # 2CTA d=192 already released early because dQ shares TMEM with S/P.
+        if const_expr(not self.tmem_dQ_overlaps_S):
+            # Late S_P release: everything whose dQ does not alias S/P.
             with cute.arch.elect_one():
                 pipeline_S_P.consumer_release(consumer_state_S_P_dP)
         pipeline_LSE.consumer_release(consumer_state_LSE)
@@ -5367,16 +5854,32 @@ class FlashAttentionBackwardSm100:
                 pipeline_dS.producer_acquire(producer_state_dS)
                 if tidx == 0 and self.debug_print:
                     cute.printf('compute_step: CTA %d m_block=%d after dS.producer_acquire', cute.arch.block_idx_in_cluster(), m_block)
-                if const_expr(self.use_2cta_instrs):
+                if const_expr(self.use_2cta_instrs and not self.folded_kv_acc):
                     tdPrdS_xchg = cute.make_fragment_like(tdPrdS_cvt, self.ds_dtype)
+                if const_expr(self.folded_kv_acc and self.use_2cta_bigd):
+                    # sdS_xchg aliases sdQaccum on the bigd path and the folded store
+                    # below goes straight into it, so the drain has to be done first.
+                    cute.arch.mbarrier_wait(
+                        dQaccum_empty_mbar_ptr, phase=producer_state_dS.phase
+                    )
 
-            # RMEM->TMEM: always write to TMEM for MMA
-            if const_expr(not self.use_smem_dS_for_mma_dK or self.use_2cta_instrs):
+            # RMEM->TMEM: only when the dK MMA reads dS from TMEM
+            if const_expr(not self.mma_dS_from_smem):
                 tdPrdS_r2t_f32 = cute.recast_tensor(tdPrdS_cvt, Float32)
                 cute.copy(thr_copy_r2t, tdPrdS_r2t_f32, tdPtdS_r2t[None, stage, 0, 0])
 
+            if const_expr(self.folded_kv_acc):
+                # The dK MMA's A view wants every m row of our own n slice, so this
+                # store is unconditional. The dQ MMA's A view wants our own m half
+                # over both n slices: a thread's m half is its lane half, so half the
+                # threads store locally and half store into the exchange buffer.
+                cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
+                if m_half_idx == cta_rank_in_cluster:
+                    cute.autovec_copy(tdPrdS_cvt, tRS_sdS_dq[None, stage])
+                else:
+                    cute.autovec_copy(tdPrdS_cvt, tRS_sdS_xchg[None, stage])
             # RMEM->SMEM: For 2-CTA, keep exchange stage in registers, write non-exchange to sdS
-            if const_expr(self.use_2cta_instrs):
+            elif const_expr(self.use_2cta_instrs):
                 if exchange_stage == stage:
                     cute.autovec_copy(tdPrdS_cvt, tdPrdS_xchg)
                 else:
@@ -5395,9 +5898,10 @@ class FlashAttentionBackwardSm100:
                 pipeline_dP.consumer_release(consumer_state_S_P_dP)
         consumer_state_S_P_dP.advance()
 
-        # After the loop: copy exchange registers to sdS_xchg buffer
-        if const_expr(self.use_2cta_instrs):
-            if const_expr(self.tile_hdim == 192):
+        # After the loop: copy exchange registers to sdS_xchg buffer. The folded path
+        # stored straight into sdS_xchg inside the loop, so it has nothing to do here.
+        if const_expr(self.use_2cta_instrs and not self.folded_kv_acc):
+            if const_expr(self.use_2cta_bigd):
                 if tidx == 0 and self.debug_print:
                     cute.printf('compute_step: CTA %d m_block=%d before dQaccum_empty.mbarrier_wait phase=%d', cute.arch.block_idx_in_cluster(), m_block, producer_state_dS.phase)
                 cute.arch.mbarrier_wait(
@@ -5631,7 +6135,7 @@ class FlashAttentionBackwardSm100:
             # branch is unclear: D-only is 1CTA-ish but tile_hdim==192, so this would
             # evaluate False unless is_split_d is added to the OR. Revisit when D-only
             # is wired up.
-            delay_semaphore_release = (self.is_split_dv) or (not self.tile_hdim == 192)
+            delay_semaphore_release = (self.is_split_dv) or (not self.use_2cta_bigd)
             n_block_global_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
 
             if tidx == 0 and self.debug_print:
@@ -6032,10 +6536,10 @@ class FlashAttentionBackwardSm100:
                                 1,
                             )
 
-            # 2CTA d=192 (non-split_dv): drain dQ-accum bulk reduces and arrive
+            # 2CTA big-hdim (non-split_dv): drain dQ-accum bulk reduces and arrive
             # on dQaccum_empty barrier so MMA can re-use dQ TMEM. split_dv (1CTA)
             # does not use this barrier.
-            if const_expr(self.tile_hdim == 192 and not self.is_split_dv):
+            if const_expr(self.use_2cta_bigd and not self.is_split_dv):
                 if const_expr(self.sdQaccum_stage > 1):
                     if is_tma_warp:
                         cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
@@ -6046,7 +6550,7 @@ class FlashAttentionBackwardSm100:
             # semaphore release
             # NOTE: arrive_inc calls red_release which issues membar
             if const_expr(self.deterministic and not delay_semaphore_release):
-                if const_expr(self.sdQaccum_stage > 1 and not self.tile_hdim == 192):
+                if const_expr(self.sdQaccum_stage > 1 and not self.use_2cta_bigd):
                     if is_tma_warp:
                         cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                     self.reduce_sync_barrier.arrive_and_wait()
@@ -6238,12 +6742,25 @@ class FlashAttentionBackwardSm100:
         cta_group_tile_n = const_expr(self.tile_n * self.cta_group_size)
 
         if const_expr(not self.dKV_postprocess):
-            sdKV = sdKV[None, None, wg_idx]  # (tile_n, 64) for bf16
+            num_strips = self.epi_smem_strips
+            # Buffer index = wg * num_strips + strip. With a folded accumulator
+            # threads 0..63 hold hdim strip 0 and threads 64..127 strip 1
+            # (delta = tile_hdim / 2, i.e. the TMEM lane halves).
+            strip_idx = tidx // self.epi_threads_r2s
+            sdKV_r2s = sdKV[None, None, wg_idx * num_strips + strip_idx]
+            sdKV_strips = [
+                sdKV[None, None, wg_idx * num_strips + s]
+                # plain range: the AST preprocessor does not rewrite comprehensions,
+                # so range_constexpr would reach its runtime stub and raise
+                for s in range(num_strips)
+            ]
         else:
-            sdKV = sdKV[None, wg_idx]  # (tile_n * 32) for fp32
+            num_strips = 1
+            sdKV_r2s = sdKV[None, wg_idx]  # (tile_n * 32) for fp32
+            sdKV_strips = [sdKV_r2s]
 
         # (8, tile_n / 128, 64 / 8) = (8, 1, 8) or (4, tile_n * 32 / (128 * 4)) = (4, 8)
-        tdKVsdKV_r2s = thr_copy_r2s_dKV.partition_D(sdKV)
+        tdKVsdKV_r2s = thr_copy_r2s_dKV.partition_D(sdKV_r2s)
 
         head_idx_kv = head_idx // self.qhead_per_kvhead
         if const_expr(not self.dKV_postprocess):
@@ -6251,7 +6768,13 @@ class FlashAttentionBackwardSm100:
             gdKV_p = cute.local_tile(
                 mdKV_cur, (self.tile_n, tile_hdim), (n_block, 0)
             )  # (tile_n, hdim) - per CTA
-            gdKV = self.split_wg(gdKV_p, wg_idx, num_wg)  # (tile_n, hdim / 2)
+            if const_expr(num_strips == 1):
+                gdKV = self.split_wg(gdKV_p, wg_idx, num_wg)  # (tile_n, hdim / 2)
+            else:
+                # A folded warpgroup's two strips are hdim/2 apart, so the wg does
+                # NOT own a contiguous hdim half: tile the whole hdim and index
+                # the (wg, epi_stage, strip) triple explicitly below.
+                gdKV = gdKV_p
             gdKV_epi = cute.local_tile(
                 gdKV, epi_tile, (0, None)
             )  # (tile_n, 64, epi_stage = (hdim / 2) / 64)
@@ -6266,35 +6789,42 @@ class FlashAttentionBackwardSm100:
             gdKV_p = cute.local_tile(
                 mdKV_cur, (self.tile_n * tile_hdim,), (n_block,)
             )  # (tile_n * hdim)
-            gdKV = cute.logical_divide(gdKV_p, (self.tile_n * tile_hdim // num_wg,))[
-                ((None, wg_idx),)
-            ]  # (tile_n * hdim / 2)
-            postprocess_epi_tile = self.tile_n * self.dK_reduce_ncol
+            # Panel = 128 threads x dK_reduce_ncol values. With a folded
+            # accumulator that is (2 * tile_n) rows worth of lanes covering two
+            # hdim strips, so the panel is twice as long and there are half as
+            # many; panel index stays "wg-major, then physical column chunk",
+            # which is the contiguous hdim order the postprocess decodes.
             gdKV_epi = cute.flat_divide(
-                gdKV, (postprocess_epi_tile,)
-            )  # (tile_n * dK_reduce_ncol, epi_stages)
+                gdKV_p, (self.dKV_reduce_panel,)
+            )  # (panel, num_panels)
 
         deterministic_KV = self.deterministic and self.dKV_postprocess
         if const_expr(deterministic_KV):
             mdKV_semaphore_cur = mdKV_semaphore[n_block, None, head_idx_kv, batch_idx]
 
         if const_expr(not self.dKV_postprocess):
-            tdKVsdKV, tdKVgdKV = cpasync.tma_partition(
-                tma_atom_dKV,
-                0,  # no multicast
-                cute.make_layout(1),
-                cute.group_modes(sdKV, 0, 2),
-                cute.group_modes(gdKV_epi, 0, 2),
-            )  # (TMA) and (TMA, EPI_STAGE)
-            assert len(tdKVsdKV.shape) == 1, "Wrong rank for SMEM fragment tdKVsdKV"
-            assert len(tdKVgdKV.shape) == 2, "Wrong rank for GMEM fragment tdKVgdKV"
-            num_epi_stages = cute.size(tdKVgdKV.shape[1])
+            tdKVsdKV_list = []
+            for s in cutlass.range_constexpr(num_strips):
+                tdKVsdKV_s, tdKVgdKV = cpasync.tma_partition(
+                    tma_atom_dKV,
+                    0,  # no multicast
+                    cute.make_layout(1),
+                    cute.group_modes(sdKV_strips[s], 0, 2),
+                    cute.group_modes(gdKV_epi, 0, 2),
+                )  # (TMA) and (TMA, EPI_STAGE)
+                assert len(tdKVsdKV_s.shape) == 1, "Wrong rank for SMEM fragment tdKVsdKV"
+                assert len(tdKVgdKV.shape) == 2, "Wrong rank for GMEM fragment tdKVgdKV"
+                tdKVsdKV_list.append(tdKVsdKV_s)
+            num_gmem_tiles = cute.size(tdKVgdKV.shape[1])
+            num_epi_stages = num_gmem_tiles // (num_strips * (num_wg if num_strips > 1 else 1))
             if const_expr(K_or_V == "K"):
                 assert num_epi_stages == self.num_epi_stages, f"Epi stage calculation is wrong (K). num_epi_stages:{num_epi_stages} != self.num_epi_stages: {self.num_epi_stages}"
             else:
                 assert num_epi_stages == self.num_epi_stages_v, f"Epi stage calculation is wrong (V). num_epi_stages:{num_epi_stages} != self.num_epi_stages_v: {self.num_epi_stages_v}"
         else:
-            num_epi_stages = (tile_hdim // num_wg) // self.dK_reduce_ncol
+            num_epi_stages = (
+                tile_hdim // num_wg // self.epi_num_strips // self.dK_reduce_ncol
+            )
 
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dK_reduce_ncol)), Float32
@@ -6330,8 +6860,46 @@ class FlashAttentionBackwardSm100:
 
             tdKVrdKV_t2r = cute.make_fragment(tdKVcdKV_t2r.shape, Float32)
 
+            if const_expr(
+                self.debug_print_folded
+                and self.folded_kv_acc
+                and not self.dKV_postprocess
+                and epi_stage == 0
+            ):
+                # TEMPORARY (folded d256/dv256 bring-up): the read side is known
+                # good (each thread's (n, d) coords were measured correct); what
+                # is checked here is that the two-strip write side lines up --
+                # per-thread fragment size == per-thread SMEM slice, and threads
+                # 0..63 / 64..127 landing on strips whose d differ by hdim/2.
+                print(f"[fold-epi {K_or_V}] cta_group_tile_n={cta_group_tile_n} tile_hdim={tile_hdim}")
+                print(f"[fold-epi {K_or_V}] num_wg={num_wg} strips={num_strips} epi_tile={epi_tile} stages={num_epi_stages} gmem_tiles={num_gmem_tiles}")
+                print(f"[fold-epi {K_or_V}] tdKVtdKV      = {tdKVtdKV.layout}")
+                print(f"[fold-epi {K_or_V}] t2r post-split= {tdKVtdKV_t2r.layout}")
+                print(f"[fold-epi {K_or_V}] cdKV post-spl = {tdKVcdKV_t2r.layout}")
+                print(f"[fold-epi {K_or_V}] r2s dst       = {tdKVsdKV_r2s.layout}")
+                if (
+                    tidx == 0 or tidx == 1 or tidx == 63 or tidx == 64
+                    or tidx == 65 or tidx == 127 or tidx == 128 or tidx == 192
+                ):
+                    e_first = tdKVcdKV_t2r[0]
+                    e_last = tdKVcdKV_t2r[cute.size(tdKVcdKV_t2r) - 1]
+                    cute.printf(
+                        "[fold-epi] tidx=%d wg=%d | first=(n=%d,d=%d) last=(n=%d,d=%d)",
+                        tidx,
+                        wg_idx,
+                        e_first[0],
+                        e_first[1],
+                        e_last[0],
+                        e_last[1],
+                    )
+
             assert cute.size(tdKVrdKV_t2r) == cute.size(tdKVtdKV_t2r) // cute.arch.WARP_SIZE, (
                 "RMEM<->TMEM fragment size mismatch"
+            )
+            assert cute.size(tdKVrdKV_t2r) == cute.size(tdKVsdKV_r2s), (
+                f"RMEM<->SMEM fragment size mismatch: {cute.size(tdKVrdKV_t2r)} != "
+                f"{cute.size(tdKVsdKV_r2s)} (epi_num_strips={self.epi_num_strips}, "
+                f"epi_tile={epi_tile})"
             )
 
             # TMEM -> RMEM -- copy and fence
@@ -6356,13 +6924,26 @@ class FlashAttentionBackwardSm100:
             # SMEM -> GMEM
             if leader_warp:
                 if const_expr(not self.dKV_postprocess):
-                    cute.copy(tma_atom_dKV, tdKVsdKV, tdKVgdKV[None, epi_stage])
+                    for s in cutlass.range_constexpr(num_strips):
+                        if const_expr(num_strips == 1):
+                            gmem_tile_idx = epi_stage
+                        else:
+                            # d offset = wg * (stages * ncol) + epi_stage * ncol
+                            #            + strip * (tile_hdim / 2)
+                            gmem_tile_idx = (
+                                wg_idx * num_epi_stages
+                                + epi_stage
+                                + s * num_wg * num_epi_stages
+                            )
+                        cute.copy(
+                            tma_atom_dKV, tdKVsdKV_list[s], tdKVgdKV[None, gmem_tile_idx]
+                        )
                 else:
                     with cute.arch.elect_one():
                         copy_utils.cpasync_reduce_bulk_add_f32(
-                            sdKV.iterator,
-                            gdKV_epi[None, epi_stage].iterator,
-                            self.tma_copy_bytes["dKacc"],
+                            sdKV_r2s.iterator,
+                            gdKV_epi[None, wg_idx * num_epi_stages + epi_stage].iterator,
+                            self.dKV_reduce_bytes,
                         )
                 if const_expr(epi_stage < num_epi_stages - 1 or self.is_split_d or self.is_split_dv):
                     cute.arch.cp_async_bulk_commit_group()

@@ -56,15 +56,23 @@ def mask_r2p(X: cute.Tensor, col_limit: Int32, arch: int = 90, rank1: bool = Fal
 
 
 @cute.jit
-def mask_r2p_transposed(X: cute.Tensor, row_limit_top: Int32, num_rep: int) -> None:
+def mask_r2p_transposed(
+    X: cute.Tensor, row_limit_top: Int32, num_rep: int, row_group_stride=None
+) -> None:
     # Bit manipulation, compiles down to the R2P instruction
-    # For sm100: we know that tScS_t2r[i][0] has the form 0, 1, ..., 31, 64, ..., 127
-    # or 0, 1, ..., 15, 32, ..., 47, 64, ...
+    # Element c of the fragment sits at relative row
+    #     (c // num_rep) * row_group_stride + c % num_rep
+    # For sm100 that is e.g. 0, 1, ..., 15, 32, ..., 47, 64, ... (num_rep 16,
+    # stride 32) or 0, 1, ..., 31, 64, ..., 95 (num_rep 32, stride 64).
+    # The stride is NOT always num_rep * num_wg: with a folded accumulator
+    # (2CTA d256/dv256, tile_n=64) the t2r stages advance the row by num_rep, so
+    # the fragment rows are 0..63 contiguous. Pass the stride measured off the
+    # coordinate tensor rather than assuming it.
     # We compare a transformed version of limit to 0, 1, 2, 3, 4, 5, ...
-    # Here we hardcode for the case of 2 warp groups.
-    num_wg = 2
-    row_limit_top_transformed = row_limit_top // (num_rep * num_wg) * num_rep + min(
-        row_limit_top % (num_rep * num_wg), num_rep
+    if row_group_stride is None:
+        row_group_stride = num_rep * 2  # two warp groups
+    row_limit_top_transformed = row_limit_top // row_group_stride * num_rep + min(
+        row_limit_top % row_group_stride, num_rep
     )
     ncol = cute.size(X.shape)
     # Ideally we'd move by 32 instead of 24, but mask >> i isn't correct for i == 31
@@ -599,7 +607,11 @@ class AttentionMask:
         mask_causal: cutlass.Constexpr,
         mask_local: cutlass.Constexpr,
         sStartEndRowIndices: cute.Tensor,
-        partially_masked: bool,
+        # Python bool (compile-time branch) or cutlass.Boolean (runtime branch around
+        # the unrolled element loop below, used by the 2CTA bwd flat loop). Left
+        # unannotated on purpose: a `bool` annotation makes the DSL treat a dynamic
+        # value as constexpr.
+        partially_masked,
         per_cta_tile_n: cutlass.Constexpr[int] = 0,
     ) -> None:
         """
@@ -658,7 +670,14 @@ class AttentionMask:
                         )
                 else:
                     num_rep = cute.size(tScS_t2r, mode=[0])  # 16 or 32
-                    mask_r2p_transposed(acc_S, row_limit_top, num_rep)
+                    # Row step between the fragment's t2r stages, straight from the
+                    # coordinate tensor (see mask_r2p_transposed): num_rep * 2 for the
+                    # unfolded accumulators, num_rep when the accumulator is folded.
+                    if const_expr(cute.size(tScS_t2r) > num_rep):
+                        row_group_stride = t0ScS_t2r[num_rep][ROW] - t0ScS_t2r[0][ROW]
+                    else:
+                        row_group_stride = num_rep
+                    mask_r2p_transposed(acc_S, row_limit_top, num_rep, row_group_stride)
 
                 if partially_masked:
                     # FlashMask

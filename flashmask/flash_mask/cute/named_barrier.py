@@ -30,3 +30,8 @@ class NamedBarrierBwdSm100(enum.IntEnum):
     EpilogueWG2 = enum.auto()
     Compute = enum.auto()
     dQaccReduce = enum.auto()
+    # Persistent only: end-of-work-tile fence between the load warp and the
+    # compute / reduce warps. sdK aliases sK and sdV aliases sV, so the next
+    # tile's K/V (and flashmask) loads must not start before the current tile's
+    # dKV epilogue and dQ reduction are done with those buffers.
+    TileBoundary = enum.auto()

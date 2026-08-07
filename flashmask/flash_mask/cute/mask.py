@@ -56,15 +56,23 @@ def mask_r2p(X: cute.Tensor, col_limit: Int32, arch: int = 90, rank1: bool = Fal
 
 
 @cute.jit
-def mask_r2p_transposed(X: cute.Tensor, row_limit_top: Int32, num_rep: int) -> None:
+def mask_r2p_transposed(
+    X: cute.Tensor, row_limit_top: Int32, num_rep: int, row_group_stride=None
+) -> None:
     # Bit manipulation, compiles down to the R2P instruction
-    # For sm100: we know that tScS_t2r[i][0] has the form 0, 1, ..., 31, 64, ..., 127
-    # or 0, 1, ..., 15, 32, ..., 47, 64, ...
+    # Element c of the fragment sits at relative row
+    #     (c // num_rep) * row_group_stride + c % num_rep
+    # For sm100 that is e.g. 0, 1, ..., 15, 32, ..., 47, 64, ... (num_rep 16,
+    # stride 32) or 0, 1, ..., 31, 64, ..., 95 (num_rep 32, stride 64).
+    # The stride is NOT always num_rep * num_wg: with a folded accumulator
+    # (2CTA d256/dv256, tile_n=64) the t2r stages advance the row by num_rep, so
+    # the fragment rows are 0..63 contiguous. Pass the stride measured off the
+    # coordinate tensor rather than assuming it.
     # We compare a transformed version of limit to 0, 1, 2, 3, 4, 5, ...
-    # Here we hardcode for the case of 2 warp groups.
-    num_wg = 2
-    row_limit_top_transformed = row_limit_top // (num_rep * num_wg) * num_rep + min(
-        row_limit_top % (num_rep * num_wg), num_rep
+    if row_group_stride is None:
+        row_group_stride = num_rep * 2  # two warp groups
+    row_limit_top_transformed = row_limit_top // row_group_stride * num_rep + min(
+        row_limit_top % row_group_stride, num_rep
     )
     ncol = cute.size(X.shape)
     # Ideally we'd move by 32 instead of 24, but mask >> i isn't correct for i == 31
@@ -352,6 +360,7 @@ class AttentionMask:
         n_block_idx: Int32 = None,
         encode_n_block: Int32 = None,
         generate_block_buffer_usable_block_count: Int32 = None,
+        use_r2p: cutlass.Constexpr[bool] = True,
     ) -> Optional[cutlass.pipeline.PipelineState]:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_shape = (self.tile_m, self.tile_n)
@@ -364,7 +373,14 @@ class AttentionMask:
         if n_block < 0:
             n_block = 0
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n
-        r2p = True
+        # mask_r2p masks by REGISTER INDEX: it relies on tScS_t2r[i][1] == i (see its comment).
+        # That holds only when a thread owns a whole row of the accumulator starting at column
+        # 0. With a folded accumulator (m_block_size == 64 per CTA, N split across the TMEM
+        # lane halves) thread t + 64 holds columns tile_n/2 .. tile_n-1, so its register index i
+        # is tile_n/2 short of the real column and NOTHING gets masked -- the out-of-range keys
+        # then feed softmax (observed: row_sum exactly 2x the true value). Callers on such a
+        # config pass use_r2p=False to take the coordinate-based loop instead.
+        r2p = const_expr(use_r2p)
         if const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
                 if const_expr(not r2p):
@@ -460,7 +476,7 @@ class AttentionMask:
                     else 0
                 )
                 # if cute.arch.thread_idx()[0] == 0 or cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block = {}, row_idx = {}, causal_row_offset = {}, col_limit_right = {}, col_limit_left = {}", m_block, n_block, row_idx, causal_row_offset, col_limit_right, col_limit_left)
-                for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
+                for i in cutlass.range_constexpr(cute.size(tScS_t2r.shape)):
                     col_idx = tScS_t2r[i][1]
                     acc_S[i] = (
                         -Float32.inf
@@ -476,8 +492,14 @@ class AttentionMask:
                 load_startend_row_indices_consumer_state.phase)
 
             if n_block_idx < generate_block_buffer_usable_block_count and encode_n_block >= 0:
+                # range_constexpr, not range(..., unroll_full=True): the latter emits a
+                # real loop with a dynamic induction variable, and a dynamically indexed
+                # store into acc_S keeps its alloca out of registers -- the whole S
+                # fragment then lives in local memory and every access in softmax becomes
+                # an ld.local/st.local (measured: ~16KB of local traffic per KV tile).
+                nelem = const_expr(cute.size(tScS_t2r.shape))
                 if const_expr(has_ut_start):
-                    for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
+                    for i in cutlass.range_constexpr(nelem):
                         lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
                         lte = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n] - m_block * self.tile_m
                         uts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 2] - m_block * self.tile_m
@@ -485,19 +507,19 @@ class AttentionMask:
                         if (tScS_t2r[i][0] >= lts and tScS_t2r[i][0] < lte) or (tScS_t2r[i][0] >= uts and tScS_t2r[i][0] < ute):
                             acc_S[i] = -cutlass.Float32.inf
                 elif const_expr(has_lt_end):
-                    for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
+                    for i in cutlass.range_constexpr(nelem):
                         lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
                         lte = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n] - m_block * self.tile_m
                         if tScS_t2r[i][0] >= lts and tScS_t2r[i][0] < lte:
                             acc_S[i] = -cutlass.Float32.inf
                 elif const_expr(has_ut_end):
-                    for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
+                    for i in cutlass.range_constexpr(nelem):
                         lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
                         ute = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 3] - m_block * self.tile_m
                         if tScS_t2r[i][0] >= lts or tScS_t2r[i][0] < ute:
                             acc_S[i] = -cutlass.Float32.inf
                 else:
-                    for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
+                    for i in cutlass.range_constexpr(nelem):
                         lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
                         if tScS_t2r[i][0] >= lts:
                             acc_S[i] = -cutlass.Float32.inf
@@ -585,7 +607,11 @@ class AttentionMask:
         mask_causal: cutlass.Constexpr,
         mask_local: cutlass.Constexpr,
         sStartEndRowIndices: cute.Tensor,
-        partially_masked: bool,
+        # Python bool (compile-time branch) or cutlass.Boolean (runtime branch around
+        # the unrolled element loop below, used by the 2CTA bwd flat loop). Left
+        # unannotated on purpose: a `bool` annotation makes the DSL treat a dynamic
+        # value as constexpr.
+        partially_masked,
         per_cta_tile_n: cutlass.Constexpr[int] = 0,
     ) -> None:
         """
@@ -612,7 +638,7 @@ class AttentionMask:
                 _fm_tile_n = per_cta_tile_n if const_expr(per_cta_tile_n > 0) else self.tile_n
                 for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                     col_local = tScS_t2r[i][COL] % _fm_tile_n
-                    lts = sStartEndRowIndices[col_local, 0] - m_block * self.tile_m 
+                    lts = sStartEndRowIndices[col_local, 0] - m_block * self.tile_m
                     ute = sStartEndRowIndices[col_local, 1] - m_block * self.tile_m
                     acc_S[i] = (
                         -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts else acc_S[i]
@@ -644,7 +670,14 @@ class AttentionMask:
                         )
                 else:
                     num_rep = cute.size(tScS_t2r, mode=[0])  # 16 or 32
-                    mask_r2p_transposed(acc_S, row_limit_top, num_rep)
+                    # Row step between the fragment's t2r stages, straight from the
+                    # coordinate tensor (see mask_r2p_transposed): num_rep * 2 for the
+                    # unfolded accumulators, num_rep when the accumulator is folded.
+                    if const_expr(cute.size(tScS_t2r) > num_rep):
+                        row_group_stride = t0ScS_t2r[num_rep][ROW] - t0ScS_t2r[0][ROW]
+                    else:
+                        row_group_stride = num_rep
+                    mask_r2p_transposed(acc_S, row_limit_top, num_rep, row_group_stride)
 
                 if partially_masked:
                     # FlashMask
@@ -654,7 +687,7 @@ class AttentionMask:
                     _fm_tile_n = per_cta_tile_n if const_expr(per_cta_tile_n > 0) else self.tile_n
                     for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                         col_local = tScS_t2r[i][COL] % _fm_tile_n
-                        lts = sStartEndRowIndices[col_local, 0] - m_block * self.tile_m 
+                        lts = sStartEndRowIndices[col_local, 0] - m_block * self.tile_m
                         lte = sStartEndRowIndices[col_local, 1] - m_block * self.tile_m
                         acc_S[i] = (
                             -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts and tScS_t2r[i][ROW] < lte else acc_S[i]

@@ -10,6 +10,43 @@ from cutlass._mlir.dialects import llvm
 import flash_mask.cute.mma_sm100_desc as sm100_desc
 from flash_mask.cute.utils import parse_swizzle_from_pointer
 
+# cudaFuncAttributeMaxDynamicSharedMemorySize on SM100.
+SM100_SMEM_CAPACITY_BYTES = 227 * 1024
+
+
+def tmem_cols(n: int, m_total: int, cta_group: int) -> int:
+    """Per-CTA TMEM columns taken by an ``m_total x n`` f32 accumulator.
+
+    TMEM is 128 lanes x 512 columns and accumulator rows map to lanes, so a CTA that
+    fills all 128 lanes pays ``n`` columns. The two ways of owning fewer rows do NOT
+    cost the same, which is why this rule cannot be reduced to ``n * rows / 128``:
+      - 2-CTA UMMA: the pair splits M, so a CTA owns ``m_total / 2`` rows. CuTe FOLDS
+        the tile, spreading those rows over all 128 lanes by splitting N, and the column
+        footprint shrinks by the same ratio -- 64 rows cost ``n / 2`` columns. This is
+        what lets the d256/dv256 backward keep dV and dK resident, and what makes the
+        forward's O(64 x 512) accumulator fit in 256 columns.
+      - 1-CTA with M=64: the 16-datapath interleave leaves half the lanes idle instead
+        of folding, so the tile still costs the full ``n`` columns.
+
+    The measured accumulator layouts behind these two cases (B200) are tabulated in the
+    module docstring of flash_bwd_sm100_bigd.py.
+
+    Args:
+        n: MMA N mode.
+        m_total: MMA M mode across the whole CTA group (i.e. cluster-wide).
+        cta_group: Number of CTAs participating in the MMA.
+
+    Returns:
+        TMEM columns occupied on each CTA.
+    """
+    assert cta_group in (1, 2), f"unsupported cta_group {cta_group}"
+    rows_per_cta = m_total // cta_group
+    assert rows_per_cta in (64, 128), f"unsupported accumulator rows {rows_per_cta}"
+    if cta_group == 1 or rows_per_cta == 128:
+        return n
+    assert n % 2 == 0, f"folded accumulator needs an even N, got {n}"
+    return n // 2
+
 
 @cute.jit
 def gemm_w_idx(

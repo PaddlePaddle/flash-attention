@@ -638,7 +638,7 @@ class AttentionMask:
                 _fm_tile_n = per_cta_tile_n if const_expr(per_cta_tile_n > 0) else self.tile_n
                 for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                     col_local = tScS_t2r[i][COL] % _fm_tile_n
-                    lts = sStartEndRowIndices[col_local, 0] - m_block * self.tile_m 
+                    lts = sStartEndRowIndices[col_local, 0] - m_block * self.tile_m
                     ute = sStartEndRowIndices[col_local, 1] - m_block * self.tile_m
                     acc_S[i] = (
                         -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts else acc_S[i]
@@ -687,7 +687,7 @@ class AttentionMask:
                     _fm_tile_n = per_cta_tile_n if const_expr(per_cta_tile_n > 0) else self.tile_n
                     for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                         col_local = tScS_t2r[i][COL] % _fm_tile_n
-                        lts = sStartEndRowIndices[col_local, 0] - m_block * self.tile_m 
+                        lts = sStartEndRowIndices[col_local, 0] - m_block * self.tile_m
                         lte = sStartEndRowIndices[col_local, 1] - m_block * self.tile_m
                         acc_S[i] = (
                             -cutlass.Float32.inf if tScS_t2r[i][ROW] >= lts and tScS_t2r[i][ROW] < lte else acc_S[i]

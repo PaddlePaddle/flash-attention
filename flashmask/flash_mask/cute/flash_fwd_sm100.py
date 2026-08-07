@@ -187,13 +187,11 @@ class FlashAttentionForwardSm100:
             self.head_dim_v_padded,
             n_block_size,
         )
-        # The tcgen05 MMA atom's N is capped at 256 (cutlass/cute/nvgpu/tcgen05/mma.py
-        # :198-228), so head_dim_v > 256 cannot be one instruction. It is expressed as
-        # several N-tiles of the SAME accumulator instead: the atom is built with
-        # N = pv_atom_n while the MMA *tiler* keeps the full head_dim_v, and
-        # partition_shape_C((M, head_dim_v)) then yields head_dim_v / pv_atom_n N-tiles
-        # (measured: ((64,256),1,2) for m=64 per CTA and dv=512, with the 2nd tile at
-        # physical TMEM column 128 -- i.e. 256 columns for the whole 64x512 accumulator).
+        # The tcgen05 MMA atom's N is capped at 256, so head_dim_v > 256 cannot be one
+        # instruction. It is expressed as several N-tiles of the SAME accumulator
+        # instead: the atom is built with N = pv_atom_n while the MMA *tiler* keeps the
+        # full head_dim_v, so partition_shape_C((M, head_dim_v)) yields
+        # head_dim_v / pv_atom_n N-tiles that sit side by side in TMEM columns.
         self.pv_atom_n = min(self.head_dim_v_padded, 256)
         assert self.head_dim_v_padded % self.pv_atom_n == 0
         self.qk_acc_dtype = Float32
@@ -610,17 +608,13 @@ class FlashAttentionForwardSm100:
     def tmem_cols(self, n: int) -> int:
         """Physical TMEM columns taken by an `m_block_size x n` f32 accumulator.
 
-        TMEM is 128 lanes x 512 columns. An accumulator with 128 rows maps one row per lane
-        and therefore costs `n` columns. With fewer rows CuTe folds the tile: 64 rows are
-        spread over all 128 lanes by splitting N in half, so the same tile costs only `n / 2`
-        columns (this is what lets O(64 x 512) fit in 256 columns, cf. FlashMLA's sm100
-        sparse prefill tmem_cols::{O,Q,P} layout).
+        m_block_size is this CTA's share of the MMA's M, so the cluster-wide M is
+        m_block_size * cta_group_size. The column rule (including folding) lives in
+        blackwell_helpers.tmem_cols.
         """
-        assert (n * self.m_block_size) % 128 == 0, (
-            f"accumulator tile {self.m_block_size}x{n} does not map to a whole number of "
-            "TMEM columns"
+        return sm100_utils.tmem_cols(
+            n, self.m_block_size * self.cta_group_size, self.cta_group_size
         )
-        return n * self.m_block_size // 128
 
     def folded_acc_lanes(self) -> int:
         """Number of TMEM lanes the O accumulator occupies (always 128)."""
@@ -2000,7 +1994,7 @@ class FlashAttentionForwardSm100:
 
     @cute.jit
     def prefix_sum_kernel(self, value_per_thread: Int32) -> Int32:
-        """ 
+        """
         modified from cutlass.utils.grouped_gemm_tile_scheduler_helper
         Perform prefix sum within a full warp.
 
@@ -2009,8 +2003,8 @@ class FlashAttentionForwardSm100:
         :return: The prefix sum result for this thread
         :rtype: Int32
         """
-        clamp_value = 0 
-        idx = 1 
+        clamp_value = 0
+        idx = 1
         sum_per_thread = value_per_thread
         num_generate_block_threads = cute.arch.WARP_SIZE * len(self.generate_block_warp_ids)
         tidx = cute.arch.thread_idx()[0] % num_generate_block_threads
@@ -2018,7 +2012,7 @@ class FlashAttentionForwardSm100:
         while const_expr(idx < cute.arch.WARP_SIZE):
             value = cute.arch.shuffle_sync_up(
                 sum_per_thread, idx, mask_and_clamp=clamp_value
-            )   
+            )
             if lane_idx >= idx:
                 sum_per_thread += value
             idx = idx << 1
@@ -2303,7 +2297,7 @@ class FlashAttentionForwardSm100:
             warp_id = tidx >> 5
             lane_id = tidx & 31
             # warp-wide prefix-sum
-            prefix_sum = self.prefix_sum_kernel(prefix_sum) 
+            prefix_sum = self.prefix_sum_kernel(prefix_sum)
 
             if not fully_masked:
                 # TODO(wusiming): not sure if cutlass.Int32 keep the same format as cpp
@@ -4497,7 +4491,7 @@ class FlashAttentionForwardSm100:
                 self.check_hdim_v_oob,
                 self.qhead_per_kvhead,
             )
-        
+
             # load acc O from smem to rmem for wider vectorization
             tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
             cute.autovec_copy(tOsO, tOrO)

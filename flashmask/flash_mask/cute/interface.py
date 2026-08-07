@@ -207,14 +207,14 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
         # hdim 256: mirror C++ FA3 run_mha_bwd_hdim256 (Arch>=90); dKV/dQ MMAs
         # use swapAB. The dQ-accumulation path drives the smem budget and must
         # match flash_bwd_sm90's dQacc_use_TMA (== deterministic for d256):
-        #   - non-deterministic: dQ is atomicAdd'd straight to gmem, so the 64KB
-        #     dQ smem staging buffer is dropped. That headroom buys a 2-stage Q
-        #     pipeline and the larger dense N=80 tile (~20% fewer KV-blocks;
-        #     flashmask keeps N=64 to match its block-list tiling).
-        #   - deterministic: ordered accumulation forces the TMA-staging path,
-        #     re-adding the 64KB buffer. 2-stage Q / N=80 would then overflow
-        #     Hopper's ~227KB smem (CUDA_ERROR_INVALID_VALUE at launch), so use
-        #     a 1-stage Q pipeline and N=64.
+        #   - non-deterministic: dQ is atomicAdd'd straight to gmem, so the dQ smem
+        #     staging buffer is dropped. That headroom buys a 2-stage Q pipeline and
+        #     the larger dense N=80 tile (fewer KV blocks; flashmask keeps N=64 to
+        #     match its block-list tiling).
+        #   - deterministic: ordered accumulation forces the TMA-staging path, which
+        #     re-adds that buffer. 2-stage Q / N=80 would then overflow Hopper's smem
+        #     limit (CUDA_ERROR_INVALID_VALUE at launch), so use a 1-stage Q pipeline
+        #     and N=64.
         if deterministic:
             n_block_size, num_stages_Q = 64, 1
         else:
@@ -368,12 +368,11 @@ def _flash_attn_fwd(
     # head_dim > 256 keeps head_dim_v whole and runs the folded (m_block_size == 64)
     # accumulator config below. There used to be a fallback that split head_dim_v into
     # several <= 256-wide passes; it is gone because every extra pass costs a FULL
-    # redundant Q*K^T. For d=dv=512 the split is 1.5x the useful FLOPs (measured 49.5ms /
-    # 711 effective TFLOPs/s, vs 37.8ms / 931 effective for the single pass on
-    # b16 s8192 h16 d512), and at dv=128 it is 2.5x (86.9ms / 405 effective).
+    # redundant Q*K^T. For d=dv=512 the split is 1.5x the useful FLOPs, and at dv=128 it
+    # is 2.5x; both measured slower than the single pass by the same order.
     #
     # The features the folded accumulator cannot express are therefore not supported at
-    # head_dim_v > 256 -- assert instead of silently taking a 1.3-2.3x slower route. See
+    # head_dim_v > 256 -- assert instead of silently taking a measurably slower route. See
     # also the folded_acc asserts in FlashAttentionForwardSm100.__init__.
     if compute_capability == 10 and head_dim > 256 and v.shape[-1] > 256:
         assert v.shape[-1] <= 512, (
@@ -394,9 +393,9 @@ def _flash_attn_fwd(
             "head_dim_v > 256 does not support block sparsity (folded accumulator)"
         )
 
-    # num_stages=2 exceeds Hopper's ~227KB per-block shared-memory limit
-    # (e.g. hdim=256 needs ~320KB -> cuLaunchKernel CUDA_ERROR_INVALID_VALUE), so
-    # shrink the N tile to 64. Set BEFORE the flashmask nblock max/min + block-list
+    # num_stages=2 exceeds Hopper's per-block shared-memory limit at hdim > 128
+    # (cuLaunchKernel returns CUDA_ERROR_INVALID_VALUE), so shrink the N tile to 64.
+    # Set BEFORE the flashmask nblock max/min + block-list
     # generation below so prepare_block_maxmin / reduce_block_count /
     # compute_flashmask_block_lists and the kernel all agree on n_block_size
     # (otherwise the per-n_block arrays disagree in length -> reshape error).
@@ -404,8 +403,8 @@ def _flash_attn_fwd(
         n_block_size = 64
         # d256/dv256 dense fwd is tensor-core bound; a larger KV tile (80 vs 64,
         # matching mainline FA3) cuts KV-loop iterations/overhead and feeds the
-        # MMA better. smem at N=80 (sQ 64KB + sK 80KB + sV 80KB ~= 224KB, no P
-        # since mma_pv_is_rs) fits Hopper's ~227KB. Only widen the dense
+        # MMA better, and it still fits Hopper's smem limit because mma_pv_is_rs
+        # means there is no P buffer. Only widen the dense
         # (non-flashmask) d256 case: flashmask keeps 64 so the block max/min scan
         # + block-list tiling (kBlockN) agree (and leave headroom for s_rowidx);
         # head_dim=192 keeps 64 (dv=128 tile is a different smem shape).
@@ -414,23 +413,19 @@ def _flash_attn_fwd(
 
     # SM100 per-pass config for head_dim=576 (head_dim_v <= 256 after the split above).
     # m_block stays 128: the softmax TMEM load atom needs a QK accumulator with M=128.
-    # With m=128 the KV tile must shrink to 32 to fit SMEM, since Q alone takes
-    # m*576*2B = 144KB (sO overlaps sQ) and K/V share one buffer of kv_stage*n*576*2B
-    # (72KB at n=32, kv_stage=2) -> ~216KB of the ~227KB budget.
+    # With m=128 the KV tile must shrink to 32 to fit SMEM, since Q alone takes most of
+    # the budget (sO overlaps sQ) and K/V share one buffer.
     # n_block must stay a multiple of 32 (tilePlikeFP32 = n//32*16).
     is_bigd_fwd = compute_capability == 10 and head_dim > 256
     if is_bigd_fwd:
         m_block_size = 128
         n_block_size = 32
 
-    # SM100 big-d (d>256, dv<=256 per pass): the 1-CTA config is forced to n=32 because
-    # sQ alone is m*d*2B = 128KB at m=128, which caps FLOP-per-SMEM-byte at ~35 (vs the
-    # ~85 needed to saturate the tensor core) and is why hd512 fwd collapses to ~103ms.
-    # A 2-CTA (tcgen05 CTA-pair) UMMA splits the MMA's N across the pair, so sK/sV per CTA
-    # is halved and n can double at identical SMEM: measured per-CTA footprint for
-    # (m=128, n=64, d=512, dv=256, q_stage=1, kv_stage=2) is sQ 128K + sK 64K + sV 32K,
-    # i.e. exactly the 1-CTA n=32 footprint, while the pair's MMA tile grows from
-    # 128x32 to 256x64 (4x the FLOPs per KV tile load).
+    # SM100 big-d (d>256, dv<=256 per pass): the 1-CTA config is forced to n=32 because sQ
+    # alone eats most of the SMEM budget at m=128, which leaves far too little
+    # FLOP-per-SMEM-byte to saturate the tensor core. A 2-CTA (tcgen05 CTA-pair) UMMA
+    # splits the MMA's N across the pair, so sK/sV per CTA is halved and n can double at
+    # the same footprint, multiplying the FLOPs per KV tile load.
     #
     # m_block_size stays 128 for every per-pass (dv <= 256) config. The MMA's M is split
     # across the pair, so a CTA owns m_block_size accumulator rows; every TMEM copy in
@@ -444,17 +439,16 @@ def _flash_attn_fwd(
     if is_bigd_fwd:
         # Enabled for both the dense and the flashmask path. An earlier "flashmask hangs
         # with the CTA pair" report turned out to be the test harness running out of
-        # memory while building its reference attn_bias (cuda-gdb showed no resident
-        # kernel; the stack was a paddle `set_value_` strided copy), not a kernel
-        # deadlock, so there is no reason to keep flashmask on the slower 1-CTA config.
+        # memory while building its reference attn_bias, not a kernel deadlock, so there
+        # is no reason to keep flashmask on the slower 1-CTA config.
         use_2cta_instrs = True
     if use_2cta_instrs:
-        # m_block_size 128 keeps one accumulator row per thread. 64 folds the accumulator (64
-        # rows spread over all 128 TMEM lanes, N split between the lane halves), which HALVES
-        # its column cost: O(64x512) f32 takes 256 of the 512 TMEM columns, so dv=512 fits in
-        # ONE pass (O 256 + S 32 + P 16 = 304). That is the only way to avoid a 1.5x QK
-        # redundancy; the price is half the arithmetic intensity per KV tile (the pair covers
-        # 128 query rows instead of 256).
+        # m_block_size 128 keeps one accumulator row per thread. 64 folds the accumulator
+        # (64 rows spread over all 128 TMEM lanes, N split between the lane halves), which
+        # HALVES its TMEM column cost and is the only reason dv=512 fits in ONE pass --
+        # i.e. the only way to avoid the redundant QK of a multi-pass split. The price is
+        # half the arithmetic intensity per KV tile (the pair covers 128 query rows
+        # instead of 256).
         if v.shape[-1] > 256:
             m_block_size = 64
         else:
@@ -652,8 +646,8 @@ def _flash_attn_fwd(
 
     if out is None:
         # then stored, so fully-masked rows/blocks (incl. generate_empty_mask) come
-        # out as 0. So on SM90 use an uninitialized buffer to skip the ~1GB O
-        # zero-fill that dominates short-seq / high-sparsity calls (~5% fwd speedup).
+        # out as 0. So on SM90 use an uninitialized buffer to skip the O
+        # zero-fill that dominates short-seq / high-sparsity calls (measured fwd speedup).
         # On SM100 the flashmask fwd skips the O store for a fully-masked query block
         # (valid_block_count == 0) and has no zero-writer for it, so that O tile would
         # be left uninitialized -- keep paddle.zeros on SM100.
@@ -778,10 +772,10 @@ def _flash_attn_fwd(
     current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
 
     # NOTE: do NOT bump n_block_size to 192 for the dense d=128 (non-causal,
-    # non-flashmask) case. tile_n=192 with num_stages=2 needs ~225 KiB smem, which
-    # hits Hopper's ~228 KiB ceiling -> 1 block/SM and near-zero L1, making Full
-    # ~6% slower than tile_n=128 (FA4 uses 128 and reaches ~647 vs ~613 TFLOP/s
-    # here). Keep the default 128 to match FA4's dense config.
+    # non-flashmask) case. tile_n=192 with num_stages=2 sits right at Hopper's smem
+    # ceiling -> 1 block/SM and near-zero L1, making Full
+    # measurably slower than tile_n=128 (FA4 uses 128 and is faster here too).
+    # Keep the default 128 to match FA4's dense config.
     if compute_capability == 10:
         # TODO: fix the varlen case
         if (
@@ -1500,7 +1494,7 @@ def _flash_attn_bwd(
     head_dim_v_rounded = (head_dim_v + hdim_round_to - 1) // hdim_round_to * hdim_round_to
 
     # dq: dq_accum -> dq postprocess always writes the full m_block range, so empty_like
-    # is safe on fixed-seqlen path and avoids a redundant bf16 fill (~150us in 4k bench).
+    # is safe on fixed-seqlen path and avoids a redundant bf16 fill.
     # dk/dv: only safe to skip the zero-fill when postprocess writes every row, i.e.
     # when dk_accum/dv_accum is in use (qhead_per_kvhead > 1 or is_split_d_bwd). In the
     # GQA-ratio==1 + not-split-d path the main bwd kernel writes dk/dv directly, and
@@ -2068,8 +2062,8 @@ def _flash_attn_bwd(
     num_threads = 256 if compute_capability == 9 else 128
     arch = compute_capability * 10
 
-    # The dK/dV postprocess decodes the fp32 accum with its 2-CTA branch
-    # (flash_bwd_postprocess.py:412+), which hard-codes row_groups = 2: it reads a
+    # The dK/dV postprocess decodes the fp32 accum with its 2-CTA branch in
+    # flash_bwd_postprocess.py, which hard-codes row_groups = 2: it reads a
     # panel of (128 threads x ncol) values and interprets threads 0..63 as rows
     # 0..63 of the block and threads 64..127 as the SAME 64 rows at hdim + 128.
     # That is exactly what the folded 2CTA bwd kernel writes with a 64-row KV
@@ -2077,9 +2071,8 @@ def _flash_attn_bwd(
     # (seqlen_k_rounded is padded to a multiple of 2 * n_block_size whenever
     # cluster_size == 2, so the pairing never runs off the end.) It is also the
     # only workable choice mechanically: tcgen05.make_tmem_copy cannot slice a
-    # 1-CTA accumulator with fewer than 128 rows -- at block_size=64 it becomes
-    # (((16,4),hdim),1,1):(((65536,2097152),1),0,0) and every Ld32x32b Repetition
-    # (8..128) is rejected.
+    # 1-CTA accumulator with fewer than 128 rows -- at block_size=64 every
+    # Ld32x32b Repetition is rejected.
     n_block_size_kv_post = (
         max(n_block_size, 128) if compute_capability == 10 else n_block_size
     )
@@ -2168,7 +2161,7 @@ def _flash_attn_bwd(
                 dtype, hd, arch, block_size, num_threads, atom_layout, swapAB,
                 use_2cta_instrs=use_2cta, cluster_size=cluster,
             )
- 
+
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
                 fa_bwd_post,
                 d_accum_t, d_out_t, scale,
@@ -2480,7 +2473,7 @@ def _flash_attn_bwd(
             head_dim, m_block_size, AtomLayoutMdQ, dQ_swapAB,
             use_2cta_instrs, 1, cu_seqlens_q_tensor, seqused_q_tensor, "dq",
         )
-        
+
         if qhead_per_kvhead > 1:
             _postprocess_run(
                 _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),

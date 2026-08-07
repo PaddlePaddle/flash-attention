@@ -1,6 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
 
-import os
 from typing import Optional, Tuple
 from dataclasses import dataclass, fields
 
@@ -307,7 +306,6 @@ class StaticPersistentClusterTileScheduler:
         num_head: Int32
         total_pairs: Int32
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
-        one_tile_only: cutlass.Constexpr[bool] = False
 
         @staticmethod
         @cute.jit
@@ -325,12 +323,6 @@ class StaticPersistentClusterTileScheduler:
                 num_head=Int32(args.num_head),
                 total_pairs=Int32(pairs_per_hb * args.num_head * args.num_batch),
                 cluster_shape_mn=args.cluster_shape_mn,
-                # Debug only: FLASHMASK_BWD_PERSISTENT_ONE_TILE=1 keeps the persistent
-                # grid and indexing but stops every CTA after its first work tile. The
-                # result is WRONG (most tiles are never computed), it only isolates
-                # "grid / index math" from "cross-tile state" when the persistent kernel
-                # faults or hangs.
-                one_tile_only=os.environ.get("FLASHMASK_BWD_PERSISTENT_ONE_TILE", "0") == "1",
             )
 
     def __init__(self, params: Params, pair_idx: Int32, *, loc=None, ip=None):
@@ -360,12 +352,6 @@ class StaticPersistentClusterTileScheduler:
         cluster = params.cluster_shape_mn[0]
         hardware_info = cutlass.utils.HardwareInfo()
         sm_count = hardware_info.get_device_multiprocessor_count()
-        # Debug only: FLASHMASK_BWD_PERSISTENT_GRID=N shrinks the grid to N CTAs so that a
-        # small problem still gives every CTA many work tiles. That is what makes a
-        # multi-tile repro small enough to read with device-side prints.
-        grid_cap = int(os.environ.get("FLASHMASK_BWD_PERSISTENT_GRID", "0"))
-        if grid_cap > 0:
-            sm_count = cutlass.min(sm_count, Int32(grid_cap))
         # A cluster launch needs grid.x to be a multiple of the cluster size; rounding up
         # can overshoot total_pairs * cluster, and those CTAs just see no valid tile.
         num_blk_x = cute.round_up(cutlass.min(sm_count, params.total_pairs * cluster), cluster)
@@ -395,10 +381,7 @@ class StaticPersistentClusterTileScheduler:
         pass
 
     def advance_to_next_work(self, *, loc=None, ip=None):
-        if const_expr(self.params.one_tile_only):
-            self._pair_idx = self.params.total_pairs
-        else:
-            self._pair_idx += cute.arch.grid_dim()[0] // self.params.cluster_shape_mn[0]
+        self._pair_idx += cute.arch.grid_dim()[0] // self.params.cluster_shape_mn[0]
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []

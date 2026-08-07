@@ -47,17 +47,15 @@ from cutlass import Float32, Int32
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from flash_mask.cute import blackwell_helpers as sm100_utils
+from flash_mask.cute.blackwell_helpers import SM100_SMEM_CAPACITY_BYTES
 from flash_mask.cute import copy_utils, layout_utils, utils
 from flash_mask.cute.tile_scheduler import SingleTileScheduler, TileSchedulerArguments
 
 
 SM100_TMEM_CAPACITY_COLUMNS = 512
-# cudaFuncAttributeMaxDynamicSharedMemorySize on SM100.
-SM100_SMEM_CAPACITY_BYTES = 227 * 1024
 # Slack for barrier storage, LSE / dPsum, the flashmask row indices and the
 # per-buffer alignment padding that cute.struct adds on top of the tile bytes.
-# Measured on 576/512: the real struct is 3076 B larger than the solver's tile bytes,
-# so 6KB is ~2x headroom.
+# The real struct runs a few KB over the solver's tile bytes, so this is ~2x headroom.
 SM100_SMEM_RESERVE_BYTES = 6 * 1024
 # UMMA N limit (cutlass/cute/nvgpu/tcgen05/mma.py).
 UMMA_MAX_N = 256
@@ -70,27 +68,6 @@ UMMA_REQUIRED_M = 128
 # in use (max of the lower-tail starts, min of the ends); the rest are headroom for the
 # 4-bound form, which needs four.
 FLASHMASK_META_SLOTS = 8
-
-
-def tmem_columns(n: int, m_total: int, cta_group: int) -> int:
-    """Return per-CTA TMEM columns for an ``m_total x n`` accumulator.
-
-    See the column rule in the module docstring.
-
-    Args:
-        n: MMA N mode.
-        m_total: MMA M mode across the full CTA group.
-        cta_group: Number of CTAs participating in the MMA.
-
-    Returns:
-        Number of TMEM columns occupied by each CTA.
-    """
-    rows_per_cta = m_total // cta_group
-    assert rows_per_cta in (64, 128), f"unexpected rows per CTA: {rows_per_cta}"
-    if cta_group == 1:
-        # M=64 uses the 16-datapath interleave: half the lanes idle, N columns.
-        return n
-    return n if rows_per_cta == 128 else n // 2
 
 
 MAX_OUT_SLOTS = 2
@@ -117,11 +94,11 @@ def tmem_plan(tile_m: int, tile_n: int, d_chunk: int, dv_chunk: int, cta_group: 
     ``d_chunk``, and it did not account for the output slot count at all, so it could
     hand back a config the constructor then rejected.
     """
-    s_cols = tmem_columns(tile_m, cta_group * tile_n, cta_group)
-    dp_cols = tmem_columns(tile_m, cta_group * tile_n, cta_group)
-    dv_cols = tmem_columns(dv_chunk, cta_group * tile_n, cta_group)
-    dk_cols = tmem_columns(d_chunk, cta_group * tile_n, cta_group)
-    dq_cols = tmem_columns(d_chunk, tile_m, cta_group)
+    s_cols = sm100_utils.tmem_cols(tile_m, cta_group * tile_n, cta_group)
+    dp_cols = sm100_utils.tmem_cols(tile_m, cta_group * tile_n, cta_group)
+    dv_cols = sm100_utils.tmem_cols(dv_chunk, cta_group * tile_n, cta_group)
+    dk_cols = sm100_utils.tmem_cols(d_chunk, cta_group * tile_n, cta_group)
+    dq_cols = sm100_utils.tmem_cols(d_chunk, tile_m, cta_group)
     out_offset = s_cols + dp_cols
     slot_cols = max(dv_cols, dk_cols, dq_cols)
     num_out_slots = min(
@@ -241,16 +218,16 @@ def solve_config(
       constructor.
 
     Ranking is MEASURED, not modelled. `flush/work` (accumulator traffic per unit of
-    work) used to be the primary key; the kernel turned out to sit at ~20% of HBM
-    bandwidth and ~11% of the MMA peak, i.e. bound by latency rather than traffic, so
+    work) used to be the primary key; the kernel turned out to sit far below both HBM
+    bandwidth and MMA peak, i.e. bound by latency rather than traffic, so
     that model does not describe the bottleneck. What the 512/512 sweep
     (b=16 s=4096 h=16) actually showed:
 
-      dv_chunk == tile_n is a sweet spot, not "wider is better": dv 128 -> 64 costs
-        10%, -> 32 costs 24%, and dv 256 (which forces d_chunk 32) is the worst config
-        measured. dv_chunk is the dV gemm's N; away from tile_n it either adds MMA
-        rounds or starves the output scratch.
-      At equal SMEM, a wider d_chunk wins: d128 beat d64 by 8%.
+      dv_chunk == tile_n is a sweet spot, not "wider is better": narrowing dv below
+        tile_n costs progressively more, and dv 256 (which forces d_chunk 32) is the
+        worst config measured. dv_chunk is the dV gemm's N; away from tile_n it either
+        adds MMA rounds or starves the output scratch.
+      At equal SMEM, a wider d_chunk wins: d128 beat d64.
 
     Hence the key: |dv_chunk - tile_n|, then d_chunk, then flush/work, then the LOWER
     K residency.
@@ -329,14 +306,14 @@ CONFIG_KEYS = (
 )
 
 # Measured pins, keyed by (head_dim, head_dim_v, cta_group). These win over the solver's
-# ranking, which is a *model*: the measured kernel sits at ~20% of HBM bandwidth and ~11%
-# of the MMA peak, so it does not currently describe the bottleneck.
+# ranking, which is a *model*: the measured kernel sits far below both HBM bandwidth and
+# MMA peak, so it does not currently describe the bottleneck.
 #
-# 512/512 (B30Z / sm103, b1/s8192/h64/hkv1, causal document mask): 23.75ms against the
-# 24.12ms of the config the solver ranked first at the time. What the pin buys is the
-# halved slice count in the drain (48 -> 24 per m tile), which is why dQ_reduce_ncol has
-# to come with the wider d_chunk -- d_chunk is the tile the drain slices, so a 64-column
-# slice is only legal once the chunk is at least 64 wide.
+# 512/512 (B30Z / sm103, causal document mask): measured faster than the config the solver
+# ranked first at the time. What the pin buys is the halved slice count in the drain
+# (48 -> 24 per m tile), which is why dQ_reduce_ncol has to come with the wider d_chunk --
+# d_chunk is the tile the drain slices, so a 64-column slice is only legal once the chunk
+# is at least 64 wide.
 _MEASURED_CONFIG = {
     (512, 512, 1): {
         "d_chunk": 128,
@@ -497,9 +474,9 @@ class FlashAttentionBackwardSm100BigD:
         # gemms per m tile are fully serialised against their own drain.
         #
         # A second slot breaks that: chunk c+1 goes to the other slot, so its gemm
-        # overlaps chunk c's T2R + reduce. This is what DSA does for its dKV
-        # (dsa_bwd_sm100.py:100-105 gives dKV two slots and aliases dKV2/3 onto
-        # them) -- note it does NOT keep dKV resident either, it double buffers.
+        # overlaps chunk c's T2R + reduce. This is what DSA does for its dKV (two
+        # slots, with dKV2/3 aliased onto them) -- note it does NOT keep dKV resident
+        # either, it double buffers.
         #
         # True residency for dK/dV is a different thing and does not fit here: at
         # tile_n=128 one resident dV is tile_n * head_dim_v * 4B = 256KB, which is
@@ -584,8 +561,8 @@ class FlashAttentionBackwardSm100BigD:
         # set of that round trip is 5 * softmax_chunk_m f32 per thread (S, P, dP, dS
         # and the two packed R2T buffers, which are half-width), so this is what keeps
         # the compute warps out of local memory: at the full tile_m = 128 it was 640
-        # f32 against 128 registers per thread, and ncu measured 65GB of local traffic
-        # with 84% of the stall budget on L1TEX. 32 keeps it at 160.
+        # f32 against 128 registers per thread, and ncu showed heavy local traffic with
+        # most of the stall budget on L1TEX. 32 keeps it at 160.
         #
         # Must divide tile_m and be a multiple of 32: the packed bf16 P / dS region is
         # addressed in W // 32 * 16 f32-equivalent columns, and the R2T store rep is
@@ -1231,7 +1208,7 @@ class FlashAttentionBackwardSm100BigD:
         # through tA_addr, so there is no full-tile view here.
         # dS in SMEM: sdSt is the natural (n, m) orientation the compute warps
         # produce, sdS the (m, n) view the dQ gemm needs as its A operand. Same
-        # bytes -- this is the dual-view trick from flash_bwd_sm100.py:1453.
+        # bytes -- this is the dual-view trick flash_bwd_sm100 uses for sdSt / sdS.
         sdSt = storage.sdS.get_tensor(
             sdSt_layout.outer, swizzle=sdSt_layout.inner, dtype=self.ds_dtype
         )
@@ -1386,8 +1363,8 @@ class FlashAttentionBackwardSm100BigD:
             cute.arch.barrier()
             max_ds = sFM_red[0]
             min_end = sFM_red[1]
-            # Which m blocks are fully masked, from the reference semantics
-            # (generate_startend_row_indices.py:4-35), evaluated for ALL columns at once
+            # Which m blocks are fully masked, from the reference semantics in
+            # generate_startend_row_indices.py, evaluated for ALL columns at once
             # via max(ds) / min(end):
             #   lower tail [ds, de) or [ds, seqlen_q)  -> block j masked if max_ds <= j*tm
             #   upper tail [0, ue)                     -> block j masked if (j+1)*tm <= min_ue
@@ -1836,19 +1813,16 @@ class FlashAttentionBackwardSm100BigD:
                 # The S -> P -> dP -> dS round trip runs in chunks of
                 # softmax_chunk_m columns instead of over the whole tile at once.
                 #
-                # Why (ncu on the 23.75ms config, b1/s8192/h64/d512):
-                #   l1tex local ld / st            34.06 GB / 31.25 GB
-                #   launch__registers_per_thread   128  (Block Limit Registers = 1)
-                #   tensor pipe utilisation        0.25 % of peak
-                #   warp cycles per issued instr   53.95, of which 45.1 (83.7%)
-                #                                  stalled on an L1TEX scoreboard
+                # Why: ncu on the pinned d512 config shows the kernel is spill bound --
+                # heavy l1tex local ld/st, the tensor pipe idle, and most warp cycles
+                # stalled on an L1TEX scoreboard.
                 # One fragment is tile_n * tile_m / 128 = 128 f32 per thread and the
                 # round trip keeps four of them live, plus the two packed R2T buffers:
                 # 640 f32 against 128 registers, and the CTA already owns the whole
-                # register file, so more registers cannot be had. 65GB of local
-                # traffic and 84% of the stall budget were the spill. Chunking makes
-                # the live set 5 * W instead of 5 * tile_m. DSA's bwd sits at 32 f32
-                # per thread here (tile 64x64, split into two Rep(4) LDTMs).
+                # register file, so more registers cannot be had. The local traffic and
+                # the bulk of the stall budget were that spill. Chunking makes the live
+                # set 5 * W instead of 5 * tile_m. DSA's bwd sits at 32 f32 per thread
+                # here (tile 64x64, split into two Rep(4) LDTMs).
                 #
                 # Everything below is built once: every chunk has the same shape and
                 # the same thread mapping, only the TMEM column offset and the m
@@ -1905,12 +1879,12 @@ class FlashAttentionBackwardSm100BigD:
                 tScS = thr_copy_t2r.partition_D(cS)
                 # Four separate f32 fragments, on purpose. Tried and REVERTED: aliasing
                 # them in pairs (P overwriting S, dS overwriting dP) to cut the live
-                # count in half made BW 23.75 -> 40.47 ms (+70%) on b1/s8192/h64/d512.
-                # make_fragment lowers to an alloca, and reading and writing the same
-                # alloca inside one unrolled loop defeats its promotion to registers, so
-                # the whole buffer lands in local memory. Left separate, ptxas sees that
-                # S dies after the P loop (and dP after the dS loop) and reuses those
-                # registers itself. Shrinking the fragments is the fix; aliasing is not.
+                # count in half measured much slower. make_fragment lowers to an alloca,
+                # and reading and writing the same alloca inside one unrolled loop
+                # defeats its promotion to registers, so the whole buffer lands in local
+                # memory. Left separate, ptxas sees that S dies after the P loop (and dP
+                # after the dS loop) and reuses those registers itself. Shrinking the
+                # fragments is the fix; aliasing is not.
                 tSrS = cute.make_fragment(tScS.shape, Float32)
                 tSrP = cute.make_fragment(tScS.shape, Float32)
                 tSrdP = cute.make_fragment(tScS.shape, Float32)
@@ -1971,13 +1945,13 @@ class FlashAttentionBackwardSm100BigD:
                 # same bytes through the transposed sdS view.
                 #
                 # Vectorised r2s, built from the T2R copy's destination TV layout -- the
-                # recipe the postprocess uses (flash_bwd_postprocess.py:438-447 and
-                # :519-524): get_smem_store_op picks the widest legal store for the
+                # recipe flash_bwd_postprocess.py uses: get_smem_store_op picks the
+                # widest legal store for the
                 # (layout, dtype) pair and make_tiled_copy re-tiles it onto exactly the
                 # thread/value mapping the T2R produced, so the register fragment can go
                 # out as 16-byte stores instead of W scalar ones. NB: make_tiled_copy_D
                 # is NOT the tool here -- it hands each thread twice the elements and
-                # does not expose layout_tv; that mistake cost four rounds.
+                # does not expose layout_tv.
                 #
                 # If this breaks, the symptom is precise: dS feeds dK through TMEM and dQ
                 # through SMEM, so dQ wrong while dK stays right means the store mapping
@@ -2042,7 +2016,7 @@ class FlashAttentionBackwardSm100BigD:
                     # the key is the per-element coordinate).
                     #
                     # Semantics, verbatim from the reference
-                    # (test_flashmask/generate_startend_row_indices.py:4-35):
+                    # (test_flashmask/generate_startend_row_indices.py):
                     #   has_end = (causal and bound_num == 2) or (not causal and == 4)
                     #   lower tail: mask rows [idx0, idx1) if has_end else [idx0, seqlen_q)
                     #   causal    : plus the causal mask (handled above)
@@ -2212,12 +2186,12 @@ class FlashAttentionBackwardSm100BigD:
             mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
             # ONE T2R per dQ_reduce_ncol-column slice, not one per chunk.
             #
-            # MEASURED, and this is what the whole drain hinges on: with the drain in and
-            # out, local ld/st went 19.70 / 19.40 GB vs 0.33 / 0.03 GB and BW 18.97ms vs
-            # 6.55ms. So all 39GB of local traffic and 65% of the runtime is this drain, and the
-            # 39GB is exactly "every T2R fragment element written once and read once"
-            # (12 chunks x 512B = 6KB per thread per m tile, x 128 threads x ~49k m
-            # tiles = 37GB). The fragments were not living in registers at all.
+            # MEASURED, and this is what the whole drain hinges on: taking the drain out
+            # collapses local ld/st to near zero and cuts the runtime by roughly two
+            # thirds. So essentially all of the local traffic is this drain, and its
+            # volume is exactly "every T2R fragment element written once and read once"
+            # (12 chunks x 512B = 6KB per thread per m tile). The fragments were not
+            # living in registers at all.
             #
             # Chunk-wide T2R needed a (ncol, flen/ncol) re-view of the fragment to hand
             # one slice at a time to the staging copy, i.e. `make_tensor(frag.iterator,
@@ -2332,10 +2306,9 @@ class FlashAttentionBackwardSm100BigD:
                             # This replaced a SMEM staging round trip (a vectorised r2s
                             # into a staging buffer, two named barriers around it, one
                             # elected thread issuing a 32KB cp.reduce.async.bulk.add.f32).
-                            # MEASURED split of the drain before that change:
-                            #   full 15.0ms, no_reduce 9.65ms, none 6.68ms
-                            # i.e. the gmem reduce was 5.35ms and the on-chip
-                            # T2R + staging was 2.97ms -- and at the one staging slot the
+                            # MEASURED split of the drain before that change: the gmem
+                            # reduce was somewhat more than half of it and the on-chip
+                            # T2R + staging the rest -- and at the one staging slot the
                             # SMEM budget allowed at ncol=64 that staging was fully
                             # serialised: wait for every outstanding reduce to have read
                             # the slot, barrier, fill, fence, barrier, issue. Per m tile

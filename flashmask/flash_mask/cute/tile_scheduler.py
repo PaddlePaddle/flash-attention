@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
+import os
 from typing import Optional, Tuple
 from dataclasses import dataclass, fields
 
@@ -278,6 +279,141 @@ class StaticPersistentTileScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return StaticPersistentTileScheduler(*(tuple(obj_list)), loc=self._loc)
+
+
+class StaticPersistentClusterTileScheduler:
+    """Persistent scheduler that hands out work per CTA *pair* instead of per CTA.
+
+    StaticPersistentTileScheduler linearizes num_block * num_head * num_batch and gives
+    CTA i the tile i, which breaks a (2, 1) cluster: with an odd num_block the two CTAs
+    of a cluster would land in different (head, batch), and the grid size
+    min(sm_count, total_blocks) is not necessarily a multiple of the cluster size.
+    Here the unit of scheduling is the pair, so both CTAs of a cluster always resolve
+    the same (head, batch) and adjacent n_block, exactly like the non-persistent
+    round_up(num_block, cluster) grid. For an odd num_block the last pair's second CTA
+    gets n_block >= num_block and is handled by the same in-kernel guards as before.
+
+    Only for the `cluster_share_tile == False` convention (the SM100 bwd), where
+    num_block counts the blocks of ONE CTA.
+    """
+
+    @dataclass
+    class Params(ParamsBase):
+        # Plain Int32, not FastDivmodDivisor: the two divisions happen once per work tile
+        # (not per m iteration), so the fast path buys nothing, and pairs_per_hb is 1
+        # whenever seqlen_k <= tile_n * cluster -- a divisor value the FastDivmod magic
+        # numbers are not worth trusting for a scheduler that produces TMA coordinates.
+        pairs_per_hb: Int32
+        num_head: Int32
+        total_pairs: Int32
+        cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+        one_tile_only: cutlass.Constexpr[bool] = False
+
+        @staticmethod
+        @cute.jit
+        def create(
+            args: TileSchedulerArguments, *, loc=None, ip=None
+        ) -> "StaticPersistentClusterTileScheduler.Params":
+            assert args.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
+            assert not args.cluster_share_tile, (
+                "StaticPersistentClusterTileScheduler assumes per-CTA num_block"
+            )
+            cluster = args.cluster_shape_mn[0]
+            pairs_per_hb = cute.ceil_div(args.num_block, cluster)
+            return StaticPersistentClusterTileScheduler.Params(
+                pairs_per_hb=Int32(pairs_per_hb),
+                num_head=Int32(args.num_head),
+                total_pairs=Int32(pairs_per_hb * args.num_head * args.num_batch),
+                cluster_shape_mn=args.cluster_shape_mn,
+                # Debug only: FLASHMASK_BWD_PERSISTENT_ONE_TILE=1 keeps the persistent
+                # grid and indexing but stops every CTA after its first work tile. The
+                # result is WRONG (most tiles are never computed), it only isolates
+                # "grid / index math" from "cross-tile state" when the persistent kernel
+                # faults or hangs.
+                one_tile_only=os.environ.get("FLASHMASK_BWD_PERSISTENT_ONE_TILE", "0") == "1",
+            )
+
+    def __init__(self, params: Params, pair_idx: Int32, *, loc=None, ip=None):
+        self.params = params
+        self._pair_idx = pair_idx
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+        return StaticPersistentClusterTileScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    @cute.jit
+    def create(params: Params, *, loc=None, ip=None) -> "StaticPersistentClusterTileScheduler":
+        pair_idx = cute.arch.block_idx()[0] // params.cluster_shape_mn[0]
+        return StaticPersistentClusterTileScheduler(params, pair_idx, loc=loc, ip=ip)
+
+    # called by host
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        cluster = params.cluster_shape_mn[0]
+        hardware_info = cutlass.utils.HardwareInfo()
+        sm_count = hardware_info.get_device_multiprocessor_count()
+        # Debug only: FLASHMASK_BWD_PERSISTENT_GRID=N shrinks the grid to N CTAs so that a
+        # small problem still gives every CTA many work tiles. That is what makes a
+        # multi-tile repro small enough to read with device-side prints.
+        grid_cap = int(os.environ.get("FLASHMASK_BWD_PERSISTENT_GRID", "0"))
+        if grid_cap > 0:
+            sm_count = cutlass.min(sm_count, Int32(grid_cap))
+        # A cluster launch needs grid.x to be a multiple of the cluster size; rounding up
+        # can overshoot total_pairs * cluster, and those CTAs just see no valid tile.
+        num_blk_x = cute.round_up(cutlass.min(sm_count, params.total_pairs * cluster), cluster)
+        return (num_blk_x, Int32(1), Int32(1))
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        params = self.params
+        hb_idx = self._pair_idx // params.pairs_per_hb
+        pair_in_hb = self._pair_idx - hb_idx * params.pairs_per_hb
+        batch_idx = hb_idx // params.num_head
+        head_idx = hb_idx - batch_idx * params.num_head
+        if const_expr(params.cluster_shape_mn[0] > 1):
+            cta_rank_in_cluster = cute.arch.block_in_cluster_idx()[0]
+            block_idx = pair_in_hb * params.cluster_shape_mn[0] + cta_rank_in_cluster
+        else:
+            block_idx = pair_in_hb
+        is_valid = self._pair_idx < params.total_pairs
+        return WorkTileInfo(
+            (Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        if const_expr(self.params.one_tile_only):
+            self._pair_idx = self.params.total_pairs
+        else:
+            self._pair_idx += cute.arch.grid_dim()[0] // self.params.cluster_shape_mn[0]
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._pair_idx]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip([self.params, self._pair_idx], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return StaticPersistentClusterTileScheduler(*(tuple(obj_list)), loc=self._loc)
 
 
 class SingleTileLPTScheduler:

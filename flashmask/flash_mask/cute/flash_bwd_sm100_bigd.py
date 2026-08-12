@@ -678,8 +678,10 @@ class FlashAttentionBackwardSm100BigD:
           dPin full/empty    2 * num_dv_chunks      dP full         1
           dVin full/empty    2 * num_dv_chunks      PdS full        1
           dKin full/empty    2 * num_d_chunks       dSsmem full     1
-          dQin full/empty    2 * num_d_chunks       tmem dealloc    1
+          dQin full/empty    2 * num_d_chunks       stats full      1
           out  full/empty    2 * (num_dv_chunks + 2 * num_d_chunks)
+                                                    stats empty     1
+                                                    tmem dealloc    1
 
         tmem dealloc is last, so it is the slot mbar_tmem_dealloc_offset points at.
         """
@@ -691,7 +693,8 @@ class FlashAttentionBackwardSm100BigD:
             + 2 * self.num_d_chunks     # dQin
             + 2 * (self.num_dv_chunks + 2 * self.num_d_chunks)  # out
         )
-        scalars = 5  # S full, dP full, PdS full, dSsmem full, tmem dealloc
+        # S full, dP full, PdS full, dSsmem full, stats full / empty, tmem dealloc.
+        scalars = 7
         return per_chunk + scalars
 
     def make_shared_storage(self, q_dtype, do_dtype, ds_dtype):
@@ -1112,6 +1115,14 @@ class FlashAttentionBackwardSm100BigD:
         mbar_out_full = mbar_dQin_empty + self.num_d_chunks
         num_out_chunks = self.num_dv_chunks + 2 * self.num_d_chunks
         mbar_out_empty = mbar_out_full + num_out_chunks
+        # LSE and dPsum for one m tile, staged in SMEM by the load warp. The compute
+        # warps used to read them straight from gmem, per element: S^T is (n, m), so the
+        # m coordinate is the per-ELEMENT one and every thread walked all tile_m values
+        # of both tensors once per m tile -- ~2 * tile_m dependent scalar loads per
+        # thread, with all 32 lanes of a warp asking for the identical value. Two bulk
+        # copies per m tile replace them.
+        mbar_stats_full = mbar_out_empty + num_out_chunks
+        mbar_stats_empty = mbar_stats_full + 1
         mbar_tmem_dealloc = mbar_ptr + self.mbar_tmem_dealloc_offset
         # The pipeline slots above have to end exactly where tmem_dealloc starts, or
         # mbar_count() and this layout have drifted apart and some barrier is aliasing
@@ -1127,6 +1138,7 @@ class FlashAttentionBackwardSm100BigD:
             + 1                         # dSsmem full
             + 2 * self.num_d_chunks     # dQin full / empty
             + 2 * num_out_chunks        # out full / empty
+            + 2                         # stats full / empty
         )
         assert pipeline_slots == self.mbar_tmem_dealloc_offset, (
             f"kernel uses {pipeline_slots} pipeline barrier slots but mbar_count() "
@@ -1165,6 +1177,12 @@ class FlashAttentionBackwardSm100BigD:
             for c in cutlass.range_constexpr(num_out_chunks):
                 cute.arch.mbarrier_init(mbar_out_full + c, 1)
                 cute.arch.mbarrier_init(mbar_out_empty + c, num_drain_threads)
+            # stats_full: one arrival from the load warp's elected lane, plus the bytes
+            # of both bulk copies. stats_empty: every compute thread, once it is done
+            # reading the tile -- the buffers are single, so the next m tile's fetch has
+            # to wait for that.
+            cute.arch.mbarrier_init(mbar_stats_full, 1)
+            cute.arch.mbarrier_init(mbar_stats_empty, num_compute_threads_init)
             cute.arch.mbarrier_init(
                 mbar_tmem_dealloc, num_compute_threads_init + num_drain_threads
             )
@@ -1233,6 +1251,12 @@ class FlashAttentionBackwardSm100BigD:
         sFM_red = storage.sFM_max_min_ptr.get_tensor(
             cute.make_layout(FLASHMASK_META_SLOTS)
         )
+        # LSE / dPsum for the current m tile. One buffer each (the m loop is serialised
+        # on them through mbar_stats_full / mbar_stats_empty), so a flat tile_m view is
+        # all that is needed -- the (tile_m, stage) layouts in _setup_smem_layout only
+        # exist to size the allocation.
+        sLSE = storage.sLSE.get_tensor(cute.make_layout(self.tile_m))
+        sdPsum = storage.sdPsum.get_tensor(cute.make_layout(self.tile_m))
         # A-operand views for the output gemms (address comes from tA_addr).
         thr_mma_dV = tiled_mma_dV.get_slice(0)
         thr_mma_dK = tiled_mma_dK.get_slice(0)
@@ -1432,11 +1456,41 @@ class FlashAttentionBackwardSm100BigD:
             # The register budget is per-warp state, not per-iteration work: setting it
             # inside the m loop re-issues setmaxnreg on every iteration.
             cute.arch.setmaxregister_decrease(self.num_regs_load)
+            # LSE / dPsum are contiguous tile_m runs of f32, so they need no TMA
+            # descriptor: a plain bulk copy moves the whole tile on one mbarrier.
+            copy_stats = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32)
+            stats_bytes = cutlass.const_expr(2 * self.tile_m * Float32.width // 8)
             phase = Int32(0)
             for it in cutlass.range(num_iters, unroll=1):
                 # The iteration counter drives the barrier phases; m_iter is the actual
                 # block index, which skips the fully masked band (see the skip range).
                 m_iter = m_lo + it if it < seg1 else seg2_base + (it - seg1)
+                # LSE / dPsum first: they are the compute warps' first dependency after
+                # S, and one bulk copy each is cheap enough to issue ahead of the
+                # operand TMAs. Single buffer, so the previous tile's readers have to be
+                # done -- on the first iteration that arrival does not exist yet, and a
+                # parity-1 wait on a fresh mbarrier blocks instead of falling through
+                # (same reason the K/Q wrap wait below is skipped at it == 0).
+                if it > 0:
+                    cute.arch.mbarrier_wait(mbar_stats_empty, phase ^ 1)
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(mbar_stats_full, stats_bytes)
+                    cute.copy(
+                        copy_stats,
+                        cute.local_tile(
+                            mLSE[batch_idx, head_idx, None], (self.tile_m,), (m_iter,)
+                        ),
+                        sLSE,
+                        mbar_ptr=mbar_stats_full,
+                    )
+                    cute.copy(
+                        copy_stats,
+                        cute.local_tile(
+                            mdPsum[batch_idx, head_idx, None], (self.tile_m,), (m_iter,)
+                        ),
+                        sdPsum,
+                        mbar_ptr=mbar_stats_full,
+                    )
                 load_K, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_K, 0, cute.make_layout(1), tSgK, sK
                 )
@@ -1978,12 +2032,11 @@ class FlashAttentionBackwardSm100BigD:
                     ),
                 )
 
-                mLSE_cur = cute.local_tile(
-                    mLSE[batch_idx, head_idx, None], (self.tile_m,), (m_iter,)
-                )
-                mdPsum_cur = cute.local_tile(
-                    mdPsum[batch_idx, head_idx, None], (self.tile_m,), (m_iter,)
-                )
+                # LSE / dPsum are read from SMEM below (the load warp stages them on
+                # mbar_stats_full): the m index is a per-ELEMENT coordinate, so reading
+                # them from gmem there cost tile_m dependent scalar loads per thread per
+                # m tile, all 32 lanes of a warp asking for the same value.
+                #
                 # Masks, applied to P rather than to S: P == 0 kills the element's
                 # contribution to dV, and dS = P * (dP - dPsum) == 0 kills it for dK and
                 # dQ too. Doing it on P also means LSE / dPsum garbage in the padded rows
@@ -2045,6 +2098,7 @@ class FlashAttentionBackwardSm100BigD:
                 # query), and softmax normalizes over keys, so LSE and dPsum are
                 # indexed by the *m* coordinate of each element.
                 cute.arch.mbarrier_wait(mbar_S_full, phase)
+                cute.arch.mbarrier_wait(mbar_stats_full, phase)
                 for cmi in cutlass.range_constexpr(self.num_softmax_chunks):
                     # DESCENDING chunk order, and it has to be: P is stored into the
                     # UPPER HALF of the S region (tmem_s_to_p_offset = tile_m // 2,
@@ -2082,7 +2136,7 @@ class FlashAttentionBackwardSm100BigD:
                     for i in cutlass.range_constexpr(frag_len):
                         m_idx = tScS[i][1] + m_off
                         p = cute.math.exp2(
-                            tSrS[i] * softmax_scale_log2 - mLSE_cur[m_idx], fastmath=True
+                            tSrS[i] * softmax_scale_log2 - sLSE[m_idx], fastmath=True
                         )
                         m_global = m_base + m_idx
                         bad = n_oob or m_global >= seqlen_q
@@ -2104,7 +2158,7 @@ class FlashAttentionBackwardSm100BigD:
                     cute.arch.fence_view_async_tmem_load()
                     for i in cutlass.range_constexpr(frag_len):
                         m_idx = tScS[i][1] + m_off
-                        tSrdS[i] = tSrP[i] * (tSrdP[i] - mdPsum_cur[m_idx])
+                        tSrdS[i] = tSrP[i] * (tSrdP[i] - sdPsum[m_idx])
 
                     # R2T of this chunk's P and dS, then its dS slice to SMEM.
                     for i in cutlass.range_constexpr(frag_len):
@@ -2135,6 +2189,9 @@ class FlashAttentionBackwardSm100BigD:
                 cute.arch.mbarrier_arrive(mbar_PdS_full)
                 cute.arch.fence_view_async_shared()
                 cute.arch.mbarrier_arrive(mbar_dSsmem_full)
+                # Every element of LSE / dPsum has been consumed by now, so the next m
+                # tile's bulk copy may overwrite them.
+                cute.arch.mbarrier_arrive(mbar_stats_empty)
 
                 # dV / dK / dQ are drained by the drain warpgroup (see the branch
                 # below); the compute warps are done with this iteration once P / dS
@@ -2293,6 +2350,16 @@ class FlashAttentionBackwardSm100BigD:
                         )
                         slice_idx = cutlass.const_expr(c // chunks_per_slice)
                         cute.arch.mbarrier_wait(mbar_out_full + out_c, phase)
+                        # The SMEM operand this gemm read (sdO for dV, sQt for dK, sKt
+                        # for dQ) is free the moment the gemm completes, and out_full IS
+                        # that completion (it carries a tcgen05.commit). Releasing it
+                        # here rather than after the drain below takes this chunk's T2R
+                        # and its vector atomics off the load warp's critical path: with
+                        # one stage per buffer, the next m iteration's fetch of that
+                        # chunk cannot start until this arrival, so the m loop used to
+                        # serialise load -> gemm -> drain -> load. out_empty stays where
+                        # it is: it guards the TMEM slot, which is what the T2R reads.
+                        cute.arch.mbarrier_arrive(in_bar + c)
                         elem_base = slice_idx * slice_stride + block_base + chunk_base
                         # Slot the mma warp wrote this chunk into.
                         slot_base = cutlass.const_expr(
@@ -2346,7 +2413,6 @@ class FlashAttentionBackwardSm100BigD:
                                     gbase + r * (num_drain_threads * 4),
                                 )
                         cute.arch.mbarrier_arrive(mbar_out_empty + out_c)
-                        cute.arch.mbarrier_arrive(in_bar + c)
 
                 phase ^= 1
 

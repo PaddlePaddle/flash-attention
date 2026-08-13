@@ -5,7 +5,7 @@ import cutlass
 import cutlass.cute as cute
 from typing import Optional, Type, Tuple, Callable, Sequence
 
-from cutlass import Int32, const_expr
+from cutlass import Int32, Int64, const_expr
 
 
 def transpose_view(a: cute.Tensor) -> cute.Tensor:
@@ -17,6 +17,115 @@ def transpose_view(a: cute.Tensor) -> cute.Tensor:
 
 def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
     return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
+
+
+def _dsl_narrows_slice_index() -> bool:
+    """Whether the installed DSL lowers slice index math in 32 bits.
+
+    4.5.0 loads the i64 strides of a dynamic layout with `ld.param.b32` and multiplies the
+    coordinates with `mul.lo.s32` before sign-extending; 4.4.1 widens first (`cvt.u64.u32` +
+    `mul.lo.s64`) and needs nothing from us.
+    """
+    try:
+        version = tuple(int(p) for p in cutlass.__version__.split(".")[:3])
+    except (AttributeError, ValueError):
+        return True  # unknown build: prefer the explicit 64-bit path over a silent wrap
+    return version >= (4, 5, 0)
+
+
+def _needs_64b_offset(a: cute.Tensor, coord) -> bool:
+    """Whether `a[coord]` is a gmem slice whose offset can overflow 32 bits.
+
+    Everything we are not sure about is left to the DSL: element access, TMA coordinate
+    tensors (no pointer iterator), nested modes, swizzled pointers (`make_ptr` cannot carry a
+    swizzle), sub-byte types, and layouts whose strides are all static -- those are folded at
+    compile time and stay correct in 4.5.0. Bailing out means the DSL's 32-bit path is used, so
+    a >2**31-element tensor of a shape rejected here still wraps; add a case rather than assume
+    it is handled.
+    """
+    if type(coord) is not tuple or not cute.has_underscore(coord):
+        return False
+    it = getattr(a, "iterator", None)
+    if not all(hasattr(it, attr) for attr in ("toint", "memspace", "alignment")):
+        return False
+    if it.memspace not in (cute.AddressSpace.gmem, cute.AddressSpace.generic):
+        return False
+    if getattr(it.type, "is_swizzled", False):
+        return False
+    if a.element_type.width % 8 != 0:
+        return False
+    stride = a.layout.stride
+    if len(coord) != len(stride):
+        return False
+    has_dynamic = False
+    for c, s in zip(coord, stride):
+        if c is None:
+            continue
+        if isinstance(c, tuple) or isinstance(s, tuple):
+            return False
+        if not isinstance(s, int):
+            has_dynamic = True
+    return has_dynamic
+
+
+def install_slice_64b() -> None:
+    """Route gmem slices through `slice_64b` on the DSL versions that narrow the index math.
+
+    Slicing is where a (batch, head) coordinate meets a dynamic i64 stride, and the `t[b, h, None]`
+    subscript syntax is the only spelling used for it here, so patching `_Tensor.__getitem__` keeps
+    every call site -- present and future -- correct without a special API to remember. Note that
+    `cute.slice_` and `cute.local_tile` reach `_cute_ir` directly and are *not* covered; they are
+    only ever applied to layouts or to already-sliced tensors whose offsets stay small.
+    No-op on 4.4.1, and idempotent.
+    """
+    from cutlass.cute.tensor import _Tensor  # DSL-private, but the only slicing entry point
+
+    if not _dsl_narrows_slice_index() or getattr(_Tensor.__getitem__, "_slice_64b", False):
+        return
+
+    orig_getitem = _Tensor.__getitem__
+
+    def __getitem__(self, coord, **kwargs):
+        if _needs_64b_offset(self, coord):
+            return slice_64b(self, coord, loc=kwargs.get("loc"), ip=kwargs.get("ip"))
+        return orig_getitem(self, coord, **kwargs)
+
+    __getitem__._slice_64b = True
+    _Tensor.__getitem__ = __getitem__
+
+
+def slice_64b(a: cute.Tensor, coord, *, loc=None, ip=None) -> cute.Tensor:
+    """`a[coord]` with the linear offset computed in 64 bits.
+
+    nvidia-cutlass-dsl 4.5.0 narrows crd2idx to 32 bits (4.4.1 kept it in 64), so slicing
+    a tensor that holds more than 2**31 elements -- dQaccum once batch*nheads*seqlen_q_
+    rounded*head_dim_rounded crosses that -- wraps to a negative address and faults. Fold
+    the integer coordinates into an Int64 byte offset ourselves; None keeps a mode, just
+    like Tensor.__getitem__. `utils.elem_pointer_i64` does the same widening for a full
+    coordinate, i.e. when no mode is kept.
+
+    `install_slice_64b` makes plain slicing take this path, so calling it directly is only
+    needed to state the intent explicitly.
+    """
+    offset = Int64(0)
+    keep = []
+    for i, c in enumerate(coord):
+        if const_expr(c is None):
+            keep.append(i)
+        else:
+            stride = a.layout.stride[i]
+            assert not isinstance(stride, tuple), "cannot fold a nested mode into an offset"
+            offset += Int64(c) * Int64(stride)
+    # HACK: as in utils.elem_pointer_i64, we assume the offset does not change the alignment
+    ptr = cute.make_ptr(
+        a.element_type,
+        a.iterator.toint() + offset * (a.element_type.width // 8),
+        a.iterator.memspace,
+        assumed_align=a.iterator.alignment,
+        loc=loc,
+        ip=ip,
+    )
+    return cute.make_tensor(ptr, cute.select(a.layout, mode=keep, loc=loc, ip=ip), loc=loc, ip=ip)
 
 
 

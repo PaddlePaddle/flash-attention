@@ -24,9 +24,13 @@ from .interface import (
 )
 
 from flash_mask.cute.cute_dsl_utils import cute_compile_patched
+from flash_mask.cute import layout_utils
 
 # Patch cute.compile to optionally dump SASS
 cute.compile = cute_compile_patched
+
+# Patch Tensor slicing to keep gmem offsets in 64 bits on nvidia-cutlass-dsl >= 4.5.0
+layout_utils.install_slice_64b()
 
 
 __all__ = [

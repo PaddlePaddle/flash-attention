@@ -99,7 +99,8 @@ def _is_valid_flash_dims(query, key, value, fa_version=2):
     #   512/512 : forward + backward verified
     if fa_version == 4:
         if (
-            (q_headdim == 512 and k_headdim == 512 and v_headdim == 512)
+            (q_headdim == 512 and k_headdim == 512 and v_headdim == 512) or
+            (q_headdim == 576 and k_headdim == 576 and v_headdim == 512)
         ):
             return True
     return False

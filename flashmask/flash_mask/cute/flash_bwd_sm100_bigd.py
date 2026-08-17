@@ -27,6 +27,15 @@ Phase 1 (the only path that runs today): cta_group=1, no swapAB, all three of dV
 are produced per m-iteration and drained by the reduce warps into the fp32 gmem
 accumulators. Correct but accum-traffic bound.
 
+Operand reuse: every tile is read by two gemms in different orientations -- K by S and
+dQ, Q by S and dK, dO by dP and dV -- and this used to re-TMA the tile for the second
+one, 28 chunk fetches per m tile. The two orientations are the same bytes (derivation in
+_setup_smem_layout), so the second gemm now reads whatever the first left in SMEM and
+_reuse_schedule decides per access whether a fetch is needed at all. At 512/512 with two
+resident K stages that is 22 fetches per m tile. The saving is TMA issue and mbarrier
+round trips on the load warp, not HBM bytes: an n-block's K is re-read by all 64 query
+heads, so L2 was already serving those fetches.
+
 Phase 2 (later): cta_group=2 + swapAB on dV/dK so both stay resident in TMEM for
 the whole m loop, dropping the accum traffic from once per m-iteration to once
 per n-block. The cta_group=2 arithmetic is already threaded through (column rules,
@@ -174,6 +183,71 @@ def _chunk_candidates(hdim: int) -> list:
     ]
 
 
+def _reuse_schedule(num_chunks: int, num_stages: int, carry: bool):
+    """Decide, per SMEM access, whether an operand chunk still has to be fetched.
+
+    Every tile is read by two gemms -- S and dQ read K, S and dK read Q, dP and dV read
+    dO -- and the second one only wants the transposed view, which is the same bytes
+    (see _setup_smem_layout), so an access whose buffer already holds the chunk it wants
+    needs no TMA. Pass 0 runs ASCENDING and pass 1 DESCENDING so that the chunk pass 0
+    leaves behind is the first one pass 1 asks for; with both ascending the hit count is
+    zero at any stage count, so the order is a precondition, not a tweak.
+
+    `carry` is whether buffer contents survive an m iteration: true for K (depends only
+    on the n block), false for Q / dO (the bytes survive but belong to the last m tile).
+
+    Returns (pass0, pass1, prologue): per-access records in issue order, plus the
+    (chunk, stage) pairs that must already be in SMEM when the m loop starts. A record's
+    `after` is the access that last used the same buffer, whose *_in_empty barrier a
+    fetch must wait on; `after_prev_iter` marks that arrival as belonging to the previous
+    m iteration, which the caller skips on the first one (a parity-1 wait on a fresh
+    mbarrier never falls through).
+    """
+    assert 1 <= num_stages <= num_chunks
+    stage_of = tuple(c % num_stages for c in range(num_chunks))
+    orders = (tuple(range(num_chunks)), tuple(reversed(range(num_chunks))))
+    accesses = tuple((p, c) for p in (0, 1) for c in orders[p])
+    n = len(accesses)
+    records = []
+    for i, (_, chunk) in enumerate(accesses):
+        stage = stage_of[chunk]
+        # Last access to the same buffer, walking backwards through the cyclic
+        # sequence. prev == i means this is the buffer's only access in the cycle.
+        prev = next(
+            (i - k) % n
+            for k in range(1, n + 1)
+            if stage_of[accesses[(i - k) % n][1]] == stage
+        )
+        from_prev_iter = prev >= i
+        hit = accesses[prev][1] == chunk and (carry or not from_prev_iter)
+        records.append(
+            dict(
+                chunk=chunk,
+                stage=stage,
+                load=not hit,
+                after=accesses[prev],
+                after_prev_iter=from_prev_iter,
+            )
+        )
+    passes = tuple(
+        tuple(r for r, (p, _) in zip(records, accesses) if p == which)
+        for which in (0, 1)
+    )
+    # A buffer whose first access in the cycle is a hit needs its content in place
+    # before the m loop starts, and that content is whatever the cycle's LAST access to
+    # that buffer left there.
+    first_of_stage, last_chunk_of_stage = {}, {}
+    for i, (_, chunk) in enumerate(accesses):
+        first_of_stage.setdefault(stage_of[chunk], i)
+        last_chunk_of_stage[stage_of[chunk]] = chunk
+    prologue = tuple(
+        (last_chunk_of_stage[s], s)
+        for s in range(num_stages)
+        if not records[first_of_stage[s]]["load"]
+    )
+    return passes[0], passes[1], prologue
+
+
 def solve_config(
     head_dim: int,
     head_dim_v: int,
@@ -314,10 +388,24 @@ CONFIG_KEYS = (
 # (48 -> 24 per m tile), which is why dQ_reduce_ncol has to come with the wider d_chunk --
 # d_chunk is the tile the drain slices, so a 64-column slice is only legal once the chunk
 # is at least 64 wide.
+# 576/512 (same host and mask): the solver picks d_chunk 96, and 96 is the worst width
+# this axis can take -- gcd(96, dv_chunk 128) is 32, so the whole drain drops to 32-column
+# slices (52 per m tile against 512/512's 24) and the axis splits into 6 chunks (16 output
+# chunks, 26 operand fetches). 576 = 2**6 * 9, so of the legal widths (32/96/192/576) only
+# 192 divides 64: it is the only way to get the 64-column slice back. Measured 13.04ms at
+# d_chunk 96 versus 10.12ms for 512/512 on the same shape, i.e. +29% time for +7.5% math.
+# The price, and the thing this pin is measuring: a 192-wide output chunk leaves
+# (512-256)/192 = 1 TMEM out slot instead of 2, so the output gemms no longer overlap the
+# drain, and 2x192 K stages do not fit in SMEM so K is single-buffered.
 _MEASURED_CONFIG = {
     (512, 512, 1): {
         "d_chunk": 128,
         "d_chunks_resident": 2,
+        "dQ_reduce_ncol": 64,
+    },
+    (576, 512, 1): {
+        "d_chunk": 192,
+        "d_chunks_resident": 1,
         "dQ_reduce_ncol": 64,
     },
 }
@@ -521,40 +609,78 @@ class FlashAttentionBackwardSm100BigD:
         # thread) live inside the compute warps' budget. DSA's sm100 bwd splits the
         # same way (4 compute + 8 reduce warps).
         self.drain_warp_ids = (0, 1, 2, 3)
-        # The TMEM->register copies are partitioned over 128 threads (one
-        # warpgroup): tcgen05.make_tmem_copy sizes its thread layout from the
-        # accumulator, and for these shapes that is 4 warps. Dispatching 8 compute
-        # warps at it made threads 128..255 read/write past their fragment. Warps 8-11
-        # stay idle until they get a tile of their own (the second warpgroup).
+        # The compute warpgroup is 4 warps, and the CTA is 12 warps. The TMEM->register
+        # copies are partitioned over 128 threads (tcgen05.make_tmem_copy sizes its
+        # thread layout from the accumulator and for these shapes that is 4 warps), so
+        # 4 warps is also the natural width.
+        #
+        # Why 12 warps and not 16: this is a register-ceiling decision, not an occupancy
+        # one. ptxas allocates 65536/threads_per_cta registers per thread, so at 512
+        # threads it can only give every warp 128 -- setmaxnreg redistributes the
+        # physical pool at runtime but cannot change what the code was compiled against.
+        # The compute branch's live set is 4 x W f32 (S/P/dP/dS) plus 2 x W/2 packed =
+        # 160 f32 before addressing, so at 16 warps it spilled unconditionally: MEASURED
+        # (log_ncu_5, d512/dv512) local ld 1.10GB / st 136.5MB with 39.5 of the 48.5 warp
+        # cycles between issues on an L1TEX scoreboard, and every register split tried
+        # at 16 warps (200/136, 152/136, 168/128, and 144 x 2 with the drain doubled)
+        # measured flat, which is the signature of a constraint and not a knob. At 384
+        # threads ptxas allocates 162 and the local traffic is exactly zero.
+        #
+        # A second compute warpgroup (8 warps, interleaving the softmax chunks with a
+        # rendezvous where the packed P / dS columns of one chunk overlap another's
+        # reads) was worth ~3%, and it cannot coexist with this: 8 compute warps + 4
+        # drain + mma / load is 16 warps, i.e. back to 128 registers and the spill. The
+        # two effects cancel to the same wall clock; this side of the trade is kept
+        # because it also removes all local traffic.
         self.compute_warp_ids = (4, 5, 6, 7)
-        self.mma_warp_id = 12
-        self.load_warp_id = 13
-        self.threads_per_cta = cute.arch.WARP_SIZE * 16
+        self.mma_warp_id = 8
+        self.load_warp_id = 9
+        # Warps 10-11 idle. They exist to complete the mma / load warpgroup: setmaxnreg
+        # is warpgroup aligned.
+        self.num_warps = 12
+        self.threads_per_cta = cute.arch.WARP_SIZE * self.num_warps
 
-        # setmaxnreg budget. The launch is 512 threads, so every warp starts at
-        # 65536/512 = 128 registers; a warpgroup asking for less must *decrease* and
-        # for more must *increase*, and the per-thread values summed over the four
-        # warpgroups must stay within 512.
-        #   drain 200 (warps 0-3)   compute 136 (4-7)   idle 24 (8-11)
-        #   load / mma 88 (12-15)
-        # The drain warpgroup got the registers the output fragments need now that
-        # the drain moved there (dV 128 + dK 64 + dQ 64 f32 per thread, processed one
-        # chunk at a time); compute keeps its 136 since its four S/P/dP/dS fragments
-        # did not change. Warps 8-11 are idle at runtime (num_regs_empty), so the budget
-        # below is what the kernel actually allocates -- reserve a second compute
-        # warpgroup here once they get a real tile.
-        self.num_regs_drain = 200
-        self.num_regs_compute = 136
+        # setmaxnreg budget. The launch is 384 threads, so every warp starts at
+        # 65536/384 = 168 registers (rounded to a multiple of 8); a warpgroup asking for
+        # less must *decrease* and for more must *increase*, and the per-thread values
+        # summed over the warpgroups must stay within 65536/128 = 512.
+        #   drain 176 (warps 0-3)   compute 240 (4-7)
+        #   load / mma 88 (8-11, warps 10-11 idle at 24)      sum 504
+        # The drain keeps the odd one out. Its inner step is "T2R one dQ_reduce_ncol
+        # slice into a 64 f32 fragment, then read that fragment out with 16
+        # red.global.add.v4.f32", and the next slice's T2R has to wait for those
+        # reductions to have read the registers. ncu calls that wait a scoreboard
+        # dependency on an L1TEX operation, and at 576/512 it is 44.8 of the 54.5
+        # cycles between issued instructions -- 82% of the whole stall budget. Hiding it
+        # needs two fragments live (2 x 64 registers) plus the addressing.
+        #
+        # Compute now gets 240 instead of the 128-136 it was pinned to at 16 warps,
+        # which is the whole point of dropping to 12 (see the warp ids above): its live
+        # set is 160 f32 plus addressing, so 240 is the first quota that can hold it
+        # without spilling. Measured history at 16 warps, all flat: 152/136, 168/128,
+        # 144 x 2 with drain doubled.
+        self.num_regs_drain = 176
+        self.num_regs_compute = 240
         self.num_regs_load = 88
         self.num_regs_mma = 88
         self.num_regs_empty = 24
         assert (
             self.num_regs_drain
             + self.num_regs_compute
-            + self.num_regs_empty
-            + max(self.num_regs_load, self.num_regs_mma)
+            + max(self.num_regs_load, self.num_regs_mma, self.num_regs_empty)
             <= 512
         )
+        # setmaxnreg takes values in [24, 256] in multiples of 8.
+        for _q in (
+            self.num_regs_drain,
+            self.num_regs_compute,
+            self.num_regs_load,
+            self.num_regs_mma,
+            self.num_regs_empty,
+        ):
+            assert 24 <= _q <= 256 and _q % 8 == 0, (
+                f"setmaxnreg value {_q} is not in [24, 256] and a multiple of 8"
+            )
 
         self.buffer_align_bytes = 1024
         # Width, in m columns, of one S -> P -> dP -> dS round trip. The live register
@@ -573,9 +699,9 @@ class FlashAttentionBackwardSm100BigD:
         self.num_softmax_chunks = self.tile_m // self.softmax_chunk_m
 
     def _setup_attributes(self):
-        # Phase 1 keeps the pipelines at their shallowest: Q and dO chunks are
-        # re-fetched per use, K holds `d_chunks_resident` chunks for the whole
-        # n-block. Deeper staging is a later perf knob.
+        # Q and dO hold one chunk at a time, K holds `d_chunks_resident` for the whole
+        # n-block. Whether a chunk is actually re-fetched for the gemm that reads it a
+        # second time is decided by the reuse schedules below, not by the stage count.
         self.Q_stage = 1
         self.dO_stage = 1
         self.K_smem_stages = self.d_chunks_resident
@@ -586,9 +712,42 @@ class FlashAttentionBackwardSm100BigD:
         self.dQ_reduce_ncol = self.dQ_reduce_ncol_cfg
         assert (self.d_chunk // self.cta_group_size) % self.dQ_reduce_ncol == 0
 
+        # SMEM operand reuse. K carries across m iterations, Q / dO do not. V has a
+        # single consumer (the dP gemm), so there is no second pass to recycle it from
+        # and it keeps its own hand-written streaming.
+        self.sched_K = _reuse_schedule(
+            self.num_d_chunks, self.K_smem_stages, carry=True
+        )
+        self.sched_Q = _reuse_schedule(self.num_d_chunks, self.Q_stage, carry=False)
+        self.sched_dO = _reuse_schedule(self.num_dv_chunks, self.dO_stage, carry=False)
+        # Only K can need a prologue: a Q / dO buffer that still holds the right chunk
+        # holds it for the *previous* m tile, so their first access is never a hit.
+        assert not self.sched_Q[2] and not self.sched_dO[2]
+
+        # dV / dK / dQ are issued in ONE order shared by the mma warp and the drain
+        # warps, and each segment runs DESCENDING so that the chunk the S / dP pass left
+        # in SMEM is the first one the output pass asks for. The order has to be shared:
+        # the drain gates the mma warp through num_out_slots scratch slots, so a drain
+        # that waits in a different order than the mma warp issues deadlocks as soon as
+        # the two diverge by more than the slot count.
+        self.out_issue = (
+            tuple(reversed(range(self.num_dv_chunks)))
+            + tuple(
+                self.num_dv_chunks + c for c in reversed(range(self.num_d_chunks))
+            )
+            + tuple(
+                self.num_dv_chunks + self.num_d_chunks + c
+                for c in reversed(range(self.num_d_chunks))
+            )
+        )
+
         # mbarrier slot offsets inside the single mbar_ptr MemRange: the pipeline slots
         # occupy [0, mbar_count() - 1) and the one scalar barrier sits at the end.
         self.mbar_tmem_dealloc_offset = self.mbar_count() - 1
+
+    def out_pos(self, out_c):
+        """Position of an output chunk in the shared dV / dK / dQ issue order."""
+        return self.out_issue.index(out_c)
 
     def _get_tiled_mma(self, ab_dtype):
         cg = self.cta_group
@@ -619,6 +778,24 @@ class FlashAttentionBackwardSm100BigD:
         mma_S, mma_dP, mma_dK, mma_dV, mma_dQ = self._get_tiled_mma(ab_dtype)
         la = sm100_utils_basic.make_smem_layout_a
         lb = sm100_utils_basic.make_smem_layout_b
+
+        # The transposed views below (sQt / sKt / sdO) are the SAME BYTES as their
+        # partners (sQ / sK / sdOt), which is what lets the gemm reading a tile second
+        # reuse what the first left in SMEM (see _reuse_schedule). From
+        # cutlass.utils.blackwell_helpers: an operand layout is
+        # tile_to_mma_shape(atom, shape, order) with the atom chosen by the MAJOR mode
+        # size and order (1,2,3) for K-major, (2,1,3) for MN-major. K_SWnn and MN_SWnn
+        # are each other's transpose and the order flip lays out the non-major axis
+        # first, so a K-major (X, Y) tile and an MN-major (Y, X) tile sharing major axis
+        # Y are the same map. The kernel already relies on this for dS (sdSt is the
+        # A-K-major (n, m) view and sdS the A-MN-major (m, n) view of one buffer), so the
+        # dQ path is its standing test.
+        #
+        # This holds at the major-mode sizes this config runs at, not universally: the
+        # d_chunk=64 pair really is transposed, sK ((128,16),1,4,8):((64,1),0,16,8192)
+        # against sKt ((64,16),1,8,8):((1,64),0,1024,8192), because a 64-element major
+        # mode selects a different swizzle atom on the two sides. Hence the assertion at
+        # the end of this function.
 
         # S^T = K @ Q^T : all d chunks of K stay resident for the n-block, Q is
         # streamed one chunk at a time.
@@ -667,6 +844,18 @@ class FlashAttentionBackwardSm100BigD:
             shape=(self.tile_m, self.dO_stage), stride=(1, cute.round_up(self.tile_m, 64))
         )
 
+        # A transposed view that is not byte-identical to its partner would make the
+        # second gemm read a transposed tile -- which compiles and returns a wrong
+        # answer -- so check the extents agree at the sizes this config runs at.
+        for k_major, mn_major in (
+            (self.sQ_layout, self.sQt_layout),
+            (self.sK_layout, self.sKt_layout),
+            (self.sdOt_layout, self.sdO_layout),
+        ):
+            assert cute.cosize(k_major) == cute.cosize(mn_major), (
+                "an operand and its transposed view must occupy the same bytes"
+            )
+
     def mbar_count(self):
         """Number of Int64 mbarrier slots in SharedStorage.
 
@@ -678,8 +867,9 @@ class FlashAttentionBackwardSm100BigD:
           dPin full/empty    2 * num_dv_chunks      dP full         1
           dVin full/empty    2 * num_dv_chunks      PdS full        1
           dKin full/empty    2 * num_d_chunks       dSsmem full     1
-          dQin full/empty    2 * num_d_chunks       stats full      1
+          dQin full/empty    2 * num_d_chunks       K prologue      1
           out  full/empty    2 * (num_dv_chunks + 2 * num_d_chunks)
+                                                    stats full      1
                                                     stats empty     1
                                                     tmem dealloc    1
 
@@ -693,8 +883,9 @@ class FlashAttentionBackwardSm100BigD:
             + 2 * self.num_d_chunks     # dQin
             + 2 * (self.num_dv_chunks + 2 * self.num_d_chunks)  # out
         )
-        # S full, dP full, PdS full, dSsmem full, stats full / empty, tmem dealloc.
-        scalars = 7
+        # S full, dP full, PdS full, dSsmem full, K prologue, stats full / empty,
+        # tmem dealloc.
+        scalars = 8
         return per_chunk + scalars
 
     def make_shared_storage(self, q_dtype, do_dtype, ds_dtype):
@@ -896,15 +1087,11 @@ class FlashAttentionBackwardSm100BigD:
         mQ, mK, mV, mdO = [
             layout_utils.select(t, mode=layout_transpose) for t in (mQ, mK, mV, mdO)
         ]
-        # The dV / dK gemms take dO / Q as MN-major B operands, i.e. their smem
-        # tile is (chunk, tile_m) -- the transpose of the (s, d) gmem order used by
-        # the dP / S gemms. They therefore need their own (d, s, h, b) views (this
-        # is why the existing kernel carries both mQ/mQt and mdO/mdOt). With
-        # dv_chunk == tile_m the shapes coincide, so getting this wrong compiles
-        # and silently reads the transpose.
-        mdO_dV, mQ_dK, mK_dQ = [
-            layout_utils.select(t, mode=[1, 0, 2, 3]) for t in (mdO, mQ, mK)
-        ]
+        # No (d, s, h, b) views here on purpose. The dV / dK / dQ gemms take dO / Q / K
+        # as MN-major operands, i.e. their SMEM tile is the transpose of the (s, d) tile
+        # the S / dP gemms use -- but only the LOGICAL shape is transposed, the bytes are
+        # identical (see _setup_smem_layout). So one TMA atom per tensor fills the buffer
+        # for both gemms and the second one reads it through the transposed view.
 
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
         tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_A(
@@ -941,34 +1128,9 @@ class FlashAttentionBackwardSm100BigD:
             tiled_mma_dP,
             self.cluster_shape_mnk.shape,
         )
-        # dV_c = P^T @ dO_c and dK_c = dS^T @ Q_c need dO / Q in the other
-        # orientation, so they get their own atoms (and are re-TMA'd into the same
-        # buffers once dP / S are done with them).
-        tma_atom_dO, tma_tensor_dO = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            mdO_dV,
-            cute.select(self.sdO_layout, mode=[0, 1, 2]),
-            self.mma_tiler_pdo,
-            tiled_mma_dV,
-            self.cluster_shape_mnk.shape,
-        )
-        tma_atom_Qt, tma_tensor_Qt = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            mQ_dK,
-            cute.select(self.sQt_layout, mode=[0, 1, 2]),
-            self.mma_tiler_dsq,
-            tiled_mma_dK,
-            self.cluster_shape_mnk.shape,
-        )
-        # dQ_c = dS^T @ K_c needs K in the (d, s) orientation as its B operand.
-        tma_atom_Kt, tma_tensor_Kt = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            mK_dQ,
-            cute.select(self.sKt_layout, mode=[0, 1, 2]),
-            self.mma_tiler_dsk,
-            tiled_mma_dQ,
-            self.cluster_shape_mnk.shape,
-        )
+        # dV_c = P^T @ dO_c, dK_c = dS^T @ Q_c and dQ_c = dS @ K_c read dO / Q / K
+        # through their MN-major views, which are byte-identical to the K-major ones
+        # above, so they need no atoms and no reload of their own.
         self.tma_copy_bytes = {
             name: self.cta_group_size
             * cute.size_in_bytes(dtype, cute.select(layout, mode=[0, 1, 2]))
@@ -977,9 +1139,6 @@ class FlashAttentionBackwardSm100BigD:
                 ("K", self.k_dtype, self.sK_layout),
                 ("V", self.v_dtype, self.sV_layout),
                 ("dOt", self.do_dtype, self.sdOt_layout),
-                ("dO", self.do_dtype, self.sdO_layout),
-                ("Qt", self.q_dtype, self.sQt_layout),
-                ("Kt", self.k_dtype, self.sKt_layout),
             ]
         }
 
@@ -990,9 +1149,6 @@ class FlashAttentionBackwardSm100BigD:
             tma_tensor_K,
             tma_tensor_V,
             tma_tensor_dOt,
-            tma_tensor_dO,
-            tma_tensor_Qt,
-            tma_tensor_Kt,
             mLSE,
             mdPsum,
             mFM,
@@ -1003,9 +1159,6 @@ class FlashAttentionBackwardSm100BigD:
             tma_atom_K,
             tma_atom_V,
             tma_atom_dOt,
-            tma_atom_dO,
-            tma_atom_Qt,
-            tma_atom_Kt,
             tiled_mma_S,
             tiled_mma_dP,
             tiled_mma_dV,
@@ -1037,9 +1190,6 @@ class FlashAttentionBackwardSm100BigD:
         mK: cute.Tensor,
         mV: cute.Tensor,
         mdO: cute.Tensor,
-        mdO_dV: cute.Tensor,
-        mQ_dK: cute.Tensor,
-        mK_dQ: cute.Tensor,
         mLSE: cute.Tensor,
         mdPsum: cute.Tensor,
         mFM: Optional[cute.Tensor],
@@ -1050,9 +1200,6 @@ class FlashAttentionBackwardSm100BigD:
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
         tma_atom_dOt: cute.CopyAtom,
-        tma_atom_dO: cute.CopyAtom,
-        tma_atom_Qt: cute.CopyAtom,
-        tma_atom_Kt: cute.CopyAtom,
         tiled_mma_S: cute.TiledMma,
         tiled_mma_dP: cute.TiledMma,
         tiled_mma_dV: cute.TiledMma,
@@ -1115,13 +1262,16 @@ class FlashAttentionBackwardSm100BigD:
         mbar_out_full = mbar_dQin_empty + self.num_d_chunks
         num_out_chunks = self.num_dv_chunks + 2 * self.num_d_chunks
         mbar_out_empty = mbar_out_full + num_out_chunks
+        # K only depends on the n block, so the chunks the steady-state reuse schedule
+        # expects to already be resident when the m loop starts are fetched once, here.
+        mbar_Kpre_full = mbar_out_empty + num_out_chunks
         # LSE and dPsum for one m tile, staged in SMEM by the load warp. The compute
         # warps used to read them straight from gmem, per element: S^T is (n, m), so the
         # m coordinate is the per-ELEMENT one and every thread walked all tile_m values
         # of both tensors once per m tile -- ~2 * tile_m dependent scalar loads per
         # thread, with all 32 lanes of a warp asking for the identical value. Two bulk
         # copies per m tile replace them.
-        mbar_stats_full = mbar_out_empty + num_out_chunks
+        mbar_stats_full = mbar_Kpre_full + 1
         mbar_stats_empty = mbar_stats_full + 1
         mbar_tmem_dealloc = mbar_ptr + self.mbar_tmem_dealloc_offset
         # The pipeline slots above have to end exactly where tmem_dealloc starts, or
@@ -1138,6 +1288,7 @@ class FlashAttentionBackwardSm100BigD:
             + 1                         # dSsmem full
             + 2 * self.num_d_chunks     # dQin full / empty
             + 2 * num_out_chunks        # out full / empty
+            + 1                         # K prologue full
             + 2                         # stats full / empty
         )
         assert pipeline_slots == self.mbar_tmem_dealloc_offset, (
@@ -1177,6 +1328,7 @@ class FlashAttentionBackwardSm100BigD:
             for c in cutlass.range_constexpr(num_out_chunks):
                 cute.arch.mbarrier_init(mbar_out_full + c, 1)
                 cute.arch.mbarrier_init(mbar_out_empty + c, num_drain_threads)
+            cute.arch.mbarrier_init(mbar_Kpre_full, 1)
             # stats_full: one arrival from the load warp's elected lane, plus the bytes
             # of both bulk copies. stats_empty: every compute thread, once it is done
             # reading the tile -- the buffers are single, so the next m tile's fetch has
@@ -1195,10 +1347,9 @@ class FlashAttentionBackwardSm100BigD:
         sdOt = storage.sdO.get_tensor(
             sdOt_layout.outer, swizzle=sdOt_layout.inner, dtype=self.do_dtype
         )
-        # Second views of the same storage, used after their first consumer is
-        # done: dV needs dO in the (dv_chunk, tile_m) orientation and dK needs Q^T,
-        # so both are re-TMA'd into the buffer they already occupy (the existing
-        # kernel does the same, see its "dO_low reload (for dV_low)").
+        # Second views of the same buffer, used by the gemm that reads the tile after
+        # the S / dP gemm is done with it: dV wants dO as (dv_chunk, tile_m) and dK
+        # wants Q^T. Same bytes, so no reload (see _setup_smem_layout).
         sdO = storage.sdO.get_tensor(
             sdO_layout.outer, swizzle=sdO_layout.inner, dtype=self.do_dtype
         )
@@ -1421,41 +1572,27 @@ class FlashAttentionBackwardSm100BigD:
         gK = cute.local_tile(
             mK_cur, cute.select(self.mma_tiler_kq, mode=[0, 2]), (n_block, None)
         )
-        gQ = cute.local_tile(
-            mQ_cur, cute.select(self.mma_tiler_kq, mode=[1, 2]), (0, None)
-        )
-        gdOt = cute.local_tile(
-            mdO_cur, cute.select(self.mma_tiler_vdo, mode=[1, 2]), (0, None)
-        )
-        # dO / Q^T for the dV / dK gemms come from the (d, s, h, b) views, so the
-        # tile is (chunk, tile_m) and the chunk index lives in mode 0.
-        gdO = cute.local_tile(
-            mdO_dV[None, None, head_idx, batch_idx],
-            cute.select(self.mma_tiler_pdo, mode=[1, 2]),
-            (None, 0),
-        )
-        gQt = cute.local_tile(
-            mQ_dK[None, None, head_idx, batch_idx],
-            cute.select(self.mma_tiler_dsq, mode=[1, 2]),
-            (None, 0),
-        )
-        # K^T for dQ: (d, s) view, tile (d_chunk, tile_n), chunk in mode 0.
-        gKt = cute.local_tile(
-            mK_dQ[None, None, head_idx_kv, batch_idx],
-            cute.select(self.mma_tiler_dsk, mode=[1, 2]),
-            (None, n_block),
-        )
         tSgK = thr_mma_S.partition_A(gK)
-        tSgQ = thr_mma_S.partition_B(gQ)
-        tdPgdOt = thr_mma_dP.partition_B(gdOt)
-        tdVgdO = thr_mma_dV.partition_B(gdO)
-        tdKgQt = thr_mma_dK.partition_B(gQt)
-        tdQgKt = thr_mma_dQ.partition_B(gKt)
 
         if warp_idx == self.load_warp_id:
             # The register budget is per-warp state, not per-iteration work: setting it
             # inside the m loop re-issues setmaxnreg on every iteration.
             cute.arch.setmaxregister_decrease(self.num_regs_load)
+            # K only depends on the n block, so one copy fn serves the whole kernel --
+            # including the prologue, which puts the chunks the steady-state schedule
+            # expects to be resident into place before the m loop.
+            load_K, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_K, 0, cute.make_layout(1), tSgK, sK
+            )
+            K_pre = cutlass.const_expr(self.sched_K[2])
+            if cutlass.const_expr(len(K_pre) > 0):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        mbar_Kpre_full,
+                        cutlass.const_expr(len(K_pre) * self.tma_copy_bytes["K"]),
+                    )
+                for i in cutlass.range_constexpr(len(K_pre)):
+                    load_K(K_pre[i][0], K_pre[i][1], tma_bar_ptr=mbar_Kpre_full)
             # LSE / dPsum are contiguous tile_m runs of f32, so they need no TMA
             # descriptor: a plain bulk copy moves the whole tile on one mbarrier.
             copy_stats = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32)
@@ -1465,12 +1602,42 @@ class FlashAttentionBackwardSm100BigD:
                 # The iteration counter drives the barrier phases; m_iter is the actual
                 # block index, which skips the fully masked band (see the skip range).
                 m_iter = m_lo + it if it < seg1 else seg2_base + (it - seg1)
+
+                def wait_after(rec, empty_bars):
+                    """Wait for the gemm that last read the buffer this fetch overwrites.
+
+                    ``rec["after"]`` is the (pass index, chunk) of that reader, which
+                    _reuse_schedule derived from the buffer's access cycle;
+                    ``empty_bars`` maps a pass index to its ``*_in_empty`` barrier base.
+                    A hit overwrites nothing, so it waits for nothing.
+
+                    The wrapped case has to be skipped on the first iteration:
+                    mbarrier_wait spins on try_wait.parity, which only returns once the
+                    phase with that parity has COMPLETED, so a parity-1 wait on a fresh
+                    barrier blocks forever instead of falling through.
+                    """
+                    if cutlass.const_expr(not rec["load"]):
+                        return
+                    bar = empty_bars[rec["after"][0]] + rec["after"][1]
+                    if cutlass.const_expr(rec["after_prev_iter"]):
+                        if it > 0:
+                            cute.arch.mbarrier_wait(bar, phase ^ 1)
+                    else:
+                        cute.arch.mbarrier_wait(bar, phase)
+
+                def publish(bar, nbytes):
+                    """Arm `bar` for a fetch of `nbytes`, or just complete it if 0."""
+                    with cute.arch.elect_one():
+                        if cutlass.const_expr(nbytes > 0):
+                            cute.arch.mbarrier_arrive_and_expect_tx(bar, nbytes)
+                        else:
+                            cute.arch.mbarrier_arrive(bar)
+
                 # LSE / dPsum first: they are the compute warps' first dependency after
                 # S, and one bulk copy each is cheap enough to issue ahead of the
                 # operand TMAs. Single buffer, so the previous tile's readers have to be
-                # done -- on the first iteration that arrival does not exist yet, and a
-                # parity-1 wait on a fresh mbarrier blocks instead of falling through
-                # (same reason the K/Q wrap wait below is skipped at it == 0).
+                # done -- on the first iteration that arrival does not exist yet (a
+                # parity-1 wait on a fresh mbarrier never falls through).
                 if it > 0:
                     cute.arch.mbarrier_wait(mbar_stats_empty, phase ^ 1)
                 with cute.arch.elect_one():
@@ -1491,9 +1658,6 @@ class FlashAttentionBackwardSm100BigD:
                         sdPsum,
                         mbar_ptr=mbar_stats_full,
                     )
-                load_K, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_K, 0, cute.make_layout(1), tSgK, sK
-                )
                 load_Q, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_Q, 0, cute.make_layout(1), thr_mma_S.partition_B(
                         cute.local_tile(
@@ -1503,55 +1667,36 @@ class FlashAttentionBackwardSm100BigD:
                         )
                     ), sQ
                 )
-                # K streams through d_chunks_resident buffers (3 chunks, 2 buffers at
-                # tile_n=128) and Q through its single stage; both for chunk c land on
-                # the same barrier, so chunk c waits for chunk c-1 to be consumed.
-                for c in cutlass.range_constexpr(self.num_d_chunks):
-                    # The dependency wraps across m iterations: chunk 0 of this
-                    # iteration reuses the buffer that the previous iteration's last
-                    # chunk was still reading. Without this the loads raced ahead and
-                    # the MMA saw a half-overwritten buffer (illegal access).
-                    #
-                    # The wrap wait must be SKIPPED on the first iteration.
-                    # mbarrier_wait spins on mbarrier.try_wait.parity, which only
-                    # returns once the phase with that parity has *completed*: on a
-                    # fresh barrier a wait for parity 1 blocks until two completions,
-                    # so "phase ^ 1" on the first iteration (it == 0) is a deadlock,
-                    # not a no-op.
-                    if cutlass.const_expr(c > 0):
-                        cute.arch.mbarrier_wait(mbar_Sin_empty + (c - 1), phase)
-                    else:
-                        if it > 0:
-                            cute.arch.mbarrier_wait(
-                                mbar_Sin_empty + (self.num_d_chunks - 1), phase ^ 1
-                            )
-                            # sQ and sK are each used TWICE per iteration through a
-                            # second view: sQt (for dK) aliases sQ, sKt (for dQ)
-                            # aliases sK. The release for the next iteration therefore
-                            # has to come from the LAST consumer of the buffer, not
-                            # from the S loop -- with only the Sin_empty gate the next
-                            # iteration's K/Q loads overwrote the buffers while the
-                            # dK / dQ gemms were still reading them.
-                            cute.arch.mbarrier_wait(
-                                mbar_dKin_empty + (self.num_d_chunks - 1), phase ^ 1
-                            )
-                            cute.arch.mbarrier_wait(
-                                mbar_dQin_empty + (self.num_d_chunks - 1), phase ^ 1
-                            )
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            mbar_Sin_full + c,
-                            self.tma_copy_bytes["K"] + self.tma_copy_bytes["Q"],
-                        )
-                    load_K(c, c % self.d_chunks_resident, tma_bar_ptr=mbar_Sin_full + c)
-                    load_Q(c, 0, tma_bar_ptr=mbar_Sin_full + c)
+                # S pass: K (A) and Q (B) for one d chunk land on the same barrier, so
+                # each chunk keeps one full/empty pair. Either fetch may be a no-op when
+                # the buffer already holds the chunk (K carries across m iterations, and
+                # the dK pass leaves Q's last chunk behind), and then the barrier is
+                # simply arrived instead of armed for bytes.
+                for pos in cutlass.range_constexpr(self.num_d_chunks):
+                    k = cutlass.const_expr(self.sched_K[0][pos])
+                    q = cutlass.const_expr(self.sched_Q[0][pos])
+                    assert k["chunk"] == q["chunk"]
+                    c = cutlass.const_expr(k["chunk"])
+                    wait_after(k, (mbar_Sin_empty, mbar_dQin_empty))
+                    wait_after(q, (mbar_Sin_empty, mbar_dKin_empty))
+                    publish(
+                        mbar_Sin_full + c,
+                        cutlass.const_expr(
+                            (self.tma_copy_bytes["K"] if k["load"] else 0)
+                            + (self.tma_copy_bytes["Q"] if q["load"] else 0)
+                        ),
+                    )
+                    if cutlass.const_expr(k["load"]):
+                        load_K(c, k["stage"], tma_bar_ptr=mbar_Sin_full + c)
+                    if cutlass.const_expr(q["load"]):
+                        load_Q(c, q["stage"], tma_bar_ptr=mbar_Sin_full + c)
                 # V + dO^T: one dv chunk at a time, both into their single stage.
                 # sV has its stage mode sliced off (rank 3), so cpasync.tma_partition
                 # needs a gmem tile of matching rank: bake the chunk index into
                 # local_tile and use single_stage=True, one copy fn per chunk (the
                 # existing kernel does the same with load_V_low / load_V_high). sdOt
                 # keeps its stage mode, so it uses the indexed form like Q.
-                load_dOt, _, _ = copy_utils.tma_get_copy_fn(
+                load_dO, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_dOt, 0, cute.make_layout(1), thr_mma_dP.partition_B(
                         cute.local_tile(
                             mdO_cur,
@@ -1560,7 +1705,9 @@ class FlashAttentionBackwardSm100BigD:
                         )
                     ), sdOt
                 )
-                for c in cutlass.range_constexpr(self.num_dv_chunks):
+                for pos in cutlass.range_constexpr(self.num_dv_chunks):
+                    o = cutlass.const_expr(self.sched_dO[0][pos])
+                    c = cutlass.const_expr(o["chunk"])
                     gV_c = cute.local_tile(
                         mV_cur, cute.select(self.mma_tiler_vdo, mode=[0, 2]), (n_block, c)
                     )
@@ -1572,8 +1719,9 @@ class FlashAttentionBackwardSm100BigD:
                         sV,
                         single_stage=True,
                     )
-                    # Same cross-iteration wrap as the K/Q loop, and again skipped on
-                    # the first iteration (a parity-1 wait on a fresh barrier blocks).
+                    # sV is a single buffer with one consumer, so its own gate is the
+                    # previous chunk's dP gemm; sdOt is what the schedule tracks (its
+                    # buffer is shared with the dV gemm's sdO view).
                     if cutlass.const_expr(c > 0):
                         cute.arch.mbarrier_wait(mbar_dPin_empty + (c - 1), phase)
                     else:
@@ -1581,111 +1729,58 @@ class FlashAttentionBackwardSm100BigD:
                             cute.arch.mbarrier_wait(
                                 mbar_dPin_empty + (self.num_dv_chunks - 1), phase ^ 1
                             )
-                            # sdO is the same buffer as sdOt (the dV view aliases the
-                            # dP view), so the next iteration's V/dO^T loads must also
-                            # wait for the dV gemm to be done with it.
-                            cute.arch.mbarrier_wait(
-                                mbar_dVin_empty + (self.num_dv_chunks - 1), phase ^ 1
-                            )
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            mbar_dPin_full + c,
-                            self.tma_copy_bytes["V"] + self.tma_copy_bytes["dOt"],
-                        )
+                    wait_after(o, (mbar_dPin_empty, mbar_dVin_empty))
+                    publish(
+                        mbar_dPin_full + c,
+                        cutlass.const_expr(
+                            self.tma_copy_bytes["V"]
+                            + (self.tma_copy_bytes["dOt"] if o["load"] else 0)
+                        ),
+                    )
                     load_V_c(tma_bar_ptr=mbar_dPin_full + c)
-                    load_dOt(c, 0, tma_bar_ptr=mbar_dPin_full + c)
+                    if cutlass.const_expr(o["load"]):
+                        load_dO(c, o["stage"], tma_bar_ptr=mbar_dPin_full + c)
 
-                # dO reload in the dV orientation. The buffer is the one dP just
-                # finished with, so gate the first reload on the last dP consumption.
-                load_dO, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_dO, 0, cute.make_layout(1), thr_mma_dV.partition_B(
-                        cute.local_tile(
-                            mdO_dV[None, None, head_idx, batch_idx],
-                            cute.select(self.mma_tiler_pdo, mode=[1, 2]),
-                            (None, m_iter),
-                        )
-                    ), sdO
-                )
-                cute.arch.mbarrier_wait(mbar_dPin_empty + (self.num_dv_chunks - 1), phase)
-                for c in cutlass.range_constexpr(self.num_dv_chunks):
-                    # Cross-iteration wrap, skipped on the first iteration.
-                    if cutlass.const_expr(c > 0):
-                        cute.arch.mbarrier_wait(mbar_dVin_empty + (c - 1), phase)
-                    else:
-                        if it > 0:
-                            cute.arch.mbarrier_wait(
-                                mbar_dVin_empty + (self.num_dv_chunks - 1), phase ^ 1
-                            )
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            mbar_dVin_full + c, self.tma_copy_bytes["dO"]
-                        )
-                    load_dO(c, 0, tma_bar_ptr=mbar_dVin_full + c)
+                # dV pass: dO again, through its MN-major view. Its first chunk is the
+                # one the dP pass just left in SMEM, so that fetch is gone.
+                for pos in cutlass.range_constexpr(self.num_dv_chunks):
+                    o = cutlass.const_expr(self.sched_dO[1][pos])
+                    c = cutlass.const_expr(o["chunk"])
+                    wait_after(o, (mbar_dPin_empty, mbar_dVin_empty))
+                    publish(
+                        mbar_dVin_full + c,
+                        cutlass.const_expr(
+                            self.tma_copy_bytes["dOt"] if o["load"] else 0
+                        ),
+                    )
+                    if cutlass.const_expr(o["load"]):
+                        load_dO(c, o["stage"], tma_bar_ptr=mbar_dVin_full + c)
 
-                # Q^T reload for dK, into the sQ buffer that the S gemm is done with.
-                load_Qt, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_Qt, 0, cute.make_layout(1), thr_mma_dK.partition_B(
-                        cute.local_tile(
-                            mQ_dK[None, None, head_idx, batch_idx],
-                            cute.select(self.mma_tiler_dsq, mode=[1, 2]),
-                            (None, m_iter),
-                        )
-                    ), sQt
-                )
-                cute.arch.mbarrier_wait(mbar_Sin_empty + (self.num_d_chunks - 1), phase)
-                for c in cutlass.range_constexpr(self.num_d_chunks):
-                    # Cross-iteration wrap, skipped on the first iteration.
-                    if cutlass.const_expr(c > 0):
-                        cute.arch.mbarrier_wait(mbar_dKin_empty + (c - 1), phase)
-                    else:
-                        if it > 0:
-                            cute.arch.mbarrier_wait(
-                                mbar_dKin_empty + (self.num_d_chunks - 1), phase ^ 1
-                            )
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            mbar_dKin_full + c, self.tma_copy_bytes["Qt"]
-                        )
-                    load_Qt(c, 0, tma_bar_ptr=mbar_dKin_full + c)
+                # dK pass: Q again, through its MN-major view (sQt).
+                for pos in cutlass.range_constexpr(self.num_d_chunks):
+                    q = cutlass.const_expr(self.sched_Q[1][pos])
+                    c = cutlass.const_expr(q["chunk"])
+                    wait_after(q, (mbar_Sin_empty, mbar_dKin_empty))
+                    publish(
+                        mbar_dKin_full + c,
+                        cutlass.const_expr(self.tma_copy_bytes["Q"] if q["load"] else 0),
+                    )
+                    if cutlass.const_expr(q["load"]):
+                        load_Q(c, q["stage"], tma_bar_ptr=mbar_dKin_full + c)
 
-                # K^T for the dQ gemm: the S gemm is long done with sK, so re-stream it
-                # through the same d_chunks_resident buffers in the transposed layout.
-                #
-                # Measured (do not retry): sKt is NOT an aliasable view of sK, so this
-                # re-TMA cannot be hoisted out of the m loop even though the n-block's
-                # K bytes never change. At d_chunk=64 the two layouts are
-                #   sK  ((128,16),1,4,8):((64,1),0,16,8192)
-                #   sKt ((64,16),1,8,8):((1,64),0,1024,8192)
-                # i.e. genuinely transposed strides (same swizzle S<3,4,3>). The S gemm
-                # contracts K over d, the dQ gemm contracts it over n, so one SMEM copy
-                # cannot serve both. Same for sQ / sQt and sdO / sdOt. Removing the
-                # double fetch would need either a second 128KB SMEM buffer (no room) or
-                # an in-SMEM transpose. Its cost is TMA issue + barrier latency rather
-                # than HBM traffic: all 64 query heads of an n-block re-read the same
-                # K bytes, so L2 serves them.
-                load_Kt, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_Kt, 0, cute.make_layout(1), tdQgKt, sKt
-                )
-                cute.arch.mbarrier_wait(mbar_Sin_empty + (self.num_d_chunks - 1), phase)
-                for c in cutlass.range_constexpr(self.num_d_chunks):
-                    if cutlass.const_expr(c >= self.d_chunks_resident):
-                        cute.arch.mbarrier_wait(
-                            mbar_dQin_empty + (c - self.d_chunks_resident), phase
-                        )
-                    else:
-                        # wraps into the previous m iteration (see the K/Q loop), so it
-                        # is skipped on the first iteration
-                        if it > 0:
-                            cute.arch.mbarrier_wait(
-                                mbar_dQin_empty
-                                + (c - self.d_chunks_resident + self.num_d_chunks),
-                                phase ^ 1,
-                            )
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            mbar_dQin_full + c, self.tma_copy_bytes["Kt"]
-                        )
-                    load_Kt(c, c % self.d_chunks_resident, tma_bar_ptr=mbar_dQin_full + c)
+                # dQ pass: K again, through its MN-major view (sKt). K does not depend on
+                # m, so with the descending order this pass and the S pass together fetch
+                # 4 of the 8 chunk accesses at two stages instead of all 8.
+                for pos in cutlass.range_constexpr(self.num_d_chunks):
+                    k = cutlass.const_expr(self.sched_K[1][pos])
+                    c = cutlass.const_expr(k["chunk"])
+                    wait_after(k, (mbar_Sin_empty, mbar_dQin_empty))
+                    publish(
+                        mbar_dQin_full + c,
+                        cutlass.const_expr(self.tma_copy_bytes["K"] if k["load"] else 0),
+                    )
+                    if cutlass.const_expr(k["load"]):
+                        load_K(c, k["stage"], tma_bar_ptr=mbar_dQin_full + c)
 
                 phase ^= 1
         elif warp_idx == self.mma_warp_id:
@@ -1699,6 +1794,9 @@ class FlashAttentionBackwardSm100BigD:
             cute.arch.alloc_tmem(Int32(self.tmem_alloc_cols), storage.tmem_holding_buf)
             cute.arch.sync_warp()
             cute.arch.relinquish_tmem_alloc_permit()
+            # The K chunks fetched before the m loop (see the load warp's prologue).
+            if cutlass.const_expr(len(self.sched_K[2]) > 0):
+                cute.arch.mbarrier_wait(mbar_Kpre_full, 0)
 
             phase = Int32(0)
             for it in cutlass.range(num_iters, unroll=1):
@@ -1707,7 +1805,9 @@ class FlashAttentionBackwardSm100BigD:
                 m_iter = m_lo + it if it < seg1 else seg2_base + (it - seg1)
                 tSrK = tiled_mma_S.make_fragment_A(sK)
                 tSrQ = tiled_mma_S.make_fragment_B(sQ)
-                for c in cutlass.range_constexpr(self.num_d_chunks):
+                for pos in cutlass.range_constexpr(self.num_d_chunks):
+                    k = cutlass.const_expr(self.sched_K[0][pos])
+                    c = cutlass.const_expr(k["chunk"])
                     cute.arch.mbarrier_wait(mbar_Sin_full + c, phase)
                     sm100_utils.gemm_ptx_w_idx(
                         tiled_mma_S,
@@ -1716,9 +1816,9 @@ class FlashAttentionBackwardSm100BigD:
                         tSrQ,
                         sA=sK,
                         sB=sQ,
-                        A_idx=c % self.d_chunks_resident,
+                        A_idx=k["stage"],
                         B_idx=0,
-                        zero_init=(c == 0),
+                        zero_init=(pos == 0),
                         cta_group=self.cta_group_size,
                     )
                     with cute.arch.elect_one():
@@ -1761,30 +1861,35 @@ class FlashAttentionBackwardSm100BigD:
                 # bf16 into the upper halves of those same regions.
                 cute.arch.mbarrier_wait(mbar_PdS_full, phase)
 
-                # Output chunk c writes scratch slot c % num_out_slots, so the slot's
-                # previous user is chunk c - num_out_slots -- in this iteration if that
-                # index is still >= 0, otherwise in the previous one (the chunk sequence
-                # runs continuously across m iterations, hence the phase flip). With
-                # num_out_slots == 1 this is exactly the old "wait for c - 1" rule.
-                def wait_out_slot_free(oc):
-                    prev = cutlass.const_expr(oc - self.num_out_slots)
+                # Output chunk at issue position `pos` writes scratch slot
+                # pos % num_out_slots, so the slot's previous user is the chunk
+                # num_out_slots positions earlier -- in this iteration if that position
+                # still exists, otherwise in the previous one (the sequence runs
+                # continuously across m iterations, hence the phase flip; Python's
+                # negative indexing picks the right chunk either way). The segments run
+                # descending, so this is no longer the same as "out_c - num_out_slots".
+                def wait_out_slot_free(pos):
+                    prev = cutlass.const_expr(pos - self.num_out_slots)
+                    prev_oc = cutlass.const_expr(self.out_issue[prev])
                     if cutlass.const_expr(prev >= 0):
-                        cute.arch.mbarrier_wait(mbar_out_empty + prev, phase)
+                        cute.arch.mbarrier_wait(mbar_out_empty + prev_oc, phase)
                     else:
                         if it > 0:
-                            cute.arch.mbarrier_wait(
-                                mbar_out_empty + (num_out_chunks + prev), phase ^ 1
-                            )
+                            cute.arch.mbarrier_wait(mbar_out_empty + prev_oc, phase ^ 1)
 
-                # dV_c = P^T @ dO_c   (A = P from TMEM)
+                # dV_c = P^T @ dO_c   (A = P from TMEM). Descending, like the loads and
+                # the drain: chunk num-1 is the one the dP pass left in SMEM.
                 tdVrP = tiled_mma_dV.make_fragment_A(tP)
                 tdVrdO = tiled_mma_dV.make_fragment_B(sdO)
-                for c in cutlass.range_constexpr(self.num_dv_chunks):
+                for pos_in_seg in cutlass.range_constexpr(self.num_dv_chunks):
+                    c = cutlass.const_expr(self.num_dv_chunks - 1 - pos_in_seg)
+                    out_c = cutlass.const_expr(c)
+                    pos = cutlass.const_expr(self.out_pos(out_c))
                     cute.arch.mbarrier_wait(mbar_dVin_full + c, phase)
-                    wait_out_slot_free(c)
+                    wait_out_slot_free(pos)
                     sm100_utils.gemm_ptx_w_idx(
                         tiled_mma_dV,
-                        tdVtdV_slots[c % self.num_out_slots],
+                        tdVtdV_slots[pos % self.num_out_slots],
                         tdVrP,
                         tdVrdO,
                         sA=None,
@@ -1800,18 +1905,20 @@ class FlashAttentionBackwardSm100BigD:
                         # elect_one did not reliably arm both barriers (that deadlocked
                         # the K stream). The matching *_in_empty signals are arrived by
                         # the compute warps, which only get there after out_full fired.
-                        tcgen05.commit(mbar_out_full + c)
+                        tcgen05.commit(mbar_out_full + out_c)
 
                 # dK_c = dS^T @ Q_c   (A = dS from TMEM)
                 tdKrdS = tiled_mma_dK.make_fragment_A(tdS)
                 tdKrQt = tiled_mma_dK.make_fragment_B(sQt)
-                for c in cutlass.range_constexpr(self.num_d_chunks):
-                    out_c = self.num_dv_chunks + c
+                for pos_in_seg in cutlass.range_constexpr(self.num_d_chunks):
+                    c = cutlass.const_expr(self.num_d_chunks - 1 - pos_in_seg)
+                    out_c = cutlass.const_expr(self.num_dv_chunks + c)
+                    pos = cutlass.const_expr(self.out_pos(out_c))
                     cute.arch.mbarrier_wait(mbar_dKin_full + c, phase)
-                    wait_out_slot_free(out_c)
+                    wait_out_slot_free(pos)
                     sm100_utils.gemm_ptx_w_idx(
                         tiled_mma_dK,
-                        tdKtdK_slots[out_c % self.num_out_slots],
+                        tdKtdK_slots[pos % self.num_out_slots],
                         tdKrdS,
                         tdKrQt,
                         sA=None,
@@ -1830,19 +1937,24 @@ class FlashAttentionBackwardSm100BigD:
                 cute.arch.mbarrier_wait(mbar_dSsmem_full, phase)
                 tdQrdS = tiled_mma_dQ.make_fragment_A(sdS)
                 tdQrKt = tiled_mma_dQ.make_fragment_B(sKt)
-                for c in cutlass.range_constexpr(self.num_d_chunks):
-                    out_c = self.num_dv_chunks + self.num_d_chunks + c
+                for pos_in_seg in cutlass.range_constexpr(self.num_d_chunks):
+                    k = cutlass.const_expr(self.sched_K[1][pos_in_seg])
+                    c = cutlass.const_expr(k["chunk"])
+                    out_c = cutlass.const_expr(
+                        self.num_dv_chunks + self.num_d_chunks + c
+                    )
+                    pos = cutlass.const_expr(self.out_pos(out_c))
                     cute.arch.mbarrier_wait(mbar_dQin_full + c, phase)
-                    wait_out_slot_free(out_c)
+                    wait_out_slot_free(pos)
                     sm100_utils.gemm_ptx_w_idx(
                         tiled_mma_dQ,
-                        tdQtdQ_slots[out_c % self.num_out_slots],
+                        tdQtdQ_slots[pos % self.num_out_slots],
                         tdQrdS,
                         tdQrKt,
                         sA=sdS,
                         sB=sKt,
                         A_idx=None,
-                        B_idx=c % self.d_chunks_resident,
+                        B_idx=k["stage"],
                         zero_init=True,
                         cta_group=self.cta_group_size,
                     )
@@ -1858,6 +1970,8 @@ class FlashAttentionBackwardSm100BigD:
 
         elif warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_compute)
+            # Warpgroup-relative thread id: the T2R / R2T copies are built for 128
+            # threads, so this branch indexes them with 0..127.
             compute_tidx = tidx - self.compute_warp_ids[0] * cute.arch.WARP_SIZE
             phase = Int32(0)
             for it in cutlass.range(num_iters, unroll=1):
@@ -1944,6 +2058,26 @@ class FlashAttentionBackwardSm100BigD:
                 tSrdP = cute.make_fragment(tScS.shape, Float32)
                 tSrdS = cute.make_fragment(tScS.shape, Float32)
                 frag_len = cutlass.const_expr(cute.size(tSrS))
+                # This chunk's W values of LSE / dPsum, staged out of SMEM once per
+                # chunk instead of read per element.
+                #
+                # The element loops below index LSE / dPsum by the *m* coordinate of
+                # each element, which is mode 1 of tScS and a compile-time constant, so
+                # the reads were tile_m scalar ld.shared per thread per m tile with all
+                # 32 lanes of a warp asking for the same address: at W=32 that is
+                # 2 x 32 x num_softmax_chunks = 256 shared loads per thread per m tile,
+                # which is the same order as the drain's 1536 vector atomics and the
+                # other half of the L1TEX traffic this kernel stalls on. A chunk's W
+                # values are contiguous, so one autovec_copy replaces 32 scalar loads
+                # with 8 x ld.shared.v4 (the recipe flash_bwd_sm100.py uses for its LSE
+                # / dPsum s2r). Costs W registers each; affordable only at 12 warps.
+                #
+                # Separate fragments, not one reused buffer: their live ranges do not
+                # overlap (LSE dies at the end of the P loop, dPsum is only live in the
+                # dS loop) so ptxas shares the registers anyway, and aliasing one alloca
+                # is what defeats promotion (see the note above).
+                tSrLSE = cute.make_fragment(W, Float32)
+                tSrdPsum = cute.make_fragment(W, Float32)
 
                 # R2T machinery: P and dS go back into the upper halves of the S / dP
                 # regions as bf16, where they are the A operands of the dV / dK gemms.
@@ -2133,10 +2267,19 @@ class FlashAttentionBackwardSm100BigD:
 
                     cute.copy(thr_copy_t2r, thr_copy_t2r.partition_S(tStS_c), tSrS)
                     cute.arch.fence_view_async_tmem_load()
+                    # This chunk's W LSE values, one vectorised s2r instead of a
+                    # scalar ld.shared per element.
+                    cute.autovec_copy(cute.local_tile(sLSE, (W,), (cm,)), tSrLSE)
                     for i in cutlass.range_constexpr(frag_len):
-                        m_idx = tScS[i][1] + m_off
+                        # const_expr, not just an int: mode 1 of tScS is the m
+                        # coordinate and has to be a compile-time constant for
+                        # tSrLSE[.] to stay in registers. If it ever becomes dynamic
+                        # this raises at trace time instead of silently moving the
+                        # fragment to local memory.
+                        mi = cutlass.const_expr(tScS[i][1])
+                        m_idx = cutlass.const_expr(mi + m_off)
                         p = cute.math.exp2(
-                            tSrS[i] * softmax_scale_log2 - sLSE[m_idx], fastmath=True
+                            tSrS[i] * softmax_scale_log2 - tSrLSE[mi], fastmath=True
                         )
                         m_global = m_base + m_idx
                         bad = n_oob or m_global >= seqlen_q
@@ -2149,16 +2292,16 @@ class FlashAttentionBackwardSm100BigD:
                         tSrP[i] = 0.0 if bad else p
 
                     # dP^T, then dS^T = P * (dP - dPsum[m]). The wait sits after the
-                    # FIRST PROCESSED chunk's P pass (cmi == 0, i.e. the highest cm),
-                    # where it was before this loop existed, so that pass still
-                    # overlaps the mma warp's dP gemms.
+                    # FIRST chunk's P pass so that pass still overlaps the mma warp's
+                    # dP gemms.
                     if cutlass.const_expr(cmi == 0):
                         cute.arch.mbarrier_wait(mbar_dP_full, phase)
                     cute.copy(thr_copy_t2r, thr_copy_t2r.partition_S(tdPtdP_c), tSrdP)
                     cute.arch.fence_view_async_tmem_load()
+                    cute.autovec_copy(cute.local_tile(sdPsum, (W,), (cm,)), tSrdPsum)
                     for i in cutlass.range_constexpr(frag_len):
-                        m_idx = tScS[i][1] + m_off
-                        tSrdS[i] = tSrP[i] * (tSrdP[i] - sdPsum[m_idx])
+                        mi = cutlass.const_expr(tScS[i][1])
+                        tSrdS[i] = tSrP[i] * (tSrdP[i] - tSrdPsum[mi])
 
                     # R2T of this chunk's P and dS, then its dS slice to SMEM.
                     for i in cutlass.range_constexpr(frag_len):
@@ -2343,8 +2486,13 @@ class FlashAttentionBackwardSm100BigD:
                     # because the outer (per-slice) extent is dynamic.
                     slice_stride = num_blocks * (self.tile_m * hd_slice)
                     block_base = block_idx * (self.tile_m * hd_slice)
-                    for c in cutlass.range_constexpr(nchunks):
-                        out_c = base + c
+                    # DESCENDING, the same order the mma warp issues in. The scratch
+                    # slots gate the mma warp on this warpgroup, so draining in a
+                    # different order than the mma warp issues deadlocks as soon as the
+                    # two orders diverge by more than num_out_slots.
+                    for pos_in_seg in cutlass.range_constexpr(nchunks):
+                        c = cutlass.const_expr(nchunks - 1 - pos_in_seg)
+                        out_c = cutlass.const_expr(base + c)
                         chunk_base = cutlass.const_expr(
                             (c % chunks_per_slice) * (self.tile_m * chunk_w)
                         )
@@ -2361,9 +2509,11 @@ class FlashAttentionBackwardSm100BigD:
                         # it is: it guards the TMEM slot, which is what the T2R reads.
                         cute.arch.mbarrier_arrive(in_bar + c)
                         elem_base = slice_idx * slice_stride + block_base + chunk_base
-                        # Slot the mma warp wrote this chunk into.
+                        # Slot the mma warp wrote this chunk into: by ISSUE position, not
+                        # by out_c, because the segments run descending.
                         slot_base = cutlass.const_expr(
-                            (out_c % self.num_out_slots) * self.tmem_out_slot_cols
+                            (self.out_pos(out_c) % self.num_out_slots)
+                            * self.tmem_out_slot_cols
                         )
                         for s in cutlass.range_constexpr(chunk_w // ncol):
                             # One ncol-column slice per pass: T2R it, then reduce it into

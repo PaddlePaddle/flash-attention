@@ -75,6 +75,29 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.strides[-1] != 1 else x
 
 
+def _same_storage(a, b):
+    """Whether two tensors start at the same device address.
+
+    Used to detect the kv-shared call convention (the same buffer passed as both k and
+    v). Either answers, or raises: a missing data_ptr() must NOT degrade to "not shared",
+    because the kv_shared path returns a different gradient layout (dv all-zero, dk
+    carrying dK + dV) and silently taking the other path would change the caller's
+    gradients with no signal. The kv_shared condition evaluates this last, so a raise
+    only reaches calls that match every other kv-shared criterion.
+    """
+    try:
+        return a.data_ptr() == b.data_ptr()
+    except (AttributeError, RuntimeError) as exc:
+        raise RuntimeError(
+            "cannot tell whether k and v alias: Tensor.data_ptr() is unavailable on "
+            f"this paddle build ({type(exc).__name__}: {exc}). This call matches the "
+            "bigd bwd kv_shared convention in every other respect, and kv_shared "
+            "changes the gradient layout (dv comes back all-zero, dk carries "
+            "dK + dV), so it will not be guessed. Pass distinct k / v buffers to use "
+            "the plain path."
+        ) from exc
+
+
 paddle2cute_dtype_map = {
     paddle.float16: cutlass.Float16,
     paddle.bfloat16: cutlass.BFloat16,
@@ -1241,6 +1264,35 @@ def _flash_attn_bwd(
         f"on sm_{compute_capability}0"
     )
 
+    # KV shared: the caller handed the SAME buffer as k and v (the MLA / sparse-attn
+    # convention, v = kv[..., :head_dim_v]). Then dV and dK are two halves of ONE
+    # gradient -- autograd adds the grad of the aliased input twice -- so the kernel can
+    # accumulate them into a single TMEM slot and flush them once. Detected instead of
+    # asked for: the signature stays (q, k, v).
+    #
+    # dv then comes back all-zero and dk carries dK + dV. That falls out of the existing
+    # plumbing: the kernel simply never writes dv_accum, and every dv_accum row the
+    # postprocess reads was zeroed before the launch (whole-buffer zeros, or just the
+    # kv_postprocess range when that path is taken), so its postprocess writes zeros
+    # while dk_accum receives both terms.
+    #
+    # Only the shapes the merge is implemented for. 576/512 has no chunk width that
+    # divides both axes, so the kernel pads the dv axis to 576 and lets the dO TMA
+    # zero-fill columns 512..575 (see tile_hdimv in flash_bwd_sm100_bigd.py); that keeps
+    # d_chunk at the measured 192 instead of narrowing it.
+    kv_shared = (
+        is_bigd_bwd
+        and (head_dim, head_dim_v) in ((512, 512), (576, 512))
+        and k.dtype == v.dtype
+        and list(k.shape[:-1]) == list(v.shape[:-1])
+        and v.shape[-1] <= k.shape[-1]
+        and tuple(k.strides[:-1]) == tuple(v.strides[:-1])
+        # Last on purpose: this is the only term that can raise (see _same_storage), so
+        # `and` short-circuits every call that is not otherwise a kv-shared call before
+        # the pointer comparison is attempted.
+        and _same_storage(k, v)
+    )
+
     m_block_size = 128
     n_block_size = 128
 
@@ -1822,6 +1874,9 @@ def _flash_attn_bwd(
             deterministic,
             is_split_d_bwd if compute_capability == 10 else False,
             is_split_dv_bwd if compute_capability == 10 else False,
+            # kv_shared changes the output gemms and the drain, so it is a different
+            # compiled artifact for the same shapes.
+            kv_shared,
             # overlap: an overlap grad kernel (K/V rebuilt from SRBuffer addr) and a
             # plain one for the same shapes are different compiled artifacts.
             enable_overlap,
@@ -1932,6 +1987,7 @@ def _flash_attn_bwd(
                     is_causal=causal,
                     qhead_per_kvhead=qhead_per_kvhead,
                     deterministic=deterministic,
+                    kv_shared=kv_shared,
                     fm_bound_num=(
                         0
                         if cute_flashmask_info is None
@@ -2350,14 +2406,18 @@ def _flash_attn_bwd(
         # copies rather than TMA.
         slice_d = bigd_cfg["accum_slice_d"]
         slice_dv = bigd_cfg["accum_slice_dv"]
+        # With kv_shared the kernel folded softmax_scale into dS, so dK and dQ arrive
+        # already scaled (dV never carried the scale -- that asymmetry is exactly why it
+        # had to move into dS for a merged dKV accumulator).
+        bigd_scale = cutlass.Float32(1.0) if kv_shared else softmax_scale
         assert head_dim == head_dim_rounded and head_dim_v == head_dim_v_rounded, (
             "the big-headdim postprocess writes whole head_dim slices, so head_dim "
             f"must already be a multiple of 64 (got {head_dim} / {head_dim_v})"
         )
         for accum, out, scale, hd, hd_slice, block, seq_rounded, tag in (
-            (dq_accum, dq, softmax_scale, head_dim_rounded, slice_d,
+            (dq_accum, dq, bigd_scale, head_dim_rounded, slice_d,
              m_block_size, seqlen_q_rounded, "bigd_dq"),
-            (dk_accum, dk, softmax_scale, head_dim_rounded, slice_d,
+            (dk_accum, dk, bigd_scale, head_dim_rounded, slice_d,
              n_block_size, seqlen_k_rounded, "bigd_dk"),
             (dv_accum, dv, cutlass.Float32(1.0), head_dim_v_rounded, slice_dv,
              n_block_size, seqlen_k_rounded, "bigd_dv"),

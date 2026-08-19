@@ -153,6 +153,35 @@ def atomic_add_fp32x4(
 
 
 @dsl_user_op
+def store_shared_f32x4(
+    a: Float32, b: Float32, c: Float32, d: Float32, smem_ptr: cute.Pointer, *, loc=None, ip=None
+) -> None:
+    """One 16B shared store from four register operands.
+
+    The point of taking the values as scalars rather than a tensor is that no
+    address of the source fragment is ever formed: `cute.make_tensor(frag.iterator,
+    ...)` is enough to stop SROA promoting the fragment, which pushes the whole
+    T2R fragment into local memory (measured in flash_bwd_sm100_bigd.py's drain).
+    """
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [
+            smem_ptr_i32,
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            Float32(c).ir_value(loc=loc, ip=ip),
+            Float32(d).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.v4.f32 [$0], {$1, $2, $3, $4};",
+        "r,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def set_block_rank(
     smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: Int32, *, loc=None, ip=None
 ) -> Int32:

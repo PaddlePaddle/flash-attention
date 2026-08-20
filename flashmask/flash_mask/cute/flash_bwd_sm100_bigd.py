@@ -9,32 +9,25 @@ already-working d256/d192 configs at risk. Here the chunk count and `cta_group`
 are parameters from the start, so the axis splits into as many chunks as the
 shape needs.
 
-Resource model (all numbers verified on B200, see the "column rule" below):
-
-  TMEM columns of an accumulator = N * (rows_per_cta / 128), except that a
-  cta_group=1 MMA with M=64 uses the 16-datapath interleave: it occupies lanes
-  {0-15, 32-47, 64-79, 96-111} and still spans N columns.
-
-    cta_group=1, M=128, N -> ((128,N)):((65536,1))                 -> N   cols
-    cta_group=1, M= 64, N -> (((16,4),N)):(((65536,2097152),1))    -> N   cols
-    cta_group=2, M=128, N -> ((64,(N/2,2))):((65536,(1,4194304)))  -> N/2 cols
-    cta_group=2, M=256, N -> ((128,N)):((65536,1))                 -> N   cols
-
-  (TMEM addresses put the lane in the high bits and the column in the low 16,
-  so a stride of 65536 is one lane and a stride of 1 is one column.)
+TMEM resource model (verified on B200, encoded in tmem_plan() / sm100_utils.tmem_cols):
+an accumulator costs N * (rows_per_cta / 128) columns, so cta_group=2 with M=128 halves
+the column cost. The one irregular case is cta_group=1 with M=64, which takes the
+16-datapath lane interleave and still spans N columns.
 
 Phase 1 (the only path that runs today): cta_group=1, no swapAB, all three of dV/dK/dQ
 are produced per m-iteration and drained by the reduce warps into the fp32 gmem
-accumulators. Correct but accum-traffic bound.
+accumulators. Correct but accum-traffic bound -- the drain is roughly 40% of the kernel,
+split about evenly between its dQ and dKV halves (measurements in __init__, where the
+drain cost model and the tile-size dependence are derived).
 
 Operand reuse: every tile is read by two gemms in different orientations -- K by S and
 dQ, Q by S and dK, dO by dP and dV -- and this used to re-TMA the tile for the second
-one, 28 chunk fetches per m tile. The two orientations are the same bytes (derivation in
-_setup_smem_layout), so the second gemm now reads whatever the first left in SMEM and
-_reuse_schedule decides per access whether a fetch is needed at all. At 512/512 with two
-resident K stages that is 22 fetches per m tile. The saving is TMA issue and mbarrier
-round trips on the load warp, not HBM bytes: an n-block's K is re-read by all 64 query
-heads, so L2 was already serving those fetches.
+one. The two orientations are the same bytes (derivation in _setup_smem_layout), so the
+second gemm now reads whatever the first left in SMEM and _reuse_schedule decides per
+access whether a fetch is needed at all, cutting the per-m-tile fetch count by about a
+fifth at 512/512. The saving is TMA issue and mbarrier round trips on the load warp, not
+HBM bytes: an n-block's K is re-read by all 64 query heads, so L2 was already serving
+those fetches.
 
 Phase 2 (later): cta_group=2 + swapAB on dV/dK so both stay resident in TMEM for
 the whole m loop, dropping the accum traffic from once per m-iteration to once
@@ -43,41 +36,19 @@ n_block_pair skip derivation, MMA M constraints) but the path is NOT enabled and
 never run: `_launch` passes no `cluster=` to .launch() and does not round the grid to the
 pair size, the kernel body still slices every MMA at `get_slice(0)` instead of the CTA's
 own v coordinate, and gK / gV are tiled by their own n index rather than the PAIR's.
-Before anyone spends the time on that port, read the byte accounting below -- it was
-costed out and deliberately not taken.
 
-What the drain-byte model says the port is worth, before anyone spends the time
-(MEASURED baseline: dQ drain 1.66ms, dKV drain 1.44ms at tile_m = tile_n = 128):
-
-  dQ drain bytes  = density * seqlen^2 * heads * d * 4 / (cta_group * tile_n)
-  dKV drain bytes = density * seqlen^2 * heads * d * 4 / tile_m
-
-and tmem_cols() pins which (tile_m, tile_n) are legal at cta_group=2: the dQ gemm's
-M is tile_m, the K-side gemms' M is cta_group * tile_n, and BOTH must give
-rows_per_cta in {64, 128}, i.e. tile_m in {128, 256} and tile_n in {64, 128}.
-S and dP each cost tmem_cols(n=tile_m, m=cta_group*tile_n, 2) f32 columns:
-
-  tile_m=128 tile_n=128  S+dP = 256, slot 192 -> 448 OK   dQ halves, dKV flat: -0.81ms
-  tile_m=256 tile_n= 64  S+dP = 256, slot 192 -> 448 OK   dKV halves, dQ flat: -0.72ms
-                                                          but d_chunk must drop to 96
-                                                          for SMEM, doubling the output
-                                                          chunk count (the axis this
-                                                          kernel measured as dominant)
-  tile_m=128 tile_n= 64  S+dP = 128 -> lots of room, and NOTHING is saved
-  tile_m=256 tile_n=128  S+dP = 2*256 = 512 -> no output slot fits at all
-
-So the best cta_group=2 can do is ~-0.8ms of the drain's 3.10, and it cannot take both
-halves at once. Note also that a cluster of (2,1) is entirely consumed by the MMA's own
-v mode, so num_mcast_ctas_b is 1 (see flash_bwd_sm100.py:1005): Q / dO^T are NOT
-multicast and there is no operand-traffic win to add on top.
-
-The blocker for the -0.81ms variant is the dQ gemm's A operand: at cta_group=2 its K is
-cta_group * tile_n (the pair's whole key range) while the accumulator's M folds, so each
-CTA needs dS for ITS OWN m half over BOTH CTAs' keys -- and each CTA only computed dS for
+It was costed out and deliberately not taken. The short version: the TMEM column rules
+leave only two legal (tile_m, tile_n) pairs that save anything, each halves ONE of the
+two drain terms and leaves the other flat, and the better of the two is worth well under
+a third of the drain. That variant is additionally blocked on the dQ gemm's A operand --
+at cta_group=2 its K spans the pair's whole key range while the accumulator's M folds, so
+each CTA needs dS for its own m half over BOTH CTAs' keys, and it only computed dS for
 all m over its own keys. flash_bwd_sm100.py solves this with separate_sdS_buffers /
-smem_dS_dq_block_view (:254, :481), whose byte formula asserts tile_n <= mma_k (64) and
-tile_m == mma_k * cta_group (128). tile_n=128 violates the first, so the -0.81ms config
-has no working precedent in this repo to copy.
+smem_dS_dq_block_view, but that machinery asserts tile_n <= mma_k (64), which the config
+in question violates, so there is no working precedent in this repo to copy. A cluster of
+(2,1) is also entirely consumed by the MMA's own v mode, so Q / dO^T are NOT multicast
+(see flash_bwd_sm100.py:1005) and there is no operand-traffic win to add on top. See the
+git history of this docstring for the per-config numbers.
 """
 
 import functools
@@ -415,51 +386,49 @@ CONFIG_KEYS = (
     "tile_m", "tile_n", "d_chunk", "dv_chunk", "d_chunks_resident", "dQ_reduce_ncol",
 )
 
-# Measured pins, keyed by (head_dim, head_dim_v, cta_group). These win over the solver's
-# ranking, which is a *model*: the measured kernel sits far below both HBM bandwidth and
-# MMA peak, so it does not currently describe the bottleneck.
+# Measured pins, keyed by (head_dim, head_dim_v, cta_group). A pin's optional "kv_shared"
+# block holds the overrides that mode needs, layered on top of the same shape's base pin.
+# These win over the solver's ranking, which is a *model*: the measured kernel sits far
+# below both HBM bandwidth and MMA peak, so it does not currently describe the bottleneck.
 #
 # 512/512 (B30Z / sm103, causal document mask): measured faster than the config the solver
-# ranked first at the time. What the pin buys is the halved slice count in the drain
-# (48 -> 24 per m tile), which is why dQ_reduce_ncol has to come with the wider d_chunk --
-# d_chunk is the tile the drain slices, so a 64-column slice is only legal once the chunk
-# is at least 64 wide.
-# 576/512 (same host and mask): the solver picks d_chunk 96, and 96 is the worst width
-# this axis can take -- gcd(96, dv_chunk 128) is 32, so the whole drain drops to 32-column
-# slices (52 per m tile against 512/512's 24) and the axis splits into 6 chunks (16 output
-# chunks, 26 operand fetches). 576 = 2**6 * 9, so of the legal widths (32/96/192/576) only
-# 192 divides 64: it is the only way to get the 64-column slice back. Measured 13.04ms at
-# d_chunk 96 versus 10.12ms for 512/512 on the same shape, i.e. +29% time for +7.5% math.
+# ranked first at the time. What the pin buys is a halved slice count in the drain, which is
+# why dQ_reduce_ncol has to come with the wider d_chunk -- d_chunk is the tile the drain
+# slices, so a 64-column slice is only legal once the chunk is at least 64 wide.
+# 576/512 (same host and mask): the solver picks d_chunk 96, which is the worst width this
+# axis can take -- gcd(96, dv_chunk 128) is 32, so the whole drain drops to 32-column slices
+# (roughly double the count) and the axis splits into 6 chunks. 576 = 2**6 * 9, so of the
+# legal widths (32/96/192/576) only 192 divides 64: it is the only way to get the 64-column
+# slice back, and it measured substantially faster despite doing slightly more math.
 # The price, and the thing this pin is measuring: a 192-wide output chunk leaves
 # (512-256)/192 = 1 TMEM out slot instead of 2, so the output gemms no longer overlap the
 # drain, and 2x192 K stages do not fit in SMEM so K is single-buffered.
 #
 # 576/512 kv_shared adds a 4th key element (kv_shared) because the mode changes what is
 # feasible, not just what is fast: the merge needs dv_chunk == d_chunk == 192, and the
-# drain's two staging slots then have to fit next to sQ/sK/sdO/sdS = 180224B, which
-# ncol 64 (2 x 32KB) does not and ncol 32 (2 x 16KB, 215040B total) does. The dv axis
-# is padded 512 -> 576 for the tiling; see tile_hdimv in __init__.
+# drain's two staging slots then have to fit next to sQ/sK/sdO/sdS, which ncol 64 does not
+# and ncol 32 does. The dv axis is padded 512 -> 576 for the tiling; see tile_hdimv in
+# __init__.
 _MEASURED_CONFIG = {
     (512, 512, 1): {
         "d_chunk": 128,
         "d_chunks_resident": 2,
         "dQ_reduce_ncol": 64,
+        "kv_shared": {
+            # Same widths the generic pin already uses; dv_chunk is spelled out because
+            # the merge asserts d_chunk == dv_chunk and leaving it to the solver's
+            # tie-break makes that equality a coincidence rather than a constraint.
+            "dv_chunk": 128,
+        },
     },
     (576, 512, 1): {
         "d_chunk": 192,
         "d_chunks_resident": 1,
         "dQ_reduce_ncol": 64,
-    },
-    (576, 512, 1, True): {
-        "d_chunk": 192,
-        "dv_chunk": 192,
-        "d_chunks_resident": 1,
-        "dQ_reduce_ncol": 32,
-        # Step 1 of the cta_group=2 work: the dK gemm takes dS from SMEM. Free in SMEM
-        # (the buffer already exists for the dQ gemm) and it drops the dS R2T. See
-        # ds_from_smem in __init__ for why cta_group=2 makes this mandatory rather than
-        # optional.
-        "ds_from_smem": True,
+        "kv_shared": {
+            "dv_chunk": 192,
+            "dQ_reduce_ncol": 32,
+        },
     },
 }
 
@@ -610,15 +579,20 @@ def _bigd_drain_wg_iteration(
                     barrier_id=barrier_id,
                     number_of_threads=num_wg_threads,
                 )
+                # r2s of this warpgroup's slice into its staging slot.
                 sslot = sOutAccum[None, slot_idx].iterator + wg_tidx * 4
-                for r in cutlass.range_constexpr(flen_slice // 4):
-                    copy_utils.store_shared_f32x4(
-                        frag[r * 4 + 0],
-                        frag[r * 4 + 1],
-                        frag[r * 4 + 2],
-                        frag[r * 4 + 3],
-                        sslot + r * (num_wg_threads * 4),
-                    )
+                cute.autovec_copy(
+                    cute.make_tensor(
+                        frag.iterator,
+                        cute.make_layout((4, flen_slice // 4), stride=(1, 4)),
+                    ),
+                    cute.make_tensor(
+                        sslot,
+                        cute.make_layout(
+                            (4, flen_slice // 4), stride=(1, num_wg_threads * 4)
+                        ),
+                    ),
+                )
                 cute.arch.fence_view_async_shared()
                 cute.arch.barrier(
                     barrier_id=barrier_id,
@@ -639,39 +613,46 @@ class FlashAttentionBackwardSm100BigD:
     """SM100 backward kernel specialized for head dimensions larger than 256."""
 
     @classmethod
-    def from_shape(cls, head_dim: int, head_dim_v: int, cta_group: int = 1, **kwargs):
+    def from_shape(
+        cls,
+        head_dim: int,
+        head_dim_v: int,
+        cta_group: int = 1,
+        kv_shared: bool = False,
+        **kwargs,
+    ):
         """Build a kernel with the selected configuration for a head shape.
 
         Args:
             head_dim: Query/key head dimension.
             head_dim_v: Value head dimension.
             cta_group: Number of CTAs participating in each MMA.
+            kv_shared: Whether k and v alias, which changes the pin the shape gets.
             **kwargs: Explicit constructor overrides for selected configuration values.
 
         Returns:
             Configured ``FlashAttentionBackwardSm100BigD`` instance.
         """
         cfg = solve_config(head_dim, head_dim_v, cta_group=cta_group)
-        # A kv_shared-specific pin wins over the shape's generic one: the merge
-        # constrains the chunk widths and the SMEM budget differently (see
-        # _MEASURED_CONFIG).
-        pin = _MEASURED_CONFIG.get(
-            (head_dim, head_dim_v, cta_group, bool(kwargs.get("kv_shared", False)))
+        # A shape's pin may carry a "kv_shared" block of overrides, layered on top when
+        # k and v alias: the merge constrains the chunk widths and the SMEM budget
+        # differently (see _MEASURED_CONFIG). An empty pin is the "solver only" case.
+        pin = dict(_MEASURED_CONFIG.get((head_dim, head_dim_v, cta_group), {}))
+        kv_shared_pin = pin.pop("kv_shared", {})
+        if kv_shared:
+            pin.update(kv_shared_pin)
+        assert pin.keys() <= set(CONFIG_KEYS), (
+            f"pin for {(head_dim, head_dim_v, cta_group)} (kv_shared={kv_shared}) sets "
+            f"keys the constructor does not take: "
+            f"{sorted(pin.keys() - set(CONFIG_KEYS))}"
         )
-        if pin is None:
-            pin = _MEASURED_CONFIG.get((head_dim, head_dim_v, cta_group))
-        if pin is not None:
-            cfg = {**cfg, **pin}
+        cfg = {**cfg, **pin}
+        # Precedence: explicit kwargs beat the pin, and the pin beats the solver.
         for key in CONFIG_KEYS:
             kwargs.setdefault(key, cfg[key])
-        # A pin may also set constructor args the solver knows nothing about
-        # (ds_from_smem).
-        if pin is not None:
-            for key in pin:
-                if key not in CONFIG_KEYS:
-                    kwargs.setdefault(key, pin[key])
-        kwargs.setdefault("cta_group", cta_group)
-        return cls(head_dim, head_dim_v, **kwargs)
+        return cls(
+            head_dim, head_dim_v, cta_group=cta_group, kv_shared=kv_shared, **kwargs
+        )
 
     def __init__(
         self,
@@ -690,7 +671,6 @@ class FlashAttentionBackwardSm100BigD:
         deterministic: bool = False,
         fm_bound_num: int = 0,
         kv_shared: bool = False,
-        ds_from_smem: bool = False,
     ):
         # head_dim is padded to a multiple of 64 to match head_dim_rounded in the
         # interface. Out-of-range columns need no predication here: the TMA zero-fills
@@ -720,25 +700,6 @@ class FlashAttentionBackwardSm100BigD:
         assert dQ_reduce_ncol % 4 == 0 and d_chunk % dQ_reduce_ncol == 0
         assert dv_chunk % dQ_reduce_ncol == 0
         self.dQ_reduce_ncol_cfg = dQ_reduce_ncol
-        # Where the dK gemm reads its A operand (dS) from. TMEM is this kernel's
-        # historical path; SMEM reads the sdSt view of the buffer the compute warps
-        # already fill for the dQ gemm, so it costs NO extra SMEM and it removes the dS
-        # half of the compute warps' R2T.
-        #
-        # This is step 1 of the cta_group=2 work, and it exists on its own because at
-        # cta_group=2 it stops being a choice. tile_n drops to 64 there, so the K-side
-        # accumulators FOLD (see blackwell_helpers.tmem_cols) -- which is exactly what
-        # makes a resident dKV affordable -- and a folded accumulator cannot back an MMA
-        # A operand at all: that layout wants a whole row in one lane and tmem stores are
-        # lane-local. flash_bwd_sm100.py hits the same wall and routes P / dS through
-        # SMEM whenever it folds (folded_kv_acc -> mma_P_from_smem). Landing the dS half
-        # first keeps the switch measurable on its own, at cta_group=1, where it is
-        # behaviour-preserving.
-        #
-        # P stays in TMEM for now: its SMEM buffer would be another tile_n * tile_m * 2 =
-        # 32KB and at cta_group=1 the budget has ~17KB spare. At cta_group=2 tile_n 64
-        # halves sK / sP / sdS and it fits with room over.
-        self.ds_from_smem = ds_from_smem
         self.cta_group_size = cta_group
         self.is_causal = is_causal
         self.qhead_per_kvhead = qhead_per_kvhead
@@ -803,10 +764,10 @@ class FlashAttentionBackwardSm100BigD:
         # dK gemm's accumulator, so a chunk leaves TMEM as dKV and is flushed ONCE.
         #
         # Two things that costs nothing and one it buys: the flush drops from
-        # tile_n*(d+dv) + tile_m*d to tile_n*d + tile_m*d per m tile (832KB -> 576KB at
-        # 576/512), and num_dv_chunks output chunks disappear with their tcgen05.commit
-        # and out barrier pair. The output chunk COUNT is the axis this kernel measured
-        # as dominant: d_chunk 64 / resident 4 raised it from 10 to 22 and cost +20%.
+        # tile_n*(d+dv) + tile_m*d to tile_n*d + tile_m*d per m tile, and num_dv_chunks
+        # output chunks disappear with their tcgen05.commit and out barrier pair. The
+        # output chunk COUNT is the axis this kernel measured as dominant: raising it by
+        # narrowing d_chunk and adding K residency cost noticeably more time.
         # The math is unchanged (dV is still P^T@dO), only the accumulator is shared.
         #
         # The merge needs dV chunk c to cover exactly dK chunk c's columns, hence equal
@@ -920,18 +881,17 @@ class FlashAttentionBackwardSm100BigD:
         # threads it can only give every warp 128 -- setmaxnreg redistributes the
         # physical pool at runtime but cannot change what the code was compiled against.
         # The compute branch's live set is 4 x W f32 (S/P/dP/dS) plus 2 x W/2 packed =
-        # 160 f32 before addressing, so at 16 warps it spilled unconditionally: MEASURED
-        # (log_ncu_5, d512/dv512) local ld 1.10GB / st 136.5MB with 39.5 of the 48.5 warp
-        # cycles between issues on an L1TEX scoreboard, and every register split tried
-        # at 16 warps (200/136, 152/136, 168/128, and 144 x 2 with the drain doubled)
-        # measured flat, which is the signature of a constraint and not a knob. At 384
-        # threads ptxas allocates 162 and the local traffic is exactly zero.
+        # 160 f32 before addressing, so at 16 warps it spilled unconditionally, with most
+        # of the warp cycles between issues waiting on an L1TEX scoreboard. Every register
+        # split tried at 16 warps (200/136, 152/136, 168/128, and 144 x 2 with the drain
+        # doubled) measured flat, which is the signature of a constraint and not a knob.
+        # At 384 threads ptxas allocates 162 and the local traffic is exactly zero.
         #
         # A second compute warpgroup (8 warps, interleaving the softmax chunks with a
         # rendezvous where the packed P / dS columns of one chunk overlap another's
-        # reads) was worth ~3%, and it cannot coexist with this: 8 compute warps + 4
-        # drain + mma / load is 16 warps, i.e. back to 128 registers and the spill. The
-        # two effects cancel to the same wall clock; this side of the trade is kept
+        # reads) was worth a few percent, and it cannot coexist with this: 8 compute warps
+        # + 4 drain + mma / load is 16 warps, i.e. back to 128 registers and the spill.
+        # The two effects cancel to the same wall clock; this side of the trade is kept
         # because it also removes all local traffic.
         self.compute_warp_ids = (4, 5, 6, 7)
         self.mma_warp_id = 8
@@ -951,21 +911,20 @@ class FlashAttentionBackwardSm100BigD:
         # slice into a 64 f32 fragment, then read that fragment out with 16
         # red.global.add.v4.f32", and the next slice's T2R has to wait for those
         # reductions to have read the registers. ncu calls that wait a scoreboard
-        # dependency on an L1TEX operation, and at 576/512 it is 44.8 of the 54.5
-        # cycles between issued instructions -- 82% of the whole stall budget; at
-        # 512/512 with the dKV merge it is still 30.5 of 38.1.
+        # dependency on an L1TEX operation, and it is most of the drain's whole stall
+        # budget -- the single largest one in the kernel at 576/512, and still dominant
+        # at 512/512 with the dKV merge.
         #
-        # Do NOT try to hide that by giving the drain more live state. MEASURED
-        # (512/512 kv_shared): keeping every slice of a chunk in flight (2 x 64 f32)
-        # with a 208/216 split took launch__registers_per_thread from 156 to 168 --
-        # which is the CEILING, 65536/384 -- and spilled: local ld 193.95MB, st
-        # 63.05MB, against zero before. Duration went 8.83 -> 8.77ms, i.e. flat: the
-        # spill traffic lands on L1TEX, the exact pipe the stall is on, and cancels the
-        # deeper pipeline. setmaxnreg redistributes the physical pool at runtime but
-        # cannot change what ptxas compiled against, so at 384 threads no register
-        # quota here buys the drain a second live fragment. The lever for that stall is
-        # to issue FEWER T2R/atomic pairs (dQ resident + TMA store, the way
-        # dsa_bwd_sm100.py does it), not to pipeline the ones we have.
+        # Do NOT try to hide that by giving the drain more live state. Measured on
+        # 512/512 kv_shared: keeping every slice of a chunk in flight (2 x 64 f32) with a
+        # 208/216 split pushed launch__registers_per_thread to the 65536/384 ceiling and
+        # started spilling, and the duration came out flat -- the spill traffic lands on
+        # L1TEX, the exact pipe the stall is on, and cancels the deeper pipeline.
+        # setmaxnreg redistributes the physical pool at runtime but cannot change what
+        # ptxas compiled against, so at 384 threads no register quota here buys the drain
+        # a second live fragment. The lever for that stall is to issue FEWER T2R/atomic
+        # pairs (dQ resident + TMA store, the way dsa_bwd_sm100.py does it), not to
+        # pipeline the ones we have.
         #
         # Compute gets 240 instead of the 128-136 it was pinned to at 16 warps, which
         # is the whole point of dropping to 12 (see the warp ids above): its live set is
@@ -999,9 +958,9 @@ class FlashAttentionBackwardSm100BigD:
         # Width, in m columns, of one S -> P -> dP -> dS round trip. The live register
         # set of that round trip is 5 * softmax_chunk_m f32 per thread (S, P, dP, dS
         # and the two packed R2T buffers, which are half-width), so this is what keeps
-        # the compute warps out of local memory: at the full tile_m = 128 it was 640
-        # f32 against 128 registers per thread, and ncu showed heavy local traffic with
-        # most of the stall budget on L1TEX. 32 keeps it at 160.
+        # the compute warps out of local memory: at the full tile_m = 128 that set is far
+        # more than the per-thread register quota and ncu showed heavy local traffic with
+        # most of the stall budget on L1TEX. 32 brings it inside the quota.
         #
         # Must divide tile_m and be a multiple of 32: the packed bf16 P / dS region is
         # addressed in W // 32 * 16 f32-equivalent columns, and the R2T store rep is
@@ -1031,44 +990,33 @@ class FlashAttentionBackwardSm100BigD:
         # slot the fill has to wait for the previous reduce to have read it and the
         # drain fully serialises (that is what the earlier staged version did, see the
         # drain's comment). The SMEM for them is what dropping sV under kv_shared
-        # freed: 2 * tile_m * dQ_reduce_ncol * 4B = 64KB against sV's 32KB plus the
-        # ~30KB the budget already had spare.
+        # freed: 2 * tile_m * dQ_reduce_ncol * 4B, which is more than sV's own bytes but
+        # fits in what the budget already had spare.
         #
         # Two slots is the measured optimum for the depth. The drain is what the profile
-        # blames: MEASURED (576/512 kv_shared, post-A1) 74.6% of the
-        # 31.5 cycles between issued instructions is a scoreboard dependency on an
-        # L1TEX op, at ncol 32 / 2 slots = 36 T2R+reduce pairs per m iteration. The
-        # trade is pair count against pipeline depth and both sides fit SMEM.
+        # blames -- most of the cycles between issued instructions are a scoreboard
+        # dependency on an L1TEX op. The trade is T2R+reduce pair count against pipeline
+        # depth and both sides fit SMEM, so both directions were swept on 576/512
+        # kv_shared: ncol 64 with 1 slot (half the pairs) and ncol 32 with 3 slots (a
+        # deeper pipeline) both came out slower than this default.
         #
-        # MEASURED (576/512 kv_shared, B30Z, causal document mask), bwd wall clock:
-        #   ncol 32 / 2 slots  8.7183 ms   <- this default, the optimum
-        #   ncol 64 / 1 slot   9.21   ms   (+0.49, HALF the pairs and still worse)
-        #   ncol 32 / 3 slots  8.9141 ms   (+0.20, deeper and worse)
         # So this axis is done: neither fewer L1TEX ops nor a deeper pipeline helps,
-        # which means the stall is not the drain's own shape -- it is latency the CTA
-        # has too few warps to hide (cudnn's DSA bwd carries the same 66% L1TEX
-        # throughput at 20 warps against our 12 and gets WCPII 18.15 against our
-        # 31.48). Do not re-sweep ncol / the slot count; change the warp count or
-        # remove the dQ half of the drain instead.
+        # which means the stall is not the drain's own shape -- it is latency the CTA has
+        # too few warps to hide (cudnn's DSA bwd carries the same L1TEX throughput at 20
+        # warps against our 12 and a much lower warp-cycles-per-issue). Do not re-sweep
+        # ncol / the slot count; change the warp count or remove the dQ half of the drain
+        # instead.
         #
-        # MEASURED once with throwaway probes that decomposed the dQ half of the drain
-        # into its gmem and on-chip parts:
-        #   baseline                       8.7183 ms
-        #   same ops, no DRAM              8.5754 ms   -> dq_accum's ~29GB round trip
-        #                                                 is worth only 0.14 ms
-        #   no dQ drain at all             7.0567 ms   -> the dQ drain costs 1.66 ms,
-        #                                                 92% of it on-chip (T2R +
-        #                                                 st.shared), 8% DRAM
-        #   no dKV drain                   7.2795 ms   -> the dKV drain costs 1.44 ms,
-        #                                                 all of it on-chip (dk_accum
-        #                                                 is 18.9MB and stays in L2)
-        # The whole drain is therefore 3.10 ms of the 7.95 ms kernel, and the two halves
-        # cost the same per byte (1.52 vs 1.44 on-chip for identical bytes), so the
-        # drain's cost is proportional to
+        # Throwaway probes that decomposed the drain into its gmem and on-chip parts put
+        # the whole drain at roughly 40% of the kernel, split about evenly between its dQ
+        # and dKV halves, and showed the DRAM side to be nearly free: both halves are
+        # almost entirely on-chip (T2R + st.shared), dq_accum's round trip is worth very
+        # little and dk_accum stays in L2. The two halves also cost the same per byte, so
+        # the drain's cost is proportional to
         #   density * seqlen^2 * head_dim * 4 * num_head * (1/tile_m + 1/tile_n)
         # -- the dKV term depends only on tile_m and the dQ term only on tile_n.
         #
-        # Two consequences. A bf16 accumulator would buy ~0.07 ms, so halving the
+        # Two consequences. A bf16 accumulator would buy almost nothing, so halving the
         # accumulator's bytes is pointless. And making dQ resident by flipping to a
         # Q-outer loop does NOT help: it needs tile_m 64 for the folded TMEM
         # accumulator, which doubles the dKV term and gives exactly the bytes back.
@@ -1085,7 +1033,8 @@ class FlashAttentionBackwardSm100BigD:
         # S gemms after the dQ gemms, which sit behind the same slot gate. So the
         # whole 2 * num_d_chunks * (d_chunk / ncol) slice chain is on the critical
         # path once per m iteration (which is exactly what the drain-skip probes
-        # measured: removing half the slices bought ~1.5ms). Splitting each
+        # measured: removing half the slices bought a large chunk of the drain's cost).
+        # Splitting each
         # chunk's slices by PARITY between the drain and compute warpgroups halves
         # that serial T2R chain: both warpgroups read different columns of the same
         # TMEM slot concurrently, and the compute warps are already done with their
@@ -1097,16 +1046,6 @@ class FlashAttentionBackwardSm100BigD:
             and self.out_stage >= 2
             and (self.d_chunk // self.dQ_reduce_ncol) % 2 == 0
         )
-        if self.kv_shared and not self.drain_split:
-            # The drain picks a slot from the slice's ordinal in the iteration, computed
-            # as oi * nchunks * (chunk_w // ncol) + ..., which needs every output segment
-            # to have the same shape. Under kv_shared there are exactly two (dKV and dQ)
-            # and both are num_d_chunks chunks of d_chunk. The rotation also has to come
-            # back to slot 0 at the iteration boundary. (The split drain pins one slot
-            # per warpgroup instead and does not rotate.)
-            assert (
-                2 * self.num_d_chunks * (self.d_chunk // self.dQ_reduce_ncol)
-            ) % self.out_stage == 0
 
         # SMEM operand reuse. K carries across m iterations, Q / dO do not. V has a
         # single consumer (the dP gemm), so there is no second pass to recycle it from
@@ -1167,12 +1106,7 @@ class FlashAttentionBackwardSm100BigD:
         # the K-side MMA M mode is fixed at 128; tile_m independently remains 128
         # for the accumulator staging and dQ mapping used by this kernel.
         tiled_mma_dV = mma(self.mma_tiler_pdo, mn, tmem_src)
-        # dS may come from SMEM instead (ds_from_smem, the cta_group=2 prerequisite).
-        # The layout describing that operand is sdSt_layout below, which is already
-        # built off a SMEM-sourced copy of this same MMA.
-        tiled_mma_dK = mma(
-            self.mma_tiler_dsq, mn, None if self.ds_from_smem else tmem_src
-        )
+        tiled_mma_dK = mma(self.mma_tiler_dsq, mn, tmem_src)
         tiled_mma_dQ = sm100_utils_basic.make_trivial_tiled_mma(
             ab_dtype, mn, mn, self.acc_dtype, cg, self.mma_tiler_dsk[:2]
         )
@@ -2109,8 +2043,8 @@ class FlashAttentionBackwardSm100BigD:
                 # kv_shared needs dO^T's copy fn in the S pass below, so it gets its own
                 # definition here. The split path keeps building it where it always did
                 # (with the dP pass): moving that construction earlier is semantically a
-                # no-op but it shifts where the DSL emits the address math, and MEASURED
-                # it cost the split path ~0.6ms of bwd. Same reason tdPrdOt stays inside
+                # no-op but it shifts where the DSL emits the address math, and measured
+                # a clear regression on the split path. Same reason tdPrdOt stays inside
                 # each branch in the mma warp.
                 if cutlass.const_expr(self.kv_shared):
                     load_dO, _, _ = copy_utils.tma_get_copy_fn(
@@ -2438,13 +2372,6 @@ class FlashAttentionBackwardSm100BigD:
                 # The compute warps read S and dP out, then write P and dS back as
                 # bf16 into the upper halves of those same regions.
                 cute.arch.mbarrier_wait(mbar_PdS_full, phase)
-                if cutlass.const_expr(self.ds_from_smem):
-                    # dS is an SMEM operand now, so the dK gemm needs the SMEM publish,
-                    # not just the TMEM one. Both arrives happen back to back at the tail
-                    # of the compute warps' iteration and nothing in between waits on
-                    # this warp, so hoisting the wait cannot deadlock; the dQ gemm's wait
-                    # further down is then a no-op on the same phase.
-                    cute.arch.mbarrier_wait(mbar_dSsmem_full, phase)
 
                 # Output chunk at issue position `pos` writes scratch slot
                 # pos % num_out_slots, so the slot's previous user is the chunk
@@ -2466,24 +2393,16 @@ class FlashAttentionBackwardSm100BigD:
                 # the drain: chunk num-1 is the one the dP pass left in SMEM.
                 tdVrP = tiled_mma_dV.make_fragment_A(tP)
                 tdVrdO = tiled_mma_dV.make_fragment_B(sdO)
-                # dS from TMEM (tdS) or from the (n, m) SMEM view the compute warps
-                # already fill (sdSt). The A-operand kwargs of the gemm differ with it:
-                # a TMEM operand is addressed by tA_addr, an SMEM one by sA.
-                tdKrdS = tiled_mma_dK.make_fragment_A(
-                    sdSt if self.ds_from_smem else tdS
-                )
-                dK_a_kwargs = (
-                    dict(sA=sdSt)
-                    if self.ds_from_smem
-                    else dict(sA=None, tA_addr=self.tmem_dS_offset)
-                )
+                # dS comes from TMEM (tdS), addressed by tA_addr rather than sA.
+                tdKrdS = tiled_mma_dK.make_fragment_A(tdS)
+                dK_a_kwargs = dict(sA=None, tA_addr=self.tmem_dS_offset)
                 tdKrQt = tiled_mma_dK.make_fragment_B(sQt)
                 if cutlass.const_expr(self.kv_shared):
                     # dKV_c = dS^T @ Q_c + P^T @ dO_c, both into the SAME slot: the dK
                     # gemm zero-inits it, the dV gemm accumulates on top (zero_init=False
                     # is a UMMA accumulate-in-place), so one commit and one drain cover
                     # both halves of the shared tensor's gradient. The two gemms keep
-                    # their own A operands (P in TMEM, dS in TMEM or sdSt) and their
+                    # their own A operands (P and dS, both in TMEM) and their
                     # own B operands
                     # (sQt and sdO), so no operand handling changes -- only the
                     # accumulator is shared, and both slot views address the same columns
@@ -2554,7 +2473,7 @@ class FlashAttentionBackwardSm100BigD:
                             # after out_full fired.
                             tcgen05.commit(mbar_out_full + out_c)
 
-                    # dK_c = dS^T @ Q_c   (A = dS from TMEM or from sdSt)
+                    # dK_c = dS^T @ Q_c   (A = dS from TMEM)
                     for pos_in_seg in cutlass.range_constexpr(self.num_d_chunks):
                         c = cutlass.const_expr(self.num_d_chunks - 1 - pos_in_seg)
                         out_c = cutlass.const_expr(self.out_base_dK + c)
@@ -2973,15 +2892,13 @@ class FlashAttentionBackwardSm100BigD:
                         tSrP_r2t[i] = tSrP[i].to(self.q_dtype)
                         tSrdS_r2t[i] = tSrdS[i].to(self.ds_dtype)
                     cute.copy(thr_store_P, tSrP_r2t_f32, thr_store_P.partition_D(tStP_c))
-                    if cutlass.const_expr(not self.ds_from_smem):
-                        # Only the dK gemm reads dS out of TMEM; when it takes the SMEM
-                        # operand instead, this R2T has no consumer at all (the dQ gemm
-                        # has always read the SMEM copy below).
-                        cute.copy(
-                            thr_store_dS,
-                            tSrdS_r2t_f32,
-                            thr_store_dS.partition_D(tStdS_c),
-                        )
+                    # The dK gemm reads dS out of TMEM, so this R2T has a consumer; the
+                    # dQ gemm reads the SMEM copy written below.
+                    cute.copy(
+                        thr_store_dS,
+                        tSrdS_r2t_f32,
+                        thr_store_dS.partition_D(tStdS_c),
+                    )
                     tdSsdS = thr_copy_t2r.partition_D(
                         thr_mma_S_c.partition_C(
                             cute.local_tile(sdSt_nm, (self.tile_n, W), (0, cm))
@@ -3103,18 +3020,12 @@ class FlashAttentionBackwardSm100BigD:
             mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
             # ONE T2R per dQ_reduce_ncol-column slice, not one per chunk.
             #
-            # MEASURED, and this is what the whole drain hinges on: taking the drain out
-            # collapses local ld/st to near zero and cuts the runtime by roughly two
-            # thirds. So essentially all of the local traffic is this drain, and its
-            # volume is exactly "every T2R fragment element written once and read once"
-            # (12 chunks x 512B = 6KB per thread per m tile). The fragments were not
-            # living in registers at all.
-            #
-            # Chunk-wide T2R needed a (ncol, flen/ncol) re-view of the fragment to hand
-            # one slice at a time to the staging copy, i.e. `make_tensor(frag.iterator,
-            # ...)` -- and taking an alloca's address is enough to stop SROA promoting
-            # it, whatever its size. Slicing the T2R itself removes both problems: the
-            # fragment IS one slice (64 f32 instead of 128), and no address is taken.
+            # This is what the whole drain hinges on: taking the drain out collapses local
+            # ld/st to near zero and cuts the runtime by roughly two thirds. So
+            # essentially all of the local traffic is this drain, and its volume is
+            # exactly "every T2R fragment element written once and read once". The
+            # fragments were not living in registers at all. Slicing the T2R makes each
+            # fragment one slice instead of a whole chunk, which is what shrinks it.
             #
             # Byte order is unchanged, so FlashAttentionBackwardPostprocess and
             # _unblock_accum keep working: the old code took fragment elements
@@ -3156,7 +3067,7 @@ class FlashAttentionBackwardSm100BigD:
                 # and releases the SMEM operands; the compute warpgroup takes the odd
                 # slices (see its branch). Slot 0 and named barrier 4 are this
                 # warpgroup's; the pre-split path below is what the configs that
-                # cannot split (no kv_shared, odd slice count) still take.
+                # cannot split (no kv_shared) still take.
                 for it in cutlass.range(num_iters, unroll=1):
                     m_iter = m_lo + it if it < seg1 else seg2_base + (it - seg1)
                     _bigd_drain_wg_iteration(
@@ -3285,13 +3196,13 @@ class FlashAttentionBackwardSm100BigD:
                                 # This replaced a SMEM staging round trip (a vectorised r2s
                                 # into a staging buffer, two named barriers around it, one
                                 # elected thread issuing a 32KB cp.reduce.async.bulk.add.f32).
-                                # MEASURED split of the drain before that change: the gmem
+                                # Measured split of the drain before that change: the gmem
                                 # reduce was somewhat more than half of it and the on-chip
                                 # T2R + staging the rest -- and at the one staging slot the
                                 # SMEM budget allowed at ncol=64 that staging was fully
                                 # serialised: wait for every outstanding reduce to have read
-                                # the slot, barrier, fill, fence, barrier, issue. Per m tile
-                                # that is 24 slices x 2 whole-warpgroup barriers. DSA drains
+                                # the slot, barrier, fill, fence, barrier, issue, with two
+                                # whole-warpgroup barriers per slice. DSA drains
                                 # its dKV the same way this does now (dsa_bwd_sm100.py's
                                 # scatter_dkv_atomic: float4 atomics from registers, no
                                 # staging).
@@ -3349,21 +3260,26 @@ class FlashAttentionBackwardSm100BigD:
                                     # the store is shared-memory only and the global side is
                                     # the TMA unit's problem, tracked by a bulk group.
                                     #
-                                    # The r2s is 16 hand-written st.shared.v4.f32 rather than
-                                    # a cute.copy through a re-viewed fragment on purpose:
-                                    # make_tensor(frag.iterator, ...) forms the fragment's
-                                    # address, which stops SROA promoting it and puts the
-                                    # whole T2R fragment in local memory. That is what made
-                                    # the earlier staged drain slower, not the reduce itself.
+                                    # The r2s goes through a re-viewed fragment: the
+                                    # inner mode is the 4 contiguous elements so the
+                                    # copy vectorises, the outer one strides by the
+                                    # warpgroup's thread count.
                                     sslot = sOutAccum[None, slot].iterator + drain_tidx * 4
-                                    for r in cutlass.range_constexpr(flen_slice // 4):
-                                        copy_utils.store_shared_f32x4(
-                                            frag[r * 4 + 0],
-                                            frag[r * 4 + 1],
-                                            frag[r * 4 + 2],
-                                            frag[r * 4 + 3],
-                                            sslot + r * (num_drain_threads * 4),
-                                        )
+                                    cute.autovec_copy(
+                                        cute.make_tensor(
+                                            frag.iterator,
+                                            cute.make_layout(
+                                                (4, flen_slice // 4), stride=(1, 4)
+                                            ),
+                                        ),
+                                        cute.make_tensor(
+                                            sslot,
+                                            cute.make_layout(
+                                                (4, flen_slice // 4),
+                                                stride=(1, num_drain_threads * 4),
+                                            ),
+                                        ),
+                                    )
                                     cute.arch.fence_view_async_shared()
                                     cute.arch.barrier(
                                         barrier_id=drain_barrier_id,

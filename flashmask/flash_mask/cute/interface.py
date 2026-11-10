@@ -1663,7 +1663,13 @@ def _flash_attn_bwd(
             n *= d
         return n
 
-    zero_kv_accum_range = kv_postprocess_enabled and need_kv_accum and accum_zero_axis1_kv is not None
+    zero_kv_accum_range = (
+        kv_postprocess_enabled
+        and need_kv_accum
+        and accum_zero_axis1_kv is not None
+        and not is_bigd_bwd
+    )
+
     zero_specs = []  # list of (key, shape, numel)
     if is_split_d_bwd:
         zero_specs.append(("dq_accum", dq_accum_shape, _numel(dq_accum_shape)))

@@ -361,6 +361,10 @@ class AttentionMask:
         encode_n_block: Int32 = None,
         generate_block_buffer_usable_block_count: Int32 = None,
         use_r2p: cutlass.Constexpr[bool] = True,
+        # Heads on the M axis: a CTA's rows are the q heads of ONE query token, so the
+        # flashmask row is that token (uniform over the CTA's rows) instead of
+        # `row_in_tile + m_block * tile_m`. `m_block` then counts TOKENS, not tile_m rows.
+        head_in_m: cutlass.Constexpr[bool] = False,
     ) -> Optional[cutlass.pipeline.PipelineState]:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_shape = (self.tile_m, self.tile_n)
@@ -498,30 +502,44 @@ class AttentionMask:
                 # fragment then lives in local memory and every access in softmax becomes
                 # an ld.local/st.local (measured: ~16KB of local traffic per KV tile).
                 nelem = const_expr(cute.size(tScS_t2r.shape))
+                # Row base to rebase the column bounds by, and (head-in-M only) the single
+                # row value every element of this CTA compares against. The identity
+                # coordinate spans the CTA PAIR's M range, so `>> log2(tile_m)` is this
+                # CTA's rank in the pair, i.e. which of the pair's two tokens it owns.
+                if const_expr(head_in_m):
+                    fm_row_off = m_block
+                    fm_row = tScS_t2r[0][0] // self.tile_m
+                else:
+                    fm_row_off = m_block * self.tile_m
+                    fm_row = None
                 if const_expr(has_ut_start):
                     for i in cutlass.range_constexpr(nelem):
-                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
-                        lte = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n] - m_block * self.tile_m
-                        uts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 2] - m_block * self.tile_m
-                        ute = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 3] - m_block * self.tile_m
-                        if (tScS_t2r[i][0] >= lts and tScS_t2r[i][0] < lte) or (tScS_t2r[i][0] >= uts and tScS_t2r[i][0] < ute):
+                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - fm_row_off
+                        lte = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n] - fm_row_off
+                        uts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 2] - fm_row_off
+                        ute = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 3] - fm_row_off
+                        row_i = fm_row if const_expr(head_in_m) else tScS_t2r[i][0]
+                        if (row_i >= lts and row_i < lte) or (row_i >= uts and row_i < ute):
                             acc_S[i] = -cutlass.Float32.inf
                 elif const_expr(has_lt_end):
                     for i in cutlass.range_constexpr(nelem):
-                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
-                        lte = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n] - m_block * self.tile_m
-                        if tScS_t2r[i][0] >= lts and tScS_t2r[i][0] < lte:
+                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - fm_row_off
+                        lte = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n] - fm_row_off
+                        row_i = fm_row if const_expr(head_in_m) else tScS_t2r[i][0]
+                        if row_i >= lts and row_i < lte:
                             acc_S[i] = -cutlass.Float32.inf
                 elif const_expr(has_ut_end):
                     for i in cutlass.range_constexpr(nelem):
-                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
-                        ute = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 3] - m_block * self.tile_m
-                        if tScS_t2r[i][0] >= lts or tScS_t2r[i][0] < ute:
+                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - fm_row_off
+                        ute = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 3] - fm_row_off
+                        row_i = fm_row if const_expr(head_in_m) else tScS_t2r[i][0]
+                        if row_i >= lts or row_i < ute:
                             acc_S[i] = -cutlass.Float32.inf
                 else:
                     for i in cutlass.range_constexpr(nelem):
-                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
-                        if tScS_t2r[i][0] >= lts:
+                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - fm_row_off
+                        row_i = fm_row if const_expr(head_in_m) else tScS_t2r[i][0]
+                        if row_i >= lts:
                             acc_S[i] = -cutlass.Float32.inf
 
             cute.arch.mbarrier_arrive(

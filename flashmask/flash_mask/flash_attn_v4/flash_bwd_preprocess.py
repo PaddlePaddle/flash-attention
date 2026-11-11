@@ -111,7 +111,7 @@ class FlashAttentionBackwardPreprocess:
         )
         num_copy_elems = 128 // self.dtype.width
         threads_per_row = gmem_k_block_size // num_copy_elems
-        self.gmem_tiled_copy_O = copy_utils.tiled_copy_2d(
+        self.gmem_tiled_copy_O = copy_utils.quack_tiled_copy_2d(
             self.dtype, threads_per_row, self.num_threads, num_copy_elems
         )
         universal_copy_bits = 128
